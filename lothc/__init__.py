@@ -1,0 +1,41 @@
+from ._client import (
+    JSON,
+    AsyncAuthProvider,
+    AuthProvider,
+    ConnectionError,  # noqa: A004 — deliberate, matches requests/httpx precedent
+    Data,
+    File,
+    Form,
+    Headers,
+    HTTPClient,
+    Json,
+    Params,
+    ResponseError,
+    Result,
+    SSEEvent,
+    SyncHTTPClient,
+    TimeoutError,  # noqa: A004 — deliberate, matches requests/httpx precedent
+    TransportError,
+    TypedHeaders,
+)
+
+__all__ = [
+    "JSON",
+    "AsyncAuthProvider",
+    "AuthProvider",
+    "ConnectionError",
+    "Data",
+    "File",
+    "Form",
+    "HTTPClient",
+    "Headers",
+    "Json",
+    "Params",
+    "ResponseError",
+    "Result",
+    "SSEEvent",
+    "SyncHTTPClient",
+    "TimeoutError",
+    "TransportError",
+    "TypedHeaders",
+]

@@ -1,0 +1,128 @@
+[project]
+name = "lothc"
+# No git repo/tags exist yet, so this is a static placeholder. Once the repo is created and tagged,
+# switch to `dynamic = ["version"]` + `[tool.hatch.version] source = "vcs"` (see commented block below).
+version = "0.0.0"
+description = "Lord Of The Http Clients — a typed HTTP client built on pyreqwest, with first-class pydantic and msgspec support"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = ["pyreqwest>=0.12.2"]
+
+[project.optional-dependencies]
+pydantic = ["pydantic>=2.12.5"]
+msgspec = ["msgspec>=0.19.0"]
+typeguard = ["typeguard>=4.4.0"]
+
+[dependency-groups]
+dev = [
+  "basedpyright>=1.38.0",
+  "fastapi>=0.129.0",
+  "msgspec>=0.19.0",
+  "pydantic>=2.12.5",
+  "pytest>=9.0.2",
+  "pytest-asyncio>=1.3.0",
+  "pytest-cov>=7.0.0",
+  "rich>=14.3.2",
+  "ruff>=0.15.14",
+  "typeguard>=4.4.0",
+  "uvicorn[standard]>=0.41.0",
+  "yeetr>=2026.5.22",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Once a git repo with tags exists, switch to VCS-derived versioning (git tag = source of truth):
+#   requires = ["hatchling", "hatch-vcs"]
+#   [tool.hatch.version]
+#   source = "vcs"
+# ...and add `dynamic = ["version"]` to [project] above, removing the static `version` key.
+
+[tool.hatch.build.targets.wheel]
+packages = ["lothc"]
+
+#=====================================================================================
+# Tool configurations
+#=====================================================================================
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.coverage.report]
+skip_empty = true
+
+[tool.coverage.run]
+branch = true
+source = ["lothc"]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+fix = true
+
+[tool.ruff.lint]
+select = [
+  "A",   # builtins shadowing
+  "ANN", # type annotations
+  "ARG", # unused arguments
+  "B",   # bugbear (common bugs & bad patterns)
+  "BLE", # blind excepts
+  "C4",  # comprehensions
+  "COM", # commas
+  "DTZ", # datetime timezone
+  "E",   # pycodestyle errors
+  "ERA", # eradicate commented-out code
+  "FA",  # future annotations
+  "FBT", # boolean trap
+  "F",   # pyflakes
+  "I",   # import sorting
+  "ICN", # import conventions
+  "ISC", # implicit str concat
+  "N",   # naming conventions
+  "PGH", # pygrep-hooks
+  "PTH", # pathlib
+  "PT",  # pytest style
+  "RET", # return statements
+  "RUF", # Ruff extra rules
+  "TRY", # tryceratops
+  "S",   # security
+  "SIM", # simplifications
+  "C90", # mccabe complexity
+  "TID", # tidy imports
+  "TC",  # typing under TYPE_CHECKING
+  "TD",  # TODOs must be annotated
+  "UP",  # pyupgrade / newer syntax
+  "W",   # pycodestyle warnings
+  "YTT", # flake8-2020
+  "T10", # debugger statements
+]
+ignore = [
+  "COM812",
+  "TC006",
+  "TRY003", # every raise here is a short, self-contained message; a bespoke exception class per
+  # ValueError/TypeError would be ceremony, not clarity — see style-guide.md
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["lothc"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN001", "S101"] # use of assert detected
+"examples/*" = ["T201", "ANN"] # print() and looser annotations are fine in examples
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
+
+[tool.ruff.format]
+preview = true
+
+[tool.basedpyright]
+pythonVersion = "3.13"
+typeCheckingMode = "strict"
+include = ["lothc", "tests", "examples"]
+reportMissingTypeStubs = false
+
+[[tool.basedpyright.executionEnvironments]]
+root = "tests"
+reportUnusedFunction = "none"

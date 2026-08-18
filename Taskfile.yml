@@ -1,0 +1,79 @@
+# https://taskfile.dev
+version: '3'
+
+vars:
+  PYTEST_PROFILE: '{{default "dev" .PYTEST_PROFILE}}'
+  PYTEST_ARGS_DEV: -s -vv -rA --tb=short --color=yes
+  PYTEST_ARGS_AGENT: -x -q --tb=short --no-header --disable-warnings --color=no -p no:cacheprovider
+  PYTEST_ARGS: '{{if eq .PYTEST_PROFILE "agent"}}{{.PYTEST_ARGS_AGENT}}{{else}}{{.PYTEST_ARGS_DEV}}{{end}}'
+  PYTEST_RUN: uv run pytest {{.PYTEST_ARGS}}
+
+tasks:
+  default:
+    silent: true
+    aliases: [help]
+    desc: "Print help"
+    cmd: task --list
+
+  # ------------------------------------------------------------------------------------------------
+  # - Dependencies -----------------------------------------------------------------------------------
+  # ------------------------------------------------------------------------------------------------
+  deps-sync:
+    desc: Install dependencies
+    cmd: uv sync --all-extras
+
+  deps-upgrade:
+    desc: Update dependencies
+    cmd: uv sync --all-extras --upgrade
+
+  deps-lock:
+    desc: Lock dependencies
+    cmd: uv lock
+
+  # ------------------------------------------------------------------------------------------------
+  # - Test ---------------------------------------------------------------------------------------
+  # ------------------------------------------------------------------------------------------------
+  test:
+    desc: Run the test suite
+    cmd: '{{.PYTEST_RUN}} tests {{.CLI_ARGS}}'
+
+  test-doctests:
+    desc: Run doctests
+    cmd: '{{.PYTEST_RUN}} --doctest-modules lothc {{.CLI_ARGS}}'
+
+  test-one:
+    desc: Run a single test in isolation
+    cmd: '{{.PYTEST_RUN}} {{.CLI_ARGS}}'
+
+  # ------------------------------------------------------------------------------------------------
+  # - Lint / format / typecheck ----------------------------------------------------------------------
+  # ------------------------------------------------------------------------------------------------
+  lint:
+    desc: Lint and auto-fix
+    cmd: uv run ruff check --fix {{.CLI_ARGS | default "."}}
+
+  format:
+    desc: Format code
+    cmd: uv run ruff format {{.CLI_ARGS | default "."}}
+
+  typecheck:
+    desc: Type-check with basedpyright
+    cmd: uv run basedpyright {{.CLI_ARGS | default "."}}
+
+  check:
+    desc: Lint, format-check, and typecheck (what CI runs)
+    cmds:
+      - uv run ruff check .
+      - uv run ruff format --check .
+      - uv run basedpyright .
+
+  # ------------------------------------------------------------------------------------------------
+  # - Examples -----------------------------------------------------------------------------------
+  # ------------------------------------------------------------------------------------------------
+  example-server:
+    desc: Run the example FastAPI test server on port 8701
+    cmd: uv run uvicorn --app-dir examples test_server:app --port 8701
+
+  example-run:
+    desc: Run the example showcase script against example-server
+    cmd: uv run yeet examples/run_http.py {{.CLI_ARGS}}

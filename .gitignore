@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+*.egg-info/
+.DS_Store
+
+# Handy for temporary run scripts
+tmp_*.py
+run_*.py
