@@ -1,7 +1,9 @@
 [project]
 name = "lothc"
-# No git repo/tags exist yet, so this is a static placeholder. Once the repo is created and tagged,
+# No git repo/tags exist yet, so this is a static placeholder. Once the repo is created and tagged
+# with a CalVer tag (e.g. `git tag 2026.8.18`, no "v" prefix — same scheme as the yeetr project),
 # switch to `dynamic = ["version"]` + `[tool.hatch.version] source = "vcs"` (see commented block below).
+# The tag itself becomes the version's single source of truth — nothing to bump by hand.
 version = "0.0.0"
 description = "Lord Of The Http Clients — a typed HTTP client built on pyreqwest, with first-class pydantic and msgspec support"
 readme = "README.md"
@@ -16,7 +18,7 @@ typeguard = ["typeguard>=4.4.0"]
 [dependency-groups]
 dev = [
   "basedpyright>=1.38.0",
-  "fastapi>=0.129.0",
+  "jero[granian]>=0.0.54",
   "msgspec>=0.19.0",
   "pydantic>=2.12.5",
   "pytest>=9.0.2",
@@ -25,7 +27,6 @@ dev = [
   "rich>=14.3.2",
   "ruff>=0.15.14",
   "typeguard>=4.4.0",
-  "uvicorn[standard]>=0.41.0",
   "yeetr>=2026.5.22",
 ]
 
@@ -33,11 +34,14 @@ dev = [
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# Once a git repo with tags exists, switch to VCS-derived versioning (git tag = source of truth):
+# Once a git repo exists with a CalVer tag (e.g. 2026.8.18, optionally 2026.8.18.post1 for a same-day
+# re-release — no "v" prefix), switch to VCS-derived versioning:
 #   requires = ["hatchling", "hatch-vcs"]
 #   [tool.hatch.version]
 #   source = "vcs"
 # ...and add `dynamic = ["version"]` to [project] above, removing the static `version` key.
+# setuptools-scm's default tag regex accepts a bare `\d+\.\d+...` tag as-is, so no tag_pattern
+# override should be needed — but verify once the first real tag is pushed.
 
 [tool.hatch.build.targets.wheel]
 packages = ["lothc"]

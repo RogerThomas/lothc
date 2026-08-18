@@ -12,3 +12,7 @@ dist/
 # Handy for temporary run scripts
 tmp_*.py
 run_*.py
+
+# Local environment and scratch input files
+.env
+.in
