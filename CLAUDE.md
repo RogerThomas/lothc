@@ -14,35 +14,37 @@ work with none, either, or all of them installed.
 
 ## Status
 
-No git repo exists yet (deliberately — not created yet). No persistent memory has accumulated for
-this project either, since it only just moved here from being prototyped inside another repo — this
-file is currently the *only* thing that survives between sessions, so keep it up to date as the
-source of truth on decisions and remaining work, until real project memory builds up.
+A git repo now exists (`main`, no tags pushed yet). A real test suite exists under `tests/` (see
+Testing below) and a benchmark suite under `benchmarks/` — this file is no longer the only thing
+that survives between sessions, but it's still the source of truth on decisions and remaining work,
+so keep it up to date.
 
 `version = "0.0.0"` in `pyproject.toml` is a static placeholder. This project uses **CalVer** (e.g.
 `2026.8.18`, no "v" prefix — same scheme as the `yeetr` project), derived from the git tag via
-`hatch-vcs` once a repo exists — a release is just a pushed tag, nothing to bump by hand. The exact
-change needed (uncomment `hatch-vcs`, add `dynamic = ["version"]`) is commented directly above
-`[tool.hatch.build.targets.wheel]` in `pyproject.toml`.
+`hatch-vcs` once the first tag is pushed — a release is just a pushed tag, nothing to bump by hand.
+The exact change needed (uncomment `hatch-vcs`, add `dynamic = ["version"]`) is commented directly
+above `[tool.hatch.build.targets.wheel]` in `pyproject.toml`.
+
+Not yet done, outside the roadmap below: no `LICENSE`, no CI (`.github/workflows`).
 
 ### Roadmap — what's done, what's next
 
 Done: query params (typed + raw), per-request headers (typed + raw), timeouts, transport error
-wrapping (`TransportError`/`TimeoutError`/`ConnectionError`), `put`/`patch`, SSE (with
-`TypeAdapter`/`Decoder` support), the `Data` decode-target system (`bytes` default, `lothc.JSON`,
-`TypedDict` + optional `typeguard` validation), and a bearer-token auth provider (static
-`bearer_token` or a per-request-refreshed `bearer_auth` callable).
+wrapping (`TransportError`/`TimeoutError`/`ConnectionError`), `put`/`patch`/`delete`/`head`, SSE (with
+`TypeAdapter`/`Decoder` support), `stream_get`/`stream_post` (raw chunks by default — unbuffered, safe
+for arbitrary binary content; pass `response_data_type` to switch to newline-buffered NDJSON-style typed
+decoding instead — the buffering is conditional on that param, not always-on), the `Data` decode-target
+system (`bytes` default, `lothc.JSON`, `TypedDict` + optional `typeguard` validation), a bearer-token
+auth provider (static `bearer_token` or a per-request-refreshed `bearer_auth` callable), cookie/session
+support (`cookie_store=True`), redirect control (`follow_redirects`/`max_redirects`), proxy config
+(`proxy=`), and retries (`max_retries`/`retry_methods`, implemented as a real pyreqwest
+`with_middleware` hook — backoff + `Retry-After` honored, defaults to idempotent verbs
+`get`/`put`/`delete`/`head`, `post`/`patch` require explicit opt-in via `retry_methods`).
 
-Not done yet, in rough priority order:
+Not done yet:
 
-1. **Retries** — backoff on `TransportError`/`ConnectionError` and 5xx/429, honoring `Retry-After`,
-   for idempotent verbs (`get`, `put`, `delete`, `head` — NOT blind `post`/`patch` unless opted in).
-2. **Typed error bodies** — an `error_type=SomeModel` param (mirrors `data_type`) that decodes 4xx/5xx
+1. **Typed error bodies** — an `error_type=SomeModel` param (mirrors `response_data_type`) that decodes 4xx/5xx
    bodies onto `ResponseError`, instead of just the raw `body_start` snippet it has today.
-3. **Streaming downloads** — a `stream()` method yielding raw chunks for large bodies; reuse the
-   `_sse_stream` plumbing minus the SSE record-parsing.
-4. **`delete`/`head` verbs** — `delete` is a thin wrapper over `_send_with_body` with no body params;
-   `head` returns a headers-only `Result` (no body to decode).
 
 ## Testing
 
@@ -66,6 +68,9 @@ Run with `task test-doctests`.
 - Format: `task format`
 - Type-check: `task typecheck`
 - Everything CI runs: `task check`
+- Install the git pre-commit hook: `task precommit-install` (requires `prek` — `brew install prek`,
+  a fast Rust drop-in for `pre-commit` that reads the same `.pre-commit-config.yaml`)
+- Run all pre-commit hooks against the whole repo: `task precommit`
 
 ## Manual example / smoke-testing
 
@@ -104,8 +109,9 @@ async with HTTPClient.build(base_url=..., bearer_token=..., timeout=30.0) as cli
 
 ### Verbs
 
-`get`, `get_result`, `post`, `put`, `patch`, `sse` — each is a set of `@overload`s plus one real
-implementation. See style guide for *why* overloads are used instead of a single generic signature.
+`get`, `get_result`, `post`, `put`, `patch`, `delete`, `head`, `sse`, `stream_get`, `stream_post` —
+each is a set of `@overload`s plus one real implementation. See style guide for *why* overloads are
+used instead of a single generic signature.
 
 ### Read style-guide.md before making code changes
 
@@ -129,24 +135,24 @@ Before writing any code, tell the user that you've read this file AND read and f
   don't unify them.
 - **Validation errors from the chosen decode library are NOT wrapped.** A `pydantic.ValidationError`,
   `msgspec.ValidationError`, or `typeguard.TypeCheckError` propagates natively — the user opted into
-  that library by choosing it as a `data_type`, so its own exception is the expected one to see.
+  that library by choosing it as a `response_data_type`, so its own exception is the expected one to see.
 - **basedpyright strict mode is the contract.** Every change must pass `task typecheck` with zero
   errors and, ideally, zero new `cast(...)` calls.
 - **Overload-pairs over a single generic-with-cast signature.** Every verb has two (or more) `@overload`s
-  — one with no `data_type` (returns `bytes`), one generic (`data_type: type[TData]` → `TData`) — plus
+  — one with no `response_data_type` (returns `bytes`), one generic (`response_data_type: type[TData]` → `TData`) — plus
   one real, non-generic implementation whose body returns the plain `Data` union. This is *why* there
   are almost no `cast()` calls anywhere: the implementation never claims to return the type parameter
   `TData` itself, only the overloads do, and pyright doesn't need to re-link a runtime
   `issubclass()`-narrowed value back to a type variable inside the implementation. A single generic
-  method with a value-default (`data_type: type[T] = SomeDefault`) was tried first and rejected —
+  method with a value-default (`response_data_type: type[T] = SomeDefault`) was tried first and rejected —
   it forces `cast()` at every branch inside the implementation.
 - **The `Data`/`Json`/`Params`/`Headers`/`Form`/`File` type aliases are named at the *instance* level**,
   not the class level — `File` is the tuple a caller passes, not `type[File]`. Keep new aliases
-  consistent with that (e.g. it's why `JSON` — a real class — reads correctly as `data_type: type[JSON]`
+  consistent with that (e.g. it's why `JSON` — a real class — reads correctly as `response_data_type: type[JSON]`
   without a category-slip like `type[DataType]` would).
-- **Only `lothc.JSON` (or a subclass) and `TypedDict` classes are valid dict-shaped `data_type`s** — bare
+- **Only `lothc.JSON` (or a subclass) and `TypedDict` classes are valid dict-shaped `response_data_type`s** — bare
   `dict` and `dict[str, Any]` are rejected, both statically (not in the `Data` bound) and at runtime
-  (`_validate_data_type` raises `TypeError` for both). This was almost shipped with only the static
+  (`_validate_response_data_type` raises `TypeError` for both). This was almost shipped with only the static
   rejection — a real live bug: bare `dict` silently succeeded, `dict[str, Any]` crashed with an ugly
   `issubclass() arg 1 must be a class` since a subscripted generic isn't a real class. **Lesson that
   generalizes beyond this one bug: never claim something is "rejected/enforced" from a basedpyright
@@ -160,6 +166,44 @@ Before writing any code, tell the user that you've read this file AND read and f
   `Authorization` header via pyreqwest's `.bearer_auth()`, and the old generic names hid that. Keep this
   naming precise if Basic auth (or anything else) is ever added — don't let a new mechanism quietly
   reuse the word "auth" generically again.
-- **`data_type` defaults to `bytes` everywhere** (not a `Response`/`SyncResponse` wrapper — those classes
-  were deleted). `sse()` is the deliberate exception: its bare default stays `SSEEvent`, since a stream
+- **`response_data_type` defaults to `bytes` everywhere** (not a `Response`/`SyncResponse` wrapper — those classes
+  were deleted). `sse()` is the deliberate exception: its bare default stays `SSEEvent[str]`, since a stream
   of discrete named records has no single "raw bytes" analogue the way one response body does.
+- **`SSEEvent` is generic in both `TData` and `TId` (`SSEEvent[TData, TId = str]`, matching
+  `sse()`'s own default of a required plain-`str` id when `id_type` is omitted — the class's own
+  default must track whatever `sse()` actually produces by default, not an independently-chosen
+  value; these two defaults disagreeing was a real bug caught here, not just a docs error),
+  `@dataclass(kw_only=True)`, field order `id`, `event`, `data`** — `response_data_type`
+  controls only what `.data` decodes to; `.event`/`.id` are always populated regardless of
+  whether a decode target was passed. `.event` is a plain `str`, never `None` — it has a
+  dataclass default of `"message"`, matching the SSE spec's own default for the field when
+  absent from the wire (`_parse_sse_record` independently applies the same fallback while
+  parsing; the dataclass default is just for manual/external construction, every internal call
+  site passes `event=` explicitly regardless). `.id` is genuinely `str | None` by default, since
+  the SSE spec makes `id:` an optional field a server can choose never to send — this isn't
+  overcaution to relax later, it's a real invariant, which is why `TId` exists at all.
+  **`id_type: type[Any] | UnionType | None = str` is `sse()`'s single knob for both
+  requiredness and type of `.id`** — this used to be two separate params (`id_type` for
+  coercion, `require` for a `Literal["event", "id", "id-event"] | None` presence check covering
+  both fields), then briefly a version of `id_type` alone that couldn't express "optional but
+  coerced when present" (e.g. `uuid.UUID | None`) at all. Fixed by accepting a real union
+  directly: `id_type=int | None` works the same way `response_data_type=A | B` already does for
+  discriminated unions — `type[TId]` binds `TId` to whatever's passed, union or not, and
+  `_coerce_sse_id` inspects it at runtime via `isinstance(id_type, UnionType)` +
+  `get_args(id_type)` to decide (a) whether `NoneType` is a member (→ optional) and (b) the
+  non-`None` member to actually coerce to (falls back to `str` if `id_type` was bare `None`).
+  `require`'s `"event"` half never affected any type (`.event` is never `None` either way, see
+  above) and was pure orthogonal noise — dropped rather than folded in. Don't reintroduce a
+  separate requiredness param: bare `str`/a type = required, that same type unioned with `None`
+  (or bare `None`) = optional, and that already covers every combination there is.
+  Originally `sse(response_data_type=...)` returned the decoded payload bare, discarding
+  `.event`/`.id` entirely — a real gap caught while writing the docs. Don't reintroduce that: any
+  change to SSE parsing must keep decoding scoped to `parsed_record.data`, then build a new
+  `SSEEvent(id=event_id, event=parsed_record.event, data=...)`, never yield the decoded value on
+  its own.
+- **`response_data_type` on `stream_get`/`stream_post` means something different than on every
+  other verb** — same parameter name (standardized deliberately for consistency), but on
+  `get`/`post`/etc. it decodes the *whole response body* as one value, while on the streaming
+  verbs it decodes *each NDJSON line* as a separate value. Keep this per-line-vs-whole-body
+  distinction in mind — it's a real tradeoff of the name reuse, not an oversight, and is called
+  out explicitly in `docs/streaming.md`.

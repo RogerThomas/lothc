@@ -7,6 +7,8 @@ vars:
   PYTEST_ARGS_AGENT: -x -q --tb=short --no-header --disable-warnings --color=no -p no:cacheprovider
   PYTEST_ARGS: '{{if eq .PYTEST_PROFILE "agent"}}{{.PYTEST_ARGS_AGENT}}{{else}}{{.PYTEST_ARGS_DEV}}{{end}}'
   PYTEST_RUN: uv run pytest {{.PYTEST_ARGS}}
+  PERF_CPUSET: '{{default "2" .PERF_CPUSET}}'
+  JSON_SERVER_CPUSET: '{{default "0,1" .JSON_SERVER_CPUSET}}'
 
 tasks:
   default:
@@ -67,6 +69,14 @@ tasks:
       - uv run ruff format --check .
       - uv run basedpyright .
 
+  precommit-install:
+    desc: Install the git pre-commit hook (requires prek — brew install prek)
+    cmd: prek install
+
+  precommit:
+    desc: Run all pre-commit hooks against the whole repo (requires prek)
+    cmd: prek run --all-files
+
   # ------------------------------------------------------------------------------------------------
   # - Examples -----------------------------------------------------------------------------------
   # ------------------------------------------------------------------------------------------------
@@ -78,3 +88,47 @@ tasks:
   example-run:
     desc: Run the example showcase script against example-server
     cmd: uv run yeet ./examples/run_http.py {{.CLI_ARGS}}
+
+  # ------------------------------------------------------------------------------------------------
+  # - Docs ---------------------------------------------------------------------------------------
+  # ------------------------------------------------------------------------------------------------
+  docs:
+    desc: Serve the docs site locally on port 9223 with live reload
+    cmds:
+      - defer: lsof -ti:9223 | xargs -r kill -9
+      - lsof -ti:9223 | xargs -r kill -9
+      - uv run zensical serve --dev-addr localhost:9223
+
+  docs-build:
+    desc: Build the static docs site into site/
+    cmd: uv run zensical build
+
+  # ------------------------------------------------------------------------------------------------
+  # - Benchmarks ---------------------------------------------------------------------------------
+  # ------------------------------------------------------------------------------------------------
+  perf-build:
+    desc: Build the json-server and perf benchmark images (docker compose)
+    dir: benchmarks
+    cmd: docker compose build
+
+  perf:
+    desc: >
+      Run perf.py against a separate json-server container, so the server never
+      competes with the client under test for CPU. json-server gets
+      JSON_SERVER_CPUSET cores (default "0,1"), perf gets PERF_CPUSET (default
+      "2") — e.g. JSON_SERVER_CPUSET=0,1 PERF_CPUSET=2 task perf -- --total-requests 5000.
+      Each run's JSON results land in ./results/<run_id>.json on the host.
+    dir: benchmarks
+    env:
+      JSON_SERVER_CPUSET: "{{.JSON_SERVER_CPUSET}}"
+      PERF_CPUSET: "{{.PERF_CPUSET}}"
+    cmds:
+      - mkdir -p ../results
+      - defer: docker compose down
+      - docker compose run --rm perf {{.CLI_ARGS}}
+
+  perf-svg:
+    desc: >
+      Regenerate assets/perf-race.svg from a perf.py results file. Usage:
+      task perf-svg -- results/<run_id>.json [--race-seconds N].
+    cmd: uv run yeet benchmarks/race_svg.py {{.CLI_ARGS}}

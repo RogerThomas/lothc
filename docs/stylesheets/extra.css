@@ -1,0 +1,15 @@
+.logo-dark-only {
+  display: none;
+}
+
+[data-md-color-scheme="slate"] .logo-light-only {
+  display: none;
+}
+
+[data-md-color-scheme="slate"] .logo-dark-only {
+  display: block;
+}
+
+.perf-race-img {
+  border-radius: 12px;
+}

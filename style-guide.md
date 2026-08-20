@@ -10,7 +10,7 @@
 - [3. On tests, prefer passing fixture name instead of file bytes](#3-on-tests-prefer-passing-fixture-name-instead-of-file-bytes)
 - [4. Use simple test values, not pseudo-realistic ones](#4-use-simple-test-values-not-pseudo-realistic-ones)
 - [5. Place private methods/functions before the methods/functions that use them](#5-place-private-methodsfunctions-before-the-methodsfunctions-that-use-them)
-- [6. Almost never test private methods/functions](#6-almost-never-test-private-methodsfunctions)
+- [6. Never test private methods/functions — public interface only](#6-never-test-private-methodsfunctions--public-interface-only)
 - [7. Use `@dataclass(slots=True)` for internal DTOs](#7-use-dataclassslotstrue-for-internal-dtos)
 - [8. Use `create_autospec` for mocking in tests](#8-use-create_autospec-for-mocking-in-tests)
 - [9. Almost never use globals](#9-almost-never-use-globals)
@@ -195,11 +195,13 @@ class DocumentProcessor:
         return {}
 ```
 
-## 6. Almost never test private methods/functions<a name="6-almost-never-test-private-methodsfunctions"></a>
+## 6. Never test private methods/functions — public interface only<a name="6-never-test-private-methodsfunctions--public-interface-only"></a>
 
-Private methods and functions (prefixed with `_`) are implementation details. Testing them directly couples tests to internals, making refactoring harder and tests more fragile.
+Private methods and functions (prefixed with `_`) are implementation details. This is not a soft preference: tests must **never** reach into them, directly or indirectly (no calling a private method on an instance, no patching a private attribute to observe it, no importing a private module-level function to unit-test in isolation). Every test exercises the class/module only through its public interface and asserts on externally-observable outcomes (return values, raised exceptions, side effects on a real or mocked collaborator passed in via the public interface).
 
-Instead, test the public interface. If a private method has complex logic worth testing, it is a signal it should be extracted into its own public class or function.
+Testing internals directly couples tests to implementation details, making refactoring harder and tests more fragile — a passing test suite should mean "the public contract still holds," not "these specific private helpers still exist with these specific names."
+
+If a private method has complex logic worth testing on its own, that is a signal it should be extracted into its own public class or function with its own tests — not a reason to reach into the private method from an existing test.
 
 Use dependency injection so that dependencies can be replaced with mocks in tests. Dependencies are injected via the constructor and replaced with mocks in tests. Use mock assertions (e.g. `assert_called_once_with`) to verify a component interacts with its dependencies correctly, without reaching into private implementation details.
 

@@ -1,0 +1,24 @@
+# Two separate services so the JSON server never contends with the client under
+# test for CPU — see the comment at the top of Dockerfile for why. Run via
+# `task perf` / `task perf-build` (see Taskfile.yml), not directly.
+services:
+  json-server:
+    build:
+      context: ..
+      dockerfile: benchmarks/Dockerfile
+      target: server-runtime
+    cpuset: "${JSON_SERVER_CPUSET:-0,1}"
+
+  perf:
+    build:
+      context: ..
+      dockerfile: benchmarks/Dockerfile
+      target: runtime
+    cpuset: "${PERF_CPUSET:-2}"
+    depends_on:
+      - json-server
+    environment:
+      COLUMNS: "200"
+      PERF_TARGET_URL: "http://json-server:3000"
+    volumes:
+      - ../results:/app/results

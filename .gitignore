@@ -16,3 +16,9 @@ run_*.py
 # Local environment and scratch input files
 .env
 .in
+
+# perf.py run output (JSON per run, named by ms-timestamp run id)
+/results/
+
+# zensical docs build output
+/site/
