@@ -165,3 +165,12 @@ tasks:
   asv-preview:
     desc: Serve the asv-publish dashboard locally so you can see the trend graphs
     cmd: uv run asv preview
+
+  bench-check:
+    desc: >
+      "I'm mid-edit, no commit, does this help or hurt?" Runs every asv_bench/ time_*
+      benchmark against whatever's on disk right now (dirty tree included, no git
+      involved at all) and diffs against whatever this printed last time it ran,
+      then overwrites that saved baseline with today's numbers. Edit, run, see the
+      diff; edit again, run again, see the diff against *that* run.
+    cmd: uv run yeet asv_bench/quick_check.py {{.CLI_ARGS}}

@@ -125,17 +125,43 @@ asv-discovered benchmark class because pytest is never imported anywhere in that
   benchmarks just the tip of each configured branch (`asv run`'s actual default — not "every new
   commit", which is what the special range spec `NEW` does instead).
 - View results as a trend dashboard: `task asv-publish` then `task asv-preview`
+- **"I'm mid-edit, haven't committed, does this help or hurt?"**: `task bench-check` — see
+  "Instant no-git benchmark check" below. asv fundamentally can't answer this (it's keyed on commit
+  hashes), which is a different problem than asv being broken or avoidable — `bench-check` is a
+  separate, additive tool for exactly this case, reusing the exact same benchmark methods.
 
 Two suites exist so far:
 
 - `asv_bench/bench_download.py`: `get()` vs `download()` bytes-mode vs `download(dest=Path)` against
   a large body, both `time_*` and `peakmem_*`.
-- `asv_bench/bench_verbs.py`: `get()`/`get(response_data_type=JSON)`/`post()` against small,
-  realistic JSON bodies via the exact same stdlib server the real pytest suite runs against
-  (`tests/_server.py`, loaded the same importlib way `examples/server.py` does — no `sys.path`
-  hack). Deliberately simpler than `bench_download.py`: a body this small never meaningfully skews
-  a `peakmem_*` measurement, so there's no need for a separate-process server, and no `setup_cache()`
-  since there's no expensive fixture to cache.
+- `asv_bench/bench_verbs.py`: `get()` against all five decode targets it supports (raw `bytes`,
+  `lothc.JSON`, pydantic `BaseModel`, msgspec `Struct`, `TypedDict` — the last exercises typeguard's
+  runtime validation when it's installed) plus `post()`, against small, realistic JSON bodies via
+  the exact same stdlib server the real pytest suite runs against (`tests/_server.py`, loaded the
+  same importlib way `examples/server.py` does — no `sys.path` hack). Deliberately simpler than
+  `bench_download.py`: a body this small never meaningfully skews a `peakmem_*` measurement, so
+  there's no need for a separate-process server, and no `setup_cache()` since there's no expensive
+  fixture to cache. Because pydantic/msgspec/typeguard are optional extras, not lothc's own hard
+  dependency, `asv.conf.json`'s `matrix.req` explicitly installs all three into every real isolated
+  `asv run`/`asv continuous` environment — confirmed live (the built env is literally named
+  `uv-py3.14-msgspec-pydantic-typeguard`) — otherwise those benchmark methods would import-error in
+  a from-scratch build.
+
+### Instant no-git benchmark check
+
+`task bench-check` (`asv_bench/quick_check.py` + `asv_bench/_quick_check_worker.py`) runs every
+`time_*` method across both suites above directly — no asv CLI, no commit, no `git stash`, works
+against a dirty working tree exactly as it sits on disk. Each benchmark still runs in its own
+subprocess (`_quick_check_worker.py`) so `peakmem` stays a true per-benchmark reading rather than a
+whole-run high-water mark. Mechanism: it diffs every result against
+`asv_bench/.quick_check_baseline.json` (gitignored) if that file exists, then unconditionally
+overwrites it with today's numbers — so the very next run compares against *this* one. First run
+ever just records a baseline (nothing to diff against yet). Workflow: edit code, `task bench-check`,
+see the diff, edit again, `task bench-check` again, see the diff against that run. This is
+deliberately additive to `asv run`/`asv continuous`, not a replacement — the two answer different
+questions (uncommitted dev-loop iteration vs. tracked regression history across real commits) and
+both reuse the exact same `bench_download.py`/`bench_verbs.py` benchmark definitions, so there's
+only ever one definition of what each benchmark measures.
 
 A few things that were real gotchas building `bench_download.py`, worth knowing before adding more
 benchmarks here:
