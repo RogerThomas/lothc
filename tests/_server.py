@@ -101,6 +101,12 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _handle_redirect_loop(self) -> None:
+        self.send_response(302)
+        self.send_header("Location", "/redirect-loop")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _handle_flaky(self, query: str) -> None:
         params = parse_qs(query)
         key = params["key"][0]
@@ -266,6 +272,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/set-cookie": self._handle_set_cookie,
             "/read-cookie": self._handle_read_cookie,
             "/redirect": self._handle_redirect,
+            "/redirect-loop": self._handle_redirect_loop,
             "/binary": self._handle_binary,
             "/truncated": self._handle_truncated,
         }

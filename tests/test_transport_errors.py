@@ -2,7 +2,13 @@ import socket
 
 import pytest
 
-from lothc import HTTPClient, HTTPConnectionError, HTTPTimeoutError, SyncHTTPClient
+from lothc import (
+    HTTPClient,
+    HTTPConnectionError,
+    HTTPTimeoutError,
+    HTTPTransportError,
+    SyncHTTPClient,
+)
 
 
 def _closed_port_url() -> str:
@@ -38,3 +44,17 @@ def test_sync_slow_endpoint_past_timeout_raises_timeout_error(base_url: str) -> 
         pytest.raises(HTTPTimeoutError),
     ):
         client.get("slow")
+
+
+async def test_exceeding_max_redirects_raises_transport_error(base_url: str) -> None:
+    async with HTTPClient.build(base_url=base_url, max_redirects=1) as client:
+        with pytest.raises(HTTPTransportError):
+            await client.get("redirect-loop")
+
+
+def test_sync_exceeding_max_redirects_raises_transport_error(base_url: str) -> None:
+    with (
+        SyncHTTPClient.build(base_url=base_url, max_redirects=1) as client,
+        pytest.raises(HTTPTransportError),
+    ):
+        client.get("redirect-loop")

@@ -316,6 +316,16 @@ Before writing any code, tell the user that you've read this file AND read and f
   at every `.send()` call and inside both SSE stream loops. If pyreqwest (or a future alternate
   backend) grows a new exception type that should be treated as a transport failure, translate it in
   `_translate_transport_error`, not at the call site.
+  **`pyreqwest.exceptions.RedirectError` (raised past `max_redirects`) is NOT a `TransportError`
+  subclass** — verified live via `issubclass()`, it's a sibling under `RequestError`, not a child of
+  `TransportError` — so it was leaking raw out of every `.send()`/streaming call site until caught.
+  Fixed by widening every one of those 8 call sites (both `_send`/`_send_sync` helpers, plus both
+  SSE stream loops, both `_line_stream` loops, and both `download` loops) to catch
+  `(PyreqwestTransportError, PyreqwestRedirectError)` and by widening `_translate_transport_error`'s
+  own parameter type to the same union. Maps to plain `HTTPTransportError` (the generic base, not a
+  new dedicated exception) — it's neither a timeout nor a connection-level network failure, and
+  adding a whole new public exception class for one redirect-policy edge case didn't seem justified
+  when the existing base already communicates "transport-level failure, no usable response."
 - **Status errors are separate from transport errors.** `HTTPResponseError` (4xx/5xx with a body_start
   snippet) is a different failure class from `HTTPTransportError` (never got a response at all) —
   don't unify them.
@@ -332,10 +342,14 @@ Before writing any code, tell the user that you've read this file AND read and f
   `issubclass()`-narrowed value back to a type variable inside the implementation. A single generic
   method with a value-default (`response_data_type: type[T] = SomeDefault`) was tried first and rejected —
   it forces `cast()` at every branch inside the implementation.
-- **The `Data`/`Json`/`Params`/`Headers`/`Form`/`File` type aliases are named at the *instance* level**,
+- **The `Data`/`JSONPayload`/`Params`/`Headers`/`Form`/`File` type aliases are named at the *instance* level**,
   not the class level — `File` is the tuple a caller passes, not `type[File]`. Keep new aliases
   consistent with that (e.g. it's why `JSON` — a real class — reads correctly as `response_data_type: type[JSON]`
   without a category-slip like `type[DataType]` would).
+  `JSONPayload` (the `json=` request-body alias) was named that way — not `Json` — specifically to
+  avoid a case-only collision with `JSON` (the response-decode class): they're unrelated concepts
+  (request input vs. response-decode target) that happened to differ only by capitalization, which
+  real code review flagged as a genuine readability trap, not just a style nit.
 - **Only `lothc.JSON` (or a subclass) and `TypedDict` classes are valid dict-shaped `response_data_type`s** — bare
   `dict` and `dict[str, Any]` are rejected, both statically (not in the `Data` bound) and at runtime
   (`_validate_response_data_type` raises `TypeError` for both). This was almost shipped with only the static

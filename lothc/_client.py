@@ -23,6 +23,7 @@ from typing import Any, ClassVar, Protocol, Self, cast, get_args, is_typeddict, 
 
 from pyreqwest.client import Client, ClientBuilder, SyncClient, SyncClientBuilder
 from pyreqwest.exceptions import NetworkError as PyreqwestNetworkError
+from pyreqwest.exceptions import RedirectError as PyreqwestRedirectError
 from pyreqwest.exceptions import RequestTimeoutError as PyreqwestRequestTimeoutError
 from pyreqwest.exceptions import TransportError as PyreqwestTransportError
 from pyreqwest.middleware import Next, SyncNext
@@ -53,7 +54,7 @@ class _IsTypedDict(Protocol):
 type File = tuple[str, bytes] | Path | BufferedIOBase
 type Data = BaseModel | Struct | bytes | JSON | _IsTypedDict
 type TypedHeaders = BaseModel | Struct
-type Json = dict[str, Any] | BaseModel | Struct
+type JSONPayload = dict[str, Any] | BaseModel | Struct
 type Form = dict[str, int | bytes | str | File]
 type Params = Mapping[str, str | int | float | bool] | BaseModel | Struct
 type Headers = Mapping[str, str] | BaseModel | Struct
@@ -89,11 +90,15 @@ class HTTPTimeoutError(HTTPTransportError):
     """The request exceeded its configured `timeout`."""
 
 
-def _translate_transport_error(error: PyreqwestTransportError) -> HTTPTransportError:
+def _translate_transport_error(
+    error: PyreqwestTransportError | PyreqwestRedirectError,
+) -> HTTPTransportError:
     if isinstance(error, PyreqwestRequestTimeoutError):
         return HTTPTimeoutError(str(error))
     if isinstance(error, PyreqwestNetworkError):
         return HTTPConnectionError(str(error))
+    if isinstance(error, PyreqwestRedirectError):
+        return HTTPTransportError(str(error))
     # Every real pyreqwest TransportError subclass (verified against the installed version)
     # descends from either RequestTimeoutError or NetworkError, both handled above — this is a
     # forward-compatible fallback for a future pyreqwest exception type, not reachable today.
@@ -103,14 +108,14 @@ def _translate_transport_error(error: PyreqwestTransportError) -> HTTPTransportE
 async def _send(request: ConsumedRequest) -> RawResponse:
     try:
         return await request.send()
-    except PyreqwestTransportError as error:
+    except (PyreqwestTransportError, PyreqwestRedirectError) as error:
         raise _translate_transport_error(error) from error
 
 
 def _send_sync(request: SyncConsumedRequest) -> RawSyncResponse:
     try:
         return request.send()
-    except PyreqwestTransportError as error:
+    except (PyreqwestTransportError, PyreqwestRedirectError) as error:
         raise _translate_transport_error(error) from error
 
 
@@ -378,7 +383,10 @@ def _prepare[TBuilder: BaseRequestBuilder](
 
 
 async def _attach_body[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many-return-statements
-    request_builder: TBuilder, json: Json | None, form: Form | None, content: str | bytes | None
+    request_builder: TBuilder,
+    json: JSONPayload | None,
+    form: Form | None,
+    content: str | bytes | None,
 ) -> TBuilder:
     provided_bodies = [body for body in (json, form, content) if body is not None]
     if len(provided_bodies) > 1:
@@ -399,7 +407,10 @@ async def _attach_body[TBuilder: BaseRequestBuilder](  # pylint: disable=too-man
 
 
 def _attach_body_sync[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many-return-statements
-    request_builder: TBuilder, json: Json | None, form: Form | None, content: str | bytes | None
+    request_builder: TBuilder,
+    json: JSONPayload | None,
+    form: Form | None,
+    content: str | bytes | None,
 ) -> TBuilder:
     provided_bodies = [body for body in (json, form, content) if body is not None]
     if len(provided_bodies) > 1:
@@ -680,7 +691,7 @@ class HTTPClient:
                         else:
                             decoded = _decode_json_line(parsed_record.data, response_data_type)
                             yield SSEEvent(id=event_id, event=parsed_record.event, data=decoded)
-        except PyreqwestTransportError as error:
+        except (PyreqwestTransportError, PyreqwestRedirectError) as error:
             raise _translate_transport_error(error) from error
 
     @overload
@@ -756,7 +767,7 @@ class HTTPClient:
         request_builder: RequestBuilder,
         params: Params | None,
         headers: Headers | None,
-        json: Json | None,
+        json: JSONPayload | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None,
@@ -788,7 +799,7 @@ class HTTPClient:
                             yield _decode_json_line(line.decode(), response_data_type)
                 if buffer.strip():
                     yield _decode_json_line(buffer.decode(), response_data_type)
-        except PyreqwestTransportError as error:
+        except (PyreqwestTransportError, PyreqwestRedirectError) as error:
             raise _translate_transport_error(error) from error
 
     @overload
@@ -842,7 +853,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         error_for_status: bool = True,
@@ -854,7 +865,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TLine] | TypeAdapter[TLine] | Decoder[TLine],
@@ -866,7 +877,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
@@ -914,7 +925,7 @@ class HTTPClient:
                         if chunk is None:
                             return None
                         file.write(chunk)
-        except PyreqwestTransportError as error:
+        except (PyreqwestTransportError, PyreqwestRedirectError) as error:
             raise _translate_transport_error(error) from error
 
     @overload
@@ -963,7 +974,7 @@ class HTTPClient:
         request_builder: RequestBuilder,
         params: Params | None,
         headers: Headers | None,
-        json: Json | None,
+        json: JSONPayload | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data],
@@ -984,7 +995,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         error_for_status: bool = True,
@@ -996,7 +1007,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -1008,7 +1019,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] = bytes,
@@ -1035,7 +1046,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         error_for_status: bool = True,
@@ -1047,7 +1058,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -1059,7 +1070,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] = bytes,
@@ -1084,7 +1095,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         error_for_status: bool = True,
@@ -1096,7 +1107,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -1108,7 +1119,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] = bytes,
@@ -1451,7 +1462,7 @@ class SyncHTTPClient:
                         else:
                             decoded = _decode_json_line(parsed_record.data, response_data_type)
                             yield SSEEvent(id=event_id, event=parsed_record.event, data=decoded)
-        except PyreqwestTransportError as error:
+        except (PyreqwestTransportError, PyreqwestRedirectError) as error:
             raise _translate_transport_error(error) from error
 
     @overload
@@ -1527,7 +1538,7 @@ class SyncHTTPClient:
         request_builder: SyncRequestBuilder,
         params: Params | None,
         headers: Headers | None,
-        json: Json | None,
+        json: JSONPayload | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None,
@@ -1559,7 +1570,7 @@ class SyncHTTPClient:
                             yield _decode_json_line(line.decode(), response_data_type)
                 if buffer.strip():
                     yield _decode_json_line(buffer.decode(), response_data_type)
-        except PyreqwestTransportError as error:
+        except (PyreqwestTransportError, PyreqwestRedirectError) as error:
             raise _translate_transport_error(error) from error
 
     @overload
@@ -1613,7 +1624,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         error_for_status: bool = True,
@@ -1625,7 +1636,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TLine] | TypeAdapter[TLine] | Decoder[TLine],
@@ -1637,7 +1648,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
@@ -1685,7 +1696,7 @@ class SyncHTTPClient:
                         if chunk is None:
                             return None
                         file.write(chunk)
-        except PyreqwestTransportError as error:
+        except (PyreqwestTransportError, PyreqwestRedirectError) as error:
             raise _translate_transport_error(error) from error
 
     @overload
@@ -1734,7 +1745,7 @@ class SyncHTTPClient:
         request_builder: SyncRequestBuilder,
         params: Params | None,
         headers: Headers | None,
-        json: Json | None,
+        json: JSONPayload | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data],
@@ -1753,7 +1764,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         error_for_status: bool = True,
@@ -1765,7 +1776,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -1777,7 +1788,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] = bytes,
@@ -1804,7 +1815,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         error_for_status: bool = True,
@@ -1816,7 +1827,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -1828,7 +1839,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] = bytes,
@@ -1853,7 +1864,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         error_for_status: bool = True,
@@ -1865,7 +1876,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -1877,7 +1888,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        json: Json | None = None,
+        json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] = bytes,
