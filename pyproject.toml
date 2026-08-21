@@ -69,6 +69,18 @@ source = "vcs"
 [tool.hatch.build.targets.wheel]
 packages = ["lothc"]
 
+[tool.hatch.build.targets.sdist]
+# hatchling's sdist default is "everything under version control" — verified live that this
+# shipped the ENTIRE repo to PyPI in the 0.0.1 release (perf.py, benchmarks/, asv_bench/, tests/,
+# docs/, CLAUDE.md, AGENTS.md, .github/workflows/, uv.lock, ...), none of which an installer needs
+# to build or run the package. An explicit allowlist here, mirroring the wheel's own scoping, is
+# the fix — checked the rebuilt sdist's real file list afterward, not just the config.
+include = [
+    "/lothc",
+    "/README.md",
+    "/LICENSE",
+]
+
 #=====================================================================================
 # Tool configurations
 #=====================================================================================

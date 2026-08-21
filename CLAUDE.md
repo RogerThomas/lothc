@@ -58,6 +58,21 @@ scripted via the API, since this workflow triggers on `release: published` (ref 
 *tag*, not a branch) and a misconfigured policy risks silently blocking legitimate releases with
 no easy local way to preview it first.
 
+**`[tool.hatch.build.targets.sdist]` needs an explicit `include` allowlist — the wheel doesn't.**
+hatchling's default sdist behavior is "everything under version control," not "everything the
+wheel needs." Caught this live in the real `0.0.1` release: the published sdist on PyPI was
+420KB and contained the *entire* repo — `perf.py`, `benchmarks/` (Docker + Rust source), `asv_bench/`,
+all of `tests/`, all of `docs/`, `CLAUDE.md`/`AGENTS.md`/`style-guide.md`, `.github/workflows/`,
+`uv.lock`, none of which an installer needs. The wheel was already fine (verified separately —
+`packages = ["lothc"]` under `[tool.hatch.build.targets.wheel]` already scopes it to just the
+package), only the sdist was the problem. Fixed with `include = ["/lothc", "/README.md",
+"/LICENSE"]` under the sdist target — rebuilt and verified live: 15.7KB, just `lothc/`, `LICENSE`,
+`README.md`, plus `PKG-INFO`/`pyproject.toml` (hatchling always keeps those, needed to rebuild
+from the sdist alone) and `.gitignore` (a harmless hatchling default it retains regardless of
+`include`). `0.0.1` itself was left alone rather than yanked/deleted — the bloat has no functional
+or security impact on anyone who installs it, so it didn't meet the bar for that; `0.0.2`+ ships
+the fixed sdist.
+
 ### Roadmap — what's done, what's next
 
 Done: query params (typed + raw), per-request headers (typed + raw), timeouts, transport error
