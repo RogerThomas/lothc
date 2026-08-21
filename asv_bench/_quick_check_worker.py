@@ -24,10 +24,27 @@ def main() -> None:
         suite.setup()
 
     method = getattr(suite, method_name)
-    repeat = getattr(suite_cls, "repeat", 1) or 1
+    # This tool's whole point is a fast dev-loop signal, not asv's own statistical rigor, but
+    # sub-millisecond operations (a local HTTP round-trip) are dominated by noise at low sample
+    # counts -- especially the very first call, which pays a real TCP-connection-setup cost later
+    # calls don't. Many timed samples (min-of-N, matching timeit's own approach to filtering
+    # scheduler-noise spikes) fixes that -- independent of the suite class's own `repeat`
+    # attribute, which is tuned for asv's full isolated-env runs, not this instant-feedback tool.
+    #
+    # Peak RSS, however, MUST come from exactly the first call. `ru_maxrss` is a whole-process
+    # high-water mark, so repeating a large-body operation (e.g. downloading a 50MB body) many
+    # times in one process inflates it via allocator fragmentation across repeated large
+    # allocations, not anything the benchmarked code actually did -- confirmed live: running this
+    # in a naive repeat loop pushed `peakmem_download_bytes` from ~237MB to ~1195MB with zero code
+    # change. Capturing `ru_maxrss` right after call #1, before any further repeats run, avoids
+    # that entirely since the metric is captured before the contaminating calls happen.
+    extra_timed_calls = 49
     try:
-        timings: list[float] = []
-        for _ in range(repeat):
+        start = time.perf_counter()
+        method(*args)
+        timings: list[float] = [time.perf_counter() - start]
+        peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        for _ in range(extra_timed_calls):
             start = time.perf_counter()
             method(*args)
             timings.append(time.perf_counter() - start)
@@ -35,7 +52,6 @@ def main() -> None:
     finally:
         suite.teardown(*args)
 
-    peak_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     print(json.dumps({"time": elapsed, "peakmem": peak_rss}))
 
 

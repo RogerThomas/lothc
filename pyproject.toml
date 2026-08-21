@@ -63,10 +63,10 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 
 [tool.deptry]
-# examples/ and perf.py are dev-only utility/benchmark scripts, not part of the installable
-# package — they're expected to import dev-group dependencies directly. .asv/ holds asv's own
-# per-commit checkouts + venvs (a full copy of this repo, gitignored) — not our code at all.
-exclude = ["examples", "perf\\.py", "\\.venv", "\\.asv", "tests"]
+# examples/, perf.py, and asv_bench/ are dev-only utility/benchmark scripts, not part of the
+# installable package — they're expected to import dev-group dependencies directly. .asv/ holds
+# asv's own per-commit checkouts + venvs (a full copy of this repo, gitignored) — not our code.
+exclude = ["examples", "perf\\.py", "asv_bench", "\\.venv", "\\.asv", "tests"]
 
 [tool.deptry.per_rule_ignores]
 # pydantic/msgspec/typeguard are all real, used-conditionally-at-runtime imports in

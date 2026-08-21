@@ -26,4 +26,4 @@ run_*.py
 # asv (airspeed velocity) benchmark environments/results/generated test data
 /.asv/
 /asv_bench/_data/
-/asv_bench/.quick_check_baseline.json
+/asv_bench/.quick_check_history.json

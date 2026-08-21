@@ -508,21 +508,21 @@ class HTTPClient:
     async def _check_status(self, raw_response: RawResponse) -> None:
         if raw_response.status < 400:
             return
-        raise HTTPResponseError(raw_response.status, bytes(await raw_response.bytes()))
+        raise HTTPResponseError(raw_response.status, (await raw_response.bytes()).to_bytes())
 
     async def _decode_body(self, raw_response: RawResponse, response_data_type: type[Data]) -> Data:
         _validate_response_data_type(response_data_type)
         if issubclass(response_data_type, bytes):
-            return bytes(await raw_response.bytes())
+            return (await raw_response.bytes()).to_bytes()
         if issubclass(response_data_type, dict):
             parsed = cast(dict[str, Any], await raw_response.json())
             if is_typeddict(response_data_type):
                 _validate_typed_dict(response_data_type, parsed)
             return response_data_type(parsed)
         if issubclass(response_data_type, Struct):
-            return msgspec.json.decode(bytes(await raw_response.bytes()), type=response_data_type)
+            return msgspec.json.decode(await raw_response.bytes(), type=response_data_type)
         if issubclass(response_data_type, BaseModel):
-            return response_data_type.model_validate(await raw_response.json())
+            return response_data_type.model_validate_json((await raw_response.bytes()).to_bytes())
         raise TypeError(f"Unsupported response_data_type: {response_data_type!r}")
 
     async def _parse(
@@ -899,7 +899,7 @@ class HTTPClient:
                         chunk = await raw_response.body_reader.read_chunk()
                         if chunk is None:
                             return bytes(buffer)
-                        buffer.extend(bytes(chunk))
+                        buffer += chunk
                 with dest.open("wb") as file:
                     while True:
                         chunk = await raw_response.body_reader.read_chunk()
@@ -1275,21 +1275,21 @@ class SyncHTTPClient:
     def _check_status(self, raw_response: RawSyncResponse) -> None:
         if raw_response.status < 400:
             return
-        raise HTTPResponseError(raw_response.status, bytes(raw_response.bytes()))
+        raise HTTPResponseError(raw_response.status, raw_response.bytes().to_bytes())
 
     def _decode_body(self, raw_response: RawSyncResponse, response_data_type: type[Data]) -> Data:
         _validate_response_data_type(response_data_type)
         if issubclass(response_data_type, bytes):
-            return bytes(raw_response.bytes())
+            return raw_response.bytes().to_bytes()
         if issubclass(response_data_type, dict):
             parsed = cast(dict[str, Any], raw_response.json())
             if is_typeddict(response_data_type):
                 _validate_typed_dict(response_data_type, parsed)
             return response_data_type(parsed)
         if issubclass(response_data_type, Struct):
-            return msgspec.json.decode(bytes(raw_response.bytes()), type=response_data_type)
+            return msgspec.json.decode(raw_response.bytes(), type=response_data_type)
         if issubclass(response_data_type, BaseModel):
-            return response_data_type.model_validate(raw_response.json())
+            return response_data_type.model_validate_json(raw_response.bytes().to_bytes())
         raise TypeError(f"Unsupported response_data_type: {response_data_type!r}")
 
     def _parse(
@@ -1668,7 +1668,7 @@ class SyncHTTPClient:
                         chunk = raw_response.body_reader.read_chunk()
                         if chunk is None:
                             return bytes(buffer)
-                        buffer.extend(bytes(chunk))
+                        buffer += chunk
                 with dest.open("wb") as file:
                     while True:
                         chunk = raw_response.body_reader.read_chunk()

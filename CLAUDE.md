@@ -153,15 +153,55 @@ Two suites exist so far:
 `time_*` method across both suites above directly — no asv CLI, no commit, no `git stash`, works
 against a dirty working tree exactly as it sits on disk. Each benchmark still runs in its own
 subprocess (`_quick_check_worker.py`) so `peakmem` stays a true per-benchmark reading rather than a
-whole-run high-water mark. Mechanism: it diffs every result against
-`asv_bench/.quick_check_baseline.json` (gitignored) if that file exists, then unconditionally
-overwrites it with today's numbers — so the very next run compares against *this* one. First run
-ever just records a baseline (nothing to diff against yet). Workflow: edit code, `task bench-check`,
-see the diff, edit again, `task bench-check` again, see the diff against that run. This is
-deliberately additive to `asv run`/`asv continuous`, not a replacement — the two answer different
-questions (uncommitted dev-loop iteration vs. tracked regression history across real commits) and
-both reuse the exact same `bench_download.py`/`bench_verbs.py` benchmark definitions, so there's
-only ever one definition of what each benchmark measures.
+whole-run high-water mark.
+
+Mechanism: every run computes a **content hash of `lothc/`'s own source** (sha256 over each `.py`
+file's relative path + bytes, sorted — not a git sha, no commit involved) and records this run's
+results keyed by that hash into `asv_bench/.quick_check_history.json` (gitignored, an
+ever-growing `{hash: {benchmark: {time, peakmem}}}` map, not a single overwritten file). With no
+`--against`, it prints only `lothc hash: <hash>` — there's nothing to diff against until you name
+one. Pass `--against <hash>` (a hash from *any* earlier run, not just the last one) to run again
+and get a real before/after table against that specific point — deliberately explicit instead of
+the rolling "always vs. the last run" behavior an earlier version of this tool had, so you choose
+whether you're comparing against your original clean state or against your last edit:
+
+```
+task bench-check                              # records current state, prints its hash, no table
+# ... edit code ...
+task bench-check -- --against <hash-from-above>   # diffs vs that hash, prints ITS OWN new hash
+# ... edit more ...
+task bench-check -- --against <original-hash>     # compare against the ORIGINAL again
+task bench-check -- --against <the-previous-run's-hash>  # or against just the last edit instead
+```
+
+(`yeetr` only turns *keyword-only* function parameters into `--flags` — a plain positional
+parameter becomes a positional CLI argument instead. `main()`'s `against`/`history_file` params
+are declared after a bare `*` for exactly this reason, confirmed live: without it, `--against`
+wasn't recognized as a flag at all.)
+
+This is deliberately additive to `asv run`/`asv continuous`, not a replacement — the two answer
+different questions (uncommitted dev-loop iteration vs. tracked regression history across real
+commits) and both reuse the exact same `bench_download.py`/`bench_verbs.py` benchmark definitions,
+so there's only ever one definition of what each benchmark measures.
+
+`_quick_check_worker.py` runs each benchmark's method 50 times in its own subprocess (1 + 49 more)
+and reports the **min** time (timeit's own approach — real time can only be inflated by scheduler
+noise, never deflated below the true floor, so the minimum across many samples converges on it) but
+`peakmem` from **only the first call** — `ru_maxrss` is a whole-process high-water mark, so timing
+repeats are safe (they only make the *time* reading more stable) but repeating a large-body
+operation (e.g. `download()` against a 50MB body) many times in one process inflates peakmem via
+allocator fragmentation across repeated large allocations, not anything the code being benchmarked
+actually did — confirmed live: a naive repeat-loop pushed `peakmem_download_bytes` from ~140MB to
+~1195MB with zero code change, before capturing `ru_maxrss` right after call #1 fixed it. Even with
+50 samples, `VerbSuite`'s sub-millisecond benchmarks (a local HTTP round-trip, ~0.1-0.25ms) still
+show real run-to-run spread (confirmed live: 0.85x-1.26x across three consecutive invocations with
+*no* code change) — that's genuine process-to-process variance (CPU frequency scaling, scheduler
+state, background load differing between each separate subprocess launch), not something more
+samples *within* one process run can correct for. Trust `peakmem` deltas from this tool at face
+value; treat `time` deltas on anything sub-millisecond as directional only unless the ratio is
+large — small swings there are noise, not signal. `asv continuous`'s own significance testing
+handles exactly this problem statistically for the real historical runs; this instant tool doesn't
+attempt to replicate that.
 
 A few things that were real gotchas building `bench_download.py`, worth knowing before adding more
 benchmarks here:
@@ -317,13 +357,16 @@ Before writing any code, tell the user that you've read this file AND read and f
   `bytes(await raw_response.bytes())` copies *again* (`pyreqwest.bytes.Bytes` is not a real Python
   `bytes` — confirmed live, `isinstance(b, bytes)` is `False`) — measured ~1540MB peak RSS for a
   500MB body (~3x). `download()` instead uses `build_streamed()` directly and accumulates chunks
-  itself into a `bytearray()` via `.extend()` — no `Content-Length` dependency (verified: peak RSS
+  itself into a `bytearray()` via `+= chunk` — no `Content-Length` dependency (verified: peak RSS
   is the same, ~1x payload, whether or not the header is present/pre-sizes the buffer, since
   `bytearray`'s own amortized growth already avoids the extra copies pyreqwest's internal path
-  does) — then casts to `bytes` once at the end (measured ~561MB peak, vs ~1540MB — the
-  intermediate `bytes(chunk)` per streamed chunk before `.extend()` is required only because
-  `bytearray.extend()` doesn't accept pyreqwest's `Bytes` type directly, and is negligible since
-  each chunk is small and freed immediately). Passing `dest: Path` skips the in-memory buffer
+  does) — then casts to `bytes` once at the end (measured ~561MB peak, vs ~1540MB). Use `+=`, not
+  `.extend()`, to accumulate a `pyreqwest.bytes.Bytes` chunk into a `bytearray`: `+=` (`bytearray.
+  __iadd__`) accepts any buffer-protocol object directly, so no per-chunk copy is needed at all,
+  while `.extend()` requires something iterable of `int`s, which `Bytes` doesn't implement — it
+  needs an explicit `bytes(chunk)` copy first to satisfy that, confirmed live via basedpyright
+  (`.extend(chunk)` alone fails with `reportArgumentType`). Passing `dest: Path` skips the in-memory
+  buffer
   entirely and streams straight to a file — O(chunk size) memory regardless of body size, measured
   ~1x the OS's own read-buffer, not 1x the body.
   **Deliberately did NOT change `get()`'s default path to this.** For the small JSON bodies this
@@ -333,3 +376,21 @@ Before writing any code, tell the user that you've read this file AND read and f
   already have real users depending on their current shape. `download()` is additive, not a
   retrofit — reach for it specifically when fetching something large (a presigned S3 GET URL, a
   big export, etc.), not as a general replacement for `get()`.
+- **`.to_bytes()`, never `bytes(the_thing.bytes())`, whenever a `pyreqwest.bytes.Bytes` genuinely
+  needs to become a real Python `bytes`.** Both produce the same result (a real copy — `Bytes`
+  isn't a `bytes` subclass, see above), but `.to_bytes()` is the conversion method the
+  `pyo3_bytes` crate itself provides on the object, so use it instead of routing through the
+  generic `bytes(...)` constructor's buffer-protocol dispatch. Applies at every `_check_status`/
+  `_decode_body` call site on both clients: `raw_response.bytes().to_bytes()` (sync) /
+  `(await raw_response.bytes()).to_bytes()` (async).
+- **Don't convert at all when the target library accepts a buffer-protocol object directly.**
+  `msgspec.json.decode()` does — so the `Struct` branch decodes straight from `await
+  raw_response.bytes()` (or the sync equivalent) with no `.to_bytes()`/`bytes(...)` wrapper at
+  all, skipping a full-body copy entirely. `pydantic.BaseModel.model_validate_json()` does
+  **not** — it needs a genuine `str`/`bytes`/`bytearray`, so the pydantic branch does need
+  `.to_bytes()` first. This is also why the pydantic branch switched from
+  `model_validate(await raw_response.json())` to
+  `model_validate_json((await raw_response.bytes()).to_bytes())`: the former decodes JSON via
+  pyreqwest's own parser into a Python dict, then pydantic validates that dict (an extra
+  dict-construction round-trip); the latter lets pydantic-core parse the JSON bytes directly.
+  Tracked by `asv_bench/bench_verbs.py`'s `time_get_pydantic`/`peakmem_get_pydantic`.
