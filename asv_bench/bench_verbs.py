@@ -6,6 +6,12 @@ concern. A body this small never meaningfully skews a `peakmem_*` measurement, s
 background thread in `setup()` and torn down in `teardown()`, matching `tests/conftest.py`'s own
 `base_url` fixture.
 
+Covers all four decode targets `get()` supports: raw `bytes` (default), `lothc.JSON`, a pydantic
+`BaseModel`, a msgspec `Struct`, and a `TypedDict` (which exercises typeguard's runtime validation
+when it's installed -- see `_validate_typed_dict` in `lothc/_client.py`). pydantic/msgspec/typeguard
+are all optional extras, not `lothc`'s own hard dependency, so a real isolated `asv run` build only
+has them if `asv.conf.json`'s `matrix.req` says so.
+
 See CLAUDE.md's "Regression benchmarking (asv)" section for what this suite is and isn't, and
 `bench_download.py` for the large-object suite this one is deliberately simpler than.
 """
@@ -15,9 +21,27 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from typing import cast
+from typing import TypedDict, cast
+
+from msgspec import Struct
+from pydantic import BaseModel
 
 from lothc import JSON, SyncHTTPClient
+
+
+class ItemModel(BaseModel):
+    id: int
+    name: str
+
+
+class ItemStruct(Struct):
+    id: int
+    name: str
+
+
+class ItemDict(TypedDict):
+    id: int
+    name: str
 
 
 def _make_test_server() -> ThreadingHTTPServer:
@@ -67,6 +91,24 @@ class VerbSuite:
 
     def peakmem_get_typed(self) -> None:
         self._client.get("items/7", response_data_type=JSON)
+
+    def time_get_pydantic(self) -> None:
+        self._client.get("items/7", response_data_type=ItemModel)
+
+    def peakmem_get_pydantic(self) -> None:
+        self._client.get("items/7", response_data_type=ItemModel)
+
+    def time_get_msgspec(self) -> None:
+        self._client.get("items/7", response_data_type=ItemStruct)
+
+    def peakmem_get_msgspec(self) -> None:
+        self._client.get("items/7", response_data_type=ItemStruct)
+
+    def time_get_typeguard(self) -> None:
+        self._client.get("items/7", response_data_type=ItemDict)
+
+    def peakmem_get_typeguard(self) -> None:
+        self._client.get("items/7", response_data_type=ItemDict)
 
     def time_post(self) -> None:
         self._client.post("items", json={"id": 1, "name": "item-1"})
