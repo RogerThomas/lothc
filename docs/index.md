@@ -14,6 +14,15 @@ icon: lucide/rocket
 first-class optional support for **pydantic**, **msgspec**, and **TypedDict** (validated via
 **typeguard** if installed) as decode targets.
 
+## Installing
+
+```
+uv add 'lothc[pydantic,msgspec,typeguard]'
+```
+
+Any subset of the extras works — the base package alone gets you `bytes`/`JSON`/`TypedDict`-without-validation
+support.
+
 ## Quickstart
 
 === "msgspec"
@@ -113,15 +122,6 @@ the numbers, not benchmarked around. Decoding into a real msgspec `Struct` even 
 unvalidated dict path in this run; typeguard's pure-Python validation was the one clear exception,
 costing a real, visible slowdown. See [Benchmarks](benchmarks.md) for the full numbers behind the
 chart above.
-
-## Installing
-
-```
-uv add 'lothc[pydantic,msgspec,typeguard]'
-```
-
-Any subset of the extras works — the base package alone gets you `bytes`/`JSON`/`TypedDict`-without-validation
-support.
 
 ## Highlights
 

@@ -20,4 +20,11 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run basedpyright .
-      - run: uv run pytest tests
+      - run: uv run pytest tests --cov --cov-config=pyproject.toml --cov-report=xml
+      # Uploaded from every matrix version so Codecov merges them into one accurate report,
+      # rather than the last-finishing job's coverage silently overwriting the others'.
+      - uses: codecov/codecov-action@v7
+        with:
+          files: ./coverage.xml
+          flags: py${{ matrix.python-version }}
+          fail_ci_if_error: true

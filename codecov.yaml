@@ -1,0 +1,14 @@
+coverage:
+  range: 60..90
+  round: down
+  precision: 1
+  status:
+    project:
+      default:
+        # `target: auto` compares against the base commit's own coverage rather than a fixed
+        # number — jero's fixed 90% target doesn't apply here: lothc's real coverage right now is
+        # ~77% (verified live, not guessed), so copying that number would just start every PR red.
+        # `auto` fails a PR only if it actually *regresses* coverage beyond the threshold, which is
+        # the check that's actually useful at this project's current coverage level.
+        target: auto
+        threshold: 0.5%

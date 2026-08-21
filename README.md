@@ -4,8 +4,11 @@
 
 # lothc
 
+[![PyPI](https://img.shields.io/pypi/v/lothc)](https://pypi.org/project/lothc/)
 [![CI](https://github.com/RogerThomas/lothc/actions/workflows/ci.yml/badge.svg)](https://github.com/RogerThomas/lothc/actions/workflows/ci.yml)
-[![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)](pyproject.toml)
+[![codecov](https://img.shields.io/codecov/c/github/RogerThomas/lothc/main)](https://codecov.io/gh/RogerThomas/lothc)
+[![Python versions](https://img.shields.io/pypi/pyversions/lothc)](https://pypi.org/project/lothc/)
+[![License](https://img.shields.io/pypi/l/lothc)](LICENSE)
 
 **L**ord **O**f **T**he **H**ttp **C**lients — a typed HTTP client for Python, built on
 [pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (a Rust-backed HTTP client), with first-class
