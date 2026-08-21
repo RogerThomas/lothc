@@ -145,8 +145,18 @@ tasks:
     desc: >
       Run asv_bench/ benchmarks across real commit history in an isolated env per
       commit. Usage: task asv-run -- <commit-range> (e.g. main~5..main), or with no
-      args benchmarks every commit asv hasn't already recorded results for.
+      args benchmarks just the tip of each configured branch (no history).
     cmd: uv run asv run {{.CLI_ARGS}}
+
+  asv-continuous:
+    desc: >
+      "I made a small change and committed it — did it regress anything?" Builds
+      and benchmarks two commits side by side and prints a before/after table with
+      significant changes flagged. Defaults to HEAD vs its parent. Usage:
+      task asv-continuous [-- <base> <branch>], e.g. task asv-continuous -- main~5 main.
+      Drop-in --quick is fine to sanity-check the mechanism but too noisy (one
+      sample) to trust as a real answer — omit it for the real repeat=3 sampling.
+    cmd: uv run asv continuous {{.CLI_ARGS | default "HEAD^ HEAD"}}
 
   asv-publish:
     desc: Collate .asv/results/ into a static HTML dashboard at .asv/html/

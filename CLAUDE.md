@@ -115,13 +115,30 @@ convention playing the role a pytest fixture would; there is no `@pytest.fixture
 asv-discovered benchmark class because pytest is never imported anywhere in that path.
 
 - Fast dev-loop check (no isolated env, no history, nothing saved): `task asv-quick`
+- **"I made a small change and committed it — did it regress anything?"**: `task asv-continuous`
+  (builds + benchmarks HEAD's parent and HEAD side by side, prints a before/after table with
+  significant changes flagged; pass `-- <base> <branch>` for a specific pair). Skip `--quick` here —
+  verified live that it's too noisy (single sample) and throws false-positive "regressions" comparing
+  the *same* two commits to themselves; the real `repeat=3` sampling correctly reports no change.
 - Real run across commit history (isolated env + fresh build per commit): `task asv-run -- <range>`,
-  e.g. `task asv-run -- main~5..main`, or `task asv-run -- HEAD^!` for just one commit
+  e.g. `task asv-run -- main~5..main`, or `task asv-run -- HEAD^!` for just one commit. With no args,
+  benchmarks just the tip of each configured branch (`asv run`'s actual default — not "every new
+  commit", which is what the special range spec `NEW` does instead).
 - View results as a trend dashboard: `task asv-publish` then `task asv-preview`
 
-`asv_bench/bench_download.py` is the first (and so far only) suite: `get()` vs `download()` bytes-mode
-vs `download(dest=Path)` against a large body, both `time_*` and `peakmem_*`. Two things that were
-real gotchas getting this working, worth knowing before adding more benchmarks here:
+Two suites exist so far:
+
+- `asv_bench/bench_download.py`: `get()` vs `download()` bytes-mode vs `download(dest=Path)` against
+  a large body, both `time_*` and `peakmem_*`.
+- `asv_bench/bench_verbs.py`: `get()`/`get(response_data_type=JSON)`/`post()` against small,
+  realistic JSON bodies via the exact same stdlib server the real pytest suite runs against
+  (`tests/_server.py`, loaded the same importlib way `examples/server.py` does — no `sys.path`
+  hack). Deliberately simpler than `bench_download.py`: a body this small never meaningfully skews
+  a `peakmem_*` measurement, so there's no need for a separate-process server, and no `setup_cache()`
+  since there's no expensive fixture to cache.
+
+A few things that were real gotchas building `bench_download.py`, worth knowing before adding more
+benchmarks here:
 
 - **The large-object HTTP server in `setup()` MUST be a genuine separate OS process (`subprocess.Popen`
   running stdlib `http.server`), never a thread in this process.** `peakmem_*` benchmarks measure

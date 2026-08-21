@@ -149,6 +149,9 @@ known-first-party = ["lothc"]
 "perf.py" = [
     "S101",
 ] # sanity-check asserts that the benchmark actually decoded a real body
+"asv_bench/*" = [
+    "S101", # bench_verbs.py asserts a dynamically-loaded importlib spec/loader is present,
+] # same pattern as examples/server.py
 
 [tool.ruff.lint.mccabe]
 max-complexity = 15
