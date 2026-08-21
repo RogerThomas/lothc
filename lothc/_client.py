@@ -94,7 +94,10 @@ def _translate_transport_error(error: PyreqwestTransportError) -> HTTPTransportE
         return HTTPTimeoutError(str(error))
     if isinstance(error, PyreqwestNetworkError):
         return HTTPConnectionError(str(error))
-    return HTTPTransportError(str(error))
+    # Every real pyreqwest TransportError subclass (verified against the installed version)
+    # descends from either RequestTimeoutError or NetworkError, both handled above — this is a
+    # forward-compatible fallback for a future pyreqwest exception type, not reachable today.
+    return HTTPTransportError(str(error))  # pragma: no cover
 
 
 async def _send(request: ConsumedRequest) -> RawResponse:
@@ -152,7 +155,8 @@ class _RetryMiddleware:
                 return response
             retry_after = _parse_retry_after(response.headers.get("retry-after"))
             await asyncio.sleep(_backoff_delay(attempt, self.backoff_base, retry_after))
-        raise AssertionError("unreachable")  # range(max_retries+1) is never empty
+        # range(max_retries+1) is never empty, so this is never actually reached.
+        raise AssertionError("unreachable")  # pragma: no cover
 
 
 @dataclass
@@ -178,7 +182,8 @@ class _SyncRetryMiddleware:
                 return response
             retry_after = _parse_retry_after(response.headers.get("retry-after"))
             time.sleep(_backoff_delay(attempt, self.backoff_base, retry_after))
-        raise AssertionError("unreachable")  # range(max_retries+1) is never empty
+        # range(max_retries+1) is never empty, so this is never actually reached.
+        raise AssertionError("unreachable")  # pragma: no cover
 
 
 async def _build_form(form: Form) -> FormBuilder:

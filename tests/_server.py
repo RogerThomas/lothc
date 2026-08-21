@@ -49,6 +49,17 @@ class TestAppHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(length)) if length else {}
 
+    def _handle_echo_body(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(length)
+        self._write_json(
+            200,
+            {
+                "body": raw_body.decode(),
+                "content_type": self.headers.get("Content-Type"),
+            },
+        )
+
     def _bump_counter(self, key: str) -> int:
         self._counters[key] = self._counters.get(key, 0) + 1
         return self._counters[key]
@@ -160,6 +171,52 @@ class TestAppHandler(BaseHTTPRequestHandler):
                 files.append({"name": name, "filename": filename, "size": len(payload)})
         self._write_json(200, {"fields": fields, "files": files})
 
+    def _write_sse_weird(self) -> None:
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        # A comment-only record (no `data:` line) parses to `None` and must be skipped, and a
+        # record with an unrecognized field must be ignored while still keeping its data line.
+        self.wfile.write(b": just a comment\n\n")
+        self.wfile.write(b"foo: bar\ndata: hello\n\n")
+        self.wfile.flush()
+
+    def _handle_retry_after_custom(self, query: str) -> None:
+        params = parse_qs(query)
+        key = params["key"][0]
+        value = params["value"][0]
+        attempt = self._bump_counter(key)
+        if attempt == 1:
+            self._write_json(429, {"type": "too-many-requests"}, {"Retry-After": value})
+        else:
+            self._write_json(200, {"attempts": attempt})
+
+    def _handle_ndjson_with_blank_line(self, query: str) -> None:
+        params = parse_qs(query)
+        count = int(params.get("count", ["3"])[0])
+        lines = [json.dumps({"i": i}) for i in range(count)]
+        body = ("\n\n".join(lines) + "\n").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_truncated(self) -> None:
+        # No terminating zero-length chunk is ever sent — a genuinely truncated
+        # chunked body, which surfaces as a real transport error to the client,
+        # unlike a clean connection close (which just marks a normal stream end).
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        body = b"partial-data"
+        self.wfile.write(f"{len(body):x}\r\n".encode() + body + b"\r\n")
+        self.wfile.flush()
+
     def _handle_connection_flaky(self, query: str) -> None:
         params = parse_qs(query)
         key = params["key"][0]
@@ -170,40 +227,53 @@ class TestAppHandler(BaseHTTPRequestHandler):
             return
         self._write_json(200, {"attempts": attempt})
 
+    def _handle_slow(self) -> None:
+        sleep(3)
+        self._write_json(200, {"finally": True})
+
+    def _handle_echo_headers(self) -> None:
+        headers = [{"name": name, "value": value} for name, value in self.headers.items()]
+        self._write_json(200, {"headers": headers})
+
+    def _handle_boom(self) -> None:
+        self._write_json(500, _server_error_body)
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/slow":
-            sleep(3)
-            self._write_json(200, {"finally": True})
-        elif parsed.path == "/echo-headers":
-            headers = [{"name": name, "value": value} for name, value in self.headers.items()]
-            self._write_json(200, {"headers": headers})
-        elif parsed.path == "/items":
+        if parsed.path == "/items":
             self._handle_search_items(parsed.query)
-        elif parsed.path.startswith("/items/"):
+            return
+        if parsed.path.startswith("/items/"):
             self._handle_read_item(parsed.path.removeprefix("/items/"))
-        elif parsed.path == "/events":
-            self._write_sse_events(parsed.query)
-        elif parsed.path == "/boom":
-            self._write_json(500, _server_error_body)
-        elif parsed.path == "/set-cookie":
-            self._handle_set_cookie()
-        elif parsed.path == "/read-cookie":
-            self._handle_read_cookie()
-        elif parsed.path == "/redirect":
-            self._handle_redirect()
-        elif parsed.path == "/flaky":
-            self._handle_flaky(parsed.query)
-        elif parsed.path == "/retry-after":
-            self._handle_retry_after(parsed.query)
-        elif parsed.path == "/connection-flaky":
-            self._handle_connection_flaky(parsed.query)
-        elif parsed.path == "/ndjson":
-            self._handle_ndjson(parsed.query)
-        elif parsed.path == "/binary":
-            self._handle_binary()
-        else:
+            return
+        query_routes = {
+            "/events": self._write_sse_events,
+            "/flaky": self._handle_flaky,
+            "/retry-after": self._handle_retry_after,
+            "/retry-after-custom": self._handle_retry_after_custom,
+            "/connection-flaky": self._handle_connection_flaky,
+            "/ndjson": self._handle_ndjson,
+            "/ndjson-blank-line": self._handle_ndjson_with_blank_line,
+        }
+        if parsed.path in query_routes:
+            query_routes[parsed.path](parsed.query)
+            return
+        plain_routes = {
+            "/slow": self._handle_slow,
+            "/echo-headers": self._handle_echo_headers,
+            "/events-weird": self._write_sse_weird,
+            "/boom": self._handle_boom,
+            "/set-cookie": self._handle_set_cookie,
+            "/read-cookie": self._handle_read_cookie,
+            "/redirect": self._handle_redirect,
+            "/binary": self._handle_binary,
+            "/truncated": self._handle_truncated,
+        }
+        route = plain_routes.get(parsed.path)
+        if route is None:
             self._write_json(404, _not_found_body)
+        else:
+            route()
 
     def do_HEAD(self) -> None:
         parsed = urlparse(self.path)
@@ -227,6 +297,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self._handle_ndjson_echo()
         elif parsed.path == "/upload":
             self._handle_upload()
+        elif parsed.path == "/echo-body":
+            self._handle_echo_body()
         else:
             self._write_json(404, _not_found_body)
 

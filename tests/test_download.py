@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from lothc import HTTPClient, HTTPResponseError, SyncHTTPClient
+from lothc import HTTPClient, HTTPConnectionError, HTTPResponseError, SyncHTTPClient
 
 
 async def test_download_returns_raw_bytes_by_default(client: HTTPClient) -> None:
@@ -55,3 +55,25 @@ def test_sync_download_raises_response_error_for_status(sync_client: SyncHTTPCli
         sync_client.download("boom")
 
     assert exc_info.value.status == 500
+
+
+def test_sync_download_error_for_status_false_suppresses_raise(
+    sync_client: SyncHTTPClient,
+) -> None:
+    body = sync_client.download("boom", error_for_status=False)
+
+    assert b"internal-server-error" in body
+
+
+async def test_download_transport_error_mid_stream_raises_connection_error(
+    client: HTTPClient,
+) -> None:
+    with pytest.raises(HTTPConnectionError):
+        await client.download("truncated")
+
+
+def test_sync_download_transport_error_mid_stream_raises_connection_error(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(HTTPConnectionError):
+        sync_client.download("truncated")

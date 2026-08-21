@@ -2,7 +2,7 @@ import socket
 
 import pytest
 
-from lothc import HTTPClient, HTTPConnectionError, HTTPTimeoutError
+from lothc import HTTPClient, HTTPConnectionError, HTTPTimeoutError, SyncHTTPClient
 
 
 def _closed_port_url() -> str:
@@ -22,3 +22,19 @@ async def test_slow_endpoint_past_timeout_raises_timeout_error(base_url: str) ->
     async with HTTPClient.build(base_url=base_url, timeout=0.1) as client:
         with pytest.raises(HTTPTimeoutError):
             await client.get("slow")
+
+
+def test_sync_connecting_to_a_closed_port_raises_connection_error() -> None:
+    with (
+        SyncHTTPClient.build(base_url=_closed_port_url()) as client,
+        pytest.raises(HTTPConnectionError),
+    ):
+        client.get("anything")
+
+
+def test_sync_slow_endpoint_past_timeout_raises_timeout_error(base_url: str) -> None:
+    with (
+        SyncHTTPClient.build(base_url=base_url, timeout=0.1) as client,
+        pytest.raises(HTTPTimeoutError),
+    ):
+        client.get("slow")

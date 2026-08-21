@@ -32,3 +32,15 @@ def test_sync_head_returns_headers_only_result(sync_client: SyncHTTPClient) -> N
 
     assert result.data is None
     assert result.headers["x-item-exists"] == "true"
+
+
+async def test_head_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
+    result = await client.head("missing", error_for_status=False)
+
+    assert result.status == 404
+
+
+def test_sync_head_error_for_status_false_suppresses_raise(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.head("missing", error_for_status=False)
+
+    assert result.status == 404
