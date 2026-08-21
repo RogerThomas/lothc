@@ -1,7 +1,9 @@
+from pathlib import Path
+
 from msgspec import Struct
 from pydantic import BaseModel
 
-from lothc import HTTPClient, SyncHTTPClient
+from lothc import JSON, HTTPClient, SyncHTTPClient
 
 
 class ItemModel(BaseModel):
@@ -38,6 +40,26 @@ async def test_post_with_raw_dict_json_body(client: HTTPClient) -> None:
     item = await client.post("items", json={"id": 1, "name": "ditto"}, response_data_type=ItemModel)
 
     assert item == ItemModel(id=1, name="ditto")
+
+
+async def test_post_with_form_fields_and_files(client: HTTPClient) -> None:
+    result = await client.post(
+        "upload",
+        form={"note": "hello", "avatar": b"raw-bytes", "doc": ("doc.txt", b"file-content")},
+        response_data_type=JSON,
+    )
+
+    assert result["fields"] == {"note": "hello", "avatar": "raw-bytes"}
+    assert result["files"] == [{"name": "doc", "filename": "doc.txt", "size": 12}]
+
+
+async def test_post_with_form_path_file(client: HTTPClient, tmp_path: Path) -> None:
+    upload_path = tmp_path / "upload.txt"
+    upload_path.write_bytes(b"path-content")
+
+    result = await client.post("upload", form={"doc": upload_path}, response_data_type=JSON)
+
+    assert result["files"] == [{"name": "doc", "filename": "upload.txt", "size": 12}]
 
 
 async def test_put_replaces_item(client: HTTPClient) -> None:

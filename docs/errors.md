@@ -6,19 +6,19 @@ icon: lucide/octagon-alert
 
 Two separate failure classes, never unified:
 
-- **`ResponseError`** — the server answered with a 4xx/5xx. Carries `.status` and `.body_start`
+- **`HTTPResponseError`** — the server answered with a 4xx/5xx. Carries `.status` and `.body_start`
   (the first 100 bytes of the body, for a quick look without decoding).
-- **`TransportError`** — never got a response at all: a `HTTPTimeoutError` or `HTTPConnectionError`
+- **`HTTPTransportError`** — never got a response at all: a `HTTPTimeoutError` or `HTTPConnectionError`
   subclass. pyreqwest's own exception types never leak through; they're translated to these at
   every call site.
 
 ```python
-from lothc import HTTPClient, HTTPConnectionError, HTTPTimeoutError, ResponseError
+from lothc import HTTPClient, HTTPConnectionError, HTTPResponseError, HTTPTimeoutError
 
 async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
     try:
         await client.get("pokemon/does-not-exist")
-    except ResponseError as e:
+    except HTTPResponseError as e:
         print(e.status, e.body_start)
     except HTTPTimeoutError:
         print("took too long")

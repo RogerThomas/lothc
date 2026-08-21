@@ -29,10 +29,25 @@ async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
 ![HTTP client throughput race — lothc and pyreqwest finish in well under a fifth of a second, other libraries take much longer](assets/perf-race.svg)
 
 Benchmarked with [`perf.py`](perf.py) against a tiny Rust-based static JSON server, 10,000 requests at
-concurrency 100.
+concurrency 100 — including lothc's fully-typed decode targets (`response_data_type=` a msgspec
+`Struct`, a pydantic `BaseModel`, or a `TypedDict` validated via typeguard), not just raw bytes or
+an untyped dict. The object handed back from those runs isn't just parsed JSON — it's a real,
+constructed, field-validated instance of your own type, and that validation cost is included in
+the numbers, not benchmarked around. Decoding into a real msgspec `Struct` even edged out the
+unvalidated dict path in this run; typeguard's pure-Python validation was the one clear exception,
+costing a real, visible slowdown. Full numbers: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Highlights
 
+- **First-class DTO validation and transformation, built in.** httpx, aiohttp, niquests, and every
+  other general-purpose HTTP client hand you back a response object with a `.json()` that gives
+  you, at best, a plain `dict` — decoding that into a real, validated object of your own type is
+  something *you* bolt on afterward, because it isn't what those libraries are for. In lothc it's
+  not an afterthought: pass `response_data_type` and you get back a real, constructed,
+  field-validated pydantic `BaseModel`, msgspec `Struct`, or typeguard-validated `TypedDict`
+  directly from the client — one of lothc's biggest offerings over reaching for `requests`/`httpx`
+  and validating separately. See [Benchmarks](docs/benchmarks.md) for what that costs (usually
+  nothing).
 - **`HTTPClient`** (async) and **`SyncHTTPClient`** (sync) — the same typed API, both backed by pyreqwest.
 - **Pick your decode target per call** — a pydantic `BaseModel`, a msgspec `Struct`, a `TypedDict`,
   `lothc.JSON`, or raw `bytes` (the default). No cast-laden internals — everything is built on paired
@@ -48,10 +63,13 @@ concurrency 100.
 - **Retries** — `max_retries`/`retry_methods` on `build()`, implemented as a real pyreqwest
   `with_middleware` hook. Backs off, honors `Retry-After`, and defaults to the idempotent verbs
   (`get`/`put`/`delete`/`head`) — `post`/`patch` need an explicit opt-in via `retry_methods`.
+- **Authentication** — a static `bearer_token`, or `bearer_auth` for a token resolved fresh on
+  every request (expiring/rotating tokens), plus `arbitrary_headers` for anything else that needs
+  to go out on every request (an API key header, etc.).
 - **Cookies, redirects, proxy** — `cookie_store=True` for an in-memory cookie jar,
   `follow_redirects`/`max_redirects` for redirect control, `proxy=` for proxying requests.
-- **A real transport-error hierarchy** (`TransportError` / `TimeoutError` / `ConnectionError`) and a
-  status-error type (`ResponseError`) — pyreqwest's own exception types never leak through.
+- **A real transport-error hierarchy** (`HTTPTransportError` / `HTTPTimeoutError` / `HTTPConnectionError`) and a
+  status-error type (`HTTPResponseError`) — pyreqwest's own exception types never leak through.
 - **pydantic, msgspec, and typeguard are all optional** — the library works with none, either, or all
   three installed.
 

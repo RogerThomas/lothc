@@ -105,7 +105,14 @@ Rust, so lothc stays far closer to pyreqwest's throughput than to any pure-Pytho
 ![HTTP client throughput race — lothc and pyreqwest finish in well under a fifth of a second, other libraries take much longer](assets/perf-race.svg){: .perf-race-img }
 
 Benchmarked with `perf.py` against a tiny Rust-based static JSON server, 10,000 requests at
-concurrency 100.
+concurrency 100 — including lothc's fully-typed decode targets (`response_data_type=` a msgspec
+`Struct`, a pydantic `BaseModel`, or a `TypedDict` validated via typeguard), not just raw bytes or
+an untyped dict. The object handed back from those runs isn't just parsed JSON — it's a real,
+constructed, field-validated instance of your own type, and that validation cost is included in
+the numbers, not benchmarked around. Decoding into a real msgspec `Struct` even edged out the
+unvalidated dict path in this run; typeguard's pure-Python validation was the one clear exception,
+costing a real, visible slowdown. See [Benchmarks](benchmarks.md) for the full numbers behind the
+chart above.
 
 ## Installing
 
@@ -119,6 +126,16 @@ support.
 ## Highlights
 
 <div class="grid cards" markdown>
+
+-   **DTO validation and transformation, built in**
+
+    httpx, aiohttp, niquests — general-purpose HTTP clients hand you back a response with a
+    `.json()` that gives you, at best, a plain `dict`. Decoding that into a real, validated object
+    is something you bolt on yourself afterward, because it isn't what those libraries do. In
+    lothc it's built in: `response_data_type` gets you a real, constructed, field-validated
+    pydantic `BaseModel`, msgspec `Struct`, or typeguard-validated `TypedDict` straight from the
+    client — one of lothc's biggest offerings over the alternatives. See
+    [Benchmarks](benchmarks.md) for what that actually costs (usually nothing).
 
 -   **Typed decode targets**
 
@@ -151,6 +168,12 @@ support.
     Implemented as a real pyreqwest `with_middleware` hook. Honors `Retry-After`, defaults to the
     idempotent verbs. See [Retries](retries.md).
 
+-   **Authentication**
+
+    A static `bearer_token`, or `bearer_auth` for a token resolved fresh on every request —
+    plus `arbitrary_headers` for anything else that needs to go out on every request. See
+    [Authentication](auth.md).
+
 -   **Cookies, redirects, proxy**
 
     An in-memory cookie jar, redirect control, and proxying. See
@@ -158,8 +181,8 @@ support.
 
 -   **A real error hierarchy**
 
-    `TransportError`/`TimeoutError`/`ConnectionError` for failures with no response, and a
-    separate `ResponseError` for 4xx/5xx. See [Error handling](errors.md).
+    `HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError` for failures with no response,
+    and a separate `HTTPResponseError` for 4xx/5xx. See [Error handling](errors.md).
 
 </div>
 

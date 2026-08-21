@@ -2,11 +2,13 @@
 
 `examples/server.py` (used for manual smoke-testing) reuses this same handler on a fixed port —
 this module is the one canonical server implementation for both. Endpoints: `/items`
-(GET/POST/PUT/PATCH/DELETE/HEAD), `/echo-headers`, `/slow`, `/events` (SSE), `/boom`, plus
-cookie/redirect/retry/streaming scenarios used by their own tests.
+(GET/POST/PUT/PATCH/DELETE/HEAD), `/echo-headers`, `/slow`, `/events` (SSE), `/boom`, `/upload`
+(multipart), plus cookie/redirect/retry/streaming scenarios used by their own tests.
 """
 
+import email.policy
 import json
+from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import sleep
 from typing import ClassVar, cast
@@ -137,6 +139,27 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_upload(self) -> None:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(length)
+        # `email` parses multipart/form-data correctly since it's a MIME multipart subset —
+        # confirmed against a real body lothc's own form= produces. It just wants the
+        # Content-Type as a message header, so prepend it ourselves.
+        header_bytes = f"Content-Type: {self.headers['Content-Type']}\r\n\r\n".encode()
+        message = BytesParser(policy=email.policy.default).parsebytes(header_bytes + raw_body)
+
+        fields: dict[str, str] = {}
+        files: list[dict[str, object]] = []
+        for part in message.iter_parts():
+            name = cast(str, part.get_param("name", header="content-disposition"))
+            filename = part.get_filename()
+            payload = cast(bytes, part.get_payload(decode=True))
+            if filename is None:
+                fields[name] = payload.decode()
+            else:
+                files.append({"name": name, "filename": filename, "size": len(payload)})
+        self._write_json(200, {"fields": fields, "files": files})
+
     def _handle_connection_flaky(self, query: str) -> None:
         params = parse_qs(query)
         key = params["key"][0]
@@ -202,6 +225,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self._handle_flaky(parsed.query)
         elif parsed.path == "/ndjson-echo":
             self._handle_ndjson_echo()
+        elif parsed.path == "/upload":
+            self._handle_upload()
         else:
             self._write_json(404, _not_found_body)
 

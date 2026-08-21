@@ -180,6 +180,6 @@ stream mixing different event shapes decodes natively:
 ## Errors
 
 `error_for_status` (default `True`) is checked once, before the first event is yielded — a
-4xx/5xx response raises `ResponseError` immediately rather than partway through iteration. Once
-streaming has started, a dropped connection raises the usual `TransportError` family. See
+4xx/5xx response raises `HTTPResponseError` immediately rather than partway through iteration. Once
+streaming has started, a dropped connection raises the usual `HTTPTransportError` family. See
 [Error handling](errors.md).

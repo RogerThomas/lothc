@@ -71,5 +71,5 @@ The raw-chunks default applies here too — omit `response_data_type` to get unb
 ## Errors
 
 `error_for_status` (default `True`) is checked once, before the first chunk is yielded — a
-4xx/5xx response raises `ResponseError` immediately rather than partway through the stream. See
+4xx/5xx response raises `HTTPResponseError` immediately rather than partway through the stream. See
 [Error handling](errors.md).

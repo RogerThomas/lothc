@@ -19,6 +19,8 @@ import httpx
 import httpx2
 import niquests
 from aiosonic.pools import PoolConfig
+from msgspec import Struct
+from pydantic import BaseModel
 from pyreqwest.client import Client as PyreqwestClient
 from pyreqwest.client import ClientBuilder
 from rich.console import Console
@@ -34,8 +36,152 @@ logging.getLogger("httpcore2").setLevel(logging.WARNING)
 console = Console()
 
 type Lib = Literal[
-    "httpx", "httpx_h2", "httpx2", "pyreqwest", "aiohttp", "niquests", "aiosonic", "lothc"
+    "httpx",
+    "httpx_h2",
+    "httpx2",
+    "pyreqwest",
+    "aiohttp",
+    "niquests",
+    "aiosonic",
+    "lothc",
+    "lothc-msgspec",
+    "lothc-pydantic",
+    "lothc-typeguard",
 ]
+
+type Tag = Literal["rust", "async", "web", "performance"]
+
+# The three response shapes below all mirror benchmarks/json_server/src/main.rs's actual JSON
+# body exactly (nested user/data/pagination included) — the point of the lothc-msgspec/
+# lothc-pydantic/lothc-typeguard rows is to measure the cost of a FULLY validated, fully
+# typesafe decode (real struct/model construction, real field validation, for msgspec/pydantic/
+# typeguard respectively), not just a bare `JSON` dict wrapper with no validation at all.
+
+
+class _MsgspecMetadata(Struct):
+    last_login: str
+    login_count: int
+    active: bool
+
+
+class _MsgspecUser(Struct):
+    id: int
+    name: str
+    email: str
+    roles: list[str]
+    metadata: _MsgspecMetadata
+
+
+class _MsgspecNested(Struct):
+    depth: int
+    values: list[int]
+
+
+class _MsgspecDataItem(Struct):
+    id: int
+    title: str
+    tags: list[Tag]
+    score: float
+    nested: _MsgspecNested
+
+
+class _MsgspecPagination(Struct):
+    page: int
+    limit: int
+    total: int
+    has_more: bool
+
+
+class MsgspecResponse(Struct):
+    status: str
+    timestamp: str
+    user: _MsgspecUser
+    data: list[_MsgspecDataItem]
+    pagination: _MsgspecPagination
+
+
+class _PydanticMetadata(BaseModel):
+    last_login: str
+    login_count: int
+    active: bool
+
+
+class _PydanticUser(BaseModel):
+    id: int
+    name: str
+    email: str
+    roles: list[str]
+    metadata: _PydanticMetadata
+
+
+class _PydanticNested(BaseModel):
+    depth: int
+    values: list[int]
+
+
+class _PydanticDataItem(BaseModel):
+    id: int
+    title: str
+    tags: list[Tag]
+    score: float
+    nested: _PydanticNested
+
+
+class _PydanticPagination(BaseModel):
+    page: int
+    limit: int
+    total: int
+    has_more: bool
+
+
+class PydanticResponse(BaseModel):
+    status: str
+    timestamp: str
+    user: _PydanticUser
+    data: list[_PydanticDataItem]
+    pagination: _PydanticPagination
+
+
+class _TypedDictMetadata(TypedDict):
+    last_login: str
+    login_count: int
+    active: bool
+
+
+class _TypedDictUser(TypedDict):
+    id: int
+    name: str
+    email: str
+    roles: list[str]
+    metadata: _TypedDictMetadata
+
+
+class _TypedDictNested(TypedDict):
+    depth: int
+    values: list[int]
+
+
+class _TypedDictDataItem(TypedDict):
+    id: int
+    title: str
+    tags: list[Tag]
+    score: float
+    nested: _TypedDictNested
+
+
+class _TypedDictPagination(TypedDict):
+    page: int
+    limit: int
+    total: int
+    has_more: bool
+
+
+class TypeguardResponse(TypedDict):
+    status: str
+    timestamp: str
+    user: _TypedDictUser
+    data: list[_TypedDictDataItem]
+    pagination: _TypedDictPagination
 
 
 @dataclass
@@ -89,6 +235,21 @@ async def _fetch_one_lothc(client: HTTPClient, path: str) -> None:
     assert "status" in data
 
 
+async def _fetch_one_lothc_msgspec(client: HTTPClient, path: str) -> None:
+    data = await client.get(path, response_data_type=MsgspecResponse)
+    assert data.status == "success"
+
+
+async def _fetch_one_lothc_pydantic(client: HTTPClient, path: str) -> None:
+    data = await client.get(path, response_data_type=PydanticResponse)
+    assert data.status == "success"
+
+
+async def _fetch_one_lothc_typeguard(client: HTTPClient, path: str) -> None:
+    data = await client.get(path, response_data_type=TypeguardResponse)
+    assert data["status"] == "success"
+
+
 async def _fetch_one_httpx(client: httpx.AsyncClient, path: str) -> None:
     resp = await client.get(path)
     data = resp.json()
@@ -133,7 +294,9 @@ async def _fetch_one_aiosonic(client: AiosonicClient, path: str) -> None:
 
 @overload
 def _build_client(
-    lib: Literal["lothc"], url: str, concurrency: int
+    lib: Literal["lothc", "lothc-msgspec", "lothc-pydantic", "lothc-typeguard"],
+    url: str,
+    concurrency: int,
 ) -> AbstractAsyncContextManager[HTTPClient]: ...
 @overload
 def _build_client(
@@ -165,7 +328,7 @@ def _build_client(
 ) -> AbstractAsyncContextManager[AiosonicClient]: ...
 def _build_client(lib: Lib, url: str, concurrency: int) -> AbstractAsyncContextManager[AnyClient]:
     """Return an async context manager yielding a ready-to-use client for `lib`."""
-    if lib == "lothc":
+    if lib in ("lothc", "lothc-msgspec", "lothc-pydantic", "lothc-typeguard"):
         return HTTPClient.build(base_url=url)
 
     if lib == "httpx":
@@ -305,6 +468,30 @@ async def _run_one(lib: Lib, url: str, concurrency: int, total_requests: int, wa
                 peak_mem_mb = await _measure_peak_memory(
                     _fetch_one_lothc, client, total_requests, concurrency
                 )
+        elif lib == "lothc-msgspec":
+            async with _build_client(lib, url, concurrency) as client:
+                timings, total_time, cpu_time = await _time_run(
+                    _fetch_one_lothc_msgspec, client, total_requests, concurrency, warmup
+                )
+                peak_mem_mb = await _measure_peak_memory(
+                    _fetch_one_lothc_msgspec, client, total_requests, concurrency
+                )
+        elif lib == "lothc-pydantic":
+            async with _build_client(lib, url, concurrency) as client:
+                timings, total_time, cpu_time = await _time_run(
+                    _fetch_one_lothc_pydantic, client, total_requests, concurrency, warmup
+                )
+                peak_mem_mb = await _measure_peak_memory(
+                    _fetch_one_lothc_pydantic, client, total_requests, concurrency
+                )
+        elif lib == "lothc-typeguard":
+            async with _build_client(lib, url, concurrency) as client:
+                timings, total_time, cpu_time = await _time_run(
+                    _fetch_one_lothc_typeguard, client, total_requests, concurrency, warmup
+                )
+                peak_mem_mb = await _measure_peak_memory(
+                    _fetch_one_lothc_typeguard, client, total_requests, concurrency
+                )
         elif lib == "httpx" or lib == "httpx_h2":
             async with _build_client(lib, url, concurrency) as client:
                 timings, total_time, cpu_time = await _time_run(
@@ -435,7 +622,10 @@ def _write_results_json(
 async def main(
     url: str = "http://127.0.0.1:3000",
     *,
-    libs: str = "httpx httpx2 pyreqwest aiohttp niquests aiosonic lothc",
+    libs: str = (
+        "httpx httpx2 pyreqwest aiohttp niquests aiosonic lothc "
+        "lothc-msgspec lothc-pydantic lothc-typeguard"
+    ),
     concurrency: int = 50,
     total_requests: int = 1000,
     warmup: int = 100,

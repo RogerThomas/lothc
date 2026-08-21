@@ -23,9 +23,19 @@ class ResultEntry(TypedDict):
 
 
 # Fixed color per library identity, not per finish rank — a library keeps
-# its color across runs and lineups. Slots 1-8 of the validated categorical
-# palette (see the `dataviz` skill's references/palette.md), assigned in
-# perf.py's own Lib declaration order.
+# its color across runs and lineups. Slots 1-7 of the validated categorical
+# palette (see the `dataviz` skill's references/palette.md; slot 8, red, is
+# unused), assigned in perf.py's own Lib declaration order. The three
+# lothc-msgspec/lothc-pydantic/lothc-typeguard rows are deliberately NOT three
+# more brand-new categorical hues — they're the same "lothc" identity at
+# different decode-validation depths, so (per the skill's non-negotiables:
+# "never a 9th generated hue", "color follows the entity") they take a single
+# green one-hue ordinal ramp instead (lothc.JSON is the lightest/least
+# processing, lothc-typeguard the darkest/heaviest). Verified via the skill's
+# validate_palette.js validateOrdinal(): lightness-monotone, single-hue, and
+# clears the light-surface 2:1 contrast floor at its lightest step (#00c200 ->
+# 2.35:1) — dark mode wasn't checked since this SVG has no dark variant at all
+# (confirmed: no prefers-color-scheme/media query anywhere in this file).
 _lib_colors = {
     "httpx": "#2a78d6",
     "httpx_h2": "#2a78d6",
@@ -34,7 +44,10 @@ _lib_colors = {
     "aiohttp": "#e87ba4",
     "niquests": "#eb6834",
     "aiosonic": "#eda100",
-    "lothc": "#008300",
+    "lothc": "#00c200",
+    "lothc-msgspec": "#009e00",
+    "lothc-pydantic": "#007a00",
+    "lothc-typeguard": "#005200",
 }
 
 _lane_height = 36

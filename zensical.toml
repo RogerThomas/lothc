@@ -12,10 +12,12 @@ site_description = "Lord Of The Http Clients — a typed HTTP client for Python,
 
 nav = [
   { "Get started" = "index.md" },
+  { "Benchmarks" = "benchmarks.md" },
   { "Verbs" = "verbs.md" },
   { "Streaming" = "streaming.md" },
   { "SSE" = "sse.md" },
   { "Retries" = "retries.md" },
+  { "Authentication" = "auth.md" },
   { "Cookies, redirects & proxy" = "networking.md" },
   { "Error handling" = "errors.md" },
   { "Development" = "development.md" },
