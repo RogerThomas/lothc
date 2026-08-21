@@ -143,3 +143,22 @@ result.headers
 ```
 
 Same `response_headers_type` option as `get_result`, via `result.typed_headers`.
+
+## Downloading large bodies — `download`
+
+`get()`'s default `bytes` return is fine for the small JSON bodies this library is designed
+around, but for something genuinely large (a presigned S3 GET URL, a big export) it costs extra
+memory copies internally. `download()` is a `get`-shaped verb built to avoid that:
+
+```python
+body = await client.download("exports/large-file.csv")  # bytes, ~1/3 the peak memory of get()
+
+await client.download("exports/large-file.csv", dest=Path("large-file.csv"))  # None returned
+```
+
+With no `dest`, the body still ends up fully in memory as `bytes`, just streamed into one buffer
+instead of copied several times along the way. Pass `dest: Path` to stream straight to disk
+instead — memory then stays O(chunk size) regardless of how large the body is, and the call
+returns `None` rather than the body. `download()` only ever does a `GET`; there's no
+`json`/`form`/`content` body option and no `response_data_type` — the response is always raw
+bytes, on disk or in memory. Same `params`/`headers`/`error_for_status` as every other verb.

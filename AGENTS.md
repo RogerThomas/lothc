@@ -59,6 +59,10 @@ sent on every request. `cookie_store=True` = in-memory jar. `proxy: str | None`.
   raw unbuffered bytes by default (safe for binary); `response_data_type` switches to
   newline-buffered per-line decode
 - `stream_post(path, *, params=None, headers=None, json=None, form=None, content=None, response_data_type=None, error_for_status=True) -> Iterator[bytes | TLine]`
+- `download(path, dest=None, *, params=None, headers=None, error_for_status=True) -> bytes | None` —
+  memory-efficient GET for large bodies; no `dest` streams into one buffer and returns `bytes`
+  (~1/3 the peak memory of `get()`), `dest: Path` streams straight to a file instead (`None`
+  return, O(chunk size) memory regardless of body size)
 
 `params`/`headers`: `dict`/`Mapping[str, str]`, or `BaseModel`/`Struct` (`None` fields omitted).
 `json`: `dict` | `BaseModel` | `Struct`. `form`: `dict[str, int | bytes | str | File]`, `File =
@@ -66,8 +70,8 @@ tuple[str, bytes] | Path | BufferedIOBase`. `content`: raw `str | bytes` body.
 
 ## Errors
 
-- `ResponseError(status, body_start)` — 4xx/5xx, raised when `error_for_status=True` (default)
-- `TransportError` base; `TimeoutError`, `ConnectionError` subclasses — no response received
+- `HTTPResponseError(status, body_start)` — 4xx/5xx, raised when `error_for_status=True` (default)
+- `HTTPTransportError` base; `HTTPTimeoutError`, `HTTPConnectionError` subclasses — no response received
 - pydantic/msgspec/typeguard validation errors propagate unwrapped (not translated)
 
 ## Retries

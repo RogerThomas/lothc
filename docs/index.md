@@ -145,8 +145,8 @@ chart above.
 
 -   **Every verb**
 
-    `get`, `get_result`, `post`, `put`, `patch`, `delete`, `head` — plus `sse`, `stream_get`, and
-    `stream_post` for streaming responses. See [Verbs](verbs.md).
+    `get`, `get_result`, `post`, `put`, `patch`, `delete`, `head`, `download` — plus `sse`,
+    `stream_get`, and `stream_post` for streaming responses. See [Verbs](verbs.md).
 
 -   **Typed *and* raw params/headers**
 

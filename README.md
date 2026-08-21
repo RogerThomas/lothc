@@ -54,7 +54,7 @@ typeguard-checked `TypedDict` instead — built in, not bolted on. See
 | | |
 |---|---|
 | **Two clients, one API** | `HTTPClient` (async) and `SyncHTTPClient` (sync) — identical surface, both backed by pyreqwest. |
-| **Every verb** | `get`/`get_result`, `post`, `put`, `patch`, `delete`, `head` — see [Verbs](docs/verbs.md). |
+| **Every verb** | `get`/`get_result`, `post`, `put`, `patch`, `delete`, `head`, `download` — see [Verbs](docs/verbs.md). |
 | **Typed params, headers & forms** | A `BaseModel`/`Struct` for query params or headers (with `None`-field omission), or a real multipart body via `form=`. |
 | **Precise static types** | Every verb is paired `@overload`s, not a cast-laden generic — your editor knows the exact return type. |
 | **SSE & streaming** | Typed SSE decode (discriminated unions included), plus raw or NDJSON-typed `stream_get`/`stream_post` — see [SSE](docs/sse.md) / [Streaming](docs/streaming.md). |
