@@ -27,7 +27,7 @@ async def test_get_result_includes_raw_headers(client: HTTPClient) -> None:
 
 async def test_get_result_with_typed_headers(client: HTTPClient) -> None:
     result = await client.get_result(
-        "items/7", response_data_type=ItemModel, headers_type=EchoedHeaders
+        "items/7", response_data_type=ItemModel, response_headers_type=EchoedHeaders
     )
 
     assert result.typed_headers is not None

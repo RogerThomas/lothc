@@ -39,12 +39,12 @@ sent on every request. `cookie_store=True` = in-memory jar. `proxy: str | None`.
 ## Verbs
 
 - `get(path, *, params=None, headers=None, response_data_type=bytes, error_for_status=True) -> Data`
-- `get_result(path, *, params=None, headers=None, response_data_type=bytes, headers_type=None, error_for_status=True) -> Result` —
+- `get_result(path, *, params=None, headers=None, response_data_type=bytes, response_headers_type=None, error_for_status=True) -> Result` —
   `.data .status .headers .typed_headers`
 - `post/put/patch(path, *, params=None, headers=None, json=None, form=None, content=None, response_data_type=bytes, error_for_status=True) -> Data` —
   at most one of `json`/`form`/`content`, else `ValueError`
 - `delete(path, *, params=None, headers=None, response_data_type=bytes, error_for_status=True) -> Data`
-- `head(path, *, params=None, headers=None, headers_type=None, error_for_status=True) -> Result[None]`
+- `head(path, *, params=None, headers=None, response_headers_type=None, error_for_status=True) -> Result[None]`
 - `sse(path, *, params=None, headers=None, response_data_type=None, id_type=str, error_for_status=True) -> Iterator[SSEEvent[TData, TId]]` —
   always yields `SSEEvent(id=, event=, data=)` (kw-only, `SSEEvent[TData, TId=str]`).
   `response_data_type` controls `.data`'s type only (default `str`); class | pydantic

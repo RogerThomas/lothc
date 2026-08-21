@@ -414,18 +414,21 @@ def _attach_body_sync[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many
     return request_builder
 
 
-def _parse_typed_headers(headers: dict[str, str], headers_type: type[TypedHeaders]) -> TypedHeaders:
+def _parse_typed_headers(
+    headers: dict[str, str], response_headers_type: type[TypedHeaders]
+) -> TypedHeaders:
     normalized = {name.lower().replace("-", "_"): value for name, value in headers.items()}
-    if issubclass(headers_type, Struct):
-        return msgspec.convert(normalized, type=headers_type, strict=False)
-    return headers_type.model_validate(normalized)
+    if issubclass(response_headers_type, Struct):
+        return msgspec.convert(normalized, type=response_headers_type, strict=False)
+    return response_headers_type.model_validate(normalized)
 
 
 @dataclass
 class Result[TData, THeaders: TypedHeaders | None = None]:
     """The decoded body alongside status/headers, as returned by `get_result()`/`head()`.
 
-    `.typed_headers` is `None` unless `headers_type` was passed to the call that produced this.
+    `.typed_headers` is `None` unless `response_headers_type` was passed to the call that
+    produced this.
     """
 
     data: TData
@@ -596,7 +599,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        headers_type: type[THeaders],
+        response_headers_type: type[THeaders],
         error_for_status: bool = True,
     ) -> Result[bytes, THeaders]: ...
     @overload
@@ -607,7 +610,7 @@ class HTTPClient:
         params: Params | None = None,
         headers: Headers | None = None,
         response_data_type: type[TData],
-        headers_type: type[THeaders],
+        response_headers_type: type[THeaders],
         error_for_status: bool = True,
     ) -> Result[TData, THeaders]: ...
     async def get_result(
@@ -617,11 +620,11 @@ class HTTPClient:
         params: Params | None = None,
         headers: Headers | None = None,
         response_data_type: type[Data] = bytes,
-        headers_type: type[TypedHeaders] | None = None,
+        response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
     ) -> Result[Any, Any]:
         """Like `get`, but return a `Result` carrying the decoded body alongside the response
-        status and headers. Pass `headers_type` to also get the headers parsed into
+        status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
         """
         request_builder = await self._prepare_request(self._client.get(path), params, headers)
@@ -630,10 +633,10 @@ class HTTPClient:
             await self._check_status(raw_response)
         data = await self._decode_body(raw_response, response_data_type)
         headers = dict(raw_response.headers)
-        if headers_type is None:
+        if response_headers_type is None:
             typed_headers = None
         else:
-            typed_headers = _parse_typed_headers(headers, headers_type)
+            typed_headers = _parse_typed_headers(headers, response_headers_type)
         return Result(data, raw_response.status, headers, typed_headers)
 
     async def _sse_stream(
@@ -1174,7 +1177,7 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        headers_type: type[THeaders],
+        response_headers_type: type[THeaders],
         error_for_status: bool = True,
     ) -> Result[None, THeaders]: ...
     async def head(
@@ -1183,11 +1186,11 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        headers_type: type[TypedHeaders] | None = None,
+        response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
     ) -> Result[None, Any]:
-        """HEAD `path` — headers-only, no body is ever decoded. Pass `headers_type` to get the
-        response headers parsed into `result.typed_headers`.
+        """HEAD `path` — headers-only, no body is ever decoded. Pass
+        `response_headers_type` to get the response headers parsed into `result.typed_headers`.
         """
         request_builder = await self._prepare_request(self._client.head(path), params, headers)
         raw_response = await _send(request_builder.build())
@@ -1195,7 +1198,9 @@ class HTTPClient:
             await self._check_status(raw_response)
         response_headers = dict(raw_response.headers)
         typed_headers = (
-            None if headers_type is None else _parse_typed_headers(response_headers, headers_type)
+            None
+            if response_headers_type is None
+            else _parse_typed_headers(response_headers, response_headers_type)
         )
         return Result(None, raw_response.status, response_headers, typed_headers)
 
@@ -1365,7 +1370,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        headers_type: type[THeaders],
+        response_headers_type: type[THeaders],
         error_for_status: bool = True,
     ) -> Result[bytes, THeaders]: ...
     @overload
@@ -1376,7 +1381,7 @@ class SyncHTTPClient:
         params: Params | None = None,
         headers: Headers | None = None,
         response_data_type: type[TData],
-        headers_type: type[THeaders],
+        response_headers_type: type[THeaders],
         error_for_status: bool = True,
     ) -> Result[TData, THeaders]: ...
     def get_result(
@@ -1386,11 +1391,11 @@ class SyncHTTPClient:
         params: Params | None = None,
         headers: Headers | None = None,
         response_data_type: type[Data] = bytes,
-        headers_type: type[TypedHeaders] | None = None,
+        response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
     ) -> Result[Any, Any]:
         """Like `get`, but return a `Result` carrying the decoded body alongside the response
-        status and headers. Pass `headers_type` to also get the headers parsed into
+        status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
         """
         request_builder = self._prepare_request(self._client.get(path), params, headers)
@@ -1399,10 +1404,10 @@ class SyncHTTPClient:
             self._check_status(raw_response)
         data = self._decode_body(raw_response, response_data_type)
         headers = dict(raw_response.headers)
-        if headers_type is None:
+        if response_headers_type is None:
             typed_headers = None
         else:
-            typed_headers = _parse_typed_headers(headers, headers_type)
+            typed_headers = _parse_typed_headers(headers, response_headers_type)
         return Result(data, raw_response.status, headers, typed_headers)
 
     def _sse_stream(
@@ -1941,7 +1946,7 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        headers_type: type[THeaders],
+        response_headers_type: type[THeaders],
         error_for_status: bool = True,
     ) -> Result[None, THeaders]: ...
     def head(
@@ -1950,11 +1955,11 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
-        headers_type: type[TypedHeaders] | None = None,
+        response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
     ) -> Result[None, Any]:
-        """HEAD `path` — headers-only, no body is ever decoded. Pass `headers_type` to get the
-        response headers parsed into `result.typed_headers`.
+        """HEAD `path` — headers-only, no body is ever decoded. Pass
+        `response_headers_type` to get the response headers parsed into `result.typed_headers`.
         """
         request_builder = self._prepare_request(self._client.head(path), params, headers)
         raw_response = _send_sync(request_builder.build())
@@ -1962,6 +1967,8 @@ class SyncHTTPClient:
             self._check_status(raw_response)
         response_headers = dict(raw_response.headers)
         typed_headers = (
-            None if headers_type is None else _parse_typed_headers(response_headers, headers_type)
+            None
+            if response_headers_type is None
+            else _parse_typed_headers(response_headers, response_headers_type)
         )
         return Result(None, raw_response.status, response_headers, typed_headers)

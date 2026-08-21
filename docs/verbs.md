@@ -68,7 +68,7 @@ result.status  # 200
 result.headers  # {"content-type": "application/json", ...}
 ```
 
-Pass `headers_type` (a `BaseModel`/`Struct`) to get the *response* headers validated and parsed
+Pass `response_headers_type` (a `BaseModel`/`Struct`) to get the *response* headers validated and parsed
 too, via `result.typed_headers`. Header names are lowercased and `-` becomes `_` before matching
 against your type's field names, so a `Content-Type` response header maps onto a `content_type`
 field:
@@ -78,11 +78,13 @@ class ItemHeaders(BaseModel):
     content_type: str | None = None
 
 
-result = await client.get_result("items/7", response_data_type=ItemModel, headers_type=ItemHeaders)
+result = await client.get_result(
+    "items/7", response_data_type=ItemModel, response_headers_type=ItemHeaders
+)
 result.typed_headers.content_type  # "application/json"
 ```
 
-`headers_type` works the same way on `head()` — see below.
+`response_headers_type` works the same way on `head()` — see below.
 
 ## POST, PUT, PATCH
 
@@ -140,4 +142,4 @@ result.status  # 200
 result.headers
 ```
 
-Same `headers_type` option as `get_result`, via `result.typed_headers`.
+Same `response_headers_type` option as `get_result`, via `result.typed_headers`.
