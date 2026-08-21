@@ -105,6 +105,44 @@ task example-run       # runs examples/run_http.py against it, showcasing every 
 OS-assigned one. `examples/run_http.py` doesn't yet showcase every feature added this session
 (retries, cookies, redirects, proxy, delete/head, streaming) — extend it when that's worth doing.
 
+## Regression benchmarking (asv)
+
+`asv` (airspeed velocity, `asv.conf.json` + `asv_bench/`) tracks lothc's **own** performance across
+its git history — a different job from `perf.py`/`benchmarks/` above, which compares lothc against
+*other* HTTP client libraries at a single point in time. asv never runs under pytest — it has its
+own discovery/execution harness (`asv_runner`), with its own `setup`/`teardown`/`setup_cache` class
+convention playing the role a pytest fixture would; there is no `@pytest.fixture` inside an
+asv-discovered benchmark class because pytest is never imported anywhere in that path.
+
+- Fast dev-loop check (no isolated env, no history, nothing saved): `task asv-quick`
+- Real run across commit history (isolated env + fresh build per commit): `task asv-run -- <range>`,
+  e.g. `task asv-run -- main~5..main`, or `task asv-run -- HEAD^!` for just one commit
+- View results as a trend dashboard: `task asv-publish` then `task asv-preview`
+
+`asv_bench/bench_download.py` is the first (and so far only) suite: `get()` vs `download()` bytes-mode
+vs `download(dest=Path)` against a large body, both `time_*` and `peakmem_*`. Two things that were
+real gotchas getting this working, worth knowing before adding more benchmarks here:
+
+- **The large-object HTTP server in `setup()` MUST be a genuine separate OS process (`subprocess.Popen`
+  running stdlib `http.server`), never a thread in this process.** `peakmem_*` benchmarks measure
+  `resource.getrusage(RUSAGE_SELF).ru_maxrss` — a server thread sharing this process would have its
+  own memory counted toward the very number being tracked, contaminating it.
+- **`environment_type: "uv"` + an explicit `build_command` using `python -m build --wheel -o
+  {build_cache_dir} {build_dir}`, not the default.** asv's own default build step runs `pip wheel -w
+  {build_cache_dir} {build_dir}`, which also dumps wheels for lothc's *dependencies* (pyreqwest) into
+  the same cache directory — asv's install step then can't tell which of the multiple `.whl` files in
+  there is "the" project wheel (`Found multiple wheels ... Cannot decide correct one`). `python -m
+  build --wheel` only ever produces the target project's own wheel, so this doesn't happen.
+- `setup_cache()`'s return value is pickled to disk and can be loaded by a **different process** than
+  the one that produced it (confirmed by reading `asv_runner`'s actual source) — never rely on a
+  resource started inside `setup_cache()` (a thread, a live subprocess handle) still being alive when
+  a benchmark actually runs. Only put picklable, static data there (e.g. the large fixture file's
+  path) and start any live resources fresh in `setup()`/tear them down in `teardown()`.
+- Resources acquired in `setup()` (the server subprocess, the client, a per-run temp directory for
+  the `download(dest=Path)` case) are managed via a single `contextlib.ExitStack`, closed once in
+  `teardown()` — not several independent `.terminate()`/`.cleanup()`/`__exit__()` calls in a fixed
+  order.
+
 ## Architecture
 
 Everything lives in `lothc/_client.py` (one file, deliberately — split it once it earns a split).

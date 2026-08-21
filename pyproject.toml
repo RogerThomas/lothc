@@ -21,6 +21,7 @@ typeguard = ["typeguard>=4.4.0"]
 dev = [
     "aiohttp>=3.14.3",
     "aiosonic>=1.0.5",
+    "asv>=0.6.4",
     "basedpyright>=1.38.0",
     "deptry>=0.25.1",
     "httpx>=0.28.1",
@@ -63,8 +64,9 @@ asyncio_mode = "auto"
 
 [tool.deptry]
 # examples/ and perf.py are dev-only utility/benchmark scripts, not part of the installable
-# package — they're expected to import dev-group dependencies directly.
-exclude = ["examples", "perf\\.py", "\\.venv", "tests"]
+# package — they're expected to import dev-group dependencies directly. .asv/ holds asv's own
+# per-commit checkouts + venvs (a full copy of this repo, gitignored) — not our code at all.
+exclude = ["examples", "perf\\.py", "\\.venv", "\\.asv", "tests"]
 
 [tool.deptry.per_rule_ignores]
 # pydantic/msgspec/typeguard are all real, used-conditionally-at-runtime imports in

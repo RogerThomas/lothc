@@ -22,3 +22,7 @@ run_*.py
 
 # zensical docs build output
 /site/
+
+# asv (airspeed velocity) benchmark environments/results/generated test data
+/.asv/
+/asv_bench/_data/

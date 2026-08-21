@@ -25,7 +25,19 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 COPY lothc ./lothc
 COPY perf.py ./perf.py
-RUN uv sync --frozen --group dev
+# lothc's version is dynamic (hatch-vcs, [tool.hatch.version] source = "vcs") — it normally reads
+# the version from git metadata, but this build context has no .git (and the base image has no
+# `git` binary either), so pin a pretend version instead of copying .git in just for this: the
+# version string is irrelevant here, this image only runs perf.py against lothc's code, and
+# copying .git would also bust the uv sync layer cache on every single commit. Must be the
+# generic SETUPTOOLS_SCM_PRETEND_VERSION, not the per-package _FOR_<NAME> variant — hatch-vcs
+# doesn't pass a dist name through to setuptools-scm, so the namespaced form is never matched
+# (verified locally: _FOR_LOTHC silently has no effect, the bare var works).
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
+# asv (regression-benchmark tracking of lothc's own history, unrelated to this cross-library
+# perf.py comparison) needs a C compiler to build from source and this slim image has none —
+# excluded here since perf.py never imports it; task perf doesn't need it installed.
+RUN uv sync --frozen --group dev --no-install-package asv
 
 COPY benchmarks/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

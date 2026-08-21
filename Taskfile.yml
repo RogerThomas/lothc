@@ -22,11 +22,11 @@ tasks:
   # ------------------------------------------------------------------------------------------------
   deps-sync:
     desc: Install dependencies
-    cmd: uv sync --all-extras
+    cmd: uv sync --all-extras --all-groups
 
   deps-upgrade:
     desc: Update dependencies
-    cmd: uv sync --all-extras --upgrade
+    cmd: uv sync --all-extras --all-groups --upgrade
 
   deps-lock:
     desc: Lock dependencies
@@ -131,3 +131,27 @@ tasks:
       Regenerate assets/perf-race.svg from a perf.py results file. Usage:
       task perf-svg -- results/<run_id>.json [--race-seconds N].
     cmd: uv run yeet benchmarks/race_svg.py {{.CLI_ARGS}}
+
+  # asv (airspeed velocity) tracks lothc's OWN performance across its git history — a
+  # different job than perf.py above, which compares lothc against other HTTP client
+  # libraries at a single point in time. See asv_bench/bench_download.py and CLAUDE.md.
+  asv-quick:
+    desc: >
+      Fast dev-loop check that the asv_bench/ benchmarks actually run, against the
+      current checkout — no isolated env build, no history, results not saved.
+    cmd: uv run asv run --quick --dry-run -E existing {{.CLI_ARGS}}
+
+  asv-run:
+    desc: >
+      Run asv_bench/ benchmarks across real commit history in an isolated env per
+      commit. Usage: task asv-run -- <commit-range> (e.g. main~5..main), or with no
+      args benchmarks every commit asv hasn't already recorded results for.
+    cmd: uv run asv run {{.CLI_ARGS}}
+
+  asv-publish:
+    desc: Collate .asv/results/ into a static HTML dashboard at .asv/html/
+    cmd: uv run asv publish
+
+  asv-preview:
+    desc: Serve the asv-publish dashboard locally so you can see the trend graphs
+    cmd: uv run asv preview
