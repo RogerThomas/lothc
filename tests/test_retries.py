@@ -1,6 +1,6 @@
 import pytest
 
-from lothc import JSON, HTTPClient, ResponseError, SyncHTTPClient
+from lothc import JSON, HTTPClient, HTTPResponseError, SyncHTTPClient
 
 
 async def test_retries_recovers_from_5xx_then_succeeds(base_url: str) -> None:
@@ -14,7 +14,7 @@ async def test_retries_recovers_from_5xx_then_succeeds(base_url: str) -> None:
 
 async def test_retries_exhausted_raises_response_error(base_url: str) -> None:
     async with HTTPClient.build(base_url=base_url, max_retries=1) as client:
-        with pytest.raises(ResponseError) as exc_info:
+        with pytest.raises(HTTPResponseError) as exc_info:
             await client.get("flaky", params={"key": "flaky-exhausted", "fail_times": 5})
 
     assert exc_info.value.status == 503
@@ -31,7 +31,7 @@ async def test_retries_honors_retry_after_header(base_url: str) -> None:
 
 async def test_retries_not_applied_to_post_by_default(base_url: str) -> None:
     async with HTTPClient.build(base_url=base_url, max_retries=3) as client:
-        with pytest.raises(ResponseError):
+        with pytest.raises(HTTPResponseError):
             await client.post("flaky", params={"key": "flaky-post-default", "fail_times": 1})
 
 

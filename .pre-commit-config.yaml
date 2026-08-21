@@ -29,3 +29,24 @@ repos:
         language: system
         files: \.py$
         pass_filenames: false
+
+      - id: deptry
+        name: deptry
+        entry: uv run deptry .
+        language: system
+        files: \.py$
+        pass_filenames: false
+
+      - id: vulture
+        name: vulture
+        entry: uv run vulture --min-confidence 100 lothc tests examples benchmarks perf.py vulture_whitelist.py
+        language: system
+        files: \.py$
+        pass_filenames: false
+
+      - id: pylint
+        name: pylint
+        entry: uv run pylint lothc
+        language: system
+        files: \.py$
+        pass_filenames: false

@@ -1,9 +1,9 @@
 """A minimal stdlib-only HTTP test server — no ASGI framework, no jero.
 
-Mirrors the handful of endpoints `examples/server.py` (the jero app used for
-manual smoke-testing) exposes, purely for the automated test suite: `/items`
-(GET/POST/PUT/PATCH/DELETE/HEAD), `/echo-headers`, `/slow`, `/events` (SSE),
-`/boom`, plus cookie/redirect/retry scenarios used by their own tests.
+`examples/server.py` (used for manual smoke-testing) reuses this same handler on a fixed port —
+this module is the one canonical server implementation for both. Endpoints: `/items`
+(GET/POST/PUT/PATCH/DELETE/HEAD), `/echo-headers`, `/slow`, `/events` (SSE), `/boom`, plus
+cookie/redirect/retry/streaming scenarios used by their own tests.
 """
 
 import json

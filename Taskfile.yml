@@ -81,9 +81,8 @@ tasks:
   # - Examples -----------------------------------------------------------------------------------
   # ------------------------------------------------------------------------------------------------
   example-server:
-    desc: Run the example jero test server on port 8701
-    dir: examples
-    cmd: uv run granian --interface asgi server:app --port 8701
+    desc: Run the stdlib-only example test server on port 8701
+    cmd: uv run yeet ./examples/server.py
 
   example-run:
     desc: Run the example showcase script against example-server

@@ -61,7 +61,12 @@ type AsyncAuthProvider = Callable[[], Awaitable[str]]
 type AuthProvider = Callable[[], str]
 
 
-class ResponseError(Exception):
+class HTTPResponseError(Exception):
+    """Raised when a request gets a 4xx/5xx response (`error_for_status=True`, the default).
+
+    A response WAS received — for a request that never got one, see `HTTPTransportError`.
+    """
+
     def __init__(self, status: int, body: bytes) -> None:
         self.status = status
         self.body_start = body[:100]
@@ -70,24 +75,26 @@ class ResponseError(Exception):
         super().__init__(f"Request failed with status {status}: {snippet}{truncation_marker}")
 
 
-class TransportError(Exception):
-    pass
+class HTTPTransportError(Exception):
+    """Raised when a request never got a response at all — pyreqwest's own exception types
+    never leak through; they're translated to this (or a subclass) at every call site.
+    """
 
 
-class ConnectionError(TransportError):  # noqa: A001 — deliberate, matches requests/httpx precedent
-    pass
+class HTTPConnectionError(HTTPTransportError):
+    """The connection was never established, or was lost mid-request."""
 
 
-class TimeoutError(TransportError):  # noqa: A001 — deliberate, matches requests/httpx precedent
-    pass
+class HTTPTimeoutError(HTTPTransportError):
+    """The request exceeded its configured `timeout`."""
 
 
-def _translate_transport_error(error: PyreqwestTransportError) -> TransportError:
+def _translate_transport_error(error: PyreqwestTransportError) -> HTTPTransportError:
     if isinstance(error, PyreqwestRequestTimeoutError):
-        return TimeoutError(str(error))
+        return HTTPTimeoutError(str(error))
     if isinstance(error, PyreqwestNetworkError):
-        return ConnectionError(str(error))
-    return TransportError(str(error))
+        return HTTPConnectionError(str(error))
+    return HTTPTransportError(str(error))
 
 
 async def _send(request: ConsumedRequest) -> RawResponse:
@@ -130,7 +137,7 @@ class _RetryMiddleware:
     retry_methods: frozenset[str]
     backoff_base: float = 0.1
 
-    async def __call__(self, request: Request, next: Next) -> RawResponse:  # noqa: A002 — matches pyreqwest's own middleware signature
+    async def __call__(self, request: Request, next: Next) -> RawResponse:  # noqa: A002 — matches pyreqwest's own middleware signature — pylint: disable=redefined-builtin,line-too-long
         if request.method not in self.retry_methods:
             return await next.run(request)
         for attempt in range(self.max_retries + 1):
@@ -156,7 +163,7 @@ class _SyncRetryMiddleware:
     retry_methods: frozenset[str]
     backoff_base: float = 0.1
 
-    def __call__(self, request: Request, next: SyncNext) -> RawSyncResponse:  # noqa: A002 — matches pyreqwest's own middleware signature
+    def __call__(self, request: Request, next: SyncNext) -> RawSyncResponse:  # noqa: A002 — matches pyreqwest's own middleware signature — pylint: disable=redefined-builtin,line-too-long
         if request.method not in self.retry_methods:
             return next.run(request)
         for attempt in range(self.max_retries + 1):
@@ -201,6 +208,13 @@ async def _build_form(form: Form) -> FormBuilder:
 
 @dataclass(kw_only=True)
 class SSEEvent[TData, TId = str]:
+    """One Server-Sent Event, as yielded by `sse()`.
+
+    `.event` is always a plain `str` (defaults to `"message"` per the SSE spec when the wire
+    omits it). `.id`'s type/requiredness is controlled by `sse()`'s `id_type` argument. `.data`
+    is decoded per `sse()`'s `response_data_type`, raw `str` by default.
+    """
+
     id: TId
     event: str = "message"
     data: TData
@@ -226,12 +240,17 @@ def _parse_sse_record(record: str) -> SSEEvent[str, str | None] | None:
     return SSEEvent(id=event_id, event=event, data="\n".join(data_lines))
 
 
-def _coerce_sse_id(raw_id: str | None, id_type: type[Any] | UnionType | None) -> Any:  # noqa: ANN401
+def _coerce_sse_id(raw_id: str | None, id_type: type[Any] | UnionType | None) -> Any:  # noqa: ANN401 — pylint: disable=line-too-long
     if id_type is None:
         return raw_id
     members = get_args(id_type) if isinstance(id_type, UnionType) else (id_type,)
     optional = type(None) in members
-    real_type = next((member for member in members if member is not type(None)), str)
+    # comparing type objects themselves, not checking an instance's type — isinstance() can't
+    # express "is this class literally NoneType"
+    real_type = next(
+        (member for member in members if member is not type(None)),  # pylint: disable=unidiomatic-typecheck
+        str,
+    )
     if raw_id is None:
         if optional:
             return None
@@ -353,7 +372,7 @@ def _prepare[TBuilder: BaseRequestBuilder](
     return _apply_headers(_apply_params(request_builder, params), headers)
 
 
-async def _attach_body[TBuilder: BaseRequestBuilder](
+async def _attach_body[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many-return-statements
     request_builder: TBuilder, json: Json | None, form: Form | None, content: str | bytes | None
 ) -> TBuilder:
     provided_bodies = [body for body in (json, form, content) if body is not None]
@@ -374,7 +393,7 @@ async def _attach_body[TBuilder: BaseRequestBuilder](
     return request_builder
 
 
-def _attach_body_sync[TBuilder: BaseRequestBuilder](
+def _attach_body_sync[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many-return-statements
     request_builder: TBuilder, json: Json | None, form: Form | None, content: str | bytes | None
 ) -> TBuilder:
     provided_bodies = [body for body in (json, form, content) if body is not None]
@@ -404,6 +423,11 @@ def _parse_typed_headers(headers: dict[str, str], headers_type: type[TypedHeader
 
 @dataclass
 class Result[TData, THeaders: TypedHeaders | None = None]:
+    """The decoded body alongside status/headers, as returned by `get_result()`/`head()`.
+
+    `.typed_headers` is `None` unless `headers_type` was passed to the call that produced this.
+    """
+
     data: TData
     status: int
     headers: dict[str, str]
@@ -412,6 +436,11 @@ class Result[TData, THeaders: TypedHeaders | None = None]:
 
 @dataclass
 class HTTPClient:
+    """Async typed HTTP client, built on pyreqwest. Construct via `HTTPClient.build(...)`.
+
+    See `SyncHTTPClient` for the sync mirror — same methods, same overload shapes.
+    """
+
     _default_retry_methods: ClassVar[frozenset[str]] = frozenset({"GET", "PUT", "DELETE", "HEAD"})
 
     _client: Client
@@ -435,6 +464,13 @@ class HTTPClient:
         max_retries: int = 0,
         retry_methods: frozenset[str] | None = None,
     ) -> AsyncGenerator[Self]:
+        """Build an `HTTPClient` as an async context manager.
+
+        `bearer_token` is a static token; `bearer_auth` is an async callable resolved fresh on
+        every request — provide at most one. `max_retries` enables a real retry middleware
+        (backoff, `Retry-After`-aware); with no `retry_methods`, only the idempotent verbs
+        (`GET`/`PUT`/`DELETE`/`HEAD`) retry.
+        """
         if bearer_token is not None and bearer_auth is not None:
             raise ValueError("Provide at most one of 'bearer_token' or 'bearer_auth'")
         pyreqwest_client_builder = ClientBuilder()
@@ -472,7 +508,7 @@ class HTTPClient:
     async def _check_status(self, raw_response: RawResponse) -> None:
         if raw_response.status < 400:
             return
-        raise ResponseError(raw_response.status, bytes(await raw_response.bytes()))
+        raise HTTPResponseError(raw_response.status, bytes(await raw_response.bytes()))
 
     async def _decode_body(self, raw_response: RawResponse, response_data_type: type[Data]) -> Data:
         _validate_response_data_type(response_data_type)
@@ -524,6 +560,10 @@ class HTTPClient:
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
+        """GET `path` and decode the body as `response_data_type` (raw `bytes` by default).
+
+        Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
+        """
         request_builder = await self._prepare_request(self._client.get(path), params, headers)
         raw_response = await _send(request_builder.build())
         return await self._parse(
@@ -580,6 +620,10 @@ class HTTPClient:
         headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
     ) -> Result[Any, Any]:
+        """Like `get`, but return a `Result` carrying the decoded body alongside the response
+        status and headers. Pass `headers_type` to also get the headers parsed into
+        `result.typed_headers`.
+        """
         request_builder = await self._prepare_request(self._client.get(path), params, headers)
         raw_response = await _send(request_builder.build())
         if error_for_status:
@@ -683,6 +727,13 @@ class HTTPClient:
         id_type: type[Any] | UnionType | None = str,
         error_for_status: bool = True,
     ) -> AsyncIterator[SSEEvent[Any, Any]]:
+        """Open `path` as a Server-Sent Events stream, yielding one `SSEEvent` per event.
+
+        `response_data_type` decodes `.data` (a class, `TypeAdapter`, or msgspec `Decoder`);
+        `.event`/`.id` are always populated regardless. `id_type` is the single knob for both
+        whether `id` is required and what type it becomes: a bare type (default `str`) means
+        required, that type unioned with `None` (or bare `None`) means optional.
+        """
         return self._sse_stream(
             path,
             params,
@@ -760,6 +811,11 @@ class HTTPClient:
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
         error_for_status: bool = True,
     ) -> AsyncIterator[Any]:
+        """Stream GET `path`'s response as raw `bytes` chunks (unbuffered, safe for binary).
+
+        Pass `response_data_type` to switch to newline-buffered NDJSON-style decoding instead —
+        each complete line is parsed and decoded as its own value.
+        """
         return self._line_stream(
             self._client.get(path),
             params,
@@ -808,6 +864,9 @@ class HTTPClient:
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
         error_for_status: bool = True,
     ) -> AsyncIterator[Any]:
+        """Like `stream_get`, but POST a body first — same `json`/`form`/`content` options as
+        `post` (at most one), same raw-bytes-by-default / NDJSON-via-`response_data_type` split.
+        """
         return self._line_stream(
             self._client.post(path),
             params,
@@ -818,6 +877,78 @@ class HTTPClient:
             response_data_type,
             error_for_status=error_for_status,
         )
+
+    async def _download(
+        self,
+        path: str,
+        dest: Path | None,
+        params: Params | None,
+        headers: Headers | None,
+        *,
+        error_for_status: bool,
+    ) -> bytes | None:
+        request_builder = await self._prepare_request(self._client.get(path), params, headers)
+        request = request_builder.build_streamed()
+        try:
+            async with request as raw_response:
+                if error_for_status:
+                    await self._check_status(raw_response)
+                if dest is None:
+                    buffer = bytearray()
+                    while True:
+                        chunk = await raw_response.body_reader.read_chunk()
+                        if chunk is None:
+                            return bytes(buffer)
+                        buffer.extend(bytes(chunk))
+                with dest.open("wb") as file:
+                    while True:
+                        chunk = await raw_response.body_reader.read_chunk()
+                        if chunk is None:
+                            return None
+                        file.write(chunk)
+        except PyreqwestTransportError as error:
+            raise _translate_transport_error(error) from error
+
+    @overload
+    async def download(
+        self,
+        path: str,
+        dest: None = None,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        error_for_status: bool = True,
+    ) -> bytes: ...
+    @overload
+    async def download(
+        self,
+        path: str,
+        dest: Path,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        error_for_status: bool = True,
+    ) -> None: ...
+    async def download(
+        self,
+        path: str,
+        dest: Path | None = None,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        error_for_status: bool = True,
+    ) -> bytes | None:
+        """Download `path`'s response body, optimized for large objects (e.g. a presigned GET
+        URL for a multi-GB file) — much lower peak memory than `get()` for big bodies.
+
+        With no `dest`, streams the body into one pre-grown buffer and returns `bytes` — still
+        O(body size) memory, but roughly a third of what `get()` uses (pyreqwest's own
+        `.bytes()` does two extra full copies internally). Pass `dest` to stream straight to a
+        file instead — memory then stays O(chunk size) regardless of how large the body is.
+
+        Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
+        """
+        return await self._download(path, dest, params, headers, error_for_status=error_for_status)
 
     async def _send_with_body(
         self,
@@ -875,6 +1006,9 @@ class HTTPClient:
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
+        """POST to `path` with at most one of `json`/`form`/`content` (raises `ValueError` if
+        more than one is given) and decode the response as `response_data_type`.
+        """
         return await self._send_with_body(
             self._client.post(path),
             params,
@@ -923,6 +1057,7 @@ class HTTPClient:
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
+        """PUT to `path`. Same body/decode rules as `post`."""
         return await self._send_with_body(
             self._client.put(path),
             params,
@@ -971,6 +1106,7 @@ class HTTPClient:
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
+        """PATCH `path`. Same body/decode rules as `post`."""
         return await self._send_with_body(
             self._client.patch(path),
             params,
@@ -1010,6 +1146,7 @@ class HTTPClient:
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
+        """DELETE `path` and decode the response as `response_data_type`."""
         return await self._send_with_body(
             self._client.delete(path),
             params,
@@ -1049,6 +1186,9 @@ class HTTPClient:
         headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
     ) -> Result[None, Any]:
+        """HEAD `path` — headers-only, no body is ever decoded. Pass `headers_type` to get the
+        response headers parsed into `result.typed_headers`.
+        """
         request_builder = await self._prepare_request(self._client.head(path), params, headers)
         raw_response = await _send(request_builder.build())
         if error_for_status:
@@ -1062,6 +1202,11 @@ class HTTPClient:
 
 @dataclass
 class SyncHTTPClient:
+    """Sync typed HTTP client, built on pyreqwest. Construct via `SyncHTTPClient.build(...)`.
+
+    See `HTTPClient` for the async mirror — same methods, same overload shapes.
+    """
+
     _default_retry_methods: ClassVar[frozenset[str]] = frozenset({"GET", "PUT", "DELETE", "HEAD"})
 
     _client: SyncClient
@@ -1085,6 +1230,13 @@ class SyncHTTPClient:
         max_retries: int = 0,
         retry_methods: frozenset[str] | None = None,
     ) -> Generator[Self]:
+        """Build a `SyncHTTPClient` as a context manager.
+
+        `bearer_token` is a static token; `bearer_auth` is a callable resolved fresh on every
+        request — provide at most one. `max_retries` enables a real retry middleware (backoff,
+        `Retry-After`-aware); with no `retry_methods`, only the idempotent verbs
+        (`GET`/`PUT`/`DELETE`/`HEAD`) retry.
+        """
         if bearer_token is not None and bearer_auth is not None:
             raise ValueError("Provide at most one of 'bearer_token' or 'bearer_auth'")
         sync_client_builder = SyncClientBuilder()
@@ -1123,7 +1275,7 @@ class SyncHTTPClient:
     def _check_status(self, raw_response: RawSyncResponse) -> None:
         if raw_response.status < 400:
             return
-        raise ResponseError(raw_response.status, bytes(raw_response.bytes()))
+        raise HTTPResponseError(raw_response.status, bytes(raw_response.bytes()))
 
     def _decode_body(self, raw_response: RawSyncResponse, response_data_type: type[Data]) -> Data:
         _validate_response_data_type(response_data_type)
@@ -1179,6 +1331,10 @@ class SyncHTTPClient:
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
+        """GET `path` and decode the body as `response_data_type` (raw `bytes` by default).
+
+        Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
+        """
         request_builder = self._prepare_request(self._client.get(path), params, headers)
         raw_response = _send_sync(request_builder.build())
         return self._parse(raw_response, response_data_type, error_for_status=error_for_status)
@@ -1233,6 +1389,10 @@ class SyncHTTPClient:
         headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
     ) -> Result[Any, Any]:
+        """Like `get`, but return a `Result` carrying the decoded body alongside the response
+        status and headers. Pass `headers_type` to also get the headers parsed into
+        `result.typed_headers`.
+        """
         request_builder = self._prepare_request(self._client.get(path), params, headers)
         raw_response = _send_sync(request_builder.build())
         if error_for_status:
@@ -1336,6 +1496,13 @@ class SyncHTTPClient:
         id_type: type[Any] | UnionType | None = str,
         error_for_status: bool = True,
     ) -> Iterator[SSEEvent[Any, Any]]:
+        """Open `path` as a Server-Sent Events stream, yielding one `SSEEvent` per event.
+
+        `response_data_type` decodes `.data` (a class, `TypeAdapter`, or msgspec `Decoder`);
+        `.event`/`.id` are always populated regardless. `id_type` is the single knob for both
+        whether `id` is required and what type it becomes: a bare type (default `str`) means
+        required, that type unioned with `None` (or bare `None`) means optional.
+        """
         return self._sse_stream(
             path,
             params,
@@ -1413,6 +1580,11 @@ class SyncHTTPClient:
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
         error_for_status: bool = True,
     ) -> Iterator[Any]:
+        """Stream GET `path`'s response as raw `bytes` chunks (unbuffered, safe for binary).
+
+        Pass `response_data_type` to switch to newline-buffered NDJSON-style decoding instead —
+        each complete line is parsed and decoded as its own value.
+        """
         return self._line_stream(
             self._client.get(path),
             params,
@@ -1461,6 +1633,9 @@ class SyncHTTPClient:
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
         error_for_status: bool = True,
     ) -> Iterator[Any]:
+        """Like `stream_get`, but POST a body first — same `json`/`form`/`content` options as
+        `post` (at most one), same raw-bytes-by-default / NDJSON-via-`response_data_type` split.
+        """
         return self._line_stream(
             self._client.post(path),
             params,
@@ -1471,6 +1646,78 @@ class SyncHTTPClient:
             response_data_type,
             error_for_status=error_for_status,
         )
+
+    def _download(
+        self,
+        path: str,
+        dest: Path | None,
+        params: Params | None,
+        headers: Headers | None,
+        *,
+        error_for_status: bool,
+    ) -> bytes | None:
+        request_builder = self._prepare_request(self._client.get(path), params, headers)
+        request = request_builder.build_streamed()
+        try:
+            with request as raw_response:
+                if error_for_status:
+                    self._check_status(raw_response)
+                if dest is None:
+                    buffer = bytearray()
+                    while True:
+                        chunk = raw_response.body_reader.read_chunk()
+                        if chunk is None:
+                            return bytes(buffer)
+                        buffer.extend(bytes(chunk))
+                with dest.open("wb") as file:
+                    while True:
+                        chunk = raw_response.body_reader.read_chunk()
+                        if chunk is None:
+                            return None
+                        file.write(chunk)
+        except PyreqwestTransportError as error:
+            raise _translate_transport_error(error) from error
+
+    @overload
+    def download(
+        self,
+        path: str,
+        dest: None = None,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        error_for_status: bool = True,
+    ) -> bytes: ...
+    @overload
+    def download(
+        self,
+        path: str,
+        dest: Path,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        error_for_status: bool = True,
+    ) -> None: ...
+    def download(
+        self,
+        path: str,
+        dest: Path | None = None,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        error_for_status: bool = True,
+    ) -> bytes | None:
+        """Download `path`'s response body, optimized for large objects (e.g. a presigned GET
+        URL for a multi-GB file) — much lower peak memory than `get()` for big bodies.
+
+        With no `dest`, streams the body into one pre-grown buffer and returns `bytes` — still
+        O(body size) memory, but roughly a third of what `get()` uses (pyreqwest's own
+        `.bytes()` does two extra full copies internally). Pass `dest` to stream straight to a
+        file instead — memory then stays O(chunk size) regardless of how large the body is.
+
+        Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
+        """
+        return self._download(path, dest, params, headers, error_for_status=error_for_status)
 
     def _send_with_body(
         self,
@@ -1526,6 +1773,9 @@ class SyncHTTPClient:
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
+        """POST to `path` with at most one of `json`/`form`/`content` (raises `ValueError` if
+        more than one is given) and decode the response as `response_data_type`.
+        """
         return self._send_with_body(
             self._client.post(path),
             params,
@@ -1574,6 +1824,7 @@ class SyncHTTPClient:
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
+        """PUT to `path`. Same body/decode rules as `post`."""
         return self._send_with_body(
             self._client.put(path),
             params,
@@ -1622,6 +1873,7 @@ class SyncHTTPClient:
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
+        """PATCH `path`. Same body/decode rules as `post`."""
         return self._send_with_body(
             self._client.patch(path),
             params,
@@ -1661,6 +1913,7 @@ class SyncHTTPClient:
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
+        """DELETE `path` and decode the response as `response_data_type`."""
         return self._send_with_body(
             self._client.delete(path),
             params,
@@ -1700,6 +1953,9 @@ class SyncHTTPClient:
         headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
     ) -> Result[None, Any]:
+        """HEAD `path` — headers-only, no body is ever decoded. Pass `headers_type` to get the
+        response headers parsed into `result.typed_headers`.
+        """
         request_builder = self._prepare_request(self._client.head(path), params, headers)
         raw_response = _send_sync(request_builder.build())
         if error_for_status:

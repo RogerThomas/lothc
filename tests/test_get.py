@@ -5,7 +5,7 @@ import pytest
 from msgspec import Struct
 from pydantic import BaseModel
 
-from lothc import JSON, HTTPClient, ResponseError, SyncHTTPClient
+from lothc import JSON, HTTPClient, HTTPResponseError, SyncHTTPClient
 
 
 class ItemModel(BaseModel):
@@ -99,7 +99,7 @@ async def test_get_with_raw_headers(client: HTTPClient) -> None:
 
 
 async def test_get_raises_response_error_for_status(client: HTTPClient) -> None:
-    with pytest.raises(ResponseError) as exc_info:
+    with pytest.raises(HTTPResponseError) as exc_info:
         await client.get("boom")
 
     assert exc_info.value.status == 500
@@ -118,7 +118,7 @@ def test_sync_get_decodes_pydantic_model(sync_client: SyncHTTPClient) -> None:
 
 
 def test_sync_get_raises_response_error_for_status(sync_client: SyncHTTPClient) -> None:
-    with pytest.raises(ResponseError) as exc_info:
+    with pytest.raises(HTTPResponseError) as exc_info:
         sync_client.get("boom")
 
     assert exc_info.value.status == 500

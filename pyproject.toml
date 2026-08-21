@@ -1,20 +1,16 @@
 [project]
 name = "lothc"
-# No git repo/tags exist yet, so this is a static placeholder. Once the repo is created and tagged
-# with a CalVer tag (e.g. `git tag 2026.8.18`, no "v" prefix — same scheme as the yeetr project),
-# switch to `dynamic = ["version"]` + `[tool.hatch.version] source = "vcs"` (see commented block below).
-# The tag itself becomes the version's single source of truth — nothing to bump by hand.
-version = "0.0.0"
+# SemVer (e.g. `1.0.0`, no "v" prefix), derived from the git tag via hatch-vcs (see
+# [tool.hatch.version] below) — SemVer, not CalVer, because this is a library other packages
+# depend on: the major/minor/patch split is the signal pip's resolver, Dependabot, etc. rely on to
+# know whether an upgrade is safe, which a date can't communicate. No tag has been pushed yet, so
+# this currently resolves to a `0.1.dev0+gHASH`-style fallback version — push the first real tag
+# before publishing.
+dynamic = ["version"]
 description = "Lord Of The Http Clients — a typed HTTP client built on pyreqwest, with first-class pydantic and msgspec support"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = [
-    "aiohttp>=3.14.3",
-    "httpx2>=2.12.0",
-    "niquests>=3.21.0",
-    "pyreqwest>=0.12.2",
-    "rich>=15.0.0",
-]
+dependencies = ["pyreqwest>=0.12.2"]
 
 [project.optional-dependencies]
 pydantic = ["pydantic>=2.12.5"]
@@ -23,35 +19,36 @@ typeguard = ["typeguard>=4.4.0"]
 
 [dependency-groups]
 dev = [
+    "aiohttp>=3.14.3",
     "aiosonic>=1.0.5",
     "basedpyright>=1.38.0",
+    "deptry>=0.25.1",
     "httpx>=0.28.1",
-    "jero[granian]>=0.0.54",
+    "httpx2>=2.12.0",
     "msgspec>=0.19.0",
+    "niquests>=3.21.0",
     "prek>=0.4.14",
     "pydantic>=2.12.5",
+    "pylint>=4.0.7",
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
     "pytest-cov>=7.0.0",
-    "rich>=14.3.2",
+    "rich>=15.0.0",
     "ruff>=0.15.14",
     "typeguard>=4.4.0",
+    "vulture>=2.16",
     "yeetr[uvloop]>=2026.8.14.post1",
 ]
 docs = ["zensical>=0.0.56"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
-# Once a git repo exists with a CalVer tag (e.g. 2026.8.18, optionally 2026.8.18.post1 for a same-day
-# re-release — no "v" prefix), switch to VCS-derived versioning:
-#   requires = ["hatchling", "hatch-vcs"]
-#   [tool.hatch.version]
-#   source = "vcs"
-# ...and add `dynamic = ["version"]` to [project] above, removing the static `version` key.
-# setuptools-scm's default tag regex accepts a bare `\d+\.\d+...` tag as-is, so no tag_pattern
-# override should be needed — but verify once the first real tag is pushed.
+[tool.hatch.version]
+source = "vcs"
+# setuptools_scm's default tag regex accepts a bare `\d+\.\d+.\d+` tag as-is (e.g. `1.0.0`, no "v"
+# prefix), so no tag_pattern override is needed — but verify once the first real tag is pushed.
 
 [tool.hatch.build.targets.wheel]
 packages = ["lothc"]
@@ -63,6 +60,18 @@ packages = ["lothc"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.deptry]
+# examples/ and perf.py are dev-only utility/benchmark scripts, not part of the installable
+# package — they're expected to import dev-group dependencies directly.
+exclude = ["examples", "perf\\.py", "\\.venv", "tests"]
+
+[tool.deptry.per_rule_ignores]
+# pydantic/msgspec/typeguard are all real, used-conditionally-at-runtime imports in
+# lothc/_compat.py — deptry's static scan doesn't detect usage inside that try/except pattern for
+# any of the three (confirmed empirically: msgspec only looked "used" before excluding
+# examples/perf.py above, because those *also* happened to import it directly).
+DEP002 = ["pydantic", "msgspec", "typeguard"]
 
 [tool.coverage.report]
 skip_empty = true
@@ -133,6 +142,7 @@ known-first-party = ["lothc"]
 "examples/*" = [
     "T201",
     "ANN",
+    "S101", # server.py asserts a dynamically-loaded importlib spec/loader is present
 ] # print() and looser annotations are fine in examples
 "perf.py" = [
     "S101",
@@ -153,3 +163,28 @@ reportMissingTypeStubs = false
 [[tool.basedpyright.executionEnvironments]]
 root = "tests"
 reportUnusedFunction = "none"
+
+[tool.pylint.main]
+disable = [
+    "missing-module-docstring",
+    "missing-class-docstring",
+    "missing-function-docstring", # this project deliberately writes no comments/docstrings
+    # unless the WHY is non-obvious — see style-guide.md
+    "invalid-name", # flags this project's own deliberate PEP 695 TypeVar names (TData, THeaders,
+    # TId, TLine, ...) against pylint's older single-uppercase-letter default
+    "too-many-arguments",
+    "too-many-positional-arguments", # every verb's overload set genuinely needs this many —
+    # see the overload-pairs pattern in CLAUDE.md
+    "too-few-public-methods", # the _compat.py fallback stub classes (Struct, Decoder, BaseModel,
+    # TypeAdapter) are deliberately empty placeholders, never meant to have real methods
+]
+
+[tool.pylint.design]
+max-locals = 20 # one real case (the streaming line-buffering generator) legitimately needs a
+# couple more than pylint's default 15 — matches this project's own mccabe complexity ceiling
+# ([tool.ruff.lint.mccabe] max-complexity = 15) in spirit, just a different metric
+
+[tool.pylint.format]
+max-module-lines = 2000 # _client.py is one deliberately unsplit file (see CLAUDE.md: "split it
+# once it earns a split") that's grown past pylint's default 1000-line threshold this session;
+# bumped rather than split, since no split has actually been decided on

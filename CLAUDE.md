@@ -19,13 +19,14 @@ Testing below) and a benchmark suite under `benchmarks/` — this file is no lon
 that survives between sessions, but it's still the source of truth on decisions and remaining work,
 so keep it up to date.
 
-`version = "0.0.0"` in `pyproject.toml` is a static placeholder. This project uses **CalVer** (e.g.
-`2026.8.18`, no "v" prefix — same scheme as the `yeetr` project), derived from the git tag via
-`hatch-vcs` once the first tag is pushed — a release is just a pushed tag, nothing to bump by hand.
-The exact change needed (uncomment `hatch-vcs`, add `dynamic = ["version"]`) is commented directly
-above `[tool.hatch.build.targets.wheel]` in `pyproject.toml`.
+Versioning is **SemVer** (e.g. `1.0.0`, no "v" prefix), derived from the git tag via `hatch-vcs`
+(`dynamic = ["version"]` in `pyproject.toml`, already wired up) — a release is just a pushed tag,
+nothing to bump by hand. SemVer rather than CalVer (unlike the `yeetr` CLI project) because this is
+a library other packages depend on: major/minor/patch is the signal pip's resolver, Dependabot,
+etc. rely on to know whether an upgrade is safe, which a date can't communicate. No tag has been
+pushed yet, so it currently resolves to a `0.1.dev0+gHASH`-style fallback version.
 
-Not yet done, outside the roadmap below: no `LICENSE`, no CI (`.github/workflows`).
+Not yet done, outside the roadmap below: no `LICENSE`.
 
 ### Roadmap — what's done, what's next
 
@@ -75,17 +76,18 @@ Run with `task test-doctests`.
 
 ## Manual example / smoke-testing
 
-There's no automated integration suite yet — verification against a real server has so far been done
-manually against a small jero app:
+Beyond the automated test suite (see Testing above), there's also a manual showcase script for
+eyeballing real output:
 
 ```
-task example-server   # starts a jero test app on 127.0.0.1:8701 (separate terminal)
+task example-server   # starts the stdlib test server on 127.0.0.1:8701 (separate terminal)
 task example-run       # runs examples/run_http.py against it, showcasing every feature
 ```
 
-`examples/server.py` is a minimal jero app (JSON endpoints, an SSE stream, a slow endpoint, a
-500-raising endpoint) used purely for manual verification — extend it when adding features that need a
-live round trip to prove out (new verbs, retries, streaming, etc.).
+`examples/server.py` reuses the same stdlib-only handler the automated test suite runs against
+(`tests/_server.py` — no jero, no ASGI framework), just bound to a fixed port instead of an
+OS-assigned one. `examples/run_http.py` doesn't yet showcase every feature added this session
+(retries, cookies, redirects, proxy, delete/head, streaming) — extend it when that's worth doing.
 
 ## Architecture
 
