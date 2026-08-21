@@ -31,10 +31,11 @@ Not yet done, outside the roadmap below: no `LICENSE`.
 ### Roadmap — what's done, what's next
 
 Done: query params (typed + raw), per-request headers (typed + raw), timeouts, transport error
-wrapping (`TransportError`/`TimeoutError`/`ConnectionError`), `put`/`patch`/`delete`/`head`, SSE (with
+wrapping (`HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError`), `put`/`patch`/`delete`/`head`, SSE (with
 `TypeAdapter`/`Decoder` support), `stream_get`/`stream_post` (raw chunks by default — unbuffered, safe
 for arbitrary binary content; pass `response_data_type` to switch to newline-buffered NDJSON-style typed
-decoding instead — the buffering is conditional on that param, not always-on), the `Data` decode-target
+decoding instead — the buffering is conditional on that param, not always-on), `download` (see the
+large-object note below), the `Data` decode-target
 system (`bytes` default, `lothc.JSON`, `TypedDict` + optional `typeguard` validation), a bearer-token
 auth provider (static `bearer_token` or a per-request-refreshed `bearer_auth` callable), cookie/session
 support (`cookie_store=True`), redirect control (`follow_redirects`/`max_redirects`), proxy config
@@ -45,7 +46,7 @@ support (`cookie_store=True`), redirect control (`follow_redirects`/`max_redirec
 Not done yet:
 
 1. **Typed error bodies** — an `error_type=SomeModel` param (mirrors `response_data_type`) that decodes 4xx/5xx
-   bodies onto `ResponseError`, instead of just the raw `body_start` snippet it has today.
+   bodies onto `HTTPResponseError`, instead of just the raw `body_start` snippet it has today.
 
 ## Testing
 
@@ -53,8 +54,23 @@ Not done yet:
 - Run a single test in isolation: `task test-one -- tests/test_foo.py::test_bar`
 - Run doctests: `task test-doctests`
 
-All test tasks accept `PYTEST_PROFILE=agent|dev` (default `dev`). Use `PYTEST_PROFILE=agent` for concise
-agent-consumable output; re-run a failing test with `PYTEST_PROFILE=dev` for full detail when debugging.
+> [!IMPORTANT]
+> All of the above accept `PYTEST_PROFILE=agent|dev` (default `dev`).
+> Use `PYTEST_PROFILE=agent` by default — it produces concise output suited for agent consumption.
+> If a test fails, re-run that single failing test in isolation with `PYTEST_PROFILE=dev` for full detail to help you debug.
+> Example: `task test-one PYTEST_PROFILE=dev -- tests/test_get.py::test_get_returns_raw_bytes_by_default`.
+
+> [!CAUTION]
+> `task perf`/`task perf-build` spin up real Docker containers (a separate `json-server` + `perf`
+> service via `benchmarks/docker-compose.yml`) and can run for tens of seconds to minutes depending
+> on `--total-requests`/`--concurrency`. Do not run these by default; only run when the user
+> explicitly asks for a benchmark.
+
+> [!CAUTION]
+> `task example-run` requires `task example-server` already running in a separate terminal —
+> it has no built-in fallback to start the server itself. If there's no server listening on
+> `127.0.0.1:8701`, ask the user to start it (or start it yourself in the background) rather than
+> guessing why `example-run` is failing to connect.
 
 ### Doctests
 
@@ -112,9 +128,9 @@ async with HTTPClient.build(base_url=..., bearer_token=..., timeout=30.0) as cli
 
 ### Verbs
 
-`get`, `get_result`, `post`, `put`, `patch`, `delete`, `head`, `sse`, `stream_get`, `stream_post` —
-each is a set of `@overload`s plus one real implementation. See style guide for *why* overloads are
-used instead of a single generic signature.
+`get`, `get_result`, `post`, `put`, `patch`, `delete`, `head`, `sse`, `stream_get`, `stream_post`,
+`download` — each is a set of `@overload`s plus one real implementation. See style guide for *why*
+overloads are used instead of a single generic signature.
 
 ### Read style-guide.md before making code changes
 
@@ -129,12 +145,12 @@ Before writing any code, tell the user that you've read this file AND read and f
 ## Development notes
 
 - **Never leak the backend's exception types.** pyreqwest's `TransportError`/`RequestTimeoutError`/
-  `NetworkError` are caught and translated to `lothc.TransportError`/`TimeoutError`/`ConnectionError`
+  `NetworkError` are caught and translated to `lothc.HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError`
   at every `.send()` call and inside both SSE stream loops. If pyreqwest (or a future alternate
   backend) grows a new exception type that should be treated as a transport failure, translate it in
   `_translate_transport_error`, not at the call site.
-- **Status errors are separate from transport errors.** `ResponseError` (4xx/5xx with a body_start
-  snippet) is a different failure class from `TransportError` (never got a response at all) —
+- **Status errors are separate from transport errors.** `HTTPResponseError` (4xx/5xx with a body_start
+  snippet) is a different failure class from `HTTPTransportError` (never got a response at all) —
   don't unify them.
 - **Validation errors from the chosen decode library are NOT wrapped.** A `pydantic.ValidationError`,
   `msgspec.ValidationError`, or `typeguard.TypeCheckError` propagates natively — the user opted into
@@ -210,3 +226,29 @@ Before writing any code, tell the user that you've read this file AND read and f
   verbs it decodes *each NDJSON line* as a separate value. Keep this per-line-vs-whole-body
   distinction in mind — it's a real tradeoff of the name reuse, not an oversight, and is called
   out explicitly in `docs/streaming.md`.
+- **`download(path, dest=None) -> bytes | None` exists because `get()`'s default `bytes` path is
+  genuinely expensive for large bodies, verified with a real benchmark (isolated subprocess,
+  `ru_maxrss`, 500MB body, single non-concurrent request).** Reading pyreqwest's own Rust source
+  (`response/internal/body_reader.rs`, `response/response.rs`) showed `.build().send()` +
+  `.bytes()` does **3 full copies** of the body at peak: the `FullyConsumed` read path drains the
+  whole response into a `VecDeque<Bytes>` of small chunks *before* the `Response` is even handed
+  back to Python, `.bytes()` then copies that into one fresh pre-sized buffer, and lothc's own
+  `bytes(await raw_response.bytes())` copies *again* (`pyreqwest.bytes.Bytes` is not a real Python
+  `bytes` — confirmed live, `isinstance(b, bytes)` is `False`) — measured ~1540MB peak RSS for a
+  500MB body (~3x). `download()` instead uses `build_streamed()` directly and accumulates chunks
+  itself into a `bytearray()` via `.extend()` — no `Content-Length` dependency (verified: peak RSS
+  is the same, ~1x payload, whether or not the header is present/pre-sizes the buffer, since
+  `bytearray`'s own amortized growth already avoids the extra copies pyreqwest's internal path
+  does) — then casts to `bytes` once at the end (measured ~561MB peak, vs ~1540MB — the
+  intermediate `bytes(chunk)` per streamed chunk before `.extend()` is required only because
+  `bytearray.extend()` doesn't accept pyreqwest's `Bytes` type directly, and is negligible since
+  each chunk is small and freed immediately). Passing `dest: Path` skips the in-memory buffer
+  entirely and streams straight to a file — O(chunk size) memory regardless of body size, measured
+  ~1x the OS's own read-buffer, not 1x the body.
+  **Deliberately did NOT change `get()`'s default path to this.** For the small JSON bodies this
+  library is actually designed around (hundreds of bytes to a few KB), 3x-of-nothing is still
+  nothing — the streamed-accumulation path showed no measurable latency difference either way at
+  that size in testing, so it's a pure memory-vs-complexity tradeoff, and `get()`/`post()`/etc.
+  already have real users depending on their current shape. `download()` is additive, not a
+  retrofit — reach for it specifically when fetching something large (a presigned S3 GET URL, a
+  big export, etc.), not as a general replacement for `get()`.
