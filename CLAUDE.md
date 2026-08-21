@@ -68,8 +68,9 @@ Run with `task test-doctests`.
 - Format: `task format`
 - Type-check: `task typecheck`
 - Everything CI runs: `task check`
-- Install the git pre-commit hook: `task precommit-install` (requires `prek` — `brew install prek`,
-  a fast Rust drop-in for `pre-commit` that reads the same `.pre-commit-config.yaml`)
+- Install the git pre-commit hook: `task precommit-install` (`prek` — a fast Rust drop-in for
+  `pre-commit` that reads the same `.pre-commit-config.yaml` — is a `uv`-managed dev dependency,
+  no separate install needed)
 - Run all pre-commit hooks against the whole repo: `task precommit`
 
 ## Manual example / smoke-testing

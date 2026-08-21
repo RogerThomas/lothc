@@ -70,12 +70,12 @@ tasks:
       - uv run basedpyright .
 
   precommit-install:
-    desc: Install the git pre-commit hook (requires prek — brew install prek)
-    cmd: prek install
+    desc: Install the git pre-commit hook
+    cmd: uv run prek install
 
   precommit:
-    desc: Run all pre-commit hooks against the whole repo (requires prek)
-    cmd: prek run --all-files
+    desc: Run all pre-commit hooks against the whole repo
+    cmd: uv run prek run --all-files
 
   # ------------------------------------------------------------------------------------------------
   # - Examples -----------------------------------------------------------------------------------
