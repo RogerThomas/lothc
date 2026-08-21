@@ -455,7 +455,7 @@ class HTTPClient:
         base_url: str | None = None,
         bearer_token: str | None = None,
         bearer_auth: AsyncAuthProvider | None = None,
-        arbitrary_headers: dict[str, str] | None = None,
+        default_headers: dict[str, str] | None = None,
         timeout: float | None = 30.0,
         cookie_store: bool = False,
         follow_redirects: bool = True,
@@ -476,8 +476,8 @@ class HTTPClient:
         pyreqwest_client_builder = ClientBuilder()
         if timeout is not None:
             pyreqwest_client_builder = pyreqwest_client_builder.timeout(timedelta(seconds=timeout))
-        if arbitrary_headers:
-            pyreqwest_client_builder = pyreqwest_client_builder.default_headers(arbitrary_headers)
+        if default_headers:
+            pyreqwest_client_builder = pyreqwest_client_builder.default_headers(default_headers)
         if base_url:
             pyreqwest_client_builder = pyreqwest_client_builder.base_url(base_url)
         pyreqwest_client_builder = pyreqwest_client_builder.default_cookie_store(cookie_store)
@@ -1221,7 +1221,7 @@ class SyncHTTPClient:
         base_url: str | None = None,
         bearer_token: str | None = None,
         bearer_auth: AuthProvider | None = None,
-        arbitrary_headers: dict[str, str] | None = None,
+        default_headers: dict[str, str] | None = None,
         timeout: float | None = 30.0,
         cookie_store: bool = False,
         follow_redirects: bool = True,
@@ -1242,8 +1242,8 @@ class SyncHTTPClient:
         sync_client_builder = SyncClientBuilder()
         if timeout is not None:
             sync_client_builder = sync_client_builder.timeout(timedelta(seconds=timeout))
-        if arbitrary_headers:
-            sync_client_builder = sync_client_builder.default_headers(arbitrary_headers)
+        if default_headers:
+            sync_client_builder = sync_client_builder.default_headers(default_headers)
         if base_url:
             sync_client_builder = sync_client_builder.base_url(base_url)
         sync_client_builder = sync_client_builder.default_cookie_store(cookie_store)

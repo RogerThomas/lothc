@@ -90,9 +90,9 @@ async def test_get_with_raw_headers(client: HTTPClient) -> None:
     assert headers["x-custom"] == "header-value"
 
 
-async def test_arbitrary_headers_sent_on_every_request(base_url: str) -> None:
+async def test_default_headers_sent_on_every_request(base_url: str) -> None:
     async with HTTPClient.build(
-        base_url=base_url, arbitrary_headers={"x-api-key": "secret"}
+        base_url=base_url, default_headers={"x-api-key": "secret"}
     ) as client:
         result = await client.get("echo-headers", response_data_type=JSON)
 

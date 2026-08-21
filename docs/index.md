@@ -117,7 +117,7 @@ chart above.
 ## Installing
 
 ```
-uv add lothc[pydantic,msgspec,typeguard]
+uv add 'lothc[pydantic,msgspec,typeguard]'
 ```
 
 Any subset of the extras works — the base package alone gets you `bytes`/`JSON`/`TypedDict`-without-validation
@@ -171,7 +171,7 @@ support.
 -   **Authentication**
 
     A static `bearer_token`, or `bearer_auth` for a token resolved fresh on every request —
-    plus `arbitrary_headers` for anything else that needs to go out on every request. See
+    plus `default_headers` for anything else that needs to go out on every request. See
     [Authentication](auth.md).
 
 -   **Cookies, redirects, proxy**

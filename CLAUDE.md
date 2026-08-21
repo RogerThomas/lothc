@@ -14,19 +14,49 @@ work with none, either, or all of them installed.
 
 ## Status
 
-A git repo now exists (`main`, no tags pushed yet). A real test suite exists under `tests/` (see
-Testing below) and a benchmark suite under `benchmarks/` — this file is no longer the only thing
-that survives between sessions, but it's still the source of truth on decisions and remaining work,
-so keep it up to date.
+A git repo exists, pushed to `https://github.com/RogerThomas/lothc` (`main`, tracked as `origin`).
+A real test suite exists under `tests/` (see Testing below) and a benchmark suite under
+`benchmarks/` — this file is no longer the only thing that survives between sessions, but it's
+still the source of truth on decisions and remaining work, so keep it up to date.
 
 Versioning is **SemVer** (e.g. `1.0.0`, no "v" prefix), derived from the git tag via `hatch-vcs`
 (`dynamic = ["version"]` in `pyproject.toml`, already wired up) — a release is just a pushed tag,
 nothing to bump by hand. SemVer rather than CalVer (unlike the `yeetr` CLI project) because this is
 a library other packages depend on: major/minor/patch is the signal pip's resolver, Dependabot,
-etc. rely on to know whether an upgrade is safe, which a date can't communicate. No tag has been
-pushed yet, so it currently resolves to a `0.1.dev0+gHASH`-style fallback version.
+etc. rely on to know whether an upgrade is safe, which a date can't communicate.
 
-Not yet done, outside the roadmap below: no `LICENSE`.
+### Releasing
+
+`task release` (defaults to a patch bump; `task release -- minor`/`task release -- major` for the
+others). Since the version comes entirely from the git tag (hatch-vcs), this task has nothing to
+bump in `pyproject.toml` or commit — it just: checks the tree is clean and `main` is in sync with
+`origin/main`, computes the next tag from the latest existing one (`0.0.0` baseline if none exist
+yet — the project's real first release is `0.0.1`), tags it, pushes the tag, then
+`gh release create` to publish a GitHub Release from it.
+
+That GitHub Release is the trigger — `.github/workflows/release.yml` runs on `release: published`
+and does the actual work: builds the wheel/sdist and `uv publish`s to PyPI using **Trusted
+Publishing (OIDC)** — no PyPI API token stored anywhere — via a `pypi` GitHub Environment (must be
+registered as the trusted publisher in the PyPI project's own settings, pointing at this repo +
+`release.yml` + environment name `pypi`), then deploys the docs to GitHub Pages via a
+`github-pages` environment (Pages is enabled with `build_type: workflow`, i.e. Actions-deployed,
+not the legacy branch-based build).
+
+This deliberately does **not** mirror the `yeetr`/`jero`-style release task line for line: those
+projects keep a static `version` in `pyproject.toml` (bumped via `uv version --bump`, committed,
+then tagged), which makes sense for their own non-hatch-vcs versioning — but for lothc that would
+reintroduce exactly the "remember to bump and commit before tagging" ceremony hatch-vcs exists to
+remove, and add a version-drift failure mode (tag doesn't match the committed version) that simply
+can't happen here since the tag *is* the version. Copying that pattern here would've been strictly
+worse, not just different.
+
+**Follow-up not yet done**: the `pypi` environment currently has no deployment protection rules
+(anyone who can create a GitHub Release can trigger a publish) — consider adding a tag-pattern
+restriction under Settings → Environments → pypi → "Deployment branches and tags" as defense in
+depth on top of the trusted-publisher config. Left for manual setup in the GitHub UI rather than
+scripted via the API, since this workflow triggers on `release: published` (ref context is the
+*tag*, not a branch) and a misconfigured policy risks silently blocking legitimate releases with
+no easy local way to preview it first.
 
 ### Roadmap — what's done, what's next
 
@@ -89,6 +119,7 @@ Run with `task test-doctests`.
   `pre-commit` that reads the same `.pre-commit-config.yaml` — is a `uv`-managed dev dependency,
   no separate install needed)
 - Run all pre-commit hooks against the whole repo: `task precommit`
+- Cut a release: `task release` (see "Releasing" under Status above)
 
 ## Manual example / smoke-testing
 

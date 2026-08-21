@@ -10,7 +10,7 @@ async with HTTPClient.build(
     base_url=None,
     bearer_token=None,
     bearer_auth=None,
-    arbitrary_headers=None,
+    default_headers=None,
     timeout=30.0,
     cookie_store=False,
     follow_redirects=True,
@@ -23,7 +23,7 @@ async with HTTPClient.build(
 ```
 
 `bearer_token: str` (static) xor `bearer_auth: Callable[[], Awaitable[str]]` (sync client:
-`Callable[[], str]`) — resolved fresh per request, at most one of the two. `arbitrary_headers`
+`Callable[[], str]`) — resolved fresh per request, at most one of the two. `default_headers`
 sent on every request. `cookie_store=True` = in-memory jar. `proxy: str | None`.
 
 ## Decode targets (`response_data_type`, default `bytes`)

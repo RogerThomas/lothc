@@ -1,14 +1,14 @@
 [project]
-# site_url = "https://<org>.github.io/lothc/"  # fill in once this repo is pushed to a GitHub remote
+site_url = "https://rogerthomas.github.io/lothc/"
 site_name = "lothc"
 site_description = "Lord Of The Http Clients — a typed HTTP client for Python, built on pyreqwest"
-# site_author = "Your name"
+site_author = "Roger Thomas"
 
-# copyright = "Copyright &copy; 2026 Your name"
+copyright = "Copyright &copy; 2026 Roger Thomas"
 
-# repo_url = "https://github.com/<org>/lothc"  # fill in once pushed — no remote is configured yet
-# repo_name = "<org>/lothc"
-# edit_uri = "edit/main/docs/"
+repo_url = "https://github.com/RogerThomas/lothc"
+repo_name = "RogerThomas/lothc"
+edit_uri = "edit/main/docs/"
 
 nav = [
   { "Get started" = "index.md" },
@@ -86,13 +86,13 @@ scheme = "slate"
 toggle.icon = "lucide/moon"
 toggle.name = "Switch to system preference"
 
-# [[project.extra.social]]
-# icon = "fontawesome/brands/github"
-# link = "https://github.com/user/repo"
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/RogerThomas/lothc"
 
-# [[project.extra.social]]
-# icon = "fontawesome/brands/mastodon"
-# link = "https://fosstodon.org/@user"
+[[project.extra.social]]
+icon = "fontawesome/brands/python"
+link = "https://pypi.org/project/lothc/"
 
 [project.markdown_extensions]
 abbr = {}

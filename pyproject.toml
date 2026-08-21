@@ -10,7 +10,22 @@ dynamic = ["version"]
 description = "Lord Of The Http Clients — a typed HTTP client built on pyreqwest, with first-class pydantic and msgspec support"
 readme = "README.md"
 requires-python = ">=3.13"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = ["pyreqwest>=0.12.2"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/RogerThomas/lothc"
+Repository = "https://github.com/RogerThomas/lothc"
+Documentation = "https://rogerthomas.github.io/lothc/"
+Issues = "https://github.com/RogerThomas/lothc/issues"
 
 [project.optional-dependencies]
 pydantic = ["pydantic>=2.12.5"]

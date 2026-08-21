@@ -32,16 +32,16 @@ async with HTTPClient.build(
 Both mechanisms only ever produce a `Bearer` `Authorization` header — there's no separate
 Basic-auth or custom-scheme option today.
 
-## Arbitrary static headers
+## Default headers
 
 For anything that isn't a `Bearer` token — an API key header, a custom user-agent, whatever your
-API needs on every request — pass `arbitrary_headers` at `build()` time. Unlike `bearer_auth`,
+API needs on every request — pass `default_headers` at `build()` time. Unlike `bearer_auth`,
 these are fixed for the client's whole lifetime, resolved once, not per-request:
 
 ```python
 async with HTTPClient.build(
     base_url="https://api.example.com/",
-    arbitrary_headers={"x-api-key": "my-api-key"},
+    default_headers={"x-api-key": "my-api-key"},
 ) as client:
     await client.get("items/7")  # sent with every request through this client
 ```

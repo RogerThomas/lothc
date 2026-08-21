@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Trusted Publishing (OIDC) — no PyPI token/secret needed. The environment name here must
+    # match the one configured as the trusted publisher on the PyPI project settings ("pypi").
+    environment:
+      name: pypi
+      url: https://pypi.org/p/lothc
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # hatch-vcs derives the version from git tags — needs full history to see them,
+          # not just the single commit a shallow checkout would give it.
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.13"
+
+      - run: uv build
+
+      - run: uv publish
+
+  deploy-docs:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.13"
+
+      - run: uv sync --group docs
+      - run: uv run zensical build
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - id: deployment
+        uses: actions/deploy-pages@v5

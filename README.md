@@ -4,6 +4,9 @@
 
 # lothc
 
+[![CI](https://github.com/RogerThomas/lothc/actions/workflows/ci.yml/badge.svg)](https://github.com/RogerThomas/lothc/actions/workflows/ci.yml)
+[![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)](pyproject.toml)
+
 **L**ord **O**f **T**he **H**ttp **C**lients — a typed HTTP client for Python, built on
 [pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (a Rust-backed HTTP client), with first-class
 optional support for **pydantic**, **msgspec**, and **TypedDict** (validated via **typeguard** if
@@ -39,44 +42,29 @@ costing a real, visible slowdown. Full numbers: [docs/benchmarks.md](docs/benchm
 
 ## Highlights
 
-- **First-class DTO validation and transformation, built in.** httpx, aiohttp, niquests, and every
-  other general-purpose HTTP client hand you back a response object with a `.json()` that gives
-  you, at best, a plain `dict` — decoding that into a real, validated object of your own type is
-  something *you* bolt on afterward, because it isn't what those libraries are for. In lothc it's
-  not an afterthought: pass `response_data_type` and you get back a real, constructed,
-  field-validated pydantic `BaseModel`, msgspec `Struct`, or typeguard-validated `TypedDict`
-  directly from the client — one of lothc's biggest offerings over reaching for `requests`/`httpx`
-  and validating separately. See [Benchmarks](docs/benchmarks.md) for what that costs (usually
-  nothing).
-- **`HTTPClient`** (async) and **`SyncHTTPClient`** (sync) — the same typed API, both backed by pyreqwest.
-- **Pick your decode target per call** — a pydantic `BaseModel`, a msgspec `Struct`, a `TypedDict`,
-  `lothc.JSON`, or raw `bytes` (the default). No cast-laden internals — everything is built on paired
-  `@overload`s, so every call site gets a precise static type.
-- **All the verbs**: `get`/`get_result`, `post`, `put`, `patch`, `delete`, `head` (headers-only
-  `Result`, no body decode).
-- **Typed *and* raw query params/headers** — pass a plain `dict`/`Mapping`, or a `BaseModel`/`Struct` for
-  free per-field validation and `None`-field omission.
-- **SSE support**, with `response_data_type` accepting a class, a pydantic `TypeAdapter`, or a prebuilt msgspec
-  `Decoder` — so even discriminated-union event streams decode natively.
-- **Streaming (`stream_get`/`stream_post`)** — raw chunks by default (unbuffered, safe for large
-  binary bodies), or pass `response_data_type` to switch to newline-buffered, typed NDJSON-style decoding.
-- **Retries** — `max_retries`/`retry_methods` on `build()`, implemented as a real pyreqwest
-  `with_middleware` hook. Backs off, honors `Retry-After`, and defaults to the idempotent verbs
-  (`get`/`put`/`delete`/`head`) — `post`/`patch` need an explicit opt-in via `retry_methods`.
-- **Authentication** — a static `bearer_token`, or `bearer_auth` for a token resolved fresh on
-  every request (expiring/rotating tokens), plus `arbitrary_headers` for anything else that needs
-  to go out on every request (an API key header, etc.).
-- **Cookies, redirects, proxy** — `cookie_store=True` for an in-memory cookie jar,
-  `follow_redirects`/`max_redirects` for redirect control, `proxy=` for proxying requests.
-- **A real transport-error hierarchy** (`HTTPTransportError` / `HTTPTimeoutError` / `HTTPConnectionError`) and a
-  status-error type (`HTTPResponseError`) — pyreqwest's own exception types never leak through.
-- **pydantic, msgspec, and typeguard are all optional** — the library works with none, either, or all
-  three installed.
+lothc's biggest offering over `requests`/`httpx`/`aiohttp`-and-friends: those clients hand you a
+plain `dict` from `.json()` and leave validation to you. Pass `response_data_type` to any lothc
+call and get back a real, constructed, field-validated pydantic `BaseModel`, msgspec `Struct`, or
+typeguard-checked `TypedDict` instead — built in, not bolted on. See
+[Benchmarks](docs/benchmarks.md) for what that costs (usually nothing).
+
+| | |
+|---|---|
+| **Two clients, one API** | `HTTPClient` (async) and `SyncHTTPClient` (sync) — identical surface, both backed by pyreqwest. |
+| **Every verb** | `get`/`get_result`, `post`, `put`, `patch`, `delete`, `head` — see [Verbs](docs/verbs.md). |
+| **Typed params, headers & forms** | A `BaseModel`/`Struct` for query params or headers (with `None`-field omission), or a real multipart body via `form=`. |
+| **Precise static types** | Every verb is paired `@overload`s, not a cast-laden generic — your editor knows the exact return type. |
+| **SSE & streaming** | Typed SSE decode (discriminated unions included), plus raw or NDJSON-typed `stream_get`/`stream_post` — see [SSE](docs/sse.md) / [Streaming](docs/streaming.md). |
+| **Retries with real backoff** | `max_retries`/`retry_methods`, a genuine pyreqwest middleware hook, `Retry-After`-aware — see [Retries](docs/retries.md). |
+| **Authentication** | Static `bearer_token`, a per-request-refreshed `bearer_auth`, or `default_headers` for anything else — see [Authentication](docs/auth.md). |
+| **Cookies, redirects, proxy** | `cookie_store`, `follow_redirects`/`max_redirects`, `proxy=` — see [Networking](docs/networking.md). |
+| **A real error hierarchy** | `HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError` for no response, `HTTPResponseError` for 4xx/5xx — see [Error handling](docs/errors.md). |
+| **Everything optional** | pydantic, msgspec, typeguard — works with none, either, or all three installed. |
 
 ## Installing
 
 ```
-pip install lothc[pydantic,msgspec,typeguard]
+uv add 'lothc[pydantic,msgspec,typeguard]'
 ```
 
 (Any subset of the extras works — the base package alone gets you `bytes`/`JSON`/`TypedDict`-without-validation support.)
