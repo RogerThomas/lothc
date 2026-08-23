@@ -4,6 +4,7 @@ from typing import Any, TypedDict, cast
 import pytest
 from msgspec import Struct
 from pydantic import BaseModel
+from typeguard import TypeCheckError
 
 from lothc import JSON, HTTPClient, HTTPResponseError, SyncHTTPClient
 
@@ -21,6 +22,15 @@ class ItemStruct(Struct):
 class ItemDict(TypedDict):
     id: int
     name: str
+
+
+class ItemIdOnlyDict(TypedDict):
+    id: int
+
+
+class ItemWrongTypeDict(TypedDict):
+    id: int
+    name: int
 
 
 class SearchParamsModel(BaseModel):
@@ -60,6 +70,18 @@ async def test_get_decodes_lothc_json(client: HTTPClient) -> None:
 async def test_get_decodes_typed_dict(client: HTTPClient) -> None:
     item = await client.get("items/7", response_data_type=ItemDict)
     assert item == {"id": 7, "name": "item-7"}
+
+
+async def test_get_typed_dict_ignores_undeclared_extra_keys(client: HTTPClient) -> None:
+    item = await client.get("items/7", response_data_type=ItemIdOnlyDict)
+    assert item == {"id": 7, "name": "item-7"}
+
+
+async def test_get_typed_dict_still_raises_for_a_declared_key_wrong_type(
+    client: HTTPClient,
+) -> None:
+    with pytest.raises(TypeCheckError):
+        await client.get("items/7", response_data_type=ItemWrongTypeDict)
 
 
 async def test_get_with_raw_dict_params(client: HTTPClient) -> None:
@@ -181,6 +203,11 @@ def test_sync_get_decodes_lothc_json(sync_client: SyncHTTPClient) -> None:
 
 def test_sync_get_decodes_typed_dict(sync_client: SyncHTTPClient) -> None:
     item = sync_client.get("items/7", response_data_type=ItemDict)
+    assert item == {"id": 7, "name": "item-7"}
+
+
+def test_sync_get_typed_dict_ignores_undeclared_extra_keys(sync_client: SyncHTTPClient) -> None:
+    item = sync_client.get("items/7", response_data_type=ItemIdOnlyDict)
     assert item == {"id": 7, "name": "item-7"}
 
 

@@ -13,3 +13,34 @@
 .perf-race-img {
   border-radius: 12px;
 }
+
+.md-uv-run {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  margin: 0 0 0.4em;
+  padding: 0.25em 0.6em;
+  border: none;
+  border-radius: 0.2rem;
+  background-color: var(--md-code-bg-color);
+  color: var(--md-default-fg-color--light);
+  font-family: var(--md-code-font, monospace);
+  font-size: 0.7rem;
+  cursor: pointer;
+  transition: color 0.25s, background-color 0.25s;
+}
+
+.md-uv-run:hover,
+.md-uv-run:focus {
+  color: var(--md-accent-fg-color);
+}
+
+.md-uv-run svg {
+  width: 1em;
+  height: 1em;
+  fill: currentcolor;
+}
+
+.md-uv-run--copied {
+  color: var(--md-accent-fg-color);
+}

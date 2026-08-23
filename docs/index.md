@@ -25,9 +25,13 @@ support.
 
 ## Quickstart
 
+Every snippet below is a complete, runnable script — hit the extra clipboard icon in its
+top-right corner to copy a one-liner that runs it via `uv run`, no local install needed.
+
 === "msgspec"
 
-    ```python
+    ```python {data-uv-extra="msgspec"}
+    import asyncio
     from lothc import HTTPClient
     from msgspec import Struct
 
@@ -37,14 +41,19 @@ support.
         name: str
 
 
-    async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
-        pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
-        print(pikachu)  # Pokemon(id=25, name='pikachu')
+    async def main() -> None:
+        async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
+            pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
+            print(pikachu)  # Pokemon(id=25, name='pikachu')
+
+
+    asyncio.run(main())
     ```
 
 === "pydantic"
 
-    ```python
+    ```python {data-uv-extra="pydantic"}
+    import asyncio
     from lothc import HTTPClient
     from pydantic import BaseModel
 
@@ -54,14 +63,19 @@ support.
         name: str
 
 
-    async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
-        pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
-        print(pikachu)  # id=25 name='pikachu'
+    async def main() -> None:
+        async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
+            pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
+            print(pikachu)  # id=25 name='pikachu'
+
+
+    asyncio.run(main())
     ```
 
 === "TypedDict"
 
-    ```python
+    ```python {data-uv-extra="typeguard"}
+    import asyncio
     from lothc import HTTPClient
     from typing import TypedDict
 
@@ -71,9 +85,13 @@ support.
         name: str
 
 
-    async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
-        pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
-        print(pikachu)  # {'id': 25, 'name': 'pikachu'}
+    async def main() -> None:
+        async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
+            pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
+            print(pikachu)  # {'id': 25, 'name': 'pikachu'}
+
+
+    asyncio.run(main())
     ```
 
     !!! warning
@@ -81,17 +99,26 @@ support.
         Install the `typeguard` extra to get the `TypedDict` fields validated at runtime —
         without it, the dict is returned as-is, matching the type hint on trust alone. If
         typeguard isn't installed, a warning is raised on first use; set
-        `LOTHC_SUPPRESS_TYPEGUARD_WARNING=1` to silence it.
+        `LOTHC_SUPPRESS_TYPEGUARD_WARNING=1` to silence it. The `uv run` copy button above
+        installs it, so the copied command runs fully validated. Only the fields you declare are
+        checked — a response with extra, undeclared fields (like the real PokéAPI response
+        above) still validates fine, and every field it returns, declared or not, comes back in
+        the result.
 
 === "JSON"
 
-    ```python
+    ```python {data-uv-extra=""}
+    import asyncio
     from lothc import JSON, HTTPClient
 
 
-    async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
-        pikachu = await client.get("pokemon/pikachu", response_data_type=JSON)
-        print(pikachu)  # {'id': 25, 'name': 'pikachu', ...}
+    async def main() -> None:
+        async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
+            pikachu = await client.get("pokemon/pikachu", response_data_type=JSON)
+            print(pikachu)  # {'id': 25, 'name': 'pikachu', ...}
+
+
+    asyncio.run(main())
     ```
 
     !!! warning

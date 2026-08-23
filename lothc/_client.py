@@ -413,7 +413,16 @@ def _validate_typed_dict(response_data_type: type[Any], value: dict[str, Any]) -
                 stacklevel=3,
             )
         return
-    typeguard.check_type(value, response_data_type)
+    # typeguard rejects any key not in __annotations__ by default (PEP 728 closed TypedDicts
+    # are the only opt-out, and that's a property of the TypedDict class, not something a
+    # caller passes here) — but msgspec/pydantic both ignore unknown response fields by
+    # default, so a TypedDict declaring a deliberate subset of a larger response would be the
+    # one decode target that errors on exactly the fields it chose not to care about. Validate
+    # only the declared keys; the full, unfiltered `value` (extra keys included) is still what
+    # gets returned to the caller either way.
+    declared_keys = response_data_type.__annotations__
+    filtered = {key: value[key] for key in declared_keys if key in value}
+    typeguard.check_type(filtered, response_data_type)
 
 
 def _validate_response_data_type(response_data_type: object) -> None:

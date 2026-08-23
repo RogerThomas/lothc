@@ -456,3 +456,19 @@ Before writing any code, tell the user that you've read this file AND read and f
   pyreqwest's own parser into a Python dict, then pydantic validates that dict (an extra
   dict-construction round-trip); the latter lets pydantic-core parse the JSON bytes directly.
   Tracked by `asv_bench/bench_verbs.py`'s `time_get_pydantic`/`peakmem_get_pydantic`.
+- **`_validate_typed_dict` only validates a `TypedDict`'s own declared keys, ignoring anything
+  extra in the response — a real bug, not a design choice, caught live via the docs' own
+  Quickstart example against the real PokéAPI (`/pokemon/pikachu` has ~20 fields beyond the
+  `id`/`name` the docs' `Pokemon(TypedDict)` declares).** `typeguard.check_type()` rejects any
+  key not in `__annotations__` by default (confirmed by reading `typeguard/_checkers.py`'s
+  `check_typed_dict`: `NoExtraItems` is the default unless the TypedDict itself opts into PEP
+  728's `extra_items=`, which is a property of how the caller defined their TypedDict class, not
+  something lothc can pass in) — so a `TypedDict` declaring a deliberate subset of a larger
+  response was the one decode target that errored on exactly the fields it chose not to care
+  about, while msgspec `Struct`/pydantic `BaseModel` both silently ignore unknown fields by
+  default. Fixed by filtering the dict down to only `response_data_type.__annotations__`'s keys
+  before handing it to `typeguard.check_type` — missing-required-key and wrong-type checks on
+  declared fields are unaffected (filtering only ever removes undeclared keys, never declared
+  ones), confirmed via a real test asserting a genuinely wrong-typed declared field still raises
+  `TypeCheckError`. The *returned* dict is never filtered — extra keys are still present in the
+  result either way, matching what already happens when typeguard isn't installed at all.
