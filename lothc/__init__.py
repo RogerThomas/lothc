@@ -1,6 +1,5 @@
 from ._client import (
     JSON,
-    AsyncAuthProvider,
     AuthProvider,
     Data,
     File,
@@ -15,13 +14,13 @@ from ._client import (
     Params,
     Result,
     SSEEvent,
+    SyncAuthProvider,
     SyncHTTPClient,
     TypedHeaders,
 )
 
 __all__ = [
     "JSON",
-    "AsyncAuthProvider",
     "AuthProvider",
     "Data",
     "File",
@@ -36,6 +35,7 @@ __all__ = [
     "Params",
     "Result",
     "SSEEvent",
+    "SyncAuthProvider",
     "SyncHTTPClient",
     "TypedHeaders",
 ]

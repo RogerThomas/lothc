@@ -100,6 +100,16 @@ await client.patch("items/7", json={"name": "renamed"})
 `json` also accepts a `BaseModel`/`Struct` directly (serialized for you). `content` sends a raw
 `str`/`bytes` body as-is.
 
+Each has a `_result` variant too — `post_result`/`put_result`/`patch_result` — same body options,
+but returning a `Result` alongside status and headers, exactly like `get_result` above (including
+the same `response_headers_type` option):
+
+```python
+result = await client.post_result("items", json={"name": "new-item"}, response_data_type=ItemModel)
+result.data  # ItemModel(...)
+result.status  # 200
+```
+
 ### Multipart forms and file uploads
 
 `form` builds a real `multipart/form-data` body from a `dict`. Each value's type decides how
@@ -107,9 +117,26 @@ it's sent:
 
 - `str`/`int` — a plain form field.
 - `bytes` — a form field too (no filename), for raw binary data that isn't a "file" as such.
-- `pathlib.Path` — a file part, read and streamed from disk; the filename sent is the path's own
-  `.name`.
-- `(filename, bytes)` — a file part with an explicit filename, for in-memory content.
+- `list`/`dict` (or a `BaseModel`/`Struct` instance) — JSON-encoded as that one part's body, with
+  `Content-Type: application/json` set automatically.
+- A **file**, in one of four shapes:
+  - `pathlib.Path` — read and streamed from disk; filename is the path's own `.name`.
+  - `(filename, bytes | Path | file_object)` — an explicit filename paired with the content.
+  - `(filename, bytes | Path | file_object, content_type)` — same, plus an explicit content-type
+    override.
+  - `(Path, content_type)` — keeps the path's own auto-derived filename, but overrides just the
+    content-type.
+  - An already-opened binary file object (anything `io.BufferedIOBase`, e.g. `open(path, "rb")` or
+    a `BytesIO`) also works directly, filename taken from `.name` if the object has one.
+- **A `tuple` of any of the above** repeats that field name once per element — multiple parts,
+  all sharing the same name (a real `multipart/form-data` capability, not something most HTTP
+  client libraries expose). Note this is a `tuple` specifically, not a `list` — a `list` value
+  always means "JSON-encode me as one part," never "repeat."
+
+By default, a file part's content-type is guessed from its filename's extension (via the stdlib
+`mimetypes` module) unless you gave one explicitly. Pass `infer_mime_type_from_file_extension=False`
+to disable guessing — the part then goes out with no `Content-Type` header at all unless you set
+one explicitly.
 
 ```python
 from pathlib import Path
@@ -119,8 +146,11 @@ await client.post(
     form={
         "note": "shiny",
         "avatar": b"raw-bytes-field",  # a field, not a file (no filename)
-        "manual": Path("pikachu-manual.pdf"),  # a file, filename = "pikachu-manual.pdf"
-        "photo": ("photo.png", b"...png-bytes..."),  # a file, explicit filename
+        "manual": Path("pikachu-manual.pdf"),  # a file, filename + content-type inferred
+        "photo": ("photo.png", b"...png-bytes..."),  # a file, explicit filename, mime inferred
+        "scan": ("scan.bin", b"...bytes...", "application/pdf"),  # explicit content-type override
+        "tags": ["shiny", "starter"],  # one part, JSON-encoded array body
+        "photos": (("a.png", b"..."), ("b.png", b"...")),  # two parts, both named "photos"
     },
 )
 ```
@@ -131,6 +161,9 @@ await client.post(
 await client.delete("items/7")  # bytes by default
 item = await client.delete("items/7", response_data_type=ItemModel)
 ```
+
+`delete_result` mirrors `get_result` too — same `response_data_type`/`response_headers_type`
+options, returning a `Result` instead of the bare decoded body.
 
 ## HEAD
 

@@ -215,8 +215,14 @@ disable = [
 max-locals = 20 # one real case (the streaming line-buffering generator) legitimately needs a
 # couple more than pylint's default 15 — matches this project's own mccabe complexity ceiling
 # ([tool.ruff.lint.mccabe] max-complexity = 15) in spirit, just a different metric
+max-branches = 15 # `_apply_form_value`/`_apply_sync_form_value`'s dispatch `match` statements
+# (Form/File redesign: str/int/bytes/three File-tuple shapes/bare Path/BufferedIOBase/list/dict-
+# or-model/tuple-repeat) need 13, one over pylint's default 12 — bumped to 15 to match this
+# project's own mccabe complexity ceiling ([tool.ruff.lint.mccabe] max-complexity = 15) rather
+# than pick an arbitrary number just past the current count
 
 [tool.pylint.format]
-max-module-lines = 2000 # _client.py is one deliberately unsplit file (see CLAUDE.md: "split it
-# once it earns a split") that's grown past pylint's default 1000-line threshold this session;
-# bumped rather than split, since no split has actually been decided on
+max-module-lines = 3500 # _client.py is one deliberately unsplit file (see CLAUDE.md: "split it
+# once it earns a split") that's grown past its previous bump (2000, set earlier this session)
+# to 2994 lines after the Form/File redesign; bumped again rather than split, since no split has
+# actually been decided on

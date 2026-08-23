@@ -7,7 +7,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `lothc` ("Lord Of The Http Clients") is a typed HTTP client library built on [pyreqwest](https://github.com/mostafa-hussein/pyreqwest)
 (a Rust-backed HTTP client). It provides a single, consistent typed API surface — `HTTPClient` (async)
 and `SyncHTTPClient` (sync) — with first-class, optional support for both **pydantic** and **msgspec** as
-decode targets, plus **TypedDict** support (optionally validated at runtime via **typeguard** if installed).
+both decode AND encode targets (a `BaseModel`/`Struct` instance can be passed directly as `json=`, not
+just used as a `response_data_type`), plus **TypedDict** support (decode-only — optionally validated at
+runtime via **typeguard** if installed).
 
 pydantic, msgspec, and typeguard are all optional extras (see `lothc/_compat.py`) — the library must
 work with none, either, or all of them installed.

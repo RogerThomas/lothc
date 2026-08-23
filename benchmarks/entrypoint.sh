@@ -12,4 +12,14 @@ for _ in $(seq 1 50); do
     sleep 0.1
 done
 
-exec uv run --no-sync yeet perf.py "$target_url" "$@"
+func="${PERF_FUNC:-}"
+if [ -n "$func" ]; then
+    # PERF_FUNC is the hyphenated, human-facing name (e.g. "single-call"); perf.py's
+    # actual function is the underscored Python identifier ("single_call").
+    func=$(printf '%s' "$func" | tr '-' '_')
+    # "perf.py:FUNC" (not "perf.py FUNC") — yeetr treats a bare positional FUNC as
+    # ambiguous here because main()'s first param is also a plain string (url).
+    exec uv run --no-sync yeet "perf.py:$func" "$target_url" "$@"
+else
+    exec uv run --no-sync yeet perf.py "$target_url" "$@"
+fi

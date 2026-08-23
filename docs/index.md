@@ -10,9 +10,9 @@ icon: lucide/rocket
 # lothc
 
 **L**ord **O**f **T**he **H**ttp **C**lients — a typed HTTP client for Python, built on
-[pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (a Rust-backed HTTP client), with
-first-class optional support for **pydantic**, **msgspec**, and **TypedDict** (validated via
-**typeguard** if installed) as decode targets.
+[pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (an awesome Rust-backed HTTP client),
+with first-class optional support for **pydantic** and **msgspec** as both decode *and* encode
+targets, plus **TypedDict** (validated via **typeguard** if installed) as a decode target.
 
 ## Installing
 
@@ -102,6 +102,29 @@ support.
 `SyncHTTPClient` mirrors every method in these docs one-for-one — swap `async with` for `with`,
 drop the `await`s, and everything still applies.
 
+## Why?
+
+Why was lothc built, and why should you use it?
+
+pyreqwest is a genuinely excellent HTTP client for Python, fast because the heavy lifting happens
+in Rust, not pure Python. But its API is a builder pattern (`client.get(path).build()` before you
+can even `.send()` it), unfamiliar to anyone coming from `requests`/`httpx`/`niquests`, where a
+call is just `client.get(url, params=..., headers=...)`. lothc wraps pyreqwest with exactly that
+familiar shape, so you get pyreqwest's speed without giving up the ergonomics Python HTTP users
+already expect.
+
+The other reason: Python's most popular third-party HTTP clients (httpx, aiohttp, niquests) all
+have first-class JSON support: call `.json()` and get back a `dict`. But in order for a Python
+project to be end-to-end type-safe, data crossing I/O boundaries must be validated, and if
+invalid, handled accordingly (raise an error) — a plain `dict` does neither. Closing that gap is
+exactly what lothc is designed for.
+
+The original idea was to make lothc backend-agnostic: httpx, aiohttp, niquests, and pyreqwest all
+interchangeable underneath the same typed lothc interface, so switching backends never meant
+switching your call sites. However, in the author's opinion there's currently no compelling
+reason not to just use pyreqwest, so pyreqwest is the only backend implemented today, but, if
+there's demand for an httpx/aiohttp/niquests backend, the author is happy to consider adding one.
+
 ## Performance
 
 lothc is built on top of the awesome [pyreqwest](https://github.com/mostafa-hussein/pyreqwest)
@@ -127,14 +150,11 @@ chart above.
 
 <div class="grid cards" markdown>
 
--   **DTO validation and transformation, built in**
+-   **Type-safe I/O boundaries, not bolted on**
 
-    httpx, aiohttp, niquests — general-purpose HTTP clients hand you back a response with a
-    `.json()` that gives you, at best, a plain `dict`. Decoding that into a real, validated object
-    is something you bolt on yourself afterward, because it isn't what those libraries do. In
-    lothc it's built in: `response_data_type` gets you a real, constructed, field-validated
-    pydantic `BaseModel`, msgspec `Struct`, or typeguard-validated `TypedDict` straight from the
-    client — one of lothc's biggest offerings over the alternatives. See
+    `response_data_type` gets you a real, constructed, field-validated pydantic `BaseModel`,
+    msgspec `Struct`, or typeguard-validated `TypedDict` straight from the client, instead of the
+    plain `dict` a `.json()` call leaves you to validate yourself. See
     [Benchmarks](benchmarks.md) for what that actually costs (usually nothing).
 
 -   **Typed decode targets**
@@ -142,6 +162,12 @@ chart above.
     Pick a pydantic `BaseModel`, a msgspec `Struct`, a `TypedDict`, `lothc.JSON`, or raw `bytes`
     (the default) per call. No cast-laden internals — every verb is built from paired
     `@overload`s, so every call site gets a precise static type.
+
+-   **Typed request bodies too**
+
+    `json=` isn't limited to a plain `dict` — pass a pydantic `BaseModel` or msgspec `Struct`
+    instance directly and it's encoded for you. Pydantic and msgspec are decode *and* encode
+    targets in lothc, not just decode.
 
 -   **Every verb**
 

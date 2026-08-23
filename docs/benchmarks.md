@@ -1,3 +1,7 @@
+---
+icon: lucide/gauge
+---
+
 # Benchmarks
 
 Raw numbers behind the throughput race on the [home page](index.md#performance) — run

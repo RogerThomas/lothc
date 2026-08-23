@@ -1,3 +1,4 @@
+import json
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
@@ -21,6 +22,10 @@ class ItemStruct(Struct):
 
 class RenameBody(BaseModel):
     name: str
+
+
+class EchoedHeaders(BaseModel):
+    x_custom: str | None = None
 
 
 async def test_post_with_pydantic_json_body(client: HTTPClient) -> None:
@@ -103,19 +108,201 @@ async def test_post_with_form_buffered_value_without_a_name_attribute(
     assert result["files"] == []
 
 
-async def test_post_with_form_unsupported_value_type_is_silently_skipped(
-    client: HTTPClient,
-) -> None:
-    # Not a documented/supported Form value — bypasses static typing via cast(Any, ...).
-    # Current behavior silently drops it rather than raising; asserting on that here so any
-    # future change to this behavior is a deliberate, visible one.
+async def test_post_with_form_file_mime_auto_inferred(client: HTTPClient) -> None:
+    result = await client.post(
+        "upload", form={"avatar": ("a.png", b"png-bytes")}, response_data_type=JSON
+    )
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    assert parts == [
+        {"name": "avatar", "filename": "a.png", "content_type": "image/png", "text": "png-bytes"}
+    ]
+
+
+async def test_post_with_form_file_explicit_mime_override(client: HTTPClient) -> None:
     result = await client.post(
         "upload",
-        form={"note": "hello", "bogus": cast(Any, [1, 2, 3])},
+        form={"avatar": ("a.png", b"png-bytes", "image/webp")},
         response_data_type=JSON,
     )
 
-    assert result["fields"] == {"note": "hello"}
+    parts = cast(list[dict[str, Any]], result["parts"])
+    assert parts[0]["content_type"] == "image/webp"
+
+
+async def test_post_with_form_file_mime_inference_disabled(client: HTTPClient) -> None:
+    result = await client.post(
+        "upload",
+        form={"avatar": ("a.png", b"png-bytes")},
+        infer_mime_type_from_file_extension=False,
+        response_data_type=JSON,
+    )
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    assert parts[0]["content_type"] is None
+
+
+async def test_post_with_form_path_with_content_type_override(
+    client: HTTPClient, tmp_path: Path
+) -> None:
+    upload_path = tmp_path / "upload.bin"
+    upload_path.write_bytes(b"path-content")
+
+    result = await client.post(
+        "upload", form={"doc": (upload_path, "application/pdf")}, response_data_type=JSON
+    )
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    assert parts[0] == {
+        "name": "doc",
+        "filename": "upload.bin",
+        "content_type": "application/pdf",
+        "text": "path-content",
+    }
+
+
+async def test_post_with_form_bare_path_mime_auto_inferred(
+    client: HTTPClient, tmp_path: Path
+) -> None:
+    upload_path = tmp_path / "upload.pdf"
+    upload_path.write_bytes(b"path-content")
+
+    result = await client.post("upload", form={"doc": upload_path}, response_data_type=JSON)
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    assert parts[0]["content_type"] == "application/pdf"
+
+
+async def test_post_with_form_buffered_io_mime_auto_inferred(
+    client: HTTPClient, tmp_path: Path
+) -> None:
+    file_path = tmp_path / "opened.pdf"
+    file_path.write_bytes(b"opened-content")
+
+    with file_path.open("rb") as opened_file:
+        result = await client.post("upload", form={"doc": opened_file}, response_data_type=JSON)
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    assert parts[0]["content_type"] == "application/pdf"
+
+
+async def test_post_with_form_repeated_scalar_values(client: HTTPClient) -> None:
+    result = await client.post("upload", form={"tag": (1, "x")}, response_data_type=JSON)
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    tag_parts = [part for part in parts if part["name"] == "tag"]
+    assert [part["text"] for part in tag_parts] == ["1", "x"]
+
+
+async def test_post_with_form_repeated_file_values(client: HTTPClient) -> None:
+    result = await client.post(
+        "upload",
+        form={"photos": (("a.png", b"1"), ("b.png", b"2"))},
+        response_data_type=JSON,
+    )
+
+    files = cast(list[dict[str, Any]], result["files"])
+    photo_files = [file for file in files if file["name"] == "photos"]
+    assert {file["filename"] for file in photo_files} == {"a.png", "b.png"}
+
+
+async def test_post_with_form_json_array_body(client: HTTPClient) -> None:
+    result = await client.post("upload", form={"tags": ["a", "b"]}, response_data_type=JSON)
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    assert parts[0]["content_type"] == "application/json"
+    assert json.loads(cast(str, parts[0]["text"])) == ["a", "b"]
+
+
+async def test_post_with_form_json_object_body(client: HTTPClient) -> None:
+    result = await client.post("upload", form={"meta": {"k": "v"}}, response_data_type=JSON)
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    assert parts[0]["content_type"] == "application/json"
+    assert json.loads(cast(str, parts[0]["text"])) == {"k": "v"}
+
+
+async def test_post_with_form_json_body_from_pydantic_model(client: HTTPClient) -> None:
+    result = await client.post(
+        "upload", form={"meta": ItemModel(id=1, name="ditto")}, response_data_type=JSON
+    )
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    assert parts[0]["content_type"] == "application/json"
+    assert json.loads(cast(str, parts[0]["text"])) == {"id": 1, "name": "ditto"}
+
+
+async def test_post_with_form_json_body_from_msgspec_struct(client: HTTPClient) -> None:
+    result = await client.post(
+        "upload", form={"meta": ItemStruct(id=1, name="ditto")}, response_data_type=JSON
+    )
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    assert parts[0]["content_type"] == "application/json"
+    assert json.loads(cast(str, parts[0]["text"])) == {"id": 1, "name": "ditto"}
+
+
+def test_sync_post_with_form_file_explicit_mime_override(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.post(
+        "upload",
+        form={"avatar": ("a.png", b"png-bytes", "image/webp")},
+        response_data_type=JSON,
+    )
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    assert parts[0]["content_type"] == "image/webp"
+
+
+def test_sync_post_with_form_repeated_scalar_values(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.post("upload", form={"tag": (1, "x")}, response_data_type=JSON)
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    tag_parts = [part for part in parts if part["name"] == "tag"]
+    assert [part["text"] for part in tag_parts] == ["1", "x"]
+
+
+def test_sync_post_with_form_json_array_body(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.post("upload", form={"tags": ["a", "b"]}, response_data_type=JSON)
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    assert parts[0]["content_type"] == "application/json"
+    assert json.loads(cast(str, parts[0]["text"])) == ["a", "b"]
+
+
+async def test_post_with_form_unsupported_value_type_raises_type_error(
+    client: HTTPClient,
+) -> None:
+    # Not a documented/supported Form value — bypasses static typing via cast(Any, ...).
+    with pytest.raises(TypeError, match="Unsupported form value for 'bogus'"):
+        await client.post(
+            "upload",
+            form={"note": "hello", "bogus": cast(Any, {1, 2, 3})},
+            response_data_type=JSON,
+        )
+
+
+def test_sync_post_with_form_unsupported_value_type_raises_type_error(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(TypeError, match="Unsupported form value for 'bogus'"):
+        sync_client.post(
+            "upload",
+            form={"note": "hello", "bogus": cast(Any, {1, 2, 3})},
+            response_data_type=JSON,
+        )
+
+
+async def test_post_with_form_unsupported_value_inside_repeated_tuple_raises_type_error(
+    client: HTTPClient,
+) -> None:
+    # A tuple that isn't one of the File shapes means "repeat this name" — an unsupported
+    # value among its elements must still raise, not be silently dropped.
+    with pytest.raises(TypeError, match="Unsupported form value for 'bogus'"):
+        await client.post(
+            "upload",
+            form={"bogus": cast(Any, ("ok", {1, 2, 3}))},
+            response_data_type=JSON,
+        )
 
 
 def test_sync_post_with_form_all_value_types(sync_client: SyncHTTPClient, tmp_path: Path) -> None:
@@ -135,7 +322,6 @@ def test_sync_post_with_form_all_value_types(sync_client: SyncHTTPClient, tmp_pa
                 "path_doc": path_file,
                 "opened_doc": opened_file,
                 "blob": BytesIO(b"blob-content"),
-                "bogus": cast(Any, [1, 2, 3]),
             },
             response_data_type=JSON,
         )
@@ -166,6 +352,99 @@ async def test_patch_renames_item(client: HTTPClient) -> None:
     )
 
     assert item == ItemModel(id=7, name="renamed")
+
+
+async def test_post_result_includes_status_and_data(client: HTTPClient) -> None:
+    result = await client.post_result(
+        "items", json=ItemModel(id=1, name="ditto"), response_data_type=ItemModel
+    )
+
+    assert result.status == 200
+    assert result.data == ItemModel(id=1, name="ditto")
+
+
+async def test_post_result_with_typed_headers(client: HTTPClient) -> None:
+    result = await client.post_result(
+        "items",
+        json=ItemModel(id=1, name="ditto"),
+        response_data_type=ItemModel,
+        response_headers_type=EchoedHeaders,
+    )
+
+    assert result.typed_headers is not None
+
+
+def test_sync_post_result_includes_status_and_data(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.post_result(
+        "items", json=ItemModel(id=1, name="ditto"), response_data_type=ItemModel
+    )
+
+    assert result.status == 200
+    assert result.data == ItemModel(id=1, name="ditto")
+
+
+async def test_post_result_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
+    result = await client.post_result("missing", error_for_status=False)
+
+    assert result.status == 404
+
+
+async def test_put_result_includes_status_and_data(client: HTTPClient) -> None:
+    result = await client.put_result(
+        "items/7", json=ItemModel(id=0, name="replaced"), response_data_type=ItemModel
+    )
+
+    assert result.status == 200
+    assert result.data == ItemModel(id=7, name="replaced")
+
+
+async def test_put_result_with_typed_headers(client: HTTPClient) -> None:
+    result = await client.put_result(
+        "items/7",
+        json=ItemModel(id=0, name="replaced"),
+        response_data_type=ItemModel,
+        response_headers_type=EchoedHeaders,
+    )
+
+    assert result.typed_headers is not None
+
+
+def test_sync_put_result_includes_status_and_data(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.put_result(
+        "items/7", json=ItemModel(id=0, name="replaced"), response_data_type=ItemModel
+    )
+
+    assert result.status == 200
+    assert result.data == ItemModel(id=7, name="replaced")
+
+
+async def test_patch_result_includes_status_and_data(client: HTTPClient) -> None:
+    result = await client.patch_result(
+        "items/7", json=RenameBody(name="renamed"), response_data_type=ItemModel
+    )
+
+    assert result.status == 200
+    assert result.data == ItemModel(id=7, name="renamed")
+
+
+async def test_patch_result_with_typed_headers(client: HTTPClient) -> None:
+    result = await client.patch_result(
+        "items/7",
+        json=RenameBody(name="renamed"),
+        response_data_type=ItemModel,
+        response_headers_type=EchoedHeaders,
+    )
+
+    assert result.typed_headers is not None
+
+
+def test_sync_patch_result_includes_status_and_data(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.patch_result(
+        "items/7", json=RenameBody(name="renamed"), response_data_type=ItemModel
+    )
+
+    assert result.status == 200
+    assert result.data == ItemModel(id=7, name="renamed")
 
 
 def test_sync_post_with_pydantic_json_body(sync_client: SyncHTTPClient) -> None:
