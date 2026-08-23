@@ -145,7 +145,7 @@ async def test_stream_get_transport_error_mid_stream_raises_connection_error(
 async def test_stream_get_unsupported_response_data_type_raises_type_error(
     client: HTTPClient,
 ) -> None:
-    with pytest.raises(TypeError, match="Unsupported SSE response_data_type"):
+    with pytest.raises(TypeError, match="Unsupported response_data_type"):
         [
             line
             async for line in client.stream_get(

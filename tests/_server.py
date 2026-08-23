@@ -167,15 +167,28 @@ class TestAppHandler(BaseHTTPRequestHandler):
 
         fields: dict[str, str] = {}
         files: list[dict[str, object]] = []
+        # `parts` additionally records every part in wire order (unlike `fields`, which
+        # collapses repeated names to their last value) plus each part's own Content-Type
+        # header — `.get(...)` (not `.get_content_type()`, which defaults to "text/plain"
+        # even when no header was sent) so a mime-inference test can tell "no header sent"
+        # apart from "server default".
+        parts: list[dict[str, object]] = []
         for part in message.iter_parts():
             name = cast(str, part.get_param("name", header="content-disposition"))
             filename = part.get_filename()
             payload = cast(bytes, part.get_payload(decode=True))
+            content_type = part.get("Content-Type")
+            parts.append({
+                "name": name,
+                "filename": filename,
+                "content_type": content_type,
+                "text": payload.decode(errors="replace"),
+            })
             if filename is None:
                 fields[name] = payload.decode()
             else:
                 files.append({"name": name, "filename": filename, "size": len(payload)})
-        self._write_json(200, {"fields": fields, "files": files})
+        self._write_json(200, {"fields": fields, "files": files, "parts": parts})
 
     def _write_sse_weird(self) -> None:
         self.close_connection = True

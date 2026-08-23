@@ -20,5 +20,6 @@ services:
     environment:
       COLUMNS: "200"
       PERF_TARGET_URL: "http://json-server:3000"
+      PERF_FUNC: "${PERF_FUNC:-}"
     volumes:
       - ../results:/app/results

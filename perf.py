@@ -8,7 +8,7 @@ import resource
 import time
 import tracemalloc
 from collections.abc import Awaitable, Callable
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypedDict, cast, get_args, overload
@@ -23,10 +23,12 @@ from msgspec import Struct
 from pydantic import BaseModel
 from pyreqwest.client import Client as PyreqwestClient
 from pyreqwest.client import ClientBuilder
+from pyreqwest.client import SyncClient as PyreqwestSyncClient
+from pyreqwest.client import SyncClientBuilder as PyreqwestSyncClientBuilder
 from rich.console import Console
 from rich.table import Table
 
-from lothc import JSON, HTTPClient
+from lothc import JSON, HTTPClient, SyncHTTPClient
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -215,9 +217,16 @@ type AnyClient = (
     | AiosonicClient
 )
 
+# aiohttp and aiosonic have no sync client at all — they're async-only libraries — so `sync=True`
+# is never valid for them (see the dispatch in `_run_one`).
+type AnySyncClient = (
+    SyncHTTPClient | httpx.Client | httpx2.Client | niquests.Session | PyreqwestSyncClient
+)
+
 
 class Stats(TypedDict):
     lib: Lib
+    sync: bool
     total_time: float
     throughput: float
     cpu_time: float
@@ -248,6 +257,50 @@ async def _fetch_one_lothc_pydantic(client: HTTPClient, path: str) -> None:
 async def _fetch_one_lothc_typeguard(client: HTTPClient, path: str) -> None:
     data = await client.get(path, response_data_type=TypeguardResponse)
     assert data["status"] == "success"
+
+
+def _fetch_one_lothc_sync(client: SyncHTTPClient, path: str) -> None:
+    data = client.get(path, response_data_type=JSON)
+    assert "status" in data
+
+
+def _fetch_one_lothc_msgspec_sync(client: SyncHTTPClient, path: str) -> None:
+    data = client.get(path, response_data_type=MsgspecResponse)
+    assert data.status == "success"
+
+
+def _fetch_one_lothc_pydantic_sync(client: SyncHTTPClient, path: str) -> None:
+    data = client.get(path, response_data_type=PydanticResponse)
+    assert data.status == "success"
+
+
+def _fetch_one_lothc_typeguard_sync(client: SyncHTTPClient, path: str) -> None:
+    data = client.get(path, response_data_type=TypeguardResponse)
+    assert data["status"] == "success"
+
+
+def _fetch_one_httpx_sync(client: httpx.Client, path: str) -> None:
+    resp = client.get(path)
+    data = resp.json()
+    assert "status" in data
+
+
+def _fetch_one_httpx2_sync(client: httpx2.Client, path: str) -> None:
+    resp = client.get(path)
+    data = resp.json()
+    assert "status" in data
+
+
+def _fetch_one_niquests_sync(client: niquests.Session, path: str) -> None:
+    resp = client.get(path)
+    data = resp.json()
+    assert "status" in data
+
+
+def _fetch_one_pyreqwest_sync(client: PyreqwestSyncClient, path: str) -> None:
+    resp = client.get(path).build().send()
+    data = resp.json()
+    assert "status" in data
 
 
 async def _fetch_one_httpx(client: httpx.AsyncClient, path: str) -> None:
@@ -364,6 +417,46 @@ def _build_client(lib: Lib, url: str, concurrency: int) -> AbstractAsyncContextM
     raise ValueError(f"Unknown lib: {lib}")
 
 
+@overload
+def _build_sync_client(
+    lib: Literal["lothc", "lothc-msgspec", "lothc-pydantic", "lothc-typeguard"], url: str
+) -> AbstractContextManager[SyncHTTPClient]: ...
+@overload
+def _build_sync_client(lib: Literal["httpx"], url: str) -> AbstractContextManager[httpx.Client]: ...
+@overload
+def _build_sync_client(
+    lib: Literal["httpx2"], url: str
+) -> AbstractContextManager[httpx2.Client]: ...
+@overload
+def _build_sync_client(
+    lib: Literal["niquests"], url: str
+) -> AbstractContextManager[niquests.Session]: ...
+@overload
+def _build_sync_client(
+    lib: Literal["pyreqwest"], url: str
+) -> AbstractContextManager[PyreqwestSyncClient]: ...
+def _build_sync_client(lib: Lib, url: str) -> AbstractContextManager[AnySyncClient]:
+    """Return a sync context manager yielding a ready-to-use blocking client for `lib`. Same lib
+    names as `_build_client` (its async counterpart) — sync-vs-async is conveyed by which of the
+    two you call, not by the name."""
+    if lib in ("lothc", "lothc-msgspec", "lothc-pydantic", "lothc-typeguard"):
+        return SyncHTTPClient.build(base_url=url)
+
+    if lib == "httpx":
+        return httpx.Client(base_url=url)
+
+    if lib == "httpx2":
+        return httpx2.Client(base_url=url)
+
+    if lib == "niquests":
+        return niquests.Session(base_url=url)
+
+    if lib == "pyreqwest":
+        return PyreqwestSyncClientBuilder().base_url(url).build()
+
+    raise ValueError(f"{lib!r} has no sync client")
+
+
 async def _fetch_one[ClientT](
     fetcher: Callable[[ClientT, str], Awaitable[None]], client: ClientT
 ) -> float:
@@ -447,6 +540,51 @@ async def _measure_peak_memory[ClientT](
     return peak / (1024 * 1024)
 
 
+def _fetch_one_sync[ClientT](fetcher: Callable[[ClientT, str], None], client: ClientT) -> float:
+    """Fetch once (sync, no event loop involved) and return elapsed time."""
+    start = time.perf_counter()
+    fetcher(client, "/")
+    return time.perf_counter() - start
+
+
+def _run_sequential_sync[ClientT](
+    fetcher: Callable[[ClientT, str], None], client: ClientT, total_requests: int
+) -> list[float]:
+    """Run `total_requests` calls back-to-back, one at a time — no pool, no concurrency."""
+    return [_fetch_one_sync(fetcher, client) for _ in range(total_requests)]
+
+
+def _time_run_sequential_sync[ClientT](
+    fetcher: Callable[[ClientT, str], None],
+    client: ClientT,
+    total_requests: int,
+    warmup: int,
+) -> tuple[list[float], float, float]:
+    if warmup:
+        _run_sequential_sync(fetcher, client, warmup)
+    cpu_before = resource.getrusage(resource.RUSAGE_SELF)
+    start_time = time.perf_counter()
+    timings = _run_sequential_sync(fetcher, client, total_requests)
+    total_time = time.perf_counter() - start_time
+    cpu_after = resource.getrusage(resource.RUSAGE_SELF)
+    cpu_time = (cpu_after.ru_utime + cpu_after.ru_stime) - (
+        cpu_before.ru_utime + cpu_before.ru_stime
+    )
+    return timings, total_time, cpu_time
+
+
+def _measure_peak_memory_sequential_sync[ClientT](
+    fetcher: Callable[[ClientT, str], None], client: ClientT, total_requests: int
+) -> float:
+    tracemalloc.start()
+    try:
+        _run_sequential_sync(fetcher, client, total_requests)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    return peak / (1024 * 1024)
+
+
 def _parse_libs(libs: str) -> list[Lib]:
     valid: tuple[Lib, ...] = get_args(Lib.__value__)
     result: list[Lib] = []
@@ -457,10 +595,177 @@ def _parse_libs(libs: str) -> list[Lib]:
     return result
 
 
-async def _run_one(lib: Lib, url: str, concurrency: int, total_requests: int, warmup: int) -> Stats:
-    """Run the perf test once for a single library and return its stats."""
-    with console.status(f"[bold green]Running {lib}..."):
-        if lib == "lothc":
+def _parse_sync_libs(libs: str) -> list[Lib]:
+    """Like `_parse_libs`, but restricted to the libs that actually have a sync client — see
+    `_build_sync_client`. aiohttp/aiosonic/httpx_h2/lothc's decode-target variants otherwise being
+    valid `Lib` values would let them slip through `_parse_libs`'s wider check."""
+    valid: tuple[Lib, ...] = (
+        "httpx",
+        "httpx2",
+        "niquests",
+        "pyreqwest",
+        "lothc",
+        "lothc-msgspec",
+        "lothc-pydantic",
+        "lothc-typeguard",
+    )
+    result: list[Lib] = []
+    for name in libs.split():
+        if name not in valid:
+            raise ValueError(f"Unknown sync-capable lib: {name!r} (expected one of {valid})")
+        result.append(name)
+    return result
+
+
+async def single_call(
+    url: str = "http://127.0.0.1:3000",
+    *,
+    libs: str = (
+        "httpx httpx2 pyreqwest aiohttp niquests aiosonic lothc "
+        "lothc-msgspec lothc-pydantic lothc-typeguard"
+    ),
+    concurrency: int = 1,
+    total_requests: int = 1000,
+    warmup: int = 100,
+) -> None:
+    """Async sequential: concurrency fixed at 1 against each of `libs`'s ASYNC clients — one
+    non-concurrent request at a time, so each timing is the raw wall time (t2-t1) of a single
+    request in isolation, rather than a pooled-concurrency throughput figure. See `main` for the
+    pooled-concurrency comparison, `single_call_sync` for the blocking-sync-client equivalent.
+    `concurrency` is accepted but ignored — always sequential — purely so `task perf-all` can pass
+    one shared --concurrency flag across all three tests without erroring on the two that don't
+    use it."""
+    _ = concurrency  # CLI-parity-only param, see docstring — intentionally unused
+    run_id = str(int(time.time() * 1000))
+    console.print(
+        f"[bold]Running[/bold] {total_requests} sequential requests (plus {warmup} warm-up) "
+        f"against [bold yellow]{url}[/bold yellow] [dim](run {run_id})[/dim]\n"
+    )
+
+    results = [await _run_one(lib, url, 1, total_requests, warmup) for lib in _parse_libs(libs)]
+
+    _print_results_table(results, title="Single-Call Comparison — Async Sequential")
+
+    out_path = _write_results_json(
+        results, run_id, url, 1, total_requests, warmup, prefix="single-call-"
+    )
+    console.print(f"\n[dim]Results written to {out_path}[/dim]")
+
+
+async def single_call_sync(
+    url: str = "http://127.0.0.1:3000",
+    *,
+    libs: str = (
+        "httpx httpx2 niquests pyreqwest lothc lothc-msgspec lothc-pydantic lothc-typeguard"
+    ),
+    concurrency: int = 1,
+    total_requests: int = 1000,
+    warmup: int = 100,
+) -> None:
+    """Sync sequential: one non-concurrent request at a time against each of `libs`'s blocking SYNC
+    clients — no event loop involved. aiohttp and aiosonic have no sync client so aren't included.
+    Same lib names as `perf`/`single_call` (e.g. "niquests", never "niquests-sync") — this
+    test/table is what marks them as the sync variant. See `single_call` for the async-sequential
+    equivalent, `main` for the pooled-concurrency comparison. `concurrency` is accepted but
+    ignored — always sequential — purely so `task perf-all` can pass one shared --concurrency flag
+    across all three tests without erroring on the two that don't use it."""
+    _ = concurrency  # CLI-parity-only param, see docstring — intentionally unused
+    run_id = str(int(time.time() * 1000))
+    console.print(
+        f"[bold]Running[/bold] {total_requests} sequential requests (plus {warmup} warm-up) "
+        f"against [bold yellow]{url}[/bold yellow] [dim](run {run_id})[/dim]\n"
+    )
+
+    results = [
+        await _run_one(lib, url, 1, total_requests, warmup, sync=True)
+        for lib in _parse_sync_libs(libs)
+    ]
+
+    _print_results_table(results, title="Single-Call Comparison — Sync Sequential")
+
+    out_path = _write_results_json(
+        results, run_id, url, 1, total_requests, warmup, prefix="single-call-sync-"
+    )
+    console.print(f"\n[dim]Results written to {out_path}[/dim]")
+
+
+def _run_sync_lib(
+    lib: Lib, url: str, total_requests: int, warmup: int
+) -> tuple[list[float], float, float, float]:
+    """The sync half of `_run_one`'s dispatch, split out to keep both under the project's mccabe
+    complexity ceiling — see `_run_one` for why sync-vs-async is a flag, not a separate lib name.
+    Returns (timings, total_time, cpu_time, peak_mem_mb)."""
+    if lib in ("lothc", "lothc-msgspec", "lothc-pydantic", "lothc-typeguard"):
+        fetcher = {
+            "lothc": _fetch_one_lothc_sync,
+            "lothc-msgspec": _fetch_one_lothc_msgspec_sync,
+            "lothc-pydantic": _fetch_one_lothc_pydantic_sync,
+            "lothc-typeguard": _fetch_one_lothc_typeguard_sync,
+        }[lib]
+        with _build_sync_client(lib, url) as client:
+            timings, total_time, cpu_time = _time_run_sequential_sync(
+                fetcher, client, total_requests, warmup
+            )
+            peak_mem_mb = _measure_peak_memory_sequential_sync(fetcher, client, total_requests)
+        return timings, total_time, cpu_time, peak_mem_mb
+
+    if lib == "httpx":
+        with _build_sync_client(lib, url) as client:
+            timings, total_time, cpu_time = _time_run_sequential_sync(
+                _fetch_one_httpx_sync, client, total_requests, warmup
+            )
+            peak_mem_mb = _measure_peak_memory_sequential_sync(
+                _fetch_one_httpx_sync, client, total_requests
+            )
+        return timings, total_time, cpu_time, peak_mem_mb
+
+    if lib == "httpx2":
+        with _build_sync_client(lib, url) as client:
+            timings, total_time, cpu_time = _time_run_sequential_sync(
+                _fetch_one_httpx2_sync, client, total_requests, warmup
+            )
+            peak_mem_mb = _measure_peak_memory_sequential_sync(
+                _fetch_one_httpx2_sync, client, total_requests
+            )
+        return timings, total_time, cpu_time, peak_mem_mb
+
+    if lib == "niquests":
+        with _build_sync_client(lib, url) as client:
+            timings, total_time, cpu_time = _time_run_sequential_sync(
+                _fetch_one_niquests_sync, client, total_requests, warmup
+            )
+            peak_mem_mb = _measure_peak_memory_sequential_sync(
+                _fetch_one_niquests_sync, client, total_requests
+            )
+        return timings, total_time, cpu_time, peak_mem_mb
+
+    if lib == "pyreqwest":
+        with _build_sync_client(lib, url) as client:
+            timings, total_time, cpu_time = _time_run_sequential_sync(
+                _fetch_one_pyreqwest_sync, client, total_requests, warmup
+            )
+            peak_mem_mb = _measure_peak_memory_sequential_sync(
+                _fetch_one_pyreqwest_sync, client, total_requests
+            )
+        return timings, total_time, cpu_time, peak_mem_mb
+
+    raise ValueError(f"{lib!r} has no sync client (aiohttp/aiosonic/httpx_h2 are async-only)")
+
+
+async def _run_one(
+    lib: Lib, url: str, concurrency: int, total_requests: int, warmup: int, *, sync: bool = False
+) -> Stats:
+    """Run the perf test once for a single library and return its stats. `sync=True` uses `lib`'s
+    blocking sync client instead of its async one (aiohttp/aiosonic have none — see
+    `_build_sync_client`) — always sequential regardless of `concurrency` (only meaningful via
+    `single_call_sync`). The lib name is the same either way (e.g. "niquests", never "niquests-
+    sync") since sync-vs-async is conveyed by which test/table this is, not by the name."""
+    with console.status(f"[bold green]Running {lib}{' (sync)' if sync else ''}..."):
+        if sync:
+            timings, total_time, cpu_time, peak_mem_mb = _run_sync_lib(
+                lib, url, total_requests, warmup
+            )
+        elif lib == "lothc":
             async with _build_client(lib, url, concurrency) as client:
                 timings, total_time, cpu_time = await _time_run(
                     _fetch_one_lothc, client, total_requests, concurrency, warmup
@@ -544,6 +849,7 @@ async def _run_one(lib: Lib, url: str, concurrency: int, total_requests: int, wa
     timings = sorted(timings)
     return {
         "lib": lib,
+        "sync": sync,
         "total_time": total_time,
         "throughput": total_requests / total_time,
         "cpu_time": cpu_time,
@@ -557,11 +863,11 @@ async def _run_one(lib: Lib, url: str, concurrency: int, total_requests: int, wa
     }
 
 
-def _print_results_table(results: list[Stats]) -> None:
+def _print_results_table(results: list[Stats], *, title: str = "Perf Comparison") -> None:
     ordered = sorted(results, key=lambda r: r["throughput"])
     slowest = ordered[0]["throughput"]
 
-    table = Table(title="Perf Comparison")
+    table = Table(title=title)
     table.add_column("Library", style="cyan")
     table.add_column("Total Time", justify="right")
     table.add_column("Throughput", justify="right", style="bold green")
@@ -578,7 +884,7 @@ def _print_results_table(results: list[Stats]) -> None:
     for r in ordered:
         table.add_row(
             r["lib"],
-            f"{r['total_time']:.3f}s",
+            f"{r['total_time'] * 1000:.3f}ms",
             f"{r['throughput']:.1f} req/s",
             f"x{r['throughput'] / slowest:.1f}",
             f"{r['cpu_time']:.3f}s",
@@ -601,11 +907,18 @@ def _print_results_table(results: list[Stats]) -> None:
 
 
 def _write_results_json(
-    results: list[Stats], run_id: str, url: str, concurrency: int, total_requests: int, warmup: int
+    results: list[Stats],
+    run_id: str,
+    url: str,
+    concurrency: int,
+    total_requests: int,
+    warmup: int,
+    *,
+    prefix: str = "",
 ) -> Path:
     out_dir = Path(__file__).parent / "results"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{run_id}.json"
+    out_path = out_dir / f"{prefix}{run_id}.json"
     payload = {
         "run_id": run_id,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(run_id) / 1000)),

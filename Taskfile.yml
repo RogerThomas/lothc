@@ -175,6 +175,49 @@ tasks:
       - defer: docker compose down
       - docker compose run --rm perf {{.CLI_ARGS}}
 
+  perf-single-call:
+    desc: >
+      Async sequential — same async libraries as `perf`, but one non-concurrent
+      request at a time instead of pooled, so each timing is the raw wall time of a
+      single request in isolation. See `perf-single-call-sync` for the blocking-sync-
+      client equivalent. Each run's JSON results land in
+      ./results/single-call-<run_id>.json on the host.
+    dir: benchmarks
+    env:
+      JSON_SERVER_CPUSET: "{{.JSON_SERVER_CPUSET}}"
+      PERF_CPUSET: "{{.PERF_CPUSET}}"
+      PERF_FUNC: single-call
+    cmds:
+      - mkdir -p ../results
+      - defer: docker compose down
+      - docker compose run --rm perf {{.CLI_ARGS}}
+
+  perf-single-call-sync:
+    desc: >
+      Sync sequential — one non-concurrent request at a time against lothc's blocking
+      SyncHTTPClient, no event loop involved. See `perf-single-call` for the
+      async-sequential equivalent. Each run's JSON results land in
+      ./results/single-call-sync-<run_id>.json on the host.
+    dir: benchmarks
+    env:
+      JSON_SERVER_CPUSET: "{{.JSON_SERVER_CPUSET}}"
+      PERF_CPUSET: "{{.PERF_CPUSET}}"
+      PERF_FUNC: single-call-sync
+    cmds:
+      - mkdir -p ../results
+      - defer: docker compose down
+      - docker compose run --rm perf {{.CLI_ARGS}}
+
+  perf-all:
+    desc: >
+      Run all three: `perf` (async, pooled-concurrency), `perf-single-call` (async,
+      sequential), and `perf-single-call-sync` (sync, sequential) back to back against
+      the same json-server setup.
+    cmds:
+      - task: perf
+      - task: perf-single-call
+      - task: perf-single-call-sync
+
   perf-svg:
     desc: >
       Regenerate assets/perf-race.svg from a perf.py results file. Usage:

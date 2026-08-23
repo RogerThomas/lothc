@@ -11,9 +11,19 @@
 [![License](https://img.shields.io/pypi/l/lothc)](LICENSE)
 
 **L**ord **O**f **T**he **H**ttp **C**lients — a typed HTTP client for Python, built on
-[pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (a Rust-backed HTTP client), with first-class
-optional support for **pydantic**, **msgspec**, and **TypedDict** (validated via **typeguard** if
-installed) as decode targets.
+[pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (an awesome Rust-backed HTTP client), with
+first-class optional support for **pydantic** and **msgspec** as both decode *and* encode targets, plus
+**TypedDict** (validated via **typeguard** if installed) as a decode target.
+
+## Installing
+
+```
+uv add 'lothc[pydantic,msgspec,typeguard]'
+```
+
+(Any subset of the extras works — the base package alone gets you `bytes`/`JSON`/`TypedDict`-without-validation support.)
+
+## Quickstart
 
 ```python
 from lothc import HTTPClient
@@ -30,6 +40,29 @@ async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
     print(pikachu)  # id=25 name='pikachu'
 ```
 
+## Why?
+
+Why was lothc built, and why should you use it?
+
+pyreqwest is a genuinely excellent HTTP client for Python, fast because the heavy lifting happens
+in Rust, not pure Python. But its API is a builder pattern (`client.get(path).build()` before you
+can even `.send()` it), unfamiliar to anyone coming from `requests`/`httpx`/`niquests`, where a
+call is just `client.get(url, params=..., headers=...)`. lothc wraps pyreqwest with exactly that
+familiar shape, so you get pyreqwest's speed without giving up the ergonomics Python HTTP users
+already expect.
+
+The other reason: Python's most popular third-party HTTP clients (httpx, aiohttp, niquests) all
+have first-class JSON support: call `.json()` and get back a `dict`. But in order for a Python
+project to be end-to-end type-safe, data crossing I/O boundaries must be validated, and if
+invalid, handled accordingly (raise an error) — a plain `dict` does neither. Closing that gap is
+exactly what lothc is designed for.
+
+The original idea was to make lothc backend-agnostic: httpx, aiohttp, niquests, and pyreqwest all
+interchangeable underneath the same typed lothc interface, so switching backends never meant
+switching your call sites. However, in the author's opinion there's currently no compelling
+reason not to just use pyreqwest, so pyreqwest is the only backend implemented today, but, if
+there's demand for an httpx/aiohttp/niquests backend, the author is happy to consider adding one.
+
 ## Fast
 
 ![HTTP client throughput race — lothc and pyreqwest finish in well under a fifth of a second, other libraries take much longer](assets/perf-race.svg)
@@ -45,11 +78,10 @@ costing a real, visible slowdown. Full numbers: [docs/benchmarks.md](docs/benchm
 
 ## Highlights
 
-lothc's biggest offering over `requests`/`httpx`/`aiohttp`-and-friends: those clients hand you a
-plain `dict` from `.json()` and leave validation to you. Pass `response_data_type` to any lothc
-call and get back a real, constructed, field-validated pydantic `BaseModel`, msgspec `Struct`, or
-typeguard-checked `TypedDict` instead — built in, not bolted on. See
-[Benchmarks](docs/benchmarks.md) for what that costs (usually nothing).
+Pass `response_data_type` to any lothc call and get back a real, constructed, field-validated
+pydantic `BaseModel`, msgspec `Struct`, or typeguard-checked `TypedDict`, instead of the plain
+`dict` `.json()` leaves you to validate yourself. See [Benchmarks](docs/benchmarks.md) for what
+that costs (usually nothing).
 
 | | |
 |---|---|
@@ -63,14 +95,6 @@ typeguard-checked `TypedDict` instead — built in, not bolted on. See
 | **Cookies, redirects, proxy** | `cookie_store`, `follow_redirects`/`max_redirects`, `proxy=` — see [Networking](docs/networking.md). |
 | **A real error hierarchy** | `HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError` for no response, `HTTPResponseError` for 4xx/5xx — see [Error handling](docs/errors.md). |
 | **Everything optional** | pydantic, msgspec, typeguard — works with none, either, or all three installed. |
-
-## Installing
-
-```
-uv add 'lothc[pydantic,msgspec,typeguard]'
-```
-
-(Any subset of the extras works — the base package alone gets you `bytes`/`JSON`/`TypedDict`-without-validation support.)
 
 ## Development
 

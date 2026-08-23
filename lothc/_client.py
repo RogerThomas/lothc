@@ -16,7 +16,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from io import BufferedIOBase
+from json import dumps as _json_dumps
 from json import loads as _json_loads
+from mimetypes import guess_type as _guess_mime_type
 from pathlib import Path
 from types import UnionType
 from typing import Any, ClassVar, Protocol, Self, cast, get_args, is_typeddict, overload
@@ -51,15 +53,32 @@ class _IsTypedDict(Protocol):
     __required_keys__: ClassVar[frozenset[str]]
 
 
-type File = tuple[str, bytes] | Path | BufferedIOBase
 type Data = BaseModel | Struct | bytes | JSON | _IsTypedDict
 type TypedHeaders = BaseModel | Struct
 type JSONPayload = dict[str, Any] | BaseModel | Struct
-type Form = dict[str, int | bytes | str | File]
+
+# A caller never constructs these three directly — they just write a plain tuple literal, and
+# _apply_form_value/_apply_sync_form_value tell them apart by exact arity + element type. Keep
+# them private; File (below) is the only name a caller-facing type hint ever needs.
+type _FormFileNoContentType = tuple[str, bytes | Path | BufferedIOBase]
+type _FormFileWithContentType = tuple[str, bytes | Path | BufferedIOBase, str]
+type _FormFileFromPathOverrideContentType = tuple[Path, str]
+type File = (
+    _FormFileNoContentType
+    | _FormFileWithContentType
+    | _FormFileFromPathOverrideContentType
+    | Path
+    | BufferedIOBase
+)
+# A tuple[_FormValue, ...] value in Form (below) means "repeat this part name once per element" —
+# never "JSON-encode this tuple," which is what list[Any] means instead. Keeping the repeat
+# marker as `tuple` and the JSON-array marker as `list` is what makes the two unambiguous.
+type _FormValue = str | int | bytes | list[Any] | JSONPayload | File
+type Form = dict[str, _FormValue | tuple[_FormValue, ...]]
 type Params = Mapping[str, str | int | float | bool] | BaseModel | Struct
 type Headers = Mapping[str, str] | BaseModel | Struct
-type AsyncAuthProvider = Callable[[], Awaitable[str]]
-type AuthProvider = Callable[[], str]
+type AuthProvider = Callable[[], Awaitable[str]]
+type SyncAuthProvider = Callable[[], str]
 
 
 class HTTPResponseError(Exception):
@@ -191,28 +210,144 @@ class _SyncRetryMiddleware:
         raise AssertionError("unreachable")  # pragma: no cover
 
 
-async def _build_form(form: Form) -> FormBuilder:
+def _guess_form_part_mime(
+    filename: str | None, *, infer_mime_type_from_file_extension: bool
+) -> str | None:
+    if not infer_mime_type_from_file_extension or filename is None:
+        return None
+    return _guess_mime_type(filename)[0]
+
+
+# Shared by both _apply_form_value and _apply_sync_form_value — encoding a value that's already
+# known to be JSON-shaped needs no I/O, so unlike file-content reading there's no async/sync split.
+def _encode_json_form_part(value: list[Any] | JSONPayload) -> bytes:
+    if isinstance(value, BaseModel):
+        return _json_dumps(value.model_dump(mode="json")).encode()
+    if isinstance(value, Struct):
+        return msgspec.json.encode(value)
+    return _json_dumps(value).encode()
+
+
+# `explicit_mime` always wins over inference; `filename` is only applied when given, since the
+# Path-override shape (a bare Path's own auto-derived filename, kept as-is) has no filename to
+# pass here at all. Collapsing this into one helper is what keeps _apply_form_value's/
+# _apply_sync_form_value's own branches under the complexity linter's threshold.
+def _finish_file_part(
+    part: PartBuilder,
+    filename: str | None,
+    explicit_mime: str | None,
+    *,
+    infer_mime_type_from_file_extension: bool,
+) -> PartBuilder:
+    if filename is not None:
+        part = part.file_name(filename)
+    mime = explicit_mime or _guess_form_part_mime(
+        filename, infer_mime_type_from_file_extension=infer_mime_type_from_file_extension
+    )
+    return part if mime is None else part.mime(mime)
+
+
+def _buffered_io_filename(value: BufferedIOBase) -> str | None:
+    raw_name = getattr(value, "name", None)
+    return Path(raw_name).name if isinstance(raw_name, str) else None
+
+
+async def _build_file_part(content: bytes | Path | BufferedIOBase) -> PartBuilder:
+    if isinstance(content, Path):
+        return await PartBuilder.from_file(content)
+    if isinstance(content, BufferedIOBase):
+        return PartBuilder.from_bytes(content.read())
+    return PartBuilder.from_bytes(content)
+
+
+# `value` is typed `object`, not `Form`'s value union — nothing at runtime stops a caller
+# bypassing the type checker, so the `case _` fallback below must stay reachable rather than
+# basedpyright proving it `Never` from a narrower declared type (same reasoning as
+# `_validate_response_data_type`'s `object` parameter).
+async def _apply_form_value(  # pylint: disable=too-many-return-statements
+    form_builder: FormBuilder,
+    name: str,
+    value: object,
+    *,
+    infer_mime_type_from_file_extension: bool,
+) -> FormBuilder:
+    match value:
+        case str():
+            return form_builder.text(name, value)
+        case int():
+            return form_builder.text(name, str(value))
+        case bytes():
+            return form_builder.part(name, PartBuilder.from_bytes(value))
+        case (str() as filename, bytes() | Path() | BufferedIOBase() as content):
+            part = _finish_file_part(
+                await _build_file_part(content),
+                filename,
+                None,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            )
+            return form_builder.part(name, part)
+        case (str() as filename, bytes() | Path() | BufferedIOBase() as content, str() as mime):
+            part = _finish_file_part(
+                await _build_file_part(content),
+                filename,
+                mime,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            )
+            return form_builder.part(name, part)
+        case (Path() as content_path, str() as mime):
+            part = _finish_file_part(
+                await _build_file_part(content_path),
+                None,
+                mime,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            )
+            return form_builder.part(name, part)
+        case Path():
+            part = _finish_file_part(
+                await _build_file_part(value),
+                value.name,
+                None,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            )
+            return form_builder.part(name, part)
+        case BufferedIOBase():
+            part = _finish_file_part(
+                await _build_file_part(value),
+                _buffered_io_filename(value),
+                None,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            )
+            return form_builder.part(name, part)
+        case list():
+            body = _encode_json_form_part(cast(list[Any], value))
+            return form_builder.part(name, PartBuilder.from_bytes(body).mime("application/json"))
+        case dict() | BaseModel() | Struct():
+            body = _encode_json_form_part(cast("JSONPayload", value))
+            return form_builder.part(name, PartBuilder.from_bytes(body).mime("application/json"))
+        case tuple():
+            for item in cast("tuple[object, ...]", value):
+                form_builder = await _apply_form_value(
+                    form_builder,
+                    name,
+                    item,
+                    infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+                )
+            return form_builder
+        case _:
+            raise TypeError(
+                f"Unsupported form value for {name!r}: {value!r} ({type(value).__name__})"
+            )
+
+
+async def _build_form(form: Form, *, infer_mime_type_from_file_extension: bool) -> FormBuilder:
     form_builder = FormBuilder()
     for name, value in form.items():
-        match value:
-            case str():
-                form_builder = form_builder.text(name, value)
-            case int():
-                form_builder = form_builder.text(name, str(value))
-            case bytes():
-                form_builder = form_builder.part(name, PartBuilder.from_bytes(value))
-            case Path():
-                form_builder = form_builder.part(name, await PartBuilder.from_file(value))
-            case BufferedIOBase():
-                part = PartBuilder.from_bytes(value.read())
-                file_name = getattr(value, "name", None)
-                if isinstance(file_name, str):
-                    part = part.file_name(Path(file_name).name)
-                form_builder = form_builder.part(name, part)
-            case (filename, content):
-                form_builder = form_builder.part(
-                    name, PartBuilder.from_bytes(content).file_name(filename)
-                )
+        form_builder = await _apply_form_value(
+            form_builder,
+            name,
+            value,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+        )
     return form_builder
 
 
@@ -310,31 +445,102 @@ def _decode_json_line(
         return msgspec.json.decode(data.encode(), type=response_data_type)
     if issubclass(response_data_type, BaseModel):
         return response_data_type.model_validate_json(data)
-    raise TypeError(f"Unsupported SSE response_data_type: {response_data_type!r}")
+    raise TypeError(f"Unsupported response_data_type: {response_data_type!r}")
 
 
-def _build_sync_form(form: Form) -> FormBuilder:
+def _build_sync_file_part(content: bytes | Path | BufferedIOBase) -> PartBuilder:
+    if isinstance(content, Path):
+        return PartBuilder.from_sync_file(content)
+    if isinstance(content, BufferedIOBase):
+        return PartBuilder.from_bytes(content.read())
+    return PartBuilder.from_bytes(content)
+
+
+# See _apply_form_value's comment above _build_form — same reasoning, sync mirror.
+def _apply_sync_form_value(  # pylint: disable=too-many-return-statements
+    form_builder: FormBuilder,
+    name: str,
+    value: object,
+    *,
+    infer_mime_type_from_file_extension: bool,
+) -> FormBuilder:
+    match value:
+        case str():
+            return form_builder.text(name, value)
+        case int():
+            return form_builder.text(name, str(value))
+        case bytes():
+            return form_builder.part(name, PartBuilder.from_bytes(value))
+        case (str() as filename, bytes() | Path() | BufferedIOBase() as content):
+            part = _finish_file_part(
+                _build_sync_file_part(content),
+                filename,
+                None,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            )
+            return form_builder.part(name, part)
+        case (str() as filename, bytes() | Path() | BufferedIOBase() as content, str() as mime):
+            part = _finish_file_part(
+                _build_sync_file_part(content),
+                filename,
+                mime,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            )
+            return form_builder.part(name, part)
+        case (Path() as content_path, str() as mime):
+            part = _finish_file_part(
+                _build_sync_file_part(content_path),
+                None,
+                mime,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            )
+            return form_builder.part(name, part)
+        case Path():
+            part = _finish_file_part(
+                _build_sync_file_part(value),
+                value.name,
+                None,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            )
+            return form_builder.part(name, part)
+        case BufferedIOBase():
+            part = _finish_file_part(
+                _build_sync_file_part(value),
+                _buffered_io_filename(value),
+                None,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            )
+            return form_builder.part(name, part)
+        case list():
+            body = _encode_json_form_part(cast(list[Any], value))
+            return form_builder.part(name, PartBuilder.from_bytes(body).mime("application/json"))
+        case dict() | BaseModel() | Struct():
+            body = _encode_json_form_part(cast("JSONPayload", value))
+            return form_builder.part(name, PartBuilder.from_bytes(body).mime("application/json"))
+        case tuple():
+            for item in cast("tuple[object, ...]", value):
+                form_builder = _apply_sync_form_value(
+                    form_builder,
+                    name,
+                    item,
+                    infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+                )
+            return form_builder
+        case _:
+            raise TypeError(
+                f"Unsupported form value for {name!r}: {value!r} ({type(value).__name__})"
+            )
+
+
+def _build_sync_form(form: Form, *, infer_mime_type_from_file_extension: bool) -> FormBuilder:
     form_builder = FormBuilder()
     for name, value in form.items():
-        match value:
-            case str():
-                form_builder = form_builder.text(name, value)
-            case int():
-                form_builder = form_builder.text(name, str(value))
-            case bytes():
-                form_builder = form_builder.part(name, PartBuilder.from_bytes(value))
-            case Path():
-                form_builder = form_builder.part(name, PartBuilder.from_sync_file(value))
-            case BufferedIOBase():
-                part = PartBuilder.from_bytes(value.read())
-                file_name = getattr(value, "name", None)
-                if isinstance(file_name, str):
-                    part = part.file_name(Path(file_name).name)
-                form_builder = form_builder.part(name, part)
-            case (filename, content):
-                form_builder = form_builder.part(
-                    name, PartBuilder.from_bytes(content).file_name(filename)
-                )
+        form_builder = _apply_sync_form_value(
+            form_builder,
+            name,
+            value,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+        )
     return form_builder
 
 
@@ -387,6 +593,8 @@ async def _attach_body[TBuilder: BaseRequestBuilder](  # pylint: disable=too-man
     json: JSONPayload | None,
     form: Form | None,
     content: str | bytes | None,
+    *,
+    infer_mime_type_from_file_extension: bool,
 ) -> TBuilder:
     provided_bodies = [body for body in (json, form, content) if body is not None]
     if len(provided_bodies) > 1:
@@ -398,7 +606,11 @@ async def _attach_body[TBuilder: BaseRequestBuilder](  # pylint: disable=too-man
     if json is not None:
         return request_builder.body_json(json)
     if form is not None:
-        return request_builder.multipart(await _build_form(form))
+        return request_builder.multipart(
+            await _build_form(
+                form, infer_mime_type_from_file_extension=infer_mime_type_from_file_extension
+            )
+        )
     if isinstance(content, str):
         return request_builder.body_text(content)
     if content is not None:
@@ -411,6 +623,8 @@ def _attach_body_sync[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many
     json: JSONPayload | None,
     form: Form | None,
     content: str | bytes | None,
+    *,
+    infer_mime_type_from_file_extension: bool,
 ) -> TBuilder:
     provided_bodies = [body for body in (json, form, content) if body is not None]
     if len(provided_bodies) > 1:
@@ -422,7 +636,11 @@ def _attach_body_sync[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many
     if json is not None:
         return request_builder.body_json(json)
     if form is not None:
-        return request_builder.multipart(_build_sync_form(form))
+        return request_builder.multipart(
+            _build_sync_form(
+                form, infer_mime_type_from_file_extension=infer_mime_type_from_file_extension
+            )
+        )
     if isinstance(content, str):
         return request_builder.body_text(content)
     if content is not None:
@@ -464,7 +682,7 @@ class HTTPClient:
 
     _client: Client
     _bearer_token: str | None = None
-    _bearer_auth: AsyncAuthProvider | None = None
+    _bearer_auth: AuthProvider | None = None
 
     @classmethod
     @asynccontextmanager
@@ -473,7 +691,7 @@ class HTTPClient:
         *,
         base_url: str | None = None,
         bearer_token: str | None = None,
-        bearer_auth: AsyncAuthProvider | None = None,
+        bearer_auth: AuthProvider | None = None,
         default_headers: dict[str, str] | None = None,
         timeout: float | None = 30.0,
         cookie_store: bool = False,
@@ -772,10 +990,17 @@ class HTTPClient:
         content: str | bytes | None,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None,
         *,
+        infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
     ) -> AsyncIterator[Any]:
         request_builder = await self._prepare_request(request_builder, params, headers)
-        request_builder = await _attach_body(request_builder, json, form, content)
+        request_builder = await _attach_body(
+            request_builder,
+            json,
+            form,
+            content,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+        )
         request = request_builder.build_streamed()
         try:
             async with request as raw_response:
@@ -843,6 +1068,7 @@ class HTTPClient:
             None,
             None,
             response_data_type,
+            infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
         )
 
@@ -856,6 +1082,7 @@ class HTTPClient:
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> AsyncIterator[bytes]: ...
     @overload
@@ -869,6 +1096,7 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TLine] | TypeAdapter[TLine] | Decoder[TLine],
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> AsyncIterator[TLine]: ...
     def stream_post(
@@ -881,6 +1109,7 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> AsyncIterator[Any]:
         """Like `stream_get`, but POST a body first — same `json`/`form`/`content` options as
@@ -894,6 +1123,7 @@ class HTTPClient:
             form,
             content,
             response_data_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
 
@@ -979,14 +1209,54 @@ class HTTPClient:
         content: str | bytes | None,
         response_data_type: type[Data],
         *,
+        infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
     ) -> Data:
         request_builder = await self._prepare_request(request_builder, params, headers)
-        request_builder = await _attach_body(request_builder, json, form, content)
+        request_builder = await _attach_body(
+            request_builder,
+            json,
+            form,
+            content,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+        )
         raw_response = await _send(request_builder.build())
         return await self._parse(
             raw_response, response_data_type, error_for_status=error_for_status
         )
+
+    async def _send_with_body_result(
+        self,
+        request_builder: RequestBuilder,
+        params: Params | None,
+        headers: Headers | None,
+        json: JSONPayload | None,
+        form: Form | None,
+        content: str | bytes | None,
+        response_data_type: type[Data],
+        response_headers_type: type[TypedHeaders] | None,
+        *,
+        infer_mime_type_from_file_extension: bool,
+        error_for_status: bool,
+    ) -> Result[Any, Any]:
+        request_builder = await self._prepare_request(request_builder, params, headers)
+        request_builder = await _attach_body(
+            request_builder,
+            json,
+            form,
+            content,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+        )
+        raw_response = await _send(request_builder.build())
+        if error_for_status:
+            await self._check_status(raw_response)
+        data = await self._decode_body(raw_response, response_data_type)
+        response_headers = dict(raw_response.headers)
+        if response_headers_type is None:
+            typed_headers = None
+        else:
+            typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+        return Result(data, raw_response.status, response_headers, typed_headers)
 
     @overload
     async def post(
@@ -998,6 +1268,7 @@ class HTTPClient:
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> bytes: ...
     @overload
@@ -1011,6 +1282,7 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> TData: ...
     async def post(
@@ -1023,6 +1295,7 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] = bytes,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> Data:
         """POST to `path` with at most one of `json`/`form`/`content` (raises `ValueError` if
@@ -1036,6 +1309,94 @@ class HTTPClient:
             form,
             content,
             response_data_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+        )
+
+    @overload
+    async def post_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[bytes]: ...
+    @overload
+    async def post_result[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[TData]: ...
+    @overload
+    async def post_result[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[bytes, THeaders]: ...
+    @overload
+    async def post_result[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[TData, THeaders]: ...
+    async def post_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[Data] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[Any, Any]:
+        """Like `post`, but return a `Result` carrying the decoded body alongside the response
+        status and headers. Pass `response_headers_type` to also get the headers parsed into
+        `result.typed_headers`.
+        """
+        return await self._send_with_body_result(
+            self._client.post(path),
+            params,
+            headers,
+            json,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
 
@@ -1049,6 +1410,7 @@ class HTTPClient:
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> bytes: ...
     @overload
@@ -1062,6 +1424,7 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> TData: ...
     async def put(
@@ -1074,6 +1437,7 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] = bytes,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> Data:
         """PUT to `path`. Same body/decode rules as `post`."""
@@ -1085,6 +1449,94 @@ class HTTPClient:
             form,
             content,
             response_data_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+        )
+
+    @overload
+    async def put_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[bytes]: ...
+    @overload
+    async def put_result[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[TData]: ...
+    @overload
+    async def put_result[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[bytes, THeaders]: ...
+    @overload
+    async def put_result[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[TData, THeaders]: ...
+    async def put_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[Data] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[Any, Any]:
+        """Like `put`, but return a `Result` carrying the decoded body alongside the response
+        status and headers. Pass `response_headers_type` to also get the headers parsed into
+        `result.typed_headers`.
+        """
+        return await self._send_with_body_result(
+            self._client.put(path),
+            params,
+            headers,
+            json,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
 
@@ -1098,6 +1550,7 @@ class HTTPClient:
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> bytes: ...
     @overload
@@ -1111,6 +1564,7 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> TData: ...
     async def patch(
@@ -1123,6 +1577,7 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] = bytes,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> Data:
         """PATCH `path`. Same body/decode rules as `post`."""
@@ -1134,6 +1589,94 @@ class HTTPClient:
             form,
             content,
             response_data_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+        )
+
+    @overload
+    async def patch_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[bytes]: ...
+    @overload
+    async def patch_result[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[TData]: ...
+    @overload
+    async def patch_result[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[bytes, THeaders]: ...
+    @overload
+    async def patch_result[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[TData, THeaders]: ...
+    async def patch_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[Data] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[Any, Any]:
+        """Like `patch`, but return a `Result` carrying the decoded body alongside the response
+        status and headers. Pass `response_headers_type` to also get the headers parsed into
+        `result.typed_headers`.
+        """
+        return await self._send_with_body_result(
+            self._client.patch(path),
+            params,
+            headers,
+            json,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
 
@@ -1174,6 +1717,74 @@ class HTTPClient:
             None,
             None,
             response_data_type,
+            infer_mime_type_from_file_extension=True,
+            error_for_status=error_for_status,
+        )
+
+    @overload
+    async def delete_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        error_for_status: bool = True,
+    ) -> Result[bytes]: ...
+    @overload
+    async def delete_result[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        response_data_type: type[TData],
+        error_for_status: bool = True,
+    ) -> Result[TData]: ...
+    @overload
+    async def delete_result[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+    ) -> Result[bytes, THeaders]: ...
+    @overload
+    async def delete_result[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+    ) -> Result[TData, THeaders]: ...
+    async def delete_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        response_data_type: type[Data] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        error_for_status: bool = True,
+    ) -> Result[Any, Any]:
+        """Like `delete`, but return a `Result` carrying the decoded body alongside the response
+        status and headers. Pass `response_headers_type` to also get the headers parsed into
+        `result.typed_headers`.
+        """
+        return await self._send_with_body_result(
+            self._client.delete(path),
+            params,
+            headers,
+            None,
+            None,
+            None,
+            response_data_type,
+            response_headers_type,
+            infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
         )
 
@@ -1232,7 +1843,7 @@ class SyncHTTPClient:
 
     _client: SyncClient
     _bearer_token: str | None = None
-    _bearer_auth: AuthProvider | None = None
+    _bearer_auth: SyncAuthProvider | None = None
 
     @classmethod
     @contextmanager
@@ -1241,7 +1852,7 @@ class SyncHTTPClient:
         *,
         base_url: str | None = None,
         bearer_token: str | None = None,
-        bearer_auth: AuthProvider | None = None,
+        bearer_auth: SyncAuthProvider | None = None,
         default_headers: dict[str, str] | None = None,
         timeout: float | None = 30.0,
         cookie_store: bool = False,
@@ -1543,10 +2154,17 @@ class SyncHTTPClient:
         content: str | bytes | None,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None,
         *,
+        infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
     ) -> Iterator[Any]:
         request_builder = self._prepare_request(request_builder, params, headers)
-        request_builder = _attach_body_sync(request_builder, json, form, content)
+        request_builder = _attach_body_sync(
+            request_builder,
+            json,
+            form,
+            content,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+        )
         request = request_builder.build_streamed()
         try:
             with request as raw_response:
@@ -1614,6 +2232,7 @@ class SyncHTTPClient:
             None,
             None,
             response_data_type,
+            infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
         )
 
@@ -1627,6 +2246,7 @@ class SyncHTTPClient:
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> Iterator[bytes]: ...
     @overload
@@ -1640,6 +2260,7 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TLine] | TypeAdapter[TLine] | Decoder[TLine],
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> Iterator[TLine]: ...
     def stream_post(
@@ -1652,6 +2273,7 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> Iterator[Any]:
         """Like `stream_get`, but POST a body first — same `json`/`form`/`content` options as
@@ -1665,6 +2287,7 @@ class SyncHTTPClient:
             form,
             content,
             response_data_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
 
@@ -1750,12 +2373,52 @@ class SyncHTTPClient:
         content: str | bytes | None,
         response_data_type: type[Data],
         *,
+        infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
     ) -> Data:
         request_builder = self._prepare_request(request_builder, params, headers)
-        request_builder = _attach_body_sync(request_builder, json, form, content)
+        request_builder = _attach_body_sync(
+            request_builder,
+            json,
+            form,
+            content,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+        )
         raw_response = _send_sync(request_builder.build())
         return self._parse(raw_response, response_data_type, error_for_status=error_for_status)
+
+    def _send_with_body_result(
+        self,
+        request_builder: SyncRequestBuilder,
+        params: Params | None,
+        headers: Headers | None,
+        json: JSONPayload | None,
+        form: Form | None,
+        content: str | bytes | None,
+        response_data_type: type[Data],
+        response_headers_type: type[TypedHeaders] | None,
+        *,
+        infer_mime_type_from_file_extension: bool,
+        error_for_status: bool,
+    ) -> Result[Any, Any]:
+        request_builder = self._prepare_request(request_builder, params, headers)
+        request_builder = _attach_body_sync(
+            request_builder,
+            json,
+            form,
+            content,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+        )
+        raw_response = _send_sync(request_builder.build())
+        if error_for_status:
+            self._check_status(raw_response)
+        data = self._decode_body(raw_response, response_data_type)
+        response_headers = dict(raw_response.headers)
+        if response_headers_type is None:
+            typed_headers = None
+        else:
+            typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+        return Result(data, raw_response.status, response_headers, typed_headers)
 
     @overload
     def post(
@@ -1767,6 +2430,7 @@ class SyncHTTPClient:
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> bytes: ...
     @overload
@@ -1780,6 +2444,7 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> TData: ...
     def post(
@@ -1792,6 +2457,7 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] = bytes,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> Data:
         """POST to `path` with at most one of `json`/`form`/`content` (raises `ValueError` if
@@ -1805,6 +2471,94 @@ class SyncHTTPClient:
             form,
             content,
             response_data_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+        )
+
+    @overload
+    def post_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[bytes]: ...
+    @overload
+    def post_result[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[TData]: ...
+    @overload
+    def post_result[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[bytes, THeaders]: ...
+    @overload
+    def post_result[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[TData, THeaders]: ...
+    def post_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[Data] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[Any, Any]:
+        """Like `post`, but return a `Result` carrying the decoded body alongside the response
+        status and headers. Pass `response_headers_type` to also get the headers parsed into
+        `result.typed_headers`.
+        """
+        return self._send_with_body_result(
+            self._client.post(path),
+            params,
+            headers,
+            json,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
 
@@ -1818,6 +2572,7 @@ class SyncHTTPClient:
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> bytes: ...
     @overload
@@ -1831,6 +2586,7 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> TData: ...
     def put(
@@ -1843,6 +2599,7 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] = bytes,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> Data:
         """PUT to `path`. Same body/decode rules as `post`."""
@@ -1854,6 +2611,94 @@ class SyncHTTPClient:
             form,
             content,
             response_data_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+        )
+
+    @overload
+    def put_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[bytes]: ...
+    @overload
+    def put_result[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[TData]: ...
+    @overload
+    def put_result[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[bytes, THeaders]: ...
+    @overload
+    def put_result[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[TData, THeaders]: ...
+    def put_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[Data] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[Any, Any]:
+        """Like `put`, but return a `Result` carrying the decoded body alongside the response
+        status and headers. Pass `response_headers_type` to also get the headers parsed into
+        `result.typed_headers`.
+        """
+        return self._send_with_body_result(
+            self._client.put(path),
+            params,
+            headers,
+            json,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
 
@@ -1867,6 +2712,7 @@ class SyncHTTPClient:
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> bytes: ...
     @overload
@@ -1880,6 +2726,7 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> TData: ...
     def patch(
@@ -1892,6 +2739,7 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] = bytes,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> Data:
         """PATCH `path`. Same body/decode rules as `post`."""
@@ -1903,6 +2751,94 @@ class SyncHTTPClient:
             form,
             content,
             response_data_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+        )
+
+    @overload
+    def patch_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[bytes]: ...
+    @overload
+    def patch_result[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[TData]: ...
+    @overload
+    def patch_result[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[bytes, THeaders]: ...
+    @overload
+    def patch_result[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[TData, THeaders]: ...
+    def patch_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        json: JSONPayload | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[Data] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+    ) -> Result[Any, Any]:
+        """Like `patch`, but return a `Result` carrying the decoded body alongside the response
+        status and headers. Pass `response_headers_type` to also get the headers parsed into
+        `result.typed_headers`.
+        """
+        return self._send_with_body_result(
+            self._client.patch(path),
+            params,
+            headers,
+            json,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
 
@@ -1943,6 +2879,74 @@ class SyncHTTPClient:
             None,
             None,
             response_data_type,
+            infer_mime_type_from_file_extension=True,
+            error_for_status=error_for_status,
+        )
+
+    @overload
+    def delete_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        error_for_status: bool = True,
+    ) -> Result[bytes]: ...
+    @overload
+    def delete_result[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        response_data_type: type[TData],
+        error_for_status: bool = True,
+    ) -> Result[TData]: ...
+    @overload
+    def delete_result[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+    ) -> Result[bytes, THeaders]: ...
+    @overload
+    def delete_result[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+    ) -> Result[TData, THeaders]: ...
+    def delete_result(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        response_data_type: type[Data] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        error_for_status: bool = True,
+    ) -> Result[Any, Any]:
+        """Like `delete`, but return a `Result` carrying the decoded body alongside the response
+        status and headers. Pass `response_headers_type` to also get the headers parsed into
+        `result.typed_headers`.
+        """
+        return self._send_with_body_result(
+            self._client.delete(path),
+            params,
+            headers,
+            None,
+            None,
+            None,
+            response_data_type,
+            response_headers_type,
+            infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
         )
 
