@@ -27,5 +27,5 @@ async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
 ```
 
 A validation error from whichever decode library you picked (`pydantic.ValidationError`,
-`msgspec.ValidationError`, `typeguard.TypeCheckError`) is never wrapped — it propagates as-is,
-since choosing that library as a `response_data_type` is opting into its own exception too.
+`msgspec.ValidationError`) is never wrapped — it propagates as-is, since choosing that library as
+a `response_data_type` is opting into its own exception too.

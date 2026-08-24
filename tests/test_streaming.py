@@ -1,11 +1,11 @@
-from typing import Any, TypedDict, cast
+from typing import Any, cast
 
 import pytest
 from msgspec import Struct
 from msgspec.json import Decoder
 from pydantic import BaseModel, TypeAdapter
 
-from lothc import JSON, HTTPClient, HTTPConnectionError, SyncHTTPClient
+from lothc import HTTPClient, HTTPConnectionError, SyncHTTPClient
 
 
 class Line(Struct):
@@ -13,10 +13,6 @@ class Line(Struct):
 
 
 class LineModel(BaseModel):
-    i: int
-
-
-class LineDict(TypedDict):
     i: int
 
 
@@ -43,7 +39,7 @@ async def test_stream_get_raw_mode_does_not_split_embedded_newlines(client: HTTP
 async def test_stream_get_decodes_response_data_type(client: HTTPClient) -> None:
     lines = [
         line
-        async for line in client.stream_get("ndjson", params={"count": 3}, response_data_type=JSON)
+        async for line in client.stream_get("ndjson", params={"count": 3}, response_data_type=dict)
     ]
 
     assert lines == [{"i": 0}, {"i": 1}, {"i": 2}]
@@ -61,7 +57,7 @@ async def test_stream_post_decodes_typed_lines(client: HTTPClient) -> None:
 
 
 def test_sync_stream_get_decodes_response_data_type(sync_client: SyncHTTPClient) -> None:
-    lines = list(sync_client.stream_get("ndjson", params={"count": 3}, response_data_type=JSON))
+    lines = list(sync_client.stream_get("ndjson", params={"count": 3}, response_data_type=dict))
 
     assert lines == [{"i": 0}, {"i": 1}, {"i": 2}]
 
@@ -105,17 +101,6 @@ async def test_stream_get_decodes_via_pydantic_type_adapter(client: HTTPClient) 
     assert lines == [LineModel(i=0), LineModel(i=1), LineModel(i=2)]
 
 
-async def test_stream_get_decodes_typed_dict(client: HTTPClient) -> None:
-    lines = [
-        line
-        async for line in client.stream_get(
-            "ndjson", params={"count": 3}, response_data_type=LineDict
-        )
-    ]
-
-    assert lines == [{"i": 0}, {"i": 1}, {"i": 2}]
-
-
 async def test_stream_get_raw_bytes_mode_error_for_status_false_suppresses_raise(
     client: HTTPClient,
 ) -> None:
@@ -128,7 +113,7 @@ async def test_stream_get_skips_blank_lines_between_ndjson_records(client: HTTPC
     lines = [
         line
         async for line in client.stream_get(
-            "ndjson-blank-line", params={"count": 3}, response_data_type=JSON
+            "ndjson-blank-line", params={"count": 3}, response_data_type=dict
         )
     ]
 
@@ -174,7 +159,7 @@ def test_sync_stream_get_skips_blank_lines_between_ndjson_records(
     sync_client: SyncHTTPClient,
 ) -> None:
     lines = list(
-        sync_client.stream_get("ndjson-blank-line", params={"count": 3}, response_data_type=JSON)
+        sync_client.stream_get("ndjson-blank-line", params={"count": 3}, response_data_type=dict)
     )
 
     assert lines == [{"i": 0}, {"i": 1}, {"i": 2}]

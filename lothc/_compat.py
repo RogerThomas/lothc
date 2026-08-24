@@ -2,7 +2,6 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     import msgspec
-    import typeguard
     from msgspec import Struct
     from msgspec.json import Decoder
     from pydantic import BaseModel, TypeAdapter
@@ -26,10 +25,5 @@ else:
 
         class TypeAdapter: ...
 
-    try:
-        import typeguard
-    except ImportError:
-        typeguard = None
 
-
-__all__ = ["BaseModel", "Decoder", "Struct", "TypeAdapter", "msgspec", "typeguard"]
+__all__ = ["BaseModel", "Decoder", "Struct", "TypeAdapter", "msgspec"]

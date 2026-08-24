@@ -33,13 +33,12 @@ async for event in client.sse("events"):
     print(event.data, event.event, event.id)  # SSEEvent[str, str]
 ```
 
-## The `id` field — `id_type`
+## The `id` field — `id_type` and `allow_missing_id`
 
 `id:` is always literal text on the wire, but it's frequently used to encode an integer, a
-`uuid.UUID`, or anything else with a single-argument `str`-taking constructor. `id_type` is the
-single knob for both *whether `id` is required* and *what type it becomes* — pass the type you
-want, and union it with `None` yourself when it's optional, the same way you'd write
-`response_data_type=ItemCreated | ItemDeleted` for a discriminated union elsewhere:
+`uuid.UUID`, or anything else with a single-argument `str`-taking constructor. Two independent
+knobs control it: `id_type` picks what `.id` becomes, and `allow_missing_id` picks whether a
+missing `id:` raises or becomes `None`:
 
 ```python
 async for event in client.sse("events"):
@@ -48,19 +47,18 @@ async for event in client.sse("events"):
 async for event in client.sse("events", id_type=int):
     print(event.id)  # int — required, coerced
 
-async for event in client.sse("events", id_type=int | None):
+async for event in client.sse("events", id_type=int, allow_missing_id=True):
     print(event.id)  # int | None — optional, coerced when present
 
-async for event in client.sse("events", id_type=None):
+async for event in client.sse("events", allow_missing_id=True):
     print(event.id)  # str | None — optional, never coerced
 ```
 
-- **`id_type=str`** (the default) — required, `.id` stays plain `str`.
-- **a bare type** (`id_type=int`, `id_type=uuid.UUID`) — required, `.id` coerced via
-  `id_type(raw_id)`.
-- **a type unioned with `None`** (`id_type=int | None`) — optional; coerced when present, `None`
-  when the event has no `id:`.
-- **`id_type=None`** (bare) — optional, `.id` stays `str | None`, never coerced.
+- **`id_type=str`** (the default) — `.id` stays plain `str`.
+- **a bare type** (`id_type=int`, `id_type=uuid.UUID`) — `.id` coerced via `id_type(raw_id)`.
+- **`allow_missing_id=False`** (the default) — a missing `id:` raises.
+- **`allow_missing_id=True`** — a missing `id:` becomes `None` instead of raising; the coercion
+  type still applies when `id:` *is* present.
 
 A conversion failure (e.g. `int("not-a-number")`) propagates as whatever exception that type's
 constructor raises — it isn't wrapped, same as every other decode-library error in lothc.
@@ -102,33 +100,10 @@ Pass `response_data_type` to decode `.data` into a typed object instead of leavi
         print(event.event)  # still populated, e.g. 'tick'
     ```
 
-=== "TypedDict"
+=== "dict"
 
     ```python
-    from typing import TypedDict
-
-
-    class ItemModel(TypedDict):
-        id: int
-        name: str
-
-
-    async for event in client.sse("events", response_data_type=ItemModel):
-        print(event.data)  # e.g. {'id': 25, 'name': 'pikachu'}
-        print(event.event)  # still populated, e.g. 'tick'
-    ```
-
-    !!! warning
-
-        Install the `typeguard` extra to get the `TypedDict` fields validated at runtime — same
-        caveat as everywhere else `TypedDict` is used as a decode target.
-
-=== "JSON"
-
-    ```python
-    from lothc import JSON
-
-    async for event in client.sse("events", response_data_type=JSON):
+    async for event in client.sse("events", response_data_type=dict):
         print(event.data)  # e.g. {'id': 25, 'name': 'pikachu', ...}
         print(event.event)  # still populated, e.g. 'tick'
     ```

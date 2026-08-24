@@ -41,10 +41,10 @@ async for item in client.stream_get("stream/items", response_data_type=ItemModel
     print(item)  # ItemModel(...), one per NDJSON line
 ```
 
-Same decode targets as everywhere else — a pydantic `BaseModel`, a msgspec `Struct`, a
-`TypedDict`, `lothc.JSON`, or a pydantic `TypeAdapter`/msgspec `Decoder` for a discriminated
-union (see [SSE](sse.md) for the equivalent pattern). A trailing line with no final `\n` is
-still decoded once the connection closes.
+Same decode targets as everywhere else — a pydantic `BaseModel`, a msgspec `Struct`,
+plain `dict`, or a pydantic `TypeAdapter`/msgspec `Decoder` for a discriminated union (see
+[SSE](sse.md) for the equivalent pattern). A trailing line with no final `\n` is still decoded
+once the connection closes.
 
 !!! warning
 

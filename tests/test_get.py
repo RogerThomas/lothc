@@ -1,12 +1,18 @@
 import json
-from typing import Any, TypedDict, cast
+from typing import Any, cast
 
 import pytest
 from msgspec import Struct
 from pydantic import BaseModel
-from typeguard import TypeCheckError
 
-from lothc import JSON, HTTPClient, HTTPResponseError, SyncHTTPClient
+from lothc import HTTPClient, HTTPResponseError, SyncHTTPClient
+
+# pylint: disable=duplicate-code
+# ItemModel/ItemStruct below are the same trivial fixture shape as test_write.py's own — not
+# shared via a fixture since each is a two-line, self-contained class, and style-guide.md's
+# "almost never use globals" preference for tests already argues against a shared module-level
+# constant instead. duplicate-code disabled file-wide (a line-level pragma doesn't suppress this
+# particular check — confirmed live) rather than for just this one pair.
 
 
 class ItemModel(BaseModel):
@@ -17,20 +23,6 @@ class ItemModel(BaseModel):
 class ItemStruct(Struct):
     id: int
     name: str
-
-
-class ItemDict(TypedDict):
-    id: int
-    name: str
-
-
-class ItemIdOnlyDict(TypedDict):
-    id: int
-
-
-class ItemWrongTypeDict(TypedDict):
-    id: int
-    name: int
 
 
 class SearchParamsModel(BaseModel):
@@ -62,36 +54,19 @@ async def test_get_decodes_msgspec_struct(client: HTTPClient) -> None:
     assert item == ItemStruct(id=7, name="item-7")
 
 
-async def test_get_decodes_lothc_json(client: HTTPClient) -> None:
-    item = await client.get("items/7", response_data_type=JSON)
+async def test_get_decodes_plain_dict(client: HTTPClient) -> None:
+    item = await client.get("items/7", response_data_type=dict)
     assert item == {"id": 7, "name": "item-7"}
-
-
-async def test_get_decodes_typed_dict(client: HTTPClient) -> None:
-    item = await client.get("items/7", response_data_type=ItemDict)
-    assert item == {"id": 7, "name": "item-7"}
-
-
-async def test_get_typed_dict_ignores_undeclared_extra_keys(client: HTTPClient) -> None:
-    item = await client.get("items/7", response_data_type=ItemIdOnlyDict)
-    assert item == {"id": 7, "name": "item-7"}
-
-
-async def test_get_typed_dict_still_raises_for_a_declared_key_wrong_type(
-    client: HTTPClient,
-) -> None:
-    with pytest.raises(TypeCheckError):
-        await client.get("items/7", response_data_type=ItemWrongTypeDict)
 
 
 async def test_get_with_raw_dict_params(client: HTTPClient) -> None:
-    result = await client.get("items", params={"q": "pikachu", "page": 2}, response_data_type=JSON)
+    result = await client.get("items", params={"q": "pikachu", "page": 2}, response_data_type=dict)
     assert result == {"q": "pikachu", "page": 2, "items": [{"id": 2, "name": "pikachu-match"}]}
 
 
 async def test_get_with_pydantic_params_omits_none_fields(client: HTTPClient) -> None:
     result = await client.get(
-        "items", params=SearchParamsModel(q="pikachu", page=1), response_data_type=JSON
+        "items", params=SearchParamsModel(q="pikachu", page=1), response_data_type=dict
     )
     assert result["q"] == "pikachu"
     assert result["page"] == 1
@@ -99,14 +74,14 @@ async def test_get_with_pydantic_params_omits_none_fields(client: HTTPClient) ->
 
 async def test_get_with_msgspec_params(client: HTTPClient) -> None:
     result = await client.get(
-        "items", params=SearchParamsStruct(q="pikachu", page=1), response_data_type=JSON
+        "items", params=SearchParamsStruct(q="pikachu", page=1), response_data_type=dict
     )
     assert result["q"] == "pikachu"
 
 
 async def test_get_with_raw_headers(client: HTTPClient) -> None:
     result = await client.get(
-        "echo-headers", headers={"x-custom": "header-value"}, response_data_type=JSON
+        "echo-headers", headers={"x-custom": "header-value"}, response_data_type=dict
     )
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["x-custom"] == "header-value"
@@ -126,7 +101,7 @@ async def test_get_with_pydantic_headers_omits_none_fields(client: HTTPClient) -
     result = await client.get(
         "echo-headers",
         headers=TypedHeadersModel(x_custom="header-value"),
-        response_data_type=JSON,
+        response_data_type=dict,
     )
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["x-custom"] == "header-value"
@@ -137,7 +112,7 @@ async def test_get_with_msgspec_headers_omits_none_fields(client: HTTPClient) ->
     result = await client.get(
         "echo-headers",
         headers=TypedHeadersStruct(x_custom="header-value"),
-        response_data_type=JSON,
+        response_data_type=dict,
     )
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["x-custom"] == "header-value"
@@ -148,7 +123,7 @@ async def test_default_headers_sent_on_every_request(base_url: str) -> None:
     async with HTTPClient.build(
         base_url=base_url, default_headers={"x-api-key": "secret"}
     ) as client:
-        result = await client.get("echo-headers", response_data_type=JSON)
+        result = await client.get("echo-headers", response_data_type=dict)
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["x-api-key"] == "secret"
@@ -168,11 +143,6 @@ async def test_get_error_for_status_false_suppresses_raise(client: HTTPClient) -
 async def test_get_response_data_type_not_a_class_raises_type_error(client: HTTPClient) -> None:
     with pytest.raises(TypeError, match="must be a class"):
         await client.get("items/7", response_data_type=cast(Any, "not-a-class"))
-
-
-async def test_get_response_data_type_bare_dict_raises_type_error(client: HTTPClient) -> None:
-    with pytest.raises(TypeError, match="response_data_type=dict is not supported"):
-        await client.get("items/7", response_data_type=cast(Any, dict))
 
 
 class _Unsupported:
@@ -196,18 +166,8 @@ def test_sync_get_decodes_msgspec_struct(sync_client: SyncHTTPClient) -> None:
     assert item == ItemStruct(id=7, name="item-7")
 
 
-def test_sync_get_decodes_lothc_json(sync_client: SyncHTTPClient) -> None:
-    item = sync_client.get("items/7", response_data_type=JSON)
-    assert item == {"id": 7, "name": "item-7"}
-
-
-def test_sync_get_decodes_typed_dict(sync_client: SyncHTTPClient) -> None:
-    item = sync_client.get("items/7", response_data_type=ItemDict)
-    assert item == {"id": 7, "name": "item-7"}
-
-
-def test_sync_get_typed_dict_ignores_undeclared_extra_keys(sync_client: SyncHTTPClient) -> None:
-    item = sync_client.get("items/7", response_data_type=ItemIdOnlyDict)
+def test_sync_get_decodes_plain_dict(sync_client: SyncHTTPClient) -> None:
+    item = sync_client.get("items/7", response_data_type=dict)
     assert item == {"id": 7, "name": "item-7"}
 
 

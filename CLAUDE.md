@@ -8,11 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 (a Rust-backed HTTP client). It provides a single, consistent typed API surface — `HTTPClient` (async)
 and `SyncHTTPClient` (sync) — with first-class, optional support for both **pydantic** and **msgspec** as
 both decode AND encode targets (a `BaseModel`/`Struct` instance can be passed directly as `json=`, not
-just used as a `response_data_type`), plus **TypedDict** support (decode-only — optionally validated at
-runtime via **typeguard** if installed).
+just used as a `response_data_type`).
 
-pydantic, msgspec, and typeguard are all optional extras (see `lothc/_compat.py`) — the library must
-work with none, either, or all of them installed.
+pydantic and msgspec are both optional extras (see `lothc/_compat.py`) — the library must work with
+neither, either, or both installed. `TypedDict`/`typeguard` support was deliberately removed (not
+just never added) — see the "Dropped: TypedDict/typeguard support" note under Development notes for
+why.
 
 ## Status
 
@@ -83,7 +84,7 @@ wrapping (`HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError`), `put`/
 for arbitrary binary content; pass `response_data_type` to switch to newline-buffered NDJSON-style typed
 decoding instead — the buffering is conditional on that param, not always-on), `download` (see the
 large-object note below), the `Data` decode-target
-system (`bytes` default, `lothc.JSON`, `TypedDict` + optional `typeguard` validation), a bearer-token
+system (`bytes` default, plain `dict`, pydantic `BaseModel`, msgspec `Struct`), a bearer-token
 auth provider (static `bearer_token` or a per-request-refreshed `bearer_auth` callable), cookie/session
 support (`cookie_store=True`), redirect control (`follow_redirects`/`max_redirects`), proxy config
 (`proxy=`), and retries (`max_retries`/`retry_methods`, implemented as a real pyreqwest
@@ -182,18 +183,16 @@ Two suites exist so far:
 
 - `asv_bench/bench_download.py`: `get()` vs `download()` bytes-mode vs `download(dest=Path)` against
   a large body, both `time_*` and `peakmem_*`.
-- `asv_bench/bench_verbs.py`: `get()` against all five decode targets it supports (raw `bytes`,
-  `lothc.JSON`, pydantic `BaseModel`, msgspec `Struct`, `TypedDict` — the last exercises typeguard's
-  runtime validation when it's installed) plus `post()`, against small, realistic JSON bodies via
-  the exact same stdlib server the real pytest suite runs against (`tests/_server.py`, loaded the
-  same importlib way `examples/server.py` does — no `sys.path` hack). Deliberately simpler than
-  `bench_download.py`: a body this small never meaningfully skews a `peakmem_*` measurement, so
-  there's no need for a separate-process server, and no `setup_cache()` since there's no expensive
-  fixture to cache. Because pydantic/msgspec/typeguard are optional extras, not lothc's own hard
-  dependency, `asv.conf.json`'s `matrix.req` explicitly installs all three into every real isolated
-  `asv run`/`asv continuous` environment — confirmed live (the built env is literally named
-  `uv-py3.14-msgspec-pydantic-typeguard`) — otherwise those benchmark methods would import-error in
-  a from-scratch build.
+- `asv_bench/bench_verbs.py`: `get()` against all four decode targets it supports (raw `bytes`,
+  plain `dict`, pydantic `BaseModel`, msgspec `Struct`) plus `post()`, against small, realistic
+  JSON bodies via the exact same stdlib server the real pytest suite runs against
+  (`tests/_server.py`, loaded the same importlib way `examples/server.py` does — no `sys.path`
+  hack). Deliberately simpler than `bench_download.py`: a body this small never meaningfully skews
+  a `peakmem_*` measurement, so there's no need for a separate-process server, and no
+  `setup_cache()` since there's no expensive fixture to cache. Because pydantic/msgspec are
+  optional extras, not lothc's own hard dependency, `asv.conf.json`'s `matrix.req` explicitly
+  installs both into every real isolated `asv run`/`asv continuous` environment — otherwise those
+  benchmark methods would import-error in a from-scratch build.
 
 ### Instant no-git benchmark check
 
@@ -278,7 +277,7 @@ benchmarks here:
 
 Everything lives in `lothc/_client.py` (one file, deliberately — split it once it earns a split).
 `lothc/__init__.py` re-exports the public surface. `lothc/_compat.py` isolates the optional
-pydantic/msgspec/typeguard imports (`TYPE_CHECKING` block + runtime `try/except ImportError` with stub
+pydantic/msgspec imports (`TYPE_CHECKING` block + runtime `try/except ImportError` with stub
 fallback classes).
 
 ### The two clients
@@ -331,9 +330,9 @@ Before writing any code, tell the user that you've read this file AND read and f
 - **Status errors are separate from transport errors.** `HTTPResponseError` (4xx/5xx with a body_start
   snippet) is a different failure class from `HTTPTransportError` (never got a response at all) —
   don't unify them.
-- **Validation errors from the chosen decode library are NOT wrapped.** A `pydantic.ValidationError`,
-  `msgspec.ValidationError`, or `typeguard.TypeCheckError` propagates natively — the user opted into
-  that library by choosing it as a `response_data_type`, so its own exception is the expected one to see.
+- **Validation errors from the chosen decode library are NOT wrapped.** A `pydantic.ValidationError`
+  or `msgspec.ValidationError` propagates natively — the user opted into that library by choosing
+  it as a `response_data_type`, so its own exception is the expected one to see.
 - **basedpyright strict mode is the contract.** Every change must pass `task typecheck` with zero
   errors and, ideally, zero new `cast(...)` calls.
 - **Overload-pairs over a single generic-with-cast signature.** Every verb has two (or more) `@overload`s
@@ -346,23 +345,30 @@ Before writing any code, tell the user that you've read this file AND read and f
   it forces `cast()` at every branch inside the implementation.
 - **The `Data`/`JSONPayload`/`Params`/`Headers`/`Form`/`File` type aliases are named at the *instance* level**,
   not the class level — `File` is the tuple a caller passes, not `type[File]`. Keep new aliases
-  consistent with that (e.g. it's why `JSON` — a real class — reads correctly as `response_data_type: type[JSON]`
-  without a category-slip like `type[DataType]` would).
-  `JSONPayload` (the `json=` request-body alias) was named that way — not `Json` — specifically to
-  avoid a case-only collision with `JSON` (the response-decode class): they're unrelated concepts
-  (request input vs. response-decode target) that happened to differ only by capitalization, which
-  real code review flagged as a genuine readability trap, not just a style nit.
-- **Only `lothc.JSON` (or a subclass) and `TypedDict` classes are valid dict-shaped `response_data_type`s** — bare
-  `dict` and `dict[str, Any]` are rejected, both statically (not in the `Data` bound) and at runtime
-  (`_validate_response_data_type` raises `TypeError` for both). This was almost shipped with only the static
-  rejection — a real live bug: bare `dict` silently succeeded, `dict[str, Any]` crashed with an ugly
-  `issubclass() arg 1 must be a class` since a subscripted generic isn't a real class. **Lesson that
-  generalizes beyond this one bug: never claim something is "rejected/enforced" from a basedpyright
-  result alone — Python never enforces type hints at runtime, so verify the actual runtime behavior,
-  especially for anything that reads like a safety/validation guarantee.**
-  `_IsTypedDict` (a `Protocol` bounding on `__required_keys__: ClassVar[frozenset[str]]`) is how a real
-  `TypedDict` is admitted to the `Data` bound while bare `dict` still isn't — every TypedDict class has
-  that attribute (set by its metaclass), plain `dict` doesn't.
+  consistent with that. `JSONPayload` (the `json=` request-body alias, `dict[str, Any] | BaseModel
+  | Struct`) was named that way — not `Json` — to avoid a case-only collision with the former
+  `JSON` response-decode class (removed, see below): they were unrelated concepts (request input
+  vs. response-decode target) that happened to differ only by capitalization, which real code
+  review flagged as a genuine readability trap, not just a style nit. `JSONPayload` itself is
+  unaffected by that class's removal — it's a plain `dict`/model union, never a `JSON` reference.
+- **Bare `dict` is a valid `response_data_type` (and `Data` bound member); a subscripted
+  `dict[str, Any]` is still rejected.** There used to be a dedicated `class JSON(dict[str, Any])`
+  purely so a caller had a *concrete, already-parametrized* class to pass — bare `dict` was
+  explicitly rejected (`_validate_response_data_type` raised `TypeError`) because passing it to a
+  single generic `type[TData]` overload resolved to `dict[Unknown, Unknown]` under basedpyright
+  strict mode (a generic overload copies the *argument's own* static type; it never fills in type
+  arguments from `Data`'s member list). Fixed properly instead of living with that limitation:
+  every verb that has a `[TData: Data]`-bound overload also got a second, non-generic, dedicated
+  overload with `response_data_type: type[dict[str, Any]]` (hardcoding the return type instead of
+  inferring it) placed alongside it — confirmed live via `reveal_type` that `client.get(path,
+  response_data_type=dict)` now resolves to `dict[str, Any]`, not `Unknown`. This touched 26
+  overload sites (13 verb-groups — `get`/`get_result`/`post`/`post_result`/`put`/`put_result`/
+  `patch`/`patch_result`/`delete`/`delete_result`/`sse`/`stream_get`/`stream_post` — × both
+  clients). `JSON` was removed entirely once this landed, since a plain `dict` does everything it
+  did with no lothc-specific name to learn. **Lesson that generalizes beyond this one case: never
+  claim something is "rejected/enforced" from a basedpyright result alone — Python never enforces
+  type hints at runtime, so verify the actual runtime behavior, especially for anything that reads
+  like a safety/validation guarantee.**
 - **`bearer_token` (static) / `bearer_auth` (a callable, resolved fresh on every request) — not
   `auth_token`/`auth`.** Renamed deliberately: both mechanisms only ever produce a Bearer
   `Authorization` header via pyreqwest's `.bearer_auth()`, and the old generic names hid that. Keep this
@@ -384,20 +390,29 @@ Before writing any code, tell the user that you've read this file AND read and f
   site passes `event=` explicitly regardless). `.id` is genuinely `str | None` by default, since
   the SSE spec makes `id:` an optional field a server can choose never to send — this isn't
   overcaution to relax later, it's a real invariant, which is why `TId` exists at all.
-  **`id_type: type[Any] | UnionType | None = str` is `sse()`'s single knob for both
-  requiredness and type of `.id`** — this used to be two separate params (`id_type` for
-  coercion, `require` for a `Literal["event", "id", "id-event"] | None` presence check covering
-  both fields), then briefly a version of `id_type` alone that couldn't express "optional but
-  coerced when present" (e.g. `uuid.UUID | None`) at all. Fixed by accepting a real union
-  directly: `id_type=int | None` works the same way `response_data_type=A | B` already does for
-  discriminated unions — `type[TId]` binds `TId` to whatever's passed, union or not, and
-  `_coerce_sse_id` inspects it at runtime via `isinstance(id_type, UnionType)` +
-  `get_args(id_type)` to decide (a) whether `NoneType` is a member (→ optional) and (b) the
-  non-`None` member to actually coerce to (falls back to `str` if `id_type` was bare `None`).
-  `require`'s `"event"` half never affected any type (`.event` is never `None` either way, see
-  above) and was pure orthogonal noise — dropped rather than folded in. Don't reintroduce a
-  separate requiredness param: bare `str`/a type = required, that same type unioned with `None`
-  (or bare `None`) = optional, and that already covers every combination there is.
+  **`id_type: type[TId] = str` + `allow_missing_id: bool = False` are `sse()`'s two independent
+  knobs for `.id`'s type and requiredness, respectively.** This went through three designs: two
+  separate params (`id_type` for coercion, `require` for a `Literal["event", "id",
+  "id-event"] | None` presence check covering both fields — `require`'s `"event"` half never
+  affected any type, `.event` is never `None` either way, and was pure orthogonal noise); then a
+  version accepting a real union directly (`id_type=int | None`, mirroring how
+  `response_data_type=A | B` works for discriminated unions) — this gave `basedpyright` genuinely
+  precise inference (it decomposes a union argument against a generic overload into a union of
+  results), but empirically broke every *other* type checker: `mypy`/`ty`/`zuban` all hard-error
+  on a real `UnionType` *value* being passed where a generic `type[TId]` is declared, since none
+  of them have `basedpyright`'s union-decomposition-as-fallback behavior, and widening the
+  overload to accept `UnionType` directly to satisfy them made `basedpyright` degrade to
+  `Unknown` for that exact call shape — confirmed via a real four-checker comparison, not just
+  reasoning about it. The current two-param design was tested the same way and gets full,
+  identical precision on all four checkers with zero tradeoff (confirmed via `reveal_type` on all
+  four for `id_type` omitted/given crossed with `allow_missing_id` omitted/given) — because
+  neither param is ever asked to accept a union *value*, only a plain `type[TId]` and a plain
+  `bool`, which every checker already understands identically. `_coerce_sse_id` reflects this:
+  `real_type = id_type if id_type is not None else str`, then raise-or-`None` on missing gated by
+  `allow_missing_id` alone — no more `isinstance(id_type, UnionType)`/`get_args` inspection
+  needed at all, since a union is never passed in the first place now. Don't reintroduce a
+  union-accepting `id_type` — it's a strictly worse trade across the four-checker goal than what
+  replaced it.
   Originally `sse(response_data_type=...)` returned the decoded payload bare, discarding
   `.event`/`.id` entirely — a real gap caught while writing the docs. Don't reintroduce that: any
   change to SSE parsing must keep decoding scoped to `parsed_record.data`, then build a new
@@ -456,19 +471,16 @@ Before writing any code, tell the user that you've read this file AND read and f
   pyreqwest's own parser into a Python dict, then pydantic validates that dict (an extra
   dict-construction round-trip); the latter lets pydantic-core parse the JSON bytes directly.
   Tracked by `asv_bench/bench_verbs.py`'s `time_get_pydantic`/`peakmem_get_pydantic`.
-- **`_validate_typed_dict` only validates a `TypedDict`'s own declared keys, ignoring anything
-  extra in the response — a real bug, not a design choice, caught live via the docs' own
-  Quickstart example against the real PokéAPI (`/pokemon/pikachu` has ~20 fields beyond the
-  `id`/`name` the docs' `Pokemon(TypedDict)` declares).** `typeguard.check_type()` rejects any
-  key not in `__annotations__` by default (confirmed by reading `typeguard/_checkers.py`'s
-  `check_typed_dict`: `NoExtraItems` is the default unless the TypedDict itself opts into PEP
-  728's `extra_items=`, which is a property of how the caller defined their TypedDict class, not
-  something lothc can pass in) — so a `TypedDict` declaring a deliberate subset of a larger
-  response was the one decode target that errored on exactly the fields it chose not to care
-  about, while msgspec `Struct`/pydantic `BaseModel` both silently ignore unknown fields by
-  default. Fixed by filtering the dict down to only `response_data_type.__annotations__`'s keys
-  before handing it to `typeguard.check_type` — missing-required-key and wrong-type checks on
-  declared fields are unaffected (filtering only ever removes undeclared keys, never declared
-  ones), confirmed via a real test asserting a genuinely wrong-typed declared field still raises
-  `TypeCheckError`. The *returned* dict is never filtered — extra keys are still present in the
-  result either way, matching what already happens when typeguard isn't installed at all.
+- **Dropped: `TypedDict`/`typeguard` support.** `response_data_type` used to also accept a
+  `TypedDict` class, decode-only, optionally validated at runtime via `typeguard` if installed
+  (with its own `_IsTypedDict` Protocol bounding on `__required_keys__: ClassVar[frozenset[str]]`
+  to admit a `TypedDict` into the `Data` bound, and a `_validate_typed_dict` helper that filtered
+  the dict down to declared keys before validating, since `typeguard.check_type()` rejects any
+  undeclared key by default — unlike msgspec `Struct`/pydantic `BaseModel`, which both silently
+  ignore unknown fields). Removed entirely, deliberately, not just left unmaintained: pydantic and
+  msgspec are the right tools for real validation, and keeping a third, weaker decode path around
+  (pure-Python `isinstance` walks, no compiled validator, ~3.4-3.6x slower per a real benchmark —
+  see git history for the numbers) added surface area without adding a capability the other two
+  didn't already cover better. If this ever needs resurrecting, the old `_IsTypedDict`/
+  `_validate_typed_dict` design is preserved in this file's own git history, not reinvented from
+  scratch.

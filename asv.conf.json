@@ -11,8 +11,7 @@
     "matrix": {
         "req": {
             "pydantic": [""],
-            "msgspec": [""],
-            "typeguard": [""]
+            "msgspec": [""]
         }
     },
     "benchmark_dir": "asv_bench",
