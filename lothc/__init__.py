@@ -1,5 +1,4 @@
 from ._client import (
-    JSON,
     AuthProvider,
     Data,
     File,
@@ -20,7 +19,6 @@ from ._client import (
 )
 
 __all__ = [
-    "JSON",
     "AuthProvider",
     "Data",
     "File",

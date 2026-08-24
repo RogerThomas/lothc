@@ -12,11 +12,10 @@ async def test_download_returns_raw_bytes_by_default(client: HTTPClient) -> None
 
 
 async def test_download_writes_to_file_when_dest_given(client: HTTPClient, tmp_path: Path) -> None:
-    dest = tmp_path / "out.bin"
+    dest = tmp_path / "dest"
 
-    result = await client.download("binary", dest)
+    await client.download("binary", dest)
 
-    assert result is None
     assert dest.read_bytes() == b"AAA\nBBB\x00\nCCC"
 
 
@@ -42,11 +41,10 @@ def test_sync_download_returns_raw_bytes_by_default(sync_client: SyncHTTPClient)
 def test_sync_download_writes_to_file_when_dest_given(
     sync_client: SyncHTTPClient, tmp_path: Path
 ) -> None:
-    dest = tmp_path / "out.bin"
+    dest = tmp_path / "dest"
 
-    result = sync_client.download("binary", dest)
+    sync_client.download("binary", dest)
 
-    assert result is None
     assert dest.read_bytes() == b"AAA\nBBB\x00\nCCC"
 
 

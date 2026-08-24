@@ -1,6 +1,6 @@
 from pydantic import BaseModel
 
-from lothc import JSON, HTTPClient, SyncHTTPClient
+from lothc import HTTPClient, SyncHTTPClient
 
 
 class EchoedHeaders(BaseModel):
@@ -14,13 +14,13 @@ async def test_delete_returns_raw_bytes_by_default(client: HTTPClient) -> None:
 
 
 async def test_delete_decodes_response_data_type(client: HTTPClient) -> None:
-    result = await client.delete("items/7", response_data_type=JSON)
+    result = await client.delete("items/7", response_data_type=dict)
 
     assert result == {"id": 7, "deleted": True}
 
 
 async def test_delete_result_includes_status_and_data(client: HTTPClient) -> None:
-    result = await client.delete_result("items/7", response_data_type=JSON)
+    result = await client.delete_result("items/7", response_data_type=dict)
 
     assert result.status == 200
     assert result.data == {"id": 7, "deleted": True}
@@ -28,14 +28,14 @@ async def test_delete_result_includes_status_and_data(client: HTTPClient) -> Non
 
 async def test_delete_result_with_typed_headers(client: HTTPClient) -> None:
     result = await client.delete_result(
-        "items/7", response_data_type=JSON, response_headers_type=EchoedHeaders
+        "items/7", response_data_type=dict, response_headers_type=EchoedHeaders
     )
 
     assert result.typed_headers is not None
 
 
 def test_sync_delete_result_includes_status_and_data(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.delete_result("items/7", response_data_type=JSON)
+    result = sync_client.delete_result("items/7", response_data_type=dict)
 
     assert result.status == 200
     assert result.data == {"id": 7, "deleted": True}
@@ -56,7 +56,7 @@ async def test_head_returns_headers_only_result(client: HTTPClient) -> None:
 
 
 def test_sync_delete_decodes_response_data_type(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.delete("items/7", response_data_type=JSON)
+    result = sync_client.delete("items/7", response_data_type=dict)
 
     assert result == {"id": 7, "deleted": True}
 

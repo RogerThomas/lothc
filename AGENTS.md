@@ -29,12 +29,10 @@ sent on every request. `cookie_store=True` = in-memory jar. `proxy: str | None`.
 ## Decode targets (`response_data_type`, default `bytes`)
 
 - `bytes` — raw, default
-- `lothc.JSON` — `dict[str, Any]` subclass, zero validation
+- `dict` — plain `dict[str, Any]`, zero validation
 - pydantic `BaseModel` subclass
 - msgspec `Struct` subclass
-- `TypedDict` subclass — validated via typeguard if installed, else warns once
-  (`LOTHC_SUPPRESS_TYPEGUARD_WARNING=1` to silence)
-- bare `dict` / `dict[str, Any]` — NOT allowed, raises `TypeError`
+- `dict[str, Any]` (subscripted) — NOT allowed, raises `TypeError` (not a real class)
 
 ## Verbs
 
@@ -45,16 +43,14 @@ sent on every request. `cookie_store=True` = in-memory jar. `proxy: str | None`.
   at most one of `json`/`form`/`content`, else `ValueError`
 - `delete(path, *, params=None, headers=None, response_data_type=bytes, error_for_status=True) -> Data`
 - `head(path, *, params=None, headers=None, response_headers_type=None, error_for_status=True) -> Result[None]`
-- `sse(path, *, params=None, headers=None, response_data_type=None, id_type=str, error_for_status=True) -> Iterator[SSEEvent[TData, TId]]` —
+- `sse(path, *, params=None, headers=None, response_data_type=None, id_type=str, allow_missing_id=False, error_for_status=True) -> Iterator[SSEEvent[TData, TId]]` —
   always yields `SSEEvent(id=, event=, data=)` (kw-only, `SSEEvent[TData, TId=str]`).
   `response_data_type` controls `.data`'s type only (default `str`); class | pydantic
   `TypeAdapter` | msgspec `Decoder`. `.event` is always `str`, never `None` (spec defaults it to
-  `"message"` when absent from the wire). `.id` is genuinely `str | None` per spec — `id_type` is
-  the single knob for both requiredness and type: `str` (default, required, no coercion) | any
-  other bare type e.g. `int`/`uuid.UUID` (required, coerced via `id_type(raw)`) | that type
-  unioned with `None` e.g. `int | None` (optional, coerced when present, `None` when absent) |
-  bare `None` (optional, `.id: str | None`, never coerced) — pass a union the same way you'd
-  write `response_data_type=A | B` for a discriminated union, `TId` binds to whatever you pass
+  `"message"` when absent from the wire). `.id` is genuinely `str | None` per spec — two
+  independent knobs control it: `id_type` (a bare type, default `str`, coerced via
+  `id_type(raw)`) and `allow_missing_id` (default `False` — missing `id:` raises; `True` — `.id`
+  becomes `None` instead, coercion type still applies when present)
 - `stream_get(path, *, params=None, headers=None, response_data_type=None, error_for_status=True) -> Iterator[bytes | TLine]` —
   raw unbuffered bytes by default (safe for binary); `response_data_type` switches to
   newline-buffered per-line decode
@@ -72,7 +68,7 @@ tuple[str, bytes] | Path | BufferedIOBase`. `content`: raw `str | bytes` body.
 
 - `HTTPResponseError(status, body_start)` — 4xx/5xx, raised when `error_for_status=True` (default)
 - `HTTPTransportError` base; `HTTPTimeoutError`, `HTTPConnectionError` subclasses — no response received
-- pydantic/msgspec/typeguard validation errors propagate unwrapped (not translated)
+- pydantic/msgspec validation errors propagate unwrapped (not translated)
 
 ## Retries
 

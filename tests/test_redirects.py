@@ -1,9 +1,9 @@
-from lothc import JSON, HTTPClient
+from lothc import HTTPClient
 
 
 async def test_follow_redirects_true_by_default(base_url: str) -> None:
     async with HTTPClient.build(base_url=base_url) as client:
-        result = await client.get("redirect", response_data_type=JSON)
+        result = await client.get("redirect", response_data_type=dict)
 
     assert result == {"id": 7, "name": "item-7"}
 

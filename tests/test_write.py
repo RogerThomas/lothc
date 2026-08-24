@@ -7,7 +7,7 @@ import pytest
 from msgspec import Struct
 from pydantic import BaseModel
 
-from lothc import JSON, HTTPClient, SyncHTTPClient
+from lothc import HTTPClient, SyncHTTPClient
 
 
 class ItemModel(BaseModel):
@@ -54,7 +54,7 @@ async def test_post_with_form_fields_and_files(client: HTTPClient) -> None:
     result = await client.post(
         "upload",
         form={"note": "hello", "avatar": b"raw-bytes", "doc": ("doc.txt", b"file-content")},
-        response_data_type=JSON,
+        response_data_type=dict,
     )
 
     assert result["fields"] == {"note": "hello", "avatar": "raw-bytes"}
@@ -65,7 +65,7 @@ async def test_post_with_form_path_file(client: HTTPClient, tmp_path: Path) -> N
     upload_path = tmp_path / "upload.txt"
     upload_path.write_bytes(b"path-content")
 
-    result = await client.post("upload", form={"doc": upload_path}, response_data_type=JSON)
+    result = await client.post("upload", form={"doc": upload_path}, response_data_type=dict)
 
     assert result["files"] == [{"name": "doc", "filename": "upload.txt", "size": 12}]
 
@@ -85,7 +85,7 @@ async def test_post_with_form_int_and_buffered_file(client: HTTPClient, tmp_path
                 "doc": ("doc.txt", b"file-content"),
                 "avatar": opened_file,
             },
-            response_data_type=JSON,
+            response_data_type=dict,
         )
 
     assert result["fields"] == {"page": "3"}
@@ -101,7 +101,7 @@ async def test_post_with_form_buffered_value_without_a_name_attribute(
     # opened file) must still upload — just without a filename on the multipart part, which
     # this server surfaces as a plain field rather than a file entry.
     result = await client.post(
-        "upload", form={"blob": BytesIO(b"blob-content")}, response_data_type=JSON
+        "upload", form={"blob": BytesIO(b"blob-content")}, response_data_type=dict
     )
 
     assert result["fields"] == {"blob": "blob-content"}
@@ -110,7 +110,7 @@ async def test_post_with_form_buffered_value_without_a_name_attribute(
 
 async def test_post_with_form_file_mime_auto_inferred(client: HTTPClient) -> None:
     result = await client.post(
-        "upload", form={"avatar": ("a.png", b"png-bytes")}, response_data_type=JSON
+        "upload", form={"avatar": ("a.png", b"png-bytes")}, response_data_type=dict
     )
 
     parts = cast(list[dict[str, Any]], result["parts"])
@@ -123,7 +123,7 @@ async def test_post_with_form_file_explicit_mime_override(client: HTTPClient) ->
     result = await client.post(
         "upload",
         form={"avatar": ("a.png", b"png-bytes", "image/webp")},
-        response_data_type=JSON,
+        response_data_type=dict,
     )
 
     parts = cast(list[dict[str, Any]], result["parts"])
@@ -135,7 +135,7 @@ async def test_post_with_form_file_mime_inference_disabled(client: HTTPClient) -
         "upload",
         form={"avatar": ("a.png", b"png-bytes")},
         infer_mime_type_from_file_extension=False,
-        response_data_type=JSON,
+        response_data_type=dict,
     )
 
     parts = cast(list[dict[str, Any]], result["parts"])
@@ -149,7 +149,7 @@ async def test_post_with_form_path_with_content_type_override(
     upload_path.write_bytes(b"path-content")
 
     result = await client.post(
-        "upload", form={"doc": (upload_path, "application/pdf")}, response_data_type=JSON
+        "upload", form={"doc": (upload_path, "application/pdf")}, response_data_type=dict
     )
 
     parts = cast(list[dict[str, Any]], result["parts"])
@@ -167,7 +167,7 @@ async def test_post_with_form_bare_path_mime_auto_inferred(
     upload_path = tmp_path / "upload.pdf"
     upload_path.write_bytes(b"path-content")
 
-    result = await client.post("upload", form={"doc": upload_path}, response_data_type=JSON)
+    result = await client.post("upload", form={"doc": upload_path}, response_data_type=dict)
 
     parts = cast(list[dict[str, Any]], result["parts"])
     assert parts[0]["content_type"] == "application/pdf"
@@ -180,14 +180,14 @@ async def test_post_with_form_buffered_io_mime_auto_inferred(
     file_path.write_bytes(b"opened-content")
 
     with file_path.open("rb") as opened_file:
-        result = await client.post("upload", form={"doc": opened_file}, response_data_type=JSON)
+        result = await client.post("upload", form={"doc": opened_file}, response_data_type=dict)
 
     parts = cast(list[dict[str, Any]], result["parts"])
     assert parts[0]["content_type"] == "application/pdf"
 
 
 async def test_post_with_form_repeated_scalar_values(client: HTTPClient) -> None:
-    result = await client.post("upload", form={"tag": (1, "x")}, response_data_type=JSON)
+    result = await client.post("upload", form={"tag": (1, "x")}, response_data_type=dict)
 
     parts = cast(list[dict[str, Any]], result["parts"])
     tag_parts = [part for part in parts if part["name"] == "tag"]
@@ -198,7 +198,7 @@ async def test_post_with_form_repeated_file_values(client: HTTPClient) -> None:
     result = await client.post(
         "upload",
         form={"photos": (("a.png", b"1"), ("b.png", b"2"))},
-        response_data_type=JSON,
+        response_data_type=dict,
     )
 
     files = cast(list[dict[str, Any]], result["files"])
@@ -207,7 +207,7 @@ async def test_post_with_form_repeated_file_values(client: HTTPClient) -> None:
 
 
 async def test_post_with_form_json_array_body(client: HTTPClient) -> None:
-    result = await client.post("upload", form={"tags": ["a", "b"]}, response_data_type=JSON)
+    result = await client.post("upload", form={"tags": ["a", "b"]}, response_data_type=dict)
 
     parts = cast(list[dict[str, Any]], result["parts"])
     assert parts[0]["content_type"] == "application/json"
@@ -215,7 +215,7 @@ async def test_post_with_form_json_array_body(client: HTTPClient) -> None:
 
 
 async def test_post_with_form_json_object_body(client: HTTPClient) -> None:
-    result = await client.post("upload", form={"meta": {"k": "v"}}, response_data_type=JSON)
+    result = await client.post("upload", form={"meta": {"k": "v"}}, response_data_type=dict)
 
     parts = cast(list[dict[str, Any]], result["parts"])
     assert parts[0]["content_type"] == "application/json"
@@ -224,7 +224,7 @@ async def test_post_with_form_json_object_body(client: HTTPClient) -> None:
 
 async def test_post_with_form_json_body_from_pydantic_model(client: HTTPClient) -> None:
     result = await client.post(
-        "upload", form={"meta": ItemModel(id=1, name="ditto")}, response_data_type=JSON
+        "upload", form={"meta": ItemModel(id=1, name="ditto")}, response_data_type=dict
     )
 
     parts = cast(list[dict[str, Any]], result["parts"])
@@ -234,7 +234,7 @@ async def test_post_with_form_json_body_from_pydantic_model(client: HTTPClient) 
 
 async def test_post_with_form_json_body_from_msgspec_struct(client: HTTPClient) -> None:
     result = await client.post(
-        "upload", form={"meta": ItemStruct(id=1, name="ditto")}, response_data_type=JSON
+        "upload", form={"meta": ItemStruct(id=1, name="ditto")}, response_data_type=dict
     )
 
     parts = cast(list[dict[str, Any]], result["parts"])
@@ -246,7 +246,7 @@ def test_sync_post_with_form_file_explicit_mime_override(sync_client: SyncHTTPCl
     result = sync_client.post(
         "upload",
         form={"avatar": ("a.png", b"png-bytes", "image/webp")},
-        response_data_type=JSON,
+        response_data_type=dict,
     )
 
     parts = cast(list[dict[str, Any]], result["parts"])
@@ -254,7 +254,7 @@ def test_sync_post_with_form_file_explicit_mime_override(sync_client: SyncHTTPCl
 
 
 def test_sync_post_with_form_repeated_scalar_values(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.post("upload", form={"tag": (1, "x")}, response_data_type=JSON)
+    result = sync_client.post("upload", form={"tag": (1, "x")}, response_data_type=dict)
 
     parts = cast(list[dict[str, Any]], result["parts"])
     tag_parts = [part for part in parts if part["name"] == "tag"]
@@ -262,7 +262,7 @@ def test_sync_post_with_form_repeated_scalar_values(sync_client: SyncHTTPClient)
 
 
 def test_sync_post_with_form_json_array_body(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.post("upload", form={"tags": ["a", "b"]}, response_data_type=JSON)
+    result = sync_client.post("upload", form={"tags": ["a", "b"]}, response_data_type=dict)
 
     parts = cast(list[dict[str, Any]], result["parts"])
     assert parts[0]["content_type"] == "application/json"
@@ -277,7 +277,7 @@ async def test_post_with_form_unsupported_value_type_raises_type_error(
         await client.post(
             "upload",
             form={"note": "hello", "bogus": cast(Any, {1, 2, 3})},
-            response_data_type=JSON,
+            response_data_type=dict,
         )
 
 
@@ -288,7 +288,7 @@ def test_sync_post_with_form_unsupported_value_type_raises_type_error(
         sync_client.post(
             "upload",
             form={"note": "hello", "bogus": cast(Any, {1, 2, 3})},
-            response_data_type=JSON,
+            response_data_type=dict,
         )
 
 
@@ -301,7 +301,7 @@ async def test_post_with_form_unsupported_value_inside_repeated_tuple_raises_typ
         await client.post(
             "upload",
             form={"bogus": cast(Any, ("ok", {1, 2, 3}))},
-            response_data_type=JSON,
+            response_data_type=dict,
         )
 
 
@@ -323,7 +323,7 @@ def test_sync_post_with_form_all_value_types(sync_client: SyncHTTPClient, tmp_pa
                 "opened_doc": opened_file,
                 "blob": BytesIO(b"blob-content"),
             },
-            response_data_type=JSON,
+            response_data_type=dict,
         )
 
     assert result["fields"] == {
@@ -472,13 +472,13 @@ def test_sync_patch_renames_item(sync_client: SyncHTTPClient) -> None:
 
 
 async def test_post_with_string_content(client: HTTPClient) -> None:
-    result = await client.post("echo-body", content="hello", response_data_type=JSON)
+    result = await client.post("echo-body", content="hello", response_data_type=dict)
 
     assert result["body"] == "hello"
 
 
 async def test_post_with_bytes_content(client: HTTPClient) -> None:
-    result = await client.post("echo-body", content=b"hello-bytes", response_data_type=JSON)
+    result = await client.post("echo-body", content=b"hello-bytes", response_data_type=dict)
 
     assert result["body"] == "hello-bytes"
 
@@ -489,13 +489,13 @@ async def test_post_with_more_than_one_body_kind_raises_value_error(client: HTTP
 
 
 def test_sync_post_with_string_content(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.post("echo-body", content="hello", response_data_type=JSON)
+    result = sync_client.post("echo-body", content="hello", response_data_type=dict)
 
     assert result["body"] == "hello"
 
 
 def test_sync_post_with_bytes_content(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.post("echo-body", content=b"hello-bytes", response_data_type=JSON)
+    result = sync_client.post("echo-body", content=b"hello-bytes", response_data_type=dict)
 
     assert result["body"] == "hello-bytes"
 

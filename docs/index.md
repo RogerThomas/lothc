@@ -12,22 +12,25 @@ icon: lucide/rocket
 **L**ord **O**f **T**he **H**ttp **C**lients — a typed HTTP client for Python, built on
 [pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (an awesome Rust-backed HTTP client),
 with first-class optional support for **pydantic** and **msgspec** as both decode *and* encode
-targets, plus **TypedDict** (validated via **typeguard** if installed) as a decode target.
+targets.
 
 ## Installing
 
 ```
-uv add 'lothc[pydantic,msgspec,typeguard]'
+uv add 'lothc[pydantic,msgspec]'
 ```
 
-Any subset of the extras works — the base package alone gets you `bytes`/`JSON`/`TypedDict`-without-validation
-support.
+Any subset of the extras works — the base package alone gets you `bytes`/`dict` support.
 
 ## Quickstart
 
+Every snippet below is a complete, runnable script — hit the extra clipboard icon in its
+top-right corner to copy a one-liner that runs it via `uv run`, no local install needed.
+
 === "msgspec"
 
-    ```python
+    ```python {data-uv-extra="msgspec"}
+    import asyncio
     from lothc import HTTPClient
     from msgspec import Struct
 
@@ -37,14 +40,19 @@ support.
         name: str
 
 
-    async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
-        pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
-        print(pikachu)  # Pokemon(id=25, name='pikachu')
+    async def main() -> None:
+        async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
+            pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
+            print(pikachu)  # Pokemon(id=25, name='pikachu')
+
+
+    asyncio.run(main())
     ```
 
 === "pydantic"
 
-    ```python
+    ```python {data-uv-extra="pydantic"}
+    import asyncio
     from lothc import HTTPClient
     from pydantic import BaseModel
 
@@ -54,50 +62,36 @@ support.
         name: str
 
 
-    async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
-        pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
-        print(pikachu)  # id=25 name='pikachu'
+    async def main() -> None:
+        async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
+            pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
+            print(pikachu)  # id=25 name='pikachu'
+
+
+    asyncio.run(main())
     ```
 
-=== "TypedDict"
+=== "dict"
 
-    ```python
+    ```python {data-uv-extra=""}
+    import asyncio
     from lothc import HTTPClient
-    from typing import TypedDict
 
 
-    class Pokemon(TypedDict):
-        id: int
-        name: str
+    async def main() -> None:
+        async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
+            pikachu = await client.get("pokemon/pikachu", response_data_type=dict)
+            print(pikachu)  # {'id': 25, 'name': 'pikachu', ...}
 
 
-    async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
-        pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
-        print(pikachu)  # {'id': 25, 'name': 'pikachu'}
+    asyncio.run(main())
     ```
 
     !!! warning
 
-        Install the `typeguard` extra to get the `TypedDict` fields validated at runtime —
-        without it, the dict is returned as-is, matching the type hint on trust alone. If
-        typeguard isn't installed, a warning is raised on first use; set
-        `LOTHC_SUPPRESS_TYPEGUARD_WARNING=1` to silence it.
-
-=== "JSON"
-
-    ```python
-    from lothc import JSON, HTTPClient
-
-
-    async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
-        pikachu = await client.get("pokemon/pikachu", response_data_type=JSON)
-        print(pikachu)  # {'id': 25, 'name': 'pikachu', ...}
-    ```
-
-    !!! warning
-
-        `JSON` is a plain `dict[str, Any]` subclass — no schema, no extra dependency, just parsed
-        JSON. There's no validation at all: the shape is fully trusted, on your say-so alone.
+        `response_data_type=dict` gets you a plain `dict[str, Any]` — no schema, no extra
+        dependency, just parsed JSON. There's no validation at all: the shape is fully trusted,
+        on your say-so alone.
 
 `SyncHTTPClient` mirrors every method in these docs one-for-one — swap `async with` for `with`,
 drop the `await`s, and everything still applies.
@@ -138,13 +132,11 @@ Rust, so lothc stays far closer to pyreqwest's throughput than to any pure-Pytho
 
 Benchmarked with `perf.py` against a tiny Rust-based static JSON server, 10,000 requests at
 concurrency 100 — including lothc's fully-typed decode targets (`response_data_type=` a msgspec
-`Struct`, a pydantic `BaseModel`, or a `TypedDict` validated via typeguard), not just raw bytes or
-an untyped dict. The object handed back from those runs isn't just parsed JSON — it's a real,
-constructed, field-validated instance of your own type, and that validation cost is included in
-the numbers, not benchmarked around. Decoding into a real msgspec `Struct` even edged out the
-unvalidated dict path in this run; typeguard's pure-Python validation was the one clear exception,
-costing a real, visible slowdown. See [Benchmarks](benchmarks.md) for the full numbers behind the
-chart above.
+`Struct` or a pydantic `BaseModel`), not just raw bytes or an untyped dict. The object handed back
+from those runs isn't just parsed JSON — it's a real, constructed, field-validated instance of
+your own type, and that validation cost is included in the numbers, not benchmarked around.
+Decoding into a real msgspec `Struct` even edged out the unvalidated dict path in this run. See
+[Benchmarks](benchmarks.md) for the full numbers behind the chart above.
 
 ## Highlights
 
@@ -152,16 +144,16 @@ chart above.
 
 -   **Type-safe I/O boundaries, not bolted on**
 
-    `response_data_type` gets you a real, constructed, field-validated pydantic `BaseModel`,
-    msgspec `Struct`, or typeguard-validated `TypedDict` straight from the client, instead of the
-    plain `dict` a `.json()` call leaves you to validate yourself. See
-    [Benchmarks](benchmarks.md) for what that actually costs (usually nothing).
+    `response_data_type` gets you a real, constructed, field-validated pydantic `BaseModel` or
+    msgspec `Struct` straight from the client, instead of the plain `dict` a `.json()` call
+    leaves you to validate yourself. See [Benchmarks](benchmarks.md) for what that actually costs
+    (usually nothing).
 
 -   **Typed decode targets**
 
-    Pick a pydantic `BaseModel`, a msgspec `Struct`, a `TypedDict`, `lothc.JSON`, or raw `bytes`
-    (the default) per call. No cast-laden internals — every verb is built from paired
-    `@overload`s, so every call site gets a precise static type.
+    Pick a pydantic `BaseModel`, a msgspec `Struct`, plain `dict`, or raw `bytes` (the default)
+    per call. No cast-laden internals — every verb is built from paired `@overload`s, so every
+    call site gets a precise static type.
 
 -   **Typed request bodies too**
 
@@ -212,5 +204,5 @@ chart above.
 
 </div>
 
-pydantic, msgspec, and typeguard are all optional — the library works with none, either, or all
-three installed.
+pydantic and msgspec are both optional — the library works with neither, either, or both
+installed.

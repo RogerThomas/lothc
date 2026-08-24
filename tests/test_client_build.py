@@ -1,6 +1,6 @@
 import pytest
 
-from lothc import JSON, HTTPClient, SyncHTTPClient
+from lothc import HTTPClient, SyncHTTPClient
 
 
 async def _async_bearer_auth() -> str:
@@ -21,7 +21,7 @@ async def test_build_rejects_both_bearer_token_and_bearer_auth(base_url: str) ->
 
 async def test_build_with_no_base_url_accepts_absolute_urls(base_url: str) -> None:
     async with HTTPClient.build(timeout=None) as client:
-        result = await client.get(f"{base_url}items/7", response_data_type=JSON)
+        result = await client.get(f"{base_url}items/7", response_data_type=dict)
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -50,14 +50,14 @@ def test_sync_build_rejects_both_bearer_token_and_bearer_auth(base_url: str) -> 
 
 def test_sync_build_with_no_base_url_accepts_absolute_urls(base_url: str) -> None:
     with SyncHTTPClient.build(timeout=None) as client:
-        result = client.get(f"{base_url}items/7", response_data_type=JSON)
+        result = client.get(f"{base_url}items/7", response_data_type=dict)
 
     assert result == {"id": 7, "name": "item-7"}
 
 
 def test_sync_build_with_default_headers_sent_on_every_request(base_url: str) -> None:
     with SyncHTTPClient.build(base_url=base_url, default_headers={"x-api-key": "secret"}) as client:
-        result = client.get("echo-headers", response_data_type=JSON)
+        result = client.get("echo-headers", response_data_type=dict)
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["x-api-key"] == "secret"

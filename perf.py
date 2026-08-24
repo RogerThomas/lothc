@@ -28,7 +28,7 @@ from pyreqwest.client import SyncClientBuilder as PyreqwestSyncClientBuilder
 from rich.console import Console
 from rich.table import Table
 
-from lothc import JSON, HTTPClient, SyncHTTPClient
+from lothc import HTTPClient, SyncHTTPClient
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -48,16 +48,15 @@ type Lib = Literal[
     "lothc",
     "lothc-msgspec",
     "lothc-pydantic",
-    "lothc-typeguard",
 ]
 
 type Tag = Literal["rust", "async", "web", "performance"]
 
-# The three response shapes below all mirror benchmarks/json_server/src/main.rs's actual JSON
+# The two response shapes below both mirror benchmarks/json_server/src/main.rs's actual JSON
 # body exactly (nested user/data/pagination included) — the point of the lothc-msgspec/
-# lothc-pydantic/lothc-typeguard rows is to measure the cost of a FULLY validated, fully
-# typesafe decode (real struct/model construction, real field validation, for msgspec/pydantic/
-# typeguard respectively), not just a bare `JSON` dict wrapper with no validation at all.
+# lothc-pydantic rows is to measure the cost of a FULLY validated, fully typesafe decode (real
+# struct/model construction, real field validation), not just a bare `dict` with no validation
+# at all.
 
 
 class _MsgspecMetadata(Struct):
@@ -144,48 +143,6 @@ class PydanticResponse(BaseModel):
     pagination: _PydanticPagination
 
 
-class _TypedDictMetadata(TypedDict):
-    last_login: str
-    login_count: int
-    active: bool
-
-
-class _TypedDictUser(TypedDict):
-    id: int
-    name: str
-    email: str
-    roles: list[str]
-    metadata: _TypedDictMetadata
-
-
-class _TypedDictNested(TypedDict):
-    depth: int
-    values: list[int]
-
-
-class _TypedDictDataItem(TypedDict):
-    id: int
-    title: str
-    tags: list[Tag]
-    score: float
-    nested: _TypedDictNested
-
-
-class _TypedDictPagination(TypedDict):
-    page: int
-    limit: int
-    total: int
-    has_more: bool
-
-
-class TypeguardResponse(TypedDict):
-    status: str
-    timestamp: str
-    user: _TypedDictUser
-    data: list[_TypedDictDataItem]
-    pagination: _TypedDictPagination
-
-
 @dataclass
 class AiosonicClient:
     """Wraps aiosonic.HTTPClient so it exposes the same `get(path)` shape as
@@ -240,7 +197,7 @@ class Stats(TypedDict):
 
 
 async def _fetch_one_lothc(client: HTTPClient, path: str) -> None:
-    data = await client.get(path, response_data_type=JSON)
+    data = await client.get(path, response_data_type=dict)
     assert "status" in data
 
 
@@ -254,13 +211,8 @@ async def _fetch_one_lothc_pydantic(client: HTTPClient, path: str) -> None:
     assert data.status == "success"
 
 
-async def _fetch_one_lothc_typeguard(client: HTTPClient, path: str) -> None:
-    data = await client.get(path, response_data_type=TypeguardResponse)
-    assert data["status"] == "success"
-
-
 def _fetch_one_lothc_sync(client: SyncHTTPClient, path: str) -> None:
-    data = client.get(path, response_data_type=JSON)
+    data = client.get(path, response_data_type=dict)
     assert "status" in data
 
 
@@ -272,11 +224,6 @@ def _fetch_one_lothc_msgspec_sync(client: SyncHTTPClient, path: str) -> None:
 def _fetch_one_lothc_pydantic_sync(client: SyncHTTPClient, path: str) -> None:
     data = client.get(path, response_data_type=PydanticResponse)
     assert data.status == "success"
-
-
-def _fetch_one_lothc_typeguard_sync(client: SyncHTTPClient, path: str) -> None:
-    data = client.get(path, response_data_type=TypeguardResponse)
-    assert data["status"] == "success"
 
 
 def _fetch_one_httpx_sync(client: httpx.Client, path: str) -> None:
@@ -347,7 +294,7 @@ async def _fetch_one_aiosonic(client: AiosonicClient, path: str) -> None:
 
 @overload
 def _build_client(
-    lib: Literal["lothc", "lothc-msgspec", "lothc-pydantic", "lothc-typeguard"],
+    lib: Literal["lothc", "lothc-msgspec", "lothc-pydantic"],
     url: str,
     concurrency: int,
 ) -> AbstractAsyncContextManager[HTTPClient]: ...
@@ -381,7 +328,7 @@ def _build_client(
 ) -> AbstractAsyncContextManager[AiosonicClient]: ...
 def _build_client(lib: Lib, url: str, concurrency: int) -> AbstractAsyncContextManager[AnyClient]:
     """Return an async context manager yielding a ready-to-use client for `lib`."""
-    if lib in ("lothc", "lothc-msgspec", "lothc-pydantic", "lothc-typeguard"):
+    if lib in ("lothc", "lothc-msgspec", "lothc-pydantic"):
         return HTTPClient.build(base_url=url)
 
     if lib == "httpx":
@@ -419,7 +366,7 @@ def _build_client(lib: Lib, url: str, concurrency: int) -> AbstractAsyncContextM
 
 @overload
 def _build_sync_client(
-    lib: Literal["lothc", "lothc-msgspec", "lothc-pydantic", "lothc-typeguard"], url: str
+    lib: Literal["lothc", "lothc-msgspec", "lothc-pydantic"], url: str
 ) -> AbstractContextManager[SyncHTTPClient]: ...
 @overload
 def _build_sync_client(lib: Literal["httpx"], url: str) -> AbstractContextManager[httpx.Client]: ...
@@ -439,7 +386,7 @@ def _build_sync_client(lib: Lib, url: str) -> AbstractContextManager[AnySyncClie
     """Return a sync context manager yielding a ready-to-use blocking client for `lib`. Same lib
     names as `_build_client` (its async counterpart) — sync-vs-async is conveyed by which of the
     two you call, not by the name."""
-    if lib in ("lothc", "lothc-msgspec", "lothc-pydantic", "lothc-typeguard"):
+    if lib in ("lothc", "lothc-msgspec", "lothc-pydantic"):
         return SyncHTTPClient.build(base_url=url)
 
     if lib == "httpx":
@@ -607,7 +554,6 @@ def _parse_sync_libs(libs: str) -> list[Lib]:
         "lothc",
         "lothc-msgspec",
         "lothc-pydantic",
-        "lothc-typeguard",
     )
     result: list[Lib] = []
     for name in libs.split():
@@ -621,8 +567,7 @@ async def single_call(
     url: str = "http://127.0.0.1:3000",
     *,
     libs: str = (
-        "httpx httpx2 pyreqwest aiohttp niquests aiosonic lothc "
-        "lothc-msgspec lothc-pydantic lothc-typeguard"
+        "httpx httpx2 pyreqwest aiohttp niquests aiosonic lothc lothc-msgspec lothc-pydantic"
     ),
     concurrency: int = 1,
     total_requests: int = 1000,
@@ -655,9 +600,7 @@ async def single_call(
 async def single_call_sync(
     url: str = "http://127.0.0.1:3000",
     *,
-    libs: str = (
-        "httpx httpx2 niquests pyreqwest lothc lothc-msgspec lothc-pydantic lothc-typeguard"
-    ),
+    libs: str = ("httpx httpx2 niquests pyreqwest lothc lothc-msgspec lothc-pydantic"),
     concurrency: int = 1,
     total_requests: int = 1000,
     warmup: int = 100,
@@ -695,12 +638,11 @@ def _run_sync_lib(
     """The sync half of `_run_one`'s dispatch, split out to keep both under the project's mccabe
     complexity ceiling — see `_run_one` for why sync-vs-async is a flag, not a separate lib name.
     Returns (timings, total_time, cpu_time, peak_mem_mb)."""
-    if lib in ("lothc", "lothc-msgspec", "lothc-pydantic", "lothc-typeguard"):
+    if lib in ("lothc", "lothc-msgspec", "lothc-pydantic"):
         fetcher = {
             "lothc": _fetch_one_lothc_sync,
             "lothc-msgspec": _fetch_one_lothc_msgspec_sync,
             "lothc-pydantic": _fetch_one_lothc_pydantic_sync,
-            "lothc-typeguard": _fetch_one_lothc_typeguard_sync,
         }[lib]
         with _build_sync_client(lib, url) as client:
             timings, total_time, cpu_time = _time_run_sequential_sync(
@@ -788,14 +730,6 @@ async def _run_one(
                 )
                 peak_mem_mb = await _measure_peak_memory(
                     _fetch_one_lothc_pydantic, client, total_requests, concurrency
-                )
-        elif lib == "lothc-typeguard":
-            async with _build_client(lib, url, concurrency) as client:
-                timings, total_time, cpu_time = await _time_run(
-                    _fetch_one_lothc_typeguard, client, total_requests, concurrency, warmup
-                )
-                peak_mem_mb = await _measure_peak_memory(
-                    _fetch_one_lothc_typeguard, client, total_requests, concurrency
                 )
         elif lib == "httpx" or lib == "httpx_h2":
             async with _build_client(lib, url, concurrency) as client:
@@ -936,8 +870,7 @@ async def main(
     url: str = "http://127.0.0.1:3000",
     *,
     libs: str = (
-        "httpx httpx2 pyreqwest aiohttp niquests aiosonic lothc "
-        "lothc-msgspec lothc-pydantic lothc-typeguard"
+        "httpx httpx2 pyreqwest aiohttp niquests aiosonic lothc lothc-msgspec lothc-pydantic"
     ),
     concurrency: int = 50,
     total_requests: int = 1000,

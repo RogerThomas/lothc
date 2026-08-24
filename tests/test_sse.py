@@ -39,8 +39,10 @@ async def test_sse_default_id_type_raises_when_id_missing(client: HTTPClient) ->
         [event async for event in client.sse("events", params={"omit": "id"})]
 
 
-async def test_sse_id_type_none_allows_missing_id(client: HTTPClient) -> None:
-    events = [event async for event in client.sse("events", params={"omit": "id"}, id_type=None)]
+async def test_sse_allow_missing_id_allows_missing_id(client: HTTPClient) -> None:
+    events = [
+        event async for event in client.sse("events", params={"omit": "id"}, allow_missing_id=True)
+    ]
 
     assert events[0].id is None
 
@@ -63,22 +65,25 @@ def test_sync_sse_id_type_coerces_id(sync_client: SyncHTTPClient) -> None:
     assert events[0].id == 0
 
 
-async def test_sse_id_type_optional_union_coerces_when_present(client: HTTPClient) -> None:
-    events = [event async for event in client.sse("events", id_type=int | None)]
+async def test_sse_id_type_with_allow_missing_id_coerces_when_present(client: HTTPClient) -> None:
+    events = [event async for event in client.sse("events", id_type=int, allow_missing_id=True)]
 
     assert events[0].id == 0
 
 
-async def test_sse_id_type_optional_union_allows_missing_id(client: HTTPClient) -> None:
+async def test_sse_id_type_with_allow_missing_id_allows_missing_id(client: HTTPClient) -> None:
     events = [
-        event async for event in client.sse("events", params={"omit": "id"}, id_type=int | None)
+        event
+        async for event in client.sse(
+            "events", params={"omit": "id"}, id_type=int, allow_missing_id=True
+        )
     ]
 
     assert events[0].id is None
 
 
 async def test_sse_skips_comment_only_and_unrecognized_field_records(client: HTTPClient) -> None:
-    events = [event async for event in client.sse("events-weird", id_type=None)]
+    events = [event async for event in client.sse("events-weird", allow_missing_id=True)]
 
     assert len(events) == 1
     assert events[0].data == "hello"
@@ -124,7 +129,7 @@ async def test_sse_transport_error_mid_stream_raises_connection_error(client: HT
 def test_sync_sse_skips_comment_only_and_unrecognized_field_records(
     sync_client: SyncHTTPClient,
 ) -> None:
-    events = list(sync_client.sse("events-weird", id_type=None))
+    events = list(sync_client.sse("events-weird", allow_missing_id=True))
 
     assert len(events) == 1
     assert events[0].data == "hello"
