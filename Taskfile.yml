@@ -62,6 +62,17 @@ tasks:
     desc: Type-check with basedpyright
     cmd: uv run basedpyright {{.CLI_ARGS | default "."}}
 
+  typecheck-public:
+    desc: 'Type-check the public interface (./tests) with mypy, ty, zuban & basedpyright. Runs all, fails if any do.'
+    cmd: |
+      set -u
+      rc=0
+      for tool in "mypy tests" "ty check tests" "zuban check tests" "basedpyright lothc tests"; do
+        echo "──── uv run ${tool} ────"
+        uv run ${tool} || rc=1
+      done
+      exit ${rc}
+
   check:
     desc: Lint, format-check, and typecheck (what CI runs)
     cmds:
