@@ -29,11 +29,22 @@ async with HTTPClient.build(
     await client.get("items/8")  # calls it again — always the latest token
 ```
 
-Both mechanisms only ever produce a `Bearer` `Authorization` header — there's no separate
-Basic-auth or custom-scheme option today.
+`bearer_token`/`bearer_auth` both only ever produce a `Bearer` `Authorization` header. For a
+Basic-auth `username`/`password` pair instead, pass `basic_auth` — provide at most one of the
+three:
+
+```python
+async with HTTPClient.build(
+    base_url="https://api.example.com/", basic_auth=("my-username", "my-password")
+) as client:
+    await client.get("items/7")
+```
+
+`password` may be `None` for a username with no password. There's no other custom-auth-scheme
+option today.
 
 Every verb also takes `skip_auth`, which omits the `Authorization` header for that one call —
-useful when a client configured with `bearer_token`/`bearer_auth` also needs to hit a
+useful when a client configured with `bearer_token`/`bearer_auth`/`basic_auth` also needs to hit a
 differently-authenticated target through the same instance, e.g. a presigned S3 URL that must
 never see your API's own token:
 
@@ -62,7 +73,7 @@ async with HTTPClient.build(
     await client.get("items/7")  # sent with every request through this client
 ```
 
-Combine freely with `bearer_token`/`bearer_auth` — they set different headers
+Combine freely with `bearer_token`/`bearer_auth`/`basic_auth` — they set different headers
 (`Authorization` vs. whatever you name here).
 
 ## Timeouts

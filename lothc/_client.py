@@ -39,11 +39,27 @@ from pyreqwest.request import (
 from pyreqwest.response import Response as RawResponse
 from pyreqwest.response import SyncResponse as RawSyncResponse
 
-from ._compat import BaseModel, Decoder, Struct, TypeAdapter, msgspec
+from ._compat import (
+    BaseModel,
+    BaseModelTyping,
+    Decoder,
+    DecoderTyping,
+    Struct,
+    StructTyping,
+    TypeAdapter,
+    TypeAdapterTyping,
+    msgspec,
+)
 
-type Data = BaseModel | Struct | bytes | dict[str, Any]
-type TypedHeaders = BaseModel | Struct
-type JSONPayload = dict[str, Any] | BaseModel | Struct
+# `Data`/`TypedHeaders`/`JSONPayload`/`Params`/`Headers` below deliberately use `BaseModelTyping`/
+# `StructTyping` (checker-local Protocols), not the real `BaseModel`/`Struct` — see
+# `_compat.py`'s `StructTyping` docstring for why: it keeps these aliases fully typed even when
+# msgspec/pydantic aren't resolvable to whatever type checker is running, with no precision loss
+# when they are. `isinstance`/`issubclass`/`case` checks elsewhere in this file must still use the
+# real `BaseModel`/`Struct` imported above — only these five alias definitions changed.
+type Data = BaseModelTyping | StructTyping | bytes | dict[str, Any]
+type TypedHeaders = BaseModelTyping | StructTyping
+type JSONPayload = dict[str, Any] | BaseModelTyping | StructTyping
 
 # A caller never constructs these three directly — they just write a plain tuple literal, and
 # _apply_form_value/_apply_sync_form_value tell them apart by exact arity + element type. Keep
@@ -63,8 +79,8 @@ type File = (
 # marker as `tuple` and the JSON-array marker as `list` is what makes the two unambiguous.
 type _FormValue = str | int | bytes | list[Any] | JSONPayload | File
 type Form = dict[str, _FormValue | tuple[_FormValue, ...]]
-type Params = Mapping[str, str | int | float | bool] | BaseModel | Struct
-type Headers = Mapping[str, str] | BaseModel | Struct
+type Params = Mapping[str, str | int | float | bool] | BaseModelTyping | StructTyping
+type Headers = Mapping[str, str] | BaseModelTyping | StructTyping
 type AuthProvider = Callable[[], Awaitable[str]]
 type SyncAuthProvider = Callable[[], str]
 
@@ -75,9 +91,10 @@ class HTTPResponseError(Exception):
     A response WAS received — for a request that never got one, see `HTTPTransportError`.
     """
 
-    def __init__(self, status: int, body: bytes) -> None:
+    def __init__(self, status: int, body: bytes, parsed_body: Data | None = None) -> None:
         self.status = status
         self.body_start = body[:100]
+        self.parsed_body = parsed_body
         snippet = self.body_start.decode(errors="replace")
         truncation_marker = "…" if len(body) > 100 else ""
         super().__init__(f"Request failed with status {status}: {snippet}{truncation_marker}")
@@ -387,14 +404,40 @@ def _validate_response_data_type(response_data_type: object) -> None:
         raise TypeError(f"response_data_type must be a class, got {response_data_type!r}")
 
 
+def _decode_error_body(body: bytes, error_type: type[Data]) -> Data:
+    """Decode an error response's body for `HTTPResponseError.parsed_body`. Takes plain bytes,
+    not a live response object — by the time this runs, `.bytes()` has already been consumed once
+    to populate `body_start`, and a pyreqwest response body can't be read twice."""
+    _validate_response_data_type(error_type)
+    if issubclass(error_type, bytes):
+        return body
+    if issubclass(error_type, dict):
+        parsed = cast(dict[str, Any], _json_loads(body))
+        return error_type(parsed)
+    if issubclass(error_type, Struct):
+        return msgspec.json.decode(body, type=error_type)
+    # Statically, `Data`'s remaining member here is always BaseModel (basedpyright flags the
+    # check itself as unnecessary) — but `error_type` is only actually validated to be *some*
+    # class by `_validate_response_data_type`, not proven to be a `Data` member at runtime, so an
+    # uncovered class must still fall through to the raise below.
+    if issubclass(error_type, BaseModel):  # pyright: ignore[reportUnnecessaryIsInstance] — pylint: disable=line-too-long
+        return error_type.model_validate_json(body)
+    raise TypeError(f"Unsupported error_type: {error_type!r}")
+
+
 # Return type is whatever response_data_type is — genuinely dynamic, can't state it statically.
 def _decode_json_line(
-    data: str, response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any]
+    data: str, response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any]
 ) -> Any:  # noqa: ANN401
     if isinstance(response_data_type, TypeAdapter):
         return response_data_type.validate_json(data)
     if isinstance(response_data_type, Decoder):
         return response_data_type.decode(data)
+    # basedpyright can't narrow past `TypeAdapterTyping`/`DecoderTyping` (structural Protocols —
+    # see _compat.py's `StructTyping` docstring) via the two `isinstance` checks above the way it
+    # can narrow a same-kind `issubclass` chain, so it still sees them as possible here even
+    # though both are already excluded at runtime.
+    response_data_type = cast("type[Any]", response_data_type)
     _validate_response_data_type(response_data_type)
     if issubclass(response_data_type, dict):
         dict_type = cast("type[dict[str, Any]]", response_data_type)
@@ -519,7 +562,11 @@ def _apply_params[TBuilder: BaseRequestBuilder](
             builtins = cast(dict[str, Any], msgspec.to_builtins(params))
             values = {name: value for name, value in builtins.items() if value is not None}
         case _:
-            values = params
+            # basedpyright can't narrow a `match` fallback past `BaseModelTyping`/`StructTyping`
+            # (structural Protocols — see _compat.py's `StructTyping` docstring) the way it can
+            # narrow a sequential `issubclass` chain, so it still sees them as possible here even
+            # though the two `case` patterns above already excluded any real BaseModel/Struct.
+            values = cast("Mapping[str, str | int | float | bool]", params)
     return request_builder.query(values)
 
 
@@ -534,7 +581,8 @@ def _apply_headers[TBuilder: BaseRequestBuilder](
         case Struct():
             dumped = cast(dict[str, Any], msgspec.to_builtins(headers))
         case _:
-            return request_builder.headers(dict(headers))
+            # Same basedpyright match-fallback narrowing gap as `_apply_params` above.
+            return request_builder.headers(dict(cast("Mapping[str, str]", headers)))
     normalized = {
         name.replace("_", "-"): str(value) for name, value in dumped.items() if value is not None
     }
@@ -625,7 +673,13 @@ def _parse_typed_headers(
     normalized = {name.lower().replace("-", "_"): value for name, value in headers.items()}
     if issubclass(response_headers_type, Struct):
         return msgspec.convert(normalized, type=response_headers_type, strict=False)
-    return response_headers_type.model_validate(normalized)
+    # Statically, `TypedHeaders`'s remaining member here is always BaseModel — but unlike a
+    # sequential `issubclass` chain (see `_decode_body`), basedpyright doesn't narrow past
+    # `StructTyping` from the check above alone, so this explicit check is still required to
+    # resolve `.model_validate` at all, not just for runtime-reachability.
+    if issubclass(response_headers_type, BaseModel):
+        return response_headers_type.model_validate(normalized)
+    raise TypeError(f"Unsupported response_headers_type: {response_headers_type!r}")
 
 
 @dataclass
@@ -654,6 +708,7 @@ class HTTPClient:
     _client: Client
     _bearer_token: str | None = None
     _bearer_auth: AuthProvider | None = None
+    _basic_auth: tuple[str, str | None] | None = None
 
     @classmethod
     @asynccontextmanager
@@ -663,6 +718,7 @@ class HTTPClient:
         base_url: str | None = None,
         bearer_token: str | None = None,
         bearer_auth: AuthProvider | None = None,
+        basic_auth: tuple[str, str | None] | None = None,
         default_headers: dict[str, str] | None = None,
         timeout: float | None = 30.0,
         cookie_store: bool = False,
@@ -675,12 +731,14 @@ class HTTPClient:
         """Build an `HTTPClient` as an async context manager.
 
         `bearer_token` is a static token; `bearer_auth` is an async callable resolved fresh on
-        every request — provide at most one. `max_retries` enables a real retry middleware
-        (backoff, `Retry-After`-aware); with no `retry_methods`, only the idempotent verbs
-        (`GET`/`PUT`/`DELETE`/`HEAD`) retry.
+        every request; `basic_auth` is a `(username, password)` pair — provide at most one of the
+        three. `max_retries` enables a real retry middleware (backoff, `Retry-After`-aware); with
+        no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`) retry.
         """
-        if bearer_token is not None and bearer_auth is not None:
-            raise ValueError("Provide at most one of 'bearer_token' or 'bearer_auth'")
+        if sum(value is not None for value in (bearer_token, bearer_auth, basic_auth)) > 1:
+            raise ValueError(
+                "Provide at most one of 'bearer_token', 'bearer_auth', or 'basic_auth'"
+            )
         pyreqwest_client_builder = ClientBuilder()
         if timeout is not None:
             pyreqwest_client_builder = pyreqwest_client_builder.timeout(timedelta(seconds=timeout))
@@ -698,9 +756,9 @@ class HTTPClient:
             middleware = _RetryMiddleware(max_retries, retry_methods or cls._default_retry_methods)
             pyreqwest_client_builder = pyreqwest_client_builder.with_middleware(middleware)
         async with pyreqwest_client_builder.build() as client:
-            yield cls(client, bearer_token, bearer_auth)
+            yield cls(client, bearer_token, bearer_auth, basic_auth)
 
-    async def _apply_bearer_auth(
+    async def _apply_auth(
         self, request_builder: RequestBuilder, *, skip_auth: bool
     ) -> RequestBuilder:
         if skip_auth:
@@ -709,6 +767,9 @@ class HTTPClient:
             return request_builder.bearer_auth(await self._bearer_auth())
         if self._bearer_token is not None:
             return request_builder.bearer_auth(self._bearer_token)
+        if self._basic_auth is not None:
+            username, password = self._basic_auth
+            return request_builder.basic_auth(username, password)
         return request_builder
 
     async def _prepare_request(
@@ -720,13 +781,15 @@ class HTTPClient:
         *,
         skip_auth: bool,
     ) -> RequestBuilder:
-        request_builder = await self._apply_bearer_auth(request_builder, skip_auth=skip_auth)
+        request_builder = await self._apply_auth(request_builder, skip_auth=skip_auth)
         return _prepare(request_builder, params, headers, timeout)
 
-    async def _check_status(self, raw_response: RawResponse) -> None:
+    async def _check_status(self, raw_response: RawResponse, error_type: type[Data] | None) -> None:
         if raw_response.status < 400:
             return
-        raise HTTPResponseError(raw_response.status, (await raw_response.bytes()).to_bytes())
+        body = (await raw_response.bytes()).to_bytes()
+        parsed_body = _decode_error_body(body, error_type) if error_type is not None else None
+        raise HTTPResponseError(raw_response.status, body, parsed_body)
 
     async def _decode_body(self, raw_response: RawResponse, response_data_type: type[Data]) -> Data:
         _validate_response_data_type(response_data_type)
@@ -746,10 +809,15 @@ class HTTPClient:
         raise TypeError(f"Unsupported response_data_type: {response_data_type!r}")
 
     async def _parse(
-        self, raw_response: RawResponse, response_data_type: type[Data], *, error_for_status: bool
+        self,
+        raw_response: RawResponse,
+        response_data_type: type[Data],
+        *,
+        error_for_status: bool,
+        error_type: type[Data] | None,
     ) -> Data:
         if error_for_status:
-            await self._check_status(raw_response)
+            await self._check_status(raw_response, error_type)
         return await self._decode_body(raw_response, response_data_type)
 
     @overload
@@ -762,6 +830,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes: ...
     @overload
     async def get(
@@ -774,6 +843,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> dict[str, Any]: ...
     @overload
     async def get[TData: Data](
@@ -786,6 +856,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> TData: ...
     async def get(
         self,
@@ -797,20 +868,26 @@ class HTTPClient:
         skip_auth: bool = False,
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Data:
         """GET `path` and decode the body as `response_data_type` (raw `bytes` by default).
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         request_builder = await self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
         )
         raw_response = await _send(request_builder.build())
         return await self._parse(
-            raw_response, response_data_type, error_for_status=error_for_status
+            raw_response,
+            response_data_type,
+            error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -823,6 +900,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes]: ...
     @overload
     async def get_result(
@@ -835,6 +913,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any]]: ...
     @overload
     async def get_result[TData: Data](
@@ -847,6 +926,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData]: ...
     @overload
     async def get_result[THeaders: TypedHeaders](
@@ -859,6 +939,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes, THeaders]: ...
     @overload
     async def get_result[THeaders: TypedHeaders](
@@ -872,6 +953,7 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any], THeaders]: ...
     @overload
     async def get_result[TData: Data, THeaders: TypedHeaders](
@@ -885,6 +967,7 @@ class HTTPClient:
         response_data_type: type[TData],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData, THeaders]: ...
     async def get_result(
         self,
@@ -897,20 +980,23 @@ class HTTPClient:
         response_data_type: type[Data] = bytes,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[Any, Any]:
         """Like `get`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         request_builder = await self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
         )
         raw_response = await _send(request_builder.build())
         if error_for_status:
-            await self._check_status(raw_response)
+            await self._check_status(raw_response, error_type)
         data = await self._decode_body(raw_response, response_data_type)
         headers = dict(raw_response.headers)
         if response_headers_type is None:
@@ -925,12 +1011,13 @@ class HTTPClient:
         params: Params | None,
         headers: Headers | None,
         timeout: float | None,
-        response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None,
+        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
         id_type: type[Any] | None,
         *,
         skip_auth: bool,
         allow_missing_id: bool,
         error_for_status: bool,
+        error_type: type[Data] | None,
     ) -> AsyncIterator[SSEEvent[Any, Any]]:
         request_builder = self._client.get(path).header("accept", "text/event-stream")
         request_builder = await self._prepare_request(
@@ -940,7 +1027,7 @@ class HTTPClient:
         try:
             async with request as raw_response:
                 if error_for_status:
-                    await self._check_status(raw_response)
+                    await self._check_status(raw_response, error_type)
                 buffer = b""
                 while True:
                     chunk = await raw_response.body_reader.read_chunk()
@@ -975,6 +1062,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[SSEEvent[str, str]]: ...
     @overload
     def sse(
@@ -987,6 +1075,7 @@ class HTTPClient:
         skip_auth: bool = False,
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[SSEEvent[str, str | None]]: ...
     @overload
     def sse[TId](
@@ -999,6 +1088,7 @@ class HTTPClient:
         skip_auth: bool = False,
         id_type: type[TId],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[SSEEvent[str, TId]]: ...
     @overload
     def sse[TId](
@@ -1012,6 +1102,7 @@ class HTTPClient:
         id_type: type[TId],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[SSEEvent[str, TId | None]]: ...
     @overload
     def sse(
@@ -1024,6 +1115,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[SSEEvent[dict[str, Any], str]]: ...
     @overload
     def sse[TData](
@@ -1034,8 +1126,9 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
+        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[SSEEvent[TData, str]]: ...
     @overload
     def sse(
@@ -1049,6 +1142,7 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[SSEEvent[dict[str, Any], str | None]]: ...
     @overload
     def sse[TData](
@@ -1059,9 +1153,10 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
+        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[SSEEvent[TData, str | None]]: ...
     @overload
     def sse[TId](
@@ -1075,6 +1170,7 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         id_type: type[TId],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[SSEEvent[dict[str, Any], TId]]: ...
     @overload
     def sse[TId](
@@ -1089,6 +1185,7 @@ class HTTPClient:
         id_type: type[TId],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[SSEEvent[dict[str, Any], TId | None]]: ...
     @overload
     def sse[TData, TId](
@@ -1099,9 +1196,10 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
+        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
         id_type: type[TId],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[SSEEvent[TData, TId]]: ...
     @overload
     def sse[TData, TId](
@@ -1112,10 +1210,11 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
+        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
         id_type: type[TId],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[SSEEvent[TData, TId | None]]: ...
     def sse(
         self,
@@ -1125,10 +1224,11 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
+        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         id_type: type[Any] | None = None,
         allow_missing_id: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[SSEEvent[Any, Any]]:
         """Open `path` as a Server-Sent Events stream, yielding one `SSEEvent` per event.
 
@@ -1138,7 +1238,9 @@ class HTTPClient:
         (the default) or becomes `None`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._sse_stream(
             path,
@@ -1150,6 +1252,7 @@ class HTTPClient:
             skip_auth=skip_auth,
             allow_missing_id=allow_missing_id,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     async def _line_stream(
@@ -1161,11 +1264,12 @@ class HTTPClient:
         json: JSONPayload | None,
         form: Form | None,
         content: str | bytes | None,
-        response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None,
+        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
+        error_type: type[Data] | None,
     ) -> AsyncIterator[Any]:
         request_builder = await self._prepare_request(
             request_builder, params, headers, timeout, skip_auth=skip_auth
@@ -1181,7 +1285,7 @@ class HTTPClient:
         try:
             async with request as raw_response:
                 if error_for_status:
-                    await self._check_status(raw_response)
+                    await self._check_status(raw_response, error_type)
                 if response_data_type is None:
                     while True:
                         chunk = await raw_response.body_reader.read_chunk()
@@ -1213,6 +1317,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[bytes]: ...
     @overload
     def stream_get(
@@ -1225,6 +1330,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[dict[str, Any]]: ...
     @overload
     def stream_get[TLine](
@@ -1235,8 +1341,9 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TLine] | TypeAdapter[TLine] | Decoder[TLine],
+        response_data_type: type[TLine] | TypeAdapterTyping[TLine] | DecoderTyping[TLine],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[TLine]: ...
     def stream_get(
         self,
@@ -1246,8 +1353,9 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
+        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[Any]:
         """Stream GET `path`'s response as raw `bytes` chunks (unbuffered, safe for binary).
 
@@ -1255,7 +1363,9 @@ class HTTPClient:
         each complete line is parsed and decoded as its own value.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._line_stream(
             self._client.get(path),
@@ -1269,6 +1379,7 @@ class HTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -1285,6 +1396,7 @@ class HTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[bytes]: ...
     @overload
     def stream_post(
@@ -1301,6 +1413,7 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[dict[str, Any]]: ...
     @overload
     def stream_post[TLine](
@@ -1314,9 +1427,10 @@ class HTTPClient:
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[TLine] | TypeAdapter[TLine] | Decoder[TLine],
+        response_data_type: type[TLine] | TypeAdapterTyping[TLine] | DecoderTyping[TLine],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[TLine]: ...
     def stream_post(
         self,
@@ -1329,15 +1443,18 @@ class HTTPClient:
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
+        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> AsyncIterator[Any]:
         """Like `stream_get`, but POST a body first — same `json`/`form`/`content` options as
         `post` (at most one), same raw-bytes-by-default / NDJSON-via-`response_data_type` split.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._line_stream(
             self._client.post(path),
@@ -1351,6 +1468,7 @@ class HTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     async def _download(
@@ -1363,6 +1481,7 @@ class HTTPClient:
         *,
         skip_auth: bool,
         error_for_status: bool,
+        error_type: type[Data] | None,
     ) -> bytes | None:
         request_builder = await self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
@@ -1371,7 +1490,7 @@ class HTTPClient:
         try:
             async with request as raw_response:
                 if error_for_status:
-                    await self._check_status(raw_response)
+                    await self._check_status(raw_response, error_type)
                 if dest is None:
                     buffer = bytearray()
                     while True:
@@ -1399,6 +1518,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes: ...
     @overload
     async def download(
@@ -1411,6 +1531,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> None: ...
     async def download(
         self,
@@ -1422,6 +1543,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes | None:
         """Download `path`'s response body, optimized for large objects (e.g. a presigned GET
         URL for a multi-GB file) — much lower peak memory than `get()` for big bodies.
@@ -1434,7 +1556,9 @@ class HTTPClient:
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return await self._download(
             path,
@@ -1444,6 +1568,7 @@ class HTTPClient:
             timeout,
             skip_auth=skip_auth,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     async def _send_with_body(
@@ -1460,6 +1585,7 @@ class HTTPClient:
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
+        error_type: type[Data] | None,
     ) -> Data:
         request_builder = await self._prepare_request(
             request_builder, params, headers, timeout, skip_auth=skip_auth
@@ -1473,7 +1599,10 @@ class HTTPClient:
         )
         raw_response = await _send(request_builder.build())
         return await self._parse(
-            raw_response, response_data_type, error_for_status=error_for_status
+            raw_response,
+            response_data_type,
+            error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     async def _send_with_body_result(
@@ -1491,6 +1620,7 @@ class HTTPClient:
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
+        error_type: type[Data] | None,
     ) -> Result[Any, Any]:
         request_builder = await self._prepare_request(
             request_builder, params, headers, timeout, skip_auth=skip_auth
@@ -1504,7 +1634,7 @@ class HTTPClient:
         )
         raw_response = await _send(request_builder.build())
         if error_for_status:
-            await self._check_status(raw_response)
+            await self._check_status(raw_response, error_type)
         data = await self._decode_body(raw_response, response_data_type)
         response_headers = dict(raw_response.headers)
         if response_headers_type is None:
@@ -1527,6 +1657,7 @@ class HTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes: ...
     @overload
     async def post(
@@ -1543,6 +1674,7 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> dict[str, Any]: ...
     @overload
     async def post[TData: Data](
@@ -1559,6 +1691,7 @@ class HTTPClient:
         response_data_type: type[TData],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> TData: ...
     async def post(
         self,
@@ -1574,12 +1707,15 @@ class HTTPClient:
         response_data_type: type[Data] = bytes,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Data:
         """POST to `path` with at most one of `json`/`form`/`content` (raises `ValueError` if
         more than one is given) and decode the response as `response_data_type`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return await self._send_with_body(
             self._client.post(path),
@@ -1593,6 +1729,7 @@ class HTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -1609,6 +1746,7 @@ class HTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes]: ...
     @overload
     async def post_result(
@@ -1625,6 +1763,7 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any]]: ...
     @overload
     async def post_result[TData: Data](
@@ -1641,6 +1780,7 @@ class HTTPClient:
         response_data_type: type[TData],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData]: ...
     @overload
     async def post_result[THeaders: TypedHeaders](
@@ -1657,6 +1797,7 @@ class HTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes, THeaders]: ...
     @overload
     async def post_result[THeaders: TypedHeaders](
@@ -1674,6 +1815,7 @@ class HTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any], THeaders]: ...
     @overload
     async def post_result[TData: Data, THeaders: TypedHeaders](
@@ -1691,6 +1833,7 @@ class HTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData, THeaders]: ...
     async def post_result(
         self,
@@ -1707,13 +1850,16 @@ class HTTPClient:
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[Any, Any]:
         """Like `post`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return await self._send_with_body_result(
             self._client.post(path),
@@ -1728,6 +1874,7 @@ class HTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -1744,6 +1891,7 @@ class HTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes: ...
     @overload
     async def put(
@@ -1760,6 +1908,7 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> dict[str, Any]: ...
     @overload
     async def put[TData: Data](
@@ -1776,6 +1925,7 @@ class HTTPClient:
         response_data_type: type[TData],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> TData: ...
     async def put(
         self,
@@ -1791,11 +1941,14 @@ class HTTPClient:
         response_data_type: type[Data] = bytes,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Data:
         """PUT to `path`. Same body/decode rules as `post`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return await self._send_with_body(
             self._client.put(path),
@@ -1809,6 +1962,7 @@ class HTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -1825,6 +1979,7 @@ class HTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes]: ...
     @overload
     async def put_result(
@@ -1841,6 +1996,7 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any]]: ...
     @overload
     async def put_result[TData: Data](
@@ -1857,6 +2013,7 @@ class HTTPClient:
         response_data_type: type[TData],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData]: ...
     @overload
     async def put_result[THeaders: TypedHeaders](
@@ -1873,6 +2030,7 @@ class HTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes, THeaders]: ...
     @overload
     async def put_result[THeaders: TypedHeaders](
@@ -1890,6 +2048,7 @@ class HTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any], THeaders]: ...
     @overload
     async def put_result[TData: Data, THeaders: TypedHeaders](
@@ -1907,6 +2066,7 @@ class HTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData, THeaders]: ...
     async def put_result(
         self,
@@ -1923,13 +2083,16 @@ class HTTPClient:
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[Any, Any]:
         """Like `put`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return await self._send_with_body_result(
             self._client.put(path),
@@ -1944,6 +2107,7 @@ class HTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -1960,6 +2124,7 @@ class HTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes: ...
     @overload
     async def patch(
@@ -1976,6 +2141,7 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> dict[str, Any]: ...
     @overload
     async def patch[TData: Data](
@@ -1992,6 +2158,7 @@ class HTTPClient:
         response_data_type: type[TData],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> TData: ...
     async def patch(
         self,
@@ -2007,11 +2174,14 @@ class HTTPClient:
         response_data_type: type[Data] = bytes,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Data:
         """PATCH `path`. Same body/decode rules as `post`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return await self._send_with_body(
             self._client.patch(path),
@@ -2025,6 +2195,7 @@ class HTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -2041,6 +2212,7 @@ class HTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes]: ...
     @overload
     async def patch_result(
@@ -2057,6 +2229,7 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any]]: ...
     @overload
     async def patch_result[TData: Data](
@@ -2073,6 +2246,7 @@ class HTTPClient:
         response_data_type: type[TData],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData]: ...
     @overload
     async def patch_result[THeaders: TypedHeaders](
@@ -2089,6 +2263,7 @@ class HTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes, THeaders]: ...
     @overload
     async def patch_result[THeaders: TypedHeaders](
@@ -2106,6 +2281,7 @@ class HTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any], THeaders]: ...
     @overload
     async def patch_result[TData: Data, THeaders: TypedHeaders](
@@ -2123,6 +2299,7 @@ class HTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData, THeaders]: ...
     async def patch_result(
         self,
@@ -2139,13 +2316,16 @@ class HTTPClient:
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[Any, Any]:
         """Like `patch`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return await self._send_with_body_result(
             self._client.patch(path),
@@ -2160,6 +2340,7 @@ class HTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -2172,6 +2353,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes: ...
     @overload
     async def delete(
@@ -2184,6 +2366,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> dict[str, Any]: ...
     @overload
     async def delete[TData: Data](
@@ -2196,6 +2379,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> TData: ...
     async def delete(
         self,
@@ -2207,11 +2391,14 @@ class HTTPClient:
         skip_auth: bool = False,
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Data:
         """DELETE `path` and decode the response as `response_data_type`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return await self._send_with_body(
             self._client.delete(path),
@@ -2225,6 +2412,7 @@ class HTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -2237,6 +2425,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes]: ...
     @overload
     async def delete_result(
@@ -2249,6 +2438,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any]]: ...
     @overload
     async def delete_result[TData: Data](
@@ -2261,6 +2451,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData]: ...
     @overload
     async def delete_result[THeaders: TypedHeaders](
@@ -2273,6 +2464,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes, THeaders]: ...
     @overload
     async def delete_result[THeaders: TypedHeaders](
@@ -2286,6 +2478,7 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any], THeaders]: ...
     @overload
     async def delete_result[TData: Data, THeaders: TypedHeaders](
@@ -2299,6 +2492,7 @@ class HTTPClient:
         response_data_type: type[TData],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData, THeaders]: ...
     async def delete_result(
         self,
@@ -2311,13 +2505,16 @@ class HTTPClient:
         response_data_type: type[Data] = bytes,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[Any, Any]:
         """Like `delete`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return await self._send_with_body_result(
             self._client.delete(path),
@@ -2332,6 +2529,7 @@ class HTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -2344,6 +2542,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[None]: ...
     @overload
     async def head[THeaders: TypedHeaders](
@@ -2356,6 +2555,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[None, THeaders]: ...
     async def head(
         self,
@@ -2367,19 +2567,22 @@ class HTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[None, Any]:
         """HEAD `path` — headers-only, no body is ever decoded. Pass
         `response_headers_type` to get the response headers parsed into `result.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         request_builder = await self._prepare_request(
             self._client.head(path), params, headers, timeout, skip_auth=skip_auth
         )
         raw_response = await _send(request_builder.build())
         if error_for_status:
-            await self._check_status(raw_response)
+            await self._check_status(raw_response, error_type)
         response_headers = dict(raw_response.headers)
         typed_headers = (
             None
@@ -2401,6 +2604,7 @@ class SyncHTTPClient:
     _client: SyncClient
     _bearer_token: str | None = None
     _bearer_auth: SyncAuthProvider | None = None
+    _basic_auth: tuple[str, str | None] | None = None
 
     @classmethod
     @contextmanager
@@ -2410,6 +2614,7 @@ class SyncHTTPClient:
         base_url: str | None = None,
         bearer_token: str | None = None,
         bearer_auth: SyncAuthProvider | None = None,
+        basic_auth: tuple[str, str | None] | None = None,
         default_headers: dict[str, str] | None = None,
         timeout: float | None = 30.0,
         cookie_store: bool = False,
@@ -2422,12 +2627,14 @@ class SyncHTTPClient:
         """Build a `SyncHTTPClient` as a context manager.
 
         `bearer_token` is a static token; `bearer_auth` is a callable resolved fresh on every
-        request — provide at most one. `max_retries` enables a real retry middleware (backoff,
-        `Retry-After`-aware); with no `retry_methods`, only the idempotent verbs
-        (`GET`/`PUT`/`DELETE`/`HEAD`) retry.
+        request; `basic_auth` is a `(username, password)` pair — provide at most one of the
+        three. `max_retries` enables a real retry middleware (backoff, `Retry-After`-aware); with
+        no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`) retry.
         """
-        if bearer_token is not None and bearer_auth is not None:
-            raise ValueError("Provide at most one of 'bearer_token' or 'bearer_auth'")
+        if sum(value is not None for value in (bearer_token, bearer_auth, basic_auth)) > 1:
+            raise ValueError(
+                "Provide at most one of 'bearer_token', 'bearer_auth', or 'basic_auth'"
+            )
         sync_client_builder = SyncClientBuilder()
         if timeout is not None:
             sync_client_builder = sync_client_builder.timeout(timedelta(seconds=timeout))
@@ -2446,9 +2653,9 @@ class SyncHTTPClient:
             middleware = _SyncRetryMiddleware(max_retries, retry_methods)
             sync_client_builder = sync_client_builder.with_middleware(middleware)
         with sync_client_builder.build() as client:
-            yield cls(client, bearer_token, bearer_auth)
+            yield cls(client, bearer_token, bearer_auth, basic_auth)
 
-    def _apply_bearer_auth(
+    def _apply_auth(
         self, request_builder: SyncRequestBuilder, *, skip_auth: bool
     ) -> SyncRequestBuilder:
         if skip_auth:
@@ -2457,6 +2664,9 @@ class SyncHTTPClient:
             return request_builder.bearer_auth(self._bearer_auth())
         if self._bearer_token is not None:
             return request_builder.bearer_auth(self._bearer_token)
+        if self._basic_auth is not None:
+            username, password = self._basic_auth
+            return request_builder.basic_auth(username, password)
         return request_builder
 
     def _prepare_request(
@@ -2468,13 +2678,15 @@ class SyncHTTPClient:
         *,
         skip_auth: bool,
     ) -> SyncRequestBuilder:
-        request_builder = self._apply_bearer_auth(request_builder, skip_auth=skip_auth)
+        request_builder = self._apply_auth(request_builder, skip_auth=skip_auth)
         return _prepare(request_builder, params, headers, timeout)
 
-    def _check_status(self, raw_response: RawSyncResponse) -> None:
+    def _check_status(self, raw_response: RawSyncResponse, error_type: type[Data] | None) -> None:
         if raw_response.status < 400:
             return
-        raise HTTPResponseError(raw_response.status, raw_response.bytes().to_bytes())
+        body = raw_response.bytes().to_bytes()
+        parsed_body = _decode_error_body(body, error_type) if error_type is not None else None
+        raise HTTPResponseError(raw_response.status, body, parsed_body)
 
     def _decode_body(self, raw_response: RawSyncResponse, response_data_type: type[Data]) -> Data:
         _validate_response_data_type(response_data_type)
@@ -2496,9 +2708,10 @@ class SyncHTTPClient:
         response_data_type: type[Data],
         *,
         error_for_status: bool,
+        error_type: type[Data] | None,
     ) -> Data:
         if error_for_status:
-            self._check_status(raw_response)
+            self._check_status(raw_response, error_type)
         return self._decode_body(raw_response, response_data_type)
 
     @overload
@@ -2511,6 +2724,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes: ...
     @overload
     def get(
@@ -2523,6 +2737,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> dict[str, Any]: ...
     @overload
     def get[TData: Data](
@@ -2535,6 +2750,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> TData: ...
     def get(
         self,
@@ -2546,19 +2762,27 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Data:
         """GET `path` and decode the body as `response_data_type` (raw `bytes` by default).
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         request_builder = self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
         )
         raw_response = _send_sync(request_builder.build())
-        return self._parse(raw_response, response_data_type, error_for_status=error_for_status)
+        return self._parse(
+            raw_response,
+            response_data_type,
+            error_for_status=error_for_status,
+            error_type=error_type,
+        )
 
     @overload
     def get_result(
@@ -2570,6 +2794,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes]: ...
     @overload
     def get_result(
@@ -2582,6 +2807,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any]]: ...
     @overload
     def get_result[TData: Data](
@@ -2594,6 +2820,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData]: ...
     @overload
     def get_result[THeaders: TypedHeaders](
@@ -2606,6 +2833,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes, THeaders]: ...
     @overload
     def get_result[THeaders: TypedHeaders](
@@ -2619,6 +2847,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any], THeaders]: ...
     @overload
     def get_result[TData: Data, THeaders: TypedHeaders](
@@ -2632,6 +2861,7 @@ class SyncHTTPClient:
         response_data_type: type[TData],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData, THeaders]: ...
     def get_result(
         self,
@@ -2644,20 +2874,23 @@ class SyncHTTPClient:
         response_data_type: type[Data] = bytes,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[Any, Any]:
         """Like `get`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         request_builder = self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
         )
         raw_response = _send_sync(request_builder.build())
         if error_for_status:
-            self._check_status(raw_response)
+            self._check_status(raw_response, error_type)
         data = self._decode_body(raw_response, response_data_type)
         headers = dict(raw_response.headers)
         if response_headers_type is None:
@@ -2672,12 +2905,13 @@ class SyncHTTPClient:
         params: Params | None,
         headers: Headers | None,
         timeout: float | None,
-        response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None,
+        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
         id_type: type[Any] | None,
         *,
         skip_auth: bool,
         allow_missing_id: bool,
         error_for_status: bool,
+        error_type: type[Data] | None,
     ) -> Iterator[SSEEvent[Any, Any]]:
         request_builder = self._client.get(path).header("accept", "text/event-stream")
         request_builder = self._prepare_request(
@@ -2687,7 +2921,7 @@ class SyncHTTPClient:
         try:
             with request as raw_response:
                 if error_for_status:
-                    self._check_status(raw_response)
+                    self._check_status(raw_response, error_type)
                 buffer = b""
                 while True:
                     chunk = raw_response.body_reader.read_chunk()
@@ -2722,6 +2956,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[SSEEvent[str, str]]: ...
     @overload
     def sse(
@@ -2734,6 +2969,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[SSEEvent[str, str | None]]: ...
     @overload
     def sse[TId](
@@ -2746,6 +2982,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         id_type: type[TId],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[SSEEvent[str, TId]]: ...
     @overload
     def sse[TId](
@@ -2759,6 +2996,7 @@ class SyncHTTPClient:
         id_type: type[TId],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[SSEEvent[str, TId | None]]: ...
     @overload
     def sse(
@@ -2771,6 +3009,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[SSEEvent[dict[str, Any], str]]: ...
     @overload
     def sse[TData](
@@ -2781,8 +3020,9 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
+        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[SSEEvent[TData, str]]: ...
     @overload
     def sse(
@@ -2796,6 +3036,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[SSEEvent[dict[str, Any], str | None]]: ...
     @overload
     def sse[TData](
@@ -2806,9 +3047,10 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
+        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[SSEEvent[TData, str | None]]: ...
     @overload
     def sse[TId](
@@ -2822,6 +3064,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         id_type: type[TId],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[SSEEvent[dict[str, Any], TId]]: ...
     @overload
     def sse[TId](
@@ -2836,6 +3079,7 @@ class SyncHTTPClient:
         id_type: type[TId],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[SSEEvent[dict[str, Any], TId | None]]: ...
     @overload
     def sse[TData, TId](
@@ -2846,9 +3090,10 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
+        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
         id_type: type[TId],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[SSEEvent[TData, TId]]: ...
     @overload
     def sse[TData, TId](
@@ -2859,10 +3104,11 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
+        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
         id_type: type[TId],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[SSEEvent[TData, TId | None]]: ...
     def sse(
         self,
@@ -2872,10 +3118,11 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
+        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         id_type: type[Any] | None = None,
         allow_missing_id: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[SSEEvent[Any, Any]]:
         """Open `path` as a Server-Sent Events stream, yielding one `SSEEvent` per event.
 
@@ -2885,7 +3132,9 @@ class SyncHTTPClient:
         (the default) or becomes `None`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._sse_stream(
             path,
@@ -2897,6 +3146,7 @@ class SyncHTTPClient:
             skip_auth=skip_auth,
             allow_missing_id=allow_missing_id,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     def _line_stream(
@@ -2908,11 +3158,12 @@ class SyncHTTPClient:
         json: JSONPayload | None,
         form: Form | None,
         content: str | bytes | None,
-        response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None,
+        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
+        error_type: type[Data] | None,
     ) -> Iterator[Any]:
         request_builder = self._prepare_request(
             request_builder, params, headers, timeout, skip_auth=skip_auth
@@ -2928,7 +3179,7 @@ class SyncHTTPClient:
         try:
             with request as raw_response:
                 if error_for_status:
-                    self._check_status(raw_response)
+                    self._check_status(raw_response, error_type)
                 if response_data_type is None:
                     while True:
                         chunk = raw_response.body_reader.read_chunk()
@@ -2960,6 +3211,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[bytes]: ...
     @overload
     def stream_get(
@@ -2972,6 +3224,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[dict[str, Any]]: ...
     @overload
     def stream_get[TLine](
@@ -2982,8 +3235,9 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TLine] | TypeAdapter[TLine] | Decoder[TLine],
+        response_data_type: type[TLine] | TypeAdapterTyping[TLine] | DecoderTyping[TLine],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[TLine]: ...
     def stream_get(
         self,
@@ -2993,8 +3247,9 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
+        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[Any]:
         """Stream GET `path`'s response as raw `bytes` chunks (unbuffered, safe for binary).
 
@@ -3002,7 +3257,9 @@ class SyncHTTPClient:
         each complete line is parsed and decoded as its own value.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._line_stream(
             self._client.get(path),
@@ -3016,6 +3273,7 @@ class SyncHTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -3032,6 +3290,7 @@ class SyncHTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[bytes]: ...
     @overload
     def stream_post(
@@ -3048,6 +3307,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[dict[str, Any]]: ...
     @overload
     def stream_post[TLine](
@@ -3061,9 +3321,10 @@ class SyncHTTPClient:
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[TLine] | TypeAdapter[TLine] | Decoder[TLine],
+        response_data_type: type[TLine] | TypeAdapterTyping[TLine] | DecoderTyping[TLine],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[TLine]: ...
     def stream_post(
         self,
@@ -3076,15 +3337,18 @@ class SyncHTTPClient:
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
+        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Iterator[Any]:
         """Like `stream_get`, but POST a body first — same `json`/`form`/`content` options as
         `post` (at most one), same raw-bytes-by-default / NDJSON-via-`response_data_type` split.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._line_stream(
             self._client.post(path),
@@ -3098,6 +3362,7 @@ class SyncHTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     def _download(
@@ -3110,6 +3375,7 @@ class SyncHTTPClient:
         *,
         skip_auth: bool,
         error_for_status: bool,
+        error_type: type[Data] | None,
     ) -> bytes | None:
         request_builder = self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
@@ -3118,7 +3384,7 @@ class SyncHTTPClient:
         try:
             with request as raw_response:
                 if error_for_status:
-                    self._check_status(raw_response)
+                    self._check_status(raw_response, error_type)
                 if dest is None:
                     buffer = bytearray()
                     while True:
@@ -3146,6 +3412,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes: ...
     @overload
     def download(
@@ -3158,6 +3425,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> None: ...
     def download(
         self,
@@ -3169,6 +3437,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes | None:
         """Download `path`'s response body, optimized for large objects (e.g. a presigned GET
         URL for a multi-GB file) — much lower peak memory than `get()` for big bodies.
@@ -3181,7 +3450,9 @@ class SyncHTTPClient:
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._download(
             path,
@@ -3191,6 +3462,7 @@ class SyncHTTPClient:
             timeout,
             skip_auth=skip_auth,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     def _send_with_body(
@@ -3207,6 +3479,7 @@ class SyncHTTPClient:
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
+        error_type: type[Data] | None,
     ) -> Data:
         request_builder = self._prepare_request(
             request_builder, params, headers, timeout, skip_auth=skip_auth
@@ -3219,7 +3492,12 @@ class SyncHTTPClient:
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
         )
         raw_response = _send_sync(request_builder.build())
-        return self._parse(raw_response, response_data_type, error_for_status=error_for_status)
+        return self._parse(
+            raw_response,
+            response_data_type,
+            error_for_status=error_for_status,
+            error_type=error_type,
+        )
 
     def _send_with_body_result(
         self,
@@ -3236,6 +3514,7 @@ class SyncHTTPClient:
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
+        error_type: type[Data] | None,
     ) -> Result[Any, Any]:
         request_builder = self._prepare_request(
             request_builder, params, headers, timeout, skip_auth=skip_auth
@@ -3249,7 +3528,7 @@ class SyncHTTPClient:
         )
         raw_response = _send_sync(request_builder.build())
         if error_for_status:
-            self._check_status(raw_response)
+            self._check_status(raw_response, error_type)
         data = self._decode_body(raw_response, response_data_type)
         response_headers = dict(raw_response.headers)
         if response_headers_type is None:
@@ -3272,6 +3551,7 @@ class SyncHTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes: ...
     @overload
     def post(
@@ -3288,6 +3568,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> dict[str, Any]: ...
     @overload
     def post[TData: Data](
@@ -3304,6 +3585,7 @@ class SyncHTTPClient:
         response_data_type: type[TData],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> TData: ...
     def post(
         self,
@@ -3319,12 +3601,15 @@ class SyncHTTPClient:
         response_data_type: type[Data] = bytes,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Data:
         """POST to `path` with at most one of `json`/`form`/`content` (raises `ValueError` if
         more than one is given) and decode the response as `response_data_type`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._send_with_body(
             self._client.post(path),
@@ -3338,6 +3623,7 @@ class SyncHTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -3354,6 +3640,7 @@ class SyncHTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes]: ...
     @overload
     def post_result(
@@ -3370,6 +3657,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any]]: ...
     @overload
     def post_result[TData: Data](
@@ -3386,6 +3674,7 @@ class SyncHTTPClient:
         response_data_type: type[TData],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData]: ...
     @overload
     def post_result[THeaders: TypedHeaders](
@@ -3402,6 +3691,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes, THeaders]: ...
     @overload
     def post_result[THeaders: TypedHeaders](
@@ -3419,6 +3709,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any], THeaders]: ...
     @overload
     def post_result[TData: Data, THeaders: TypedHeaders](
@@ -3436,6 +3727,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData, THeaders]: ...
     def post_result(
         self,
@@ -3452,13 +3744,16 @@ class SyncHTTPClient:
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[Any, Any]:
         """Like `post`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._send_with_body_result(
             self._client.post(path),
@@ -3473,6 +3768,7 @@ class SyncHTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -3489,6 +3785,7 @@ class SyncHTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes: ...
     @overload
     def put(
@@ -3505,6 +3802,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> dict[str, Any]: ...
     @overload
     def put[TData: Data](
@@ -3521,6 +3819,7 @@ class SyncHTTPClient:
         response_data_type: type[TData],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> TData: ...
     def put(
         self,
@@ -3536,11 +3835,14 @@ class SyncHTTPClient:
         response_data_type: type[Data] = bytes,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Data:
         """PUT to `path`. Same body/decode rules as `post`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._send_with_body(
             self._client.put(path),
@@ -3554,6 +3856,7 @@ class SyncHTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -3570,6 +3873,7 @@ class SyncHTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes]: ...
     @overload
     def put_result(
@@ -3586,6 +3890,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any]]: ...
     @overload
     def put_result[TData: Data](
@@ -3602,6 +3907,7 @@ class SyncHTTPClient:
         response_data_type: type[TData],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData]: ...
     @overload
     def put_result[THeaders: TypedHeaders](
@@ -3618,6 +3924,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes, THeaders]: ...
     @overload
     def put_result[THeaders: TypedHeaders](
@@ -3635,6 +3942,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any], THeaders]: ...
     @overload
     def put_result[TData: Data, THeaders: TypedHeaders](
@@ -3652,6 +3960,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData, THeaders]: ...
     def put_result(
         self,
@@ -3668,13 +3977,16 @@ class SyncHTTPClient:
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[Any, Any]:
         """Like `put`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._send_with_body_result(
             self._client.put(path),
@@ -3689,6 +4001,7 @@ class SyncHTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -3705,6 +4018,7 @@ class SyncHTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes: ...
     @overload
     def patch(
@@ -3721,6 +4035,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> dict[str, Any]: ...
     @overload
     def patch[TData: Data](
@@ -3737,6 +4052,7 @@ class SyncHTTPClient:
         response_data_type: type[TData],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> TData: ...
     def patch(
         self,
@@ -3752,11 +4068,14 @@ class SyncHTTPClient:
         response_data_type: type[Data] = bytes,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Data:
         """PATCH `path`. Same body/decode rules as `post`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._send_with_body(
             self._client.patch(path),
@@ -3770,6 +4089,7 @@ class SyncHTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -3786,6 +4106,7 @@ class SyncHTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes]: ...
     @overload
     def patch_result(
@@ -3802,6 +4123,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any]]: ...
     @overload
     def patch_result[TData: Data](
@@ -3818,6 +4140,7 @@ class SyncHTTPClient:
         response_data_type: type[TData],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData]: ...
     @overload
     def patch_result[THeaders: TypedHeaders](
@@ -3834,6 +4157,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes, THeaders]: ...
     @overload
     def patch_result[THeaders: TypedHeaders](
@@ -3851,6 +4175,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any], THeaders]: ...
     @overload
     def patch_result[TData: Data, THeaders: TypedHeaders](
@@ -3868,6 +4193,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData, THeaders]: ...
     def patch_result(
         self,
@@ -3884,13 +4210,16 @@ class SyncHTTPClient:
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[Any, Any]:
         """Like `patch`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._send_with_body_result(
             self._client.patch(path),
@@ -3905,6 +4234,7 @@ class SyncHTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -3917,6 +4247,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> bytes: ...
     @overload
     def delete(
@@ -3929,6 +4260,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> dict[str, Any]: ...
     @overload
     def delete[TData: Data](
@@ -3941,6 +4273,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> TData: ...
     def delete(
         self,
@@ -3952,11 +4285,14 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Data:
         """DELETE `path` and decode the response as `response_data_type`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._send_with_body(
             self._client.delete(path),
@@ -3970,6 +4306,7 @@ class SyncHTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -3982,6 +4319,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes]: ...
     @overload
     def delete_result(
@@ -3994,6 +4332,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any]]: ...
     @overload
     def delete_result[TData: Data](
@@ -4006,6 +4345,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData]: ...
     @overload
     def delete_result[THeaders: TypedHeaders](
@@ -4018,6 +4358,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[bytes, THeaders]: ...
     @overload
     def delete_result[THeaders: TypedHeaders](
@@ -4031,6 +4372,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[dict[str, Any], THeaders]: ...
     @overload
     def delete_result[TData: Data, THeaders: TypedHeaders](
@@ -4044,6 +4386,7 @@ class SyncHTTPClient:
         response_data_type: type[TData],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[TData, THeaders]: ...
     def delete_result(
         self,
@@ -4056,13 +4399,16 @@ class SyncHTTPClient:
         response_data_type: type[Data] = bytes,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[Any, Any]:
         """Like `delete`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         return self._send_with_body_result(
             self._client.delete(path),
@@ -4077,6 +4423,7 @@ class SyncHTTPClient:
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
+            error_type=error_type,
         )
 
     @overload
@@ -4089,6 +4436,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[None]: ...
     @overload
     def head[THeaders: TypedHeaders](
@@ -4101,6 +4449,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[None, THeaders]: ...
     def head(
         self,
@@ -4112,19 +4461,22 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
+        error_type: type[Data] | None = None,
     ) -> Result[None, Any]:
         """HEAD `path` — headers-only, no body is ever decoded. Pass
         `response_headers_type` to get the response headers parsed into `result.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
         """
         request_builder = self._prepare_request(
             self._client.head(path), params, headers, timeout, skip_auth=skip_auth
         )
         raw_response = _send_sync(request_builder.build())
         if error_for_status:
-            self._check_status(raw_response)
+            self._check_status(raw_response, error_type)
         response_headers = dict(raw_response.headers)
         typed_headers = (
             None

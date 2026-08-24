@@ -85,18 +85,19 @@ wrapping (`HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError`), `put`/
 for arbitrary binary content; pass `response_data_type` to switch to newline-buffered NDJSON-style typed
 decoding instead — the buffering is conditional on that param, not always-on), `download` (see the
 large-object note below), the `Data` decode-target
-system (`bytes` default, plain `dict`, pydantic `BaseModel`, msgspec `Struct`), a bearer-token
-auth provider (static `bearer_token` or a per-request-refreshed `bearer_auth` callable, plus a
-per-verb `skip_auth=True` override to omit auth for one call on both clients), cookie/session
+system (`bytes` default, plain `dict`, pydantic `BaseModel`, msgspec `Struct`), auth (static
+`bearer_token`, a per-request-refreshed `bearer_auth` callable, or a `basic_auth`
+`(username, password)` pair — provide at most one; plus a per-verb `skip_auth=True` override to
+omit auth for one call on both clients), cookie/session
 support (`cookie_store=True`), redirect control (`follow_redirects`/`max_redirects`), proxy config
-(`proxy=`), and retries (`max_retries`/`retry_methods`, implemented as a real pyreqwest
+(`proxy=`), retries (`max_retries`/`retry_methods`, implemented as a real pyreqwest
 `with_middleware` hook — backoff + `Retry-After` honored, defaults to idempotent verbs
-`get`/`put`/`delete`/`head`, `post`/`patch` require explicit opt-in via `retry_methods`).
+`get`/`put`/`delete`/`head`, `post`/`patch` require explicit opt-in via `retry_methods`), and typed
+error bodies (a per-verb `error_type=SomeModel` param, mirroring `response_data_type`, that
+decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it `None`).
 
-Not done yet:
-
-1. **Typed error bodies** — an `error_type=SomeModel` param (mirrors `response_data_type`) that decodes 4xx/5xx
-   bodies onto `HTTPResponseError`, instead of just the raw `body_start` snippet it has today.
+Not done yet: nothing outstanding right now — see git history/this file's own dev-notes below for
+what's landed and why.
 
 ## Testing
 
@@ -355,6 +356,19 @@ Before writing any code, tell the user that you've read this file AND read and f
 
 ## Development notes
 
+- **`error_type` decodes from already-fetched bytes, never the live response object.** By the
+  time `_check_status` raises, it has already called `.bytes()` once to populate `body_start` —
+  a pyreqwest response body can't be read twice, so `error_type`'s decode helper
+  (`_decode_error_body`) takes plain `bytes` and mirrors `_decode_body`'s branch order/reasoning
+  exactly, rather than reusing `_decode_body` itself (which reads directly off the response
+  object via `.bytes()`/`.json()`). It needed no new overloads at all, unlike
+  `response_data_type` — `error_type`'s value only affects what gets attached to
+  `HTTPResponseError.parsed_body` on the failure path, never the function's own return type, so
+  it's just `type[Data] | None = None` added identically to every existing overload, the same way
+  `timeout`/`skip_auth` were. A decode failure against `error_type` (e.g. the body doesn't match
+  the model) propagates the decode library's own exception uncaught, matching this file's
+  existing rule for `response_data_type` failures — see "Validation errors from the chosen decode
+  library are NOT wrapped" below.
 - **The `_compat.py` fallback stub classes must be subscriptable, or `import lothc` crashes
   outright when an optional extra is missing.** `_client.py` has many unquoted
   `Decoder[Any]`/`TypeAdapter[Any]` annotations (no `from __future__ import annotations` in that
@@ -370,17 +384,40 @@ Before writing any code, tell the user that you've read this file AND read and f
   `builtins.__import__` in a **fresh subprocess** and asserts `import lothc` still succeeds — a
   subprocess, not the existing fixture's in-process module-reload approach, since `lothc` is
   already loaded with the real msgspec/pydantic bound in the test process itself.
-  Separately: a strict-mode type checker (e.g. basedpyright) run against a consumer's own code
-  in an environment that genuinely lacks msgspec/pydantic will still show `Unknown` in unrelated
-  public overloads (`sse()`, `get_result()`, `download()`, etc.) even when that consumer never
-  touches the missing library — confirmed empirically this is **not fixable from `_compat.py`**:
-  wrapping the `TYPE_CHECKING`-branch import in its own `try/except` was tested directly and
-  pyright still ignores the `except` branch entirely for typing purposes, since `TYPE_CHECKING`
-  is unconditionally `True` for the checker regardless of whether the real package resolves. This
-  is a fundamental limitation of statically typing an optional dependency, not a lothc bug — full
-  type precision on msgspec/pydantic-touching overloads requires msgspec/pydantic to be resolvable
-  wherever the type checker runs (even just as a type-checking-only dependency), independent of
-  whether either is installed at runtime.
+  Separately, a real and more serious gap was found and fixed: a strict-mode type checker (e.g.
+  basedpyright) run against a consumer's own code in an environment that genuinely lacks
+  msgspec/pydantic showed `Unknown` in unrelated public overloads (`sse()`, `get_result()`,
+  `download()`, etc.) even when that consumer never touches the missing library — a real
+  lothc-caused problem, not something a consumer should have to route around. **First attempt —
+  wrapping the `TYPE_CHECKING`-branch import in its own `try/except` — confirmed empirically NOT
+  to work**: pyright ignores the `except` branch entirely for typing purposes once
+  `TYPE_CHECKING` is `True`, regardless of whether the real package resolves. That's a hard limit
+  of *nominal* typing (importing the real class and hoping a fallback catches the failure) — it
+  is not a hard limit of typing an optional dependency in general. **Real fix: swap the nominal
+  `Struct`/`BaseModel`/`Decoder`/`TypeAdapter` references inside `Data`/`Params`/`Headers`/
+  `TypedHeaders`/`JSONPayload`/`response_data_type` for checker-local structural `Protocol`s**
+  (`StructTyping`/`BaseModelTyping`/`DecoderTyping`/`TypeAdapterTyping` in `_compat.py`) that
+  require zero import of the real packages — `StructTyping` just declares
+  `__struct_fields__: ClassVar[tuple[str, ...]]` (msgspec puts this directly on `Struct` itself),
+  `BaseModelTyping` declares `model_config: ClassVar[Any]` (same story on pydantic's `BaseModel`),
+  and `TypeAdapterTyping`/`DecoderTyping` match on `validate_json`/`decode`'s call shape alone.
+  Since these protocols never import anything, they're never `Unknown`, in ANY environment — and
+  since a real `Struct`/`BaseModel` subclass structurally satisfies them for free, precision when
+  the packages *are* installed is completely unaffected. Confirmed live across all four checkers
+  (basedpyright/mypy/ty/zuban), in both a msgspec-absent and a both-installed environment, with a
+  real subclass passed as `response_data_type=`: always resolves to its own precise type, never
+  `Unknown`. **Runtime `isinstance`/`issubclass`/`case` dispatch must keep using the real nominal
+  `Struct`/`BaseModel`/`Decoder`/`TypeAdapter`** — the Protocols are for the five alias
+  definitions and `response_data_type`'s parameter type only, never for a runtime check. One real
+  side effect from the swap: several places that relied on basedpyright narrowing a `match`
+  statement's `case _:` fallback (or an unguarded final branch) down to "not `Struct`/`BaseModel`"
+  stopped narrowing correctly, because basedpyright can exclude a nominal class from a plain
+  sequential `issubclass`/`isinstance` **if-chain** but NOT from a `match` fallback or an
+  unguarded branch, once the union's members are Protocols rather than the nominal classes
+  themselves (confirmed by testing each shape directly) — fixed by adding an explicit narrowing
+  `issubclass`/`isinstance` guard (mirroring `_decode_body`'s already-correct if-chain) or an
+  explicit `cast` at each affected site (`_apply_params`, `_apply_headers`, `_parse_typed_headers`,
+  `_decode_json_line`), not by suppressing the resulting error.
 - **Never leak the backend's exception types.** pyreqwest's `TransportError`/`RequestTimeoutError`/
   `NetworkError` are caught and translated to `lothc.HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError`
   at every `.send()` call and inside both SSE stream loops. If pyreqwest (or a future alternate
@@ -438,11 +475,15 @@ Before writing any code, tell the user that you've read this file AND read and f
   claim something is "rejected/enforced" from a basedpyright result alone — Python never enforces
   type hints at runtime, so verify the actual runtime behavior, especially for anything that reads
   like a safety/validation guarantee.**
-- **`bearer_token` (static) / `bearer_auth` (a callable, resolved fresh on every request) — not
-  `auth_token`/`auth`.** Renamed deliberately: both mechanisms only ever produce a Bearer
-  `Authorization` header via pyreqwest's `.bearer_auth()`, and the old generic names hid that. Keep this
-  naming precise if Basic auth (or anything else) is ever added — don't let a new mechanism quietly
-  reuse the word "auth" generically again.
+- **`bearer_token` (static) / `bearer_auth` (a callable, resolved fresh on every request) / `basic_auth`
+  (a `(username, password)` pair) — not `auth_token`/`auth`.** Renamed deliberately: the first two only
+  ever produce a Bearer `Authorization` header via pyreqwest's `.bearer_auth()`, and the old generic
+  names hid that. `basic_auth` landed later, precisely named per this note's own earlier warning —
+  it calls pyreqwest's separate `.basic_auth()`, never reusing the word "auth" generically. Keep this
+  naming precise if a fourth mechanism is ever added.
+  `_apply_bearer_auth` (both clients) was renamed to `_apply_auth` when `basic_auth` landed, since it
+  now applies whichever of the three mechanisms is configured, not just bearer — a stale name here
+  would silently mislead the next person touching auth application.
 - **`response_data_type` defaults to `bytes` everywhere** (not a `Response`/`SyncResponse` wrapper — those classes
   were deleted). `sse()` is the deliberate exception: its bare default stays `SSEEvent[str]`, since a stream
   of discrete named records has no single "raw bytes" analogue the way one response body does.

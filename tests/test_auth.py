@@ -1,3 +1,7 @@
+import base64
+
+import pytest
+
 from lothc import HTTPClient, SyncHTTPClient
 
 
@@ -111,3 +115,39 @@ def test_sync_skip_auth_does_not_invoke_bearer_auth_callable(base_url: str) -> N
     subsequent_headers = {h["name"].lower(): h["value"] for h in subsequent["headers"]}
     assert "authorization" not in skipped_headers
     assert subsequent_headers["authorization"] == "Bearer token-1"
+
+
+async def test_basic_auth_sends_authorization_header(base_url: str) -> None:
+    async with HTTPClient.build(base_url=base_url, basic_auth=("username", "password")) as client:
+        result = await client.get("echo-headers", response_data_type=dict)
+
+    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    expected = base64.b64encode(b"username:password").decode()
+    assert headers["authorization"] == f"Basic {expected}"
+
+
+def test_sync_basic_auth_sends_authorization_header(base_url: str) -> None:
+    with SyncHTTPClient.build(base_url=base_url, basic_auth=("username", "password")) as client:
+        result = client.get("echo-headers", response_data_type=dict)
+
+    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    expected = base64.b64encode(b"username:password").decode()
+    assert headers["authorization"] == f"Basic {expected}"
+
+
+async def test_build_raises_when_more_than_one_auth_mechanism_provided(base_url: str) -> None:
+    with pytest.raises(ValueError, match="Provide at most one of"):
+        async with HTTPClient.build(
+            base_url=base_url, bearer_token="token-value", basic_auth=("username", "password")
+        ):
+            pass
+
+
+def test_sync_build_raises_when_more_than_one_auth_mechanism_provided(base_url: str) -> None:
+    with (
+        pytest.raises(ValueError, match="Provide at most one of"),
+        SyncHTTPClient.build(
+            base_url=base_url, bearer_token="token-value", basic_auth=("username", "password")
+        ),
+    ):
+        pass
