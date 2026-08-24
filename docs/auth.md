@@ -32,6 +32,22 @@ async with HTTPClient.build(
 Both mechanisms only ever produce a `Bearer` `Authorization` header — there's no separate
 Basic-auth or custom-scheme option today.
 
+Every verb also takes `skip_auth`, which omits the `Authorization` header for that one call —
+useful when a client configured with `bearer_token`/`bearer_auth` also needs to hit a
+differently-authenticated target through the same instance, e.g. a presigned S3 URL that must
+never see your API's own token:
+
+```python
+async with HTTPClient.build(
+    base_url="https://api.example.com/", bearer_token="my-static-token"
+) as client:
+    await client.get("items/7")  # gets the Authorization header
+    await client.get("https://presigned-bucket.example.com/file", skip_auth=True)  # doesn't
+```
+
+`skip_auth=True` also skips *calling* `bearer_auth` for that request — if refreshing the token is
+expensive (a network round-trip to an auth server, say), that cost isn't paid on a skipped call.
+
 ## Default headers
 
 For anything that isn't a `Bearer` token — an API key header, a custom user-agent, whatever your
@@ -61,3 +77,16 @@ async with HTTPClient.build(base_url="https://api.example.com/", timeout=5.0) as
 
 Pass `timeout=None` to disable it and fall back to pyreqwest's own default. See
 [Error handling](errors.md) for `HTTPTimeoutError`.
+
+Every verb also takes its own `timeout`, overriding the client's for that one call only:
+
+```python
+async with HTTPClient.build(base_url="https://api.example.com/", timeout=5.0) as client:
+    await client.get("items/7")  # uses the client default, 5s
+    await client.get("exports/large-file.csv", timeout=60.0)  # this call gets 60s instead
+```
+
+There's no way to make a single call wait forever when the client itself has a finite
+`timeout` — pyreqwest's own per-request `.timeout()` only ever accepts a duration, never a
+sentinel meaning "no timeout." To remove the limit entirely, build the client with
+`timeout=None` instead.

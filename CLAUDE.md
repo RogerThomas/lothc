@@ -78,14 +78,16 @@ the fixed sdist.
 
 ### Roadmap — what's done, what's next
 
-Done: query params (typed + raw), per-request headers (typed + raw), timeouts, transport error
+Done: query params (typed + raw), per-request headers (typed + raw), timeouts (client-level, plus
+a per-verb `timeout=` override on every verb on both clients), transport error
 wrapping (`HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError`), `put`/`patch`/`delete`/`head`, SSE (with
 `TypeAdapter`/`Decoder` support), `stream_get`/`stream_post` (raw chunks by default — unbuffered, safe
 for arbitrary binary content; pass `response_data_type` to switch to newline-buffered NDJSON-style typed
 decoding instead — the buffering is conditional on that param, not always-on), `download` (see the
 large-object note below), the `Data` decode-target
 system (`bytes` default, plain `dict`, pydantic `BaseModel`, msgspec `Struct`), a bearer-token
-auth provider (static `bearer_token` or a per-request-refreshed `bearer_auth` callable), cookie/session
+auth provider (static `bearer_token` or a per-request-refreshed `bearer_auth` callable, plus a
+per-verb `skip_auth=True` override to omit auth for one call on both clients), cookie/session
 support (`cookie_store=True`), redirect control (`follow_redirects`/`max_redirects`), proxy config
 (`proxy=`), and retries (`max_retries`/`retry_methods`, implemented as a real pyreqwest
 `with_middleware` hook — backoff + `Retry-After` honored, defaults to idempotent verbs
@@ -353,6 +355,32 @@ Before writing any code, tell the user that you've read this file AND read and f
 
 ## Development notes
 
+- **The `_compat.py` fallback stub classes must be subscriptable, or `import lothc` crashes
+  outright when an optional extra is missing.** `_client.py` has many unquoted
+  `Decoder[Any]`/`TypeAdapter[Any]` annotations (no `from __future__ import annotations` in that
+  file), evaluated eagerly at import time — confirmed live in three clean venvs (msgspec-only,
+  pydantic-only, neither) that this raised `TypeError: type 'Decoder'/'TypeAdapter' is not
+  subscriptable` on plain `import lothc`, a total regression of the "must work with neither,
+  either, or both installed" guarantee. This had gone uncaught because
+  `tests/test_compat_fallbacks.py`'s existing fixture deliberately never re-imports `lothc`
+  itself (see that file's module docstring) — it only exercises `_compat.py` in isolation. Fixed
+  by giving `Struct`/`Decoder`/`BaseModel`/`TypeAdapter`'s fallback stubs a trivial
+  `__class_getitem__` returning `cls`, plus a real regression test
+  (`test_import_lothc_succeeds_without_msgspec_or_pydantic`) that blocks both imports via
+  `builtins.__import__` in a **fresh subprocess** and asserts `import lothc` still succeeds — a
+  subprocess, not the existing fixture's in-process module-reload approach, since `lothc` is
+  already loaded with the real msgspec/pydantic bound in the test process itself.
+  Separately: a strict-mode type checker (e.g. basedpyright) run against a consumer's own code
+  in an environment that genuinely lacks msgspec/pydantic will still show `Unknown` in unrelated
+  public overloads (`sse()`, `get_result()`, `download()`, etc.) even when that consumer never
+  touches the missing library — confirmed empirically this is **not fixable from `_compat.py`**:
+  wrapping the `TYPE_CHECKING`-branch import in its own `try/except` was tested directly and
+  pyright still ignores the `except` branch entirely for typing purposes, since `TYPE_CHECKING`
+  is unconditionally `True` for the checker regardless of whether the real package resolves. This
+  is a fundamental limitation of statically typing an optional dependency, not a lothc bug — full
+  type precision on msgspec/pydantic-touching overloads requires msgspec/pydantic to be resolvable
+  wherever the type checker runs (even just as a type-checking-only dependency), independent of
+  whether either is installed at runtime.
 - **Never leak the backend's exception types.** pyreqwest's `TransportError`/`RequestTimeoutError`/
   `NetworkError` are caught and translated to `lothc.HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError`
   at every `.send()` call and inside both SSE stream loops. If pyreqwest (or a future alternate

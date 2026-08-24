@@ -12,6 +12,7 @@ sees the blocked imports.
 
 import builtins
 import importlib
+import subprocess
 import sys
 from collections.abc import Iterator, Mapping, Sequence
 from types import ModuleType
@@ -80,3 +81,34 @@ def test_base_model_and_type_adapter_fall_back_to_empty_stub_classes(
     assert isinstance(compat.BaseModel(), compat.BaseModel)
     assert isinstance(compat.TypeAdapter(), compat.TypeAdapter)
     assert not isinstance(object(), compat.BaseModel)
+
+
+def test_fallback_stubs_are_subscriptable(compat_without_optional_deps: ModuleType) -> None:
+    compat = compat_without_optional_deps
+
+    assert compat.Struct[int] is compat.Struct
+    assert compat.Decoder[int] is compat.Decoder
+    assert compat.BaseModel[int] is compat.BaseModel
+    assert compat.TypeAdapter[int] is compat.TypeAdapter
+
+
+def test_import_lothc_succeeds_without_msgspec_or_pydantic() -> None:
+    # `lothc._client` has plenty of unquoted `Decoder[Any]`/`TypeAdapter[Any]` annotations,
+    # evaluated eagerly at import time — this is a real, separate regression test from the
+    # `compat_without_optional_deps` fixture above (which deliberately never re-imports `lothc`
+    # itself, see module docstring), run in a fresh subprocess so it can't be fooled by `lothc`
+    # already being loaded in this test process with the real msgspec/pydantic bound.
+    script = (
+        "import builtins\n"
+        "_real_import = builtins.__import__\n"
+        "def _blocking_import(name, globals=None, locals=None, fromlist=(), level=0):\n"
+        "    if name.split('.')[0] in {'msgspec', 'pydantic'}:\n"
+        "        raise ImportError(f'blocked for test: {name}')\n"
+        "    return _real_import(name, globals, locals, fromlist, level)\n"
+        "builtins.__import__ = _blocking_import\n"
+        "import lothc\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stderr
