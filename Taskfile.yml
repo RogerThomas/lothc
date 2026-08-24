@@ -159,8 +159,10 @@ tasks:
       - uv run zensical serve --dev-addr localhost:9223
 
   docs-build:
-    desc: Build the static docs site into site/
-    cmd: uv run zensical build
+    desc: Build the static docs site into site/, plus agent-friendly raw Markdown (agents/all.md, llms.txt)
+    cmds:
+      - uv run zensical build
+      - uv run yeet ./scripts/build_agent_docs.py
 
   # ------------------------------------------------------------------------------------------------
   # - Benchmarks ---------------------------------------------------------------------------------

@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 if TYPE_CHECKING:
     import msgspec
@@ -13,17 +13,29 @@ else:
     except ImportError:
         msgspec = None
 
-        class Struct: ...
+        # `_client.py` has plenty of unquoted `Decoder[Any]` annotations, evaluated eagerly at
+        # import time (no `from __future__ import annotations` in that file) — without
+        # `__class_getitem__`, subscripting this stub crashes `import lothc` outright whenever
+        # msgspec isn't installed, confirmed live.
+        class Struct:
+            def __class_getitem__(cls, _item: object) -> type[Self]:
+                return cls
 
-        class Decoder: ...
+        class Decoder:
+            def __class_getitem__(cls, _item: object) -> type[Self]:
+                return cls
 
     try:
         from pydantic import BaseModel, TypeAdapter
     except ImportError:
+        # Same reasoning as Struct/Decoder above, for _client.py's `TypeAdapter[Any]` annotations.
+        class BaseModel:
+            def __class_getitem__(cls, _item: object) -> type[Self]:
+                return cls
 
-        class BaseModel: ...
-
-        class TypeAdapter: ...
+        class TypeAdapter:
+            def __class_getitem__(cls, _item: object) -> type[Self]:
+                return cls
 
 
 __all__ = ["BaseModel", "Decoder", "Struct", "TypeAdapter", "msgspec"]

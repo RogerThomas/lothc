@@ -46,6 +46,34 @@ def test_sync_slow_endpoint_past_timeout_raises_timeout_error(base_url: str) -> 
         client.get("slow")
 
 
+async def test_per_call_timeout_shorter_than_client_raises_timeout_error(base_url: str) -> None:
+    async with HTTPClient.build(base_url=base_url, timeout=30.0) as client:
+        with pytest.raises(HTTPTimeoutError):
+            await client.get("slow", timeout=0.1)
+
+
+def test_sync_per_call_timeout_shorter_than_client_raises_timeout_error(base_url: str) -> None:
+    with (
+        SyncHTTPClient.build(base_url=base_url, timeout=30.0) as client,
+        pytest.raises(HTTPTimeoutError),
+    ):
+        client.get("slow", timeout=0.1)
+
+
+async def test_per_call_timeout_longer_than_client_overrides_it(base_url: str) -> None:
+    async with HTTPClient.build(base_url=base_url, timeout=0.1) as client:
+        result = await client.get("slow", timeout=10.0, response_data_type=dict)
+
+    assert result == {"finally": True}
+
+
+def test_sync_per_call_timeout_longer_than_client_overrides_it(base_url: str) -> None:
+    with SyncHTTPClient.build(base_url=base_url, timeout=0.1) as client:
+        result = client.get("slow", timeout=10.0, response_data_type=dict)
+
+    assert result == {"finally": True}
+
+
 async def test_exceeding_max_redirects_raises_transport_error(base_url: str) -> None:
     async with HTTPClient.build(base_url=base_url, max_redirects=1) as client:
         with pytest.raises(HTTPTransportError):

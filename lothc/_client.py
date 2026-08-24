@@ -541,10 +541,22 @@ def _apply_headers[TBuilder: BaseRequestBuilder](
     return request_builder.headers(normalized)
 
 
-def _prepare[TBuilder: BaseRequestBuilder](
-    request_builder: TBuilder, params: Params | None, headers: Headers | None
+def _apply_timeout[TBuilder: BaseRequestBuilder](
+    request_builder: TBuilder, timeout: float | None
 ) -> TBuilder:
-    return _apply_headers(_apply_params(request_builder, params), headers)
+    if timeout is None:
+        return request_builder
+    return request_builder.timeout(timedelta(seconds=timeout))
+
+
+def _prepare[TBuilder: BaseRequestBuilder](
+    request_builder: TBuilder,
+    params: Params | None,
+    headers: Headers | None,
+    timeout: float | None,
+) -> TBuilder:
+    prepared = _apply_headers(_apply_params(request_builder, params), headers)
+    return _apply_timeout(prepared, timeout)
 
 
 async def _attach_body[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many-return-statements
@@ -688,7 +700,11 @@ class HTTPClient:
         async with pyreqwest_client_builder.build() as client:
             yield cls(client, bearer_token, bearer_auth)
 
-    async def _apply_bearer_auth(self, request_builder: RequestBuilder) -> RequestBuilder:
+    async def _apply_bearer_auth(
+        self, request_builder: RequestBuilder, *, skip_auth: bool
+    ) -> RequestBuilder:
+        if skip_auth:
+            return request_builder
         if self._bearer_auth is not None:
             return request_builder.bearer_auth(await self._bearer_auth())
         if self._bearer_token is not None:
@@ -696,10 +712,16 @@ class HTTPClient:
         return request_builder
 
     async def _prepare_request(
-        self, request_builder: RequestBuilder, params: Params | None, headers: Headers | None
+        self,
+        request_builder: RequestBuilder,
+        params: Params | None,
+        headers: Headers | None,
+        timeout: float | None,
+        *,
+        skip_auth: bool,
     ) -> RequestBuilder:
-        request_builder = await self._apply_bearer_auth(request_builder)
-        return _prepare(request_builder, params, headers)
+        request_builder = await self._apply_bearer_auth(request_builder, skip_auth=skip_auth)
+        return _prepare(request_builder, params, headers, timeout)
 
     async def _check_status(self, raw_response: RawResponse) -> None:
         if raw_response.status < 400:
@@ -737,6 +759,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> bytes: ...
     @overload
@@ -746,6 +770,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
     ) -> dict[str, Any]: ...
@@ -756,6 +782,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
     ) -> TData: ...
@@ -765,6 +793,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
@@ -772,7 +802,9 @@ class HTTPClient:
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
         """
-        request_builder = await self._prepare_request(self._client.get(path), params, headers)
+        request_builder = await self._prepare_request(
+            self._client.get(path), params, headers, timeout, skip_auth=skip_auth
+        )
         raw_response = await _send(request_builder.build())
         return await self._parse(
             raw_response, response_data_type, error_for_status=error_for_status
@@ -785,6 +817,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> Result[bytes]: ...
     @overload
@@ -794,6 +828,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
     ) -> Result[dict[str, Any]]: ...
@@ -804,6 +840,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
     ) -> Result[TData]: ...
@@ -814,6 +852,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
     ) -> Result[bytes, THeaders]: ...
@@ -824,6 +864,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -835,6 +877,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -845,6 +889,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[Data] = bytes,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
@@ -853,7 +899,9 @@ class HTTPClient:
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
         """
-        request_builder = await self._prepare_request(self._client.get(path), params, headers)
+        request_builder = await self._prepare_request(
+            self._client.get(path), params, headers, timeout, skip_auth=skip_auth
+        )
         raw_response = await _send(request_builder.build())
         if error_for_status:
             await self._check_status(raw_response)
@@ -870,14 +918,18 @@ class HTTPClient:
         path: str,
         params: Params | None,
         headers: Headers | None,
+        timeout: float | None,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None,
         id_type: type[Any] | None,
         *,
+        skip_auth: bool,
         allow_missing_id: bool,
         error_for_status: bool,
     ) -> AsyncIterator[SSEEvent[Any, Any]]:
         request_builder = self._client.get(path).header("accept", "text/event-stream")
-        request_builder = await self._prepare_request(request_builder, params, headers)
+        request_builder = await self._prepare_request(
+            request_builder, params, headers, timeout, skip_auth=skip_auth
+        )
         request = request_builder.build_streamed()
         try:
             async with request as raw_response:
@@ -914,6 +966,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> AsyncIterator[SSEEvent[str, str]]: ...
     @overload
@@ -923,6 +977,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
     ) -> AsyncIterator[SSEEvent[str, str | None]]: ...
@@ -933,6 +989,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         id_type: type[TId],
         error_for_status: bool = True,
     ) -> AsyncIterator[SSEEvent[str, TId]]: ...
@@ -943,6 +1001,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         id_type: type[TId],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
@@ -954,6 +1014,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
     ) -> AsyncIterator[SSEEvent[dict[str, Any], str]]: ...
@@ -964,6 +1026,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
         error_for_status: bool = True,
     ) -> AsyncIterator[SSEEvent[TData, str]]: ...
@@ -974,6 +1038,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
@@ -985,6 +1051,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
@@ -996,6 +1064,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         id_type: type[TId],
         error_for_status: bool = True,
@@ -1007,6 +1077,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         id_type: type[TId],
         allow_missing_id: Literal[True],
@@ -1019,6 +1091,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
         id_type: type[TId],
         error_for_status: bool = True,
@@ -1030,6 +1104,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
         id_type: type[TId],
         allow_missing_id: Literal[True],
@@ -1041,6 +1117,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
         id_type: type[Any] | None = None,
         allow_missing_id: bool = False,
@@ -1057,8 +1135,10 @@ class HTTPClient:
             path,
             params,
             headers,
+            timeout,
             response_data_type,
             id_type,
+            skip_auth=skip_auth,
             allow_missing_id=allow_missing_id,
             error_for_status=error_for_status,
         )
@@ -1068,15 +1148,19 @@ class HTTPClient:
         request_builder: RequestBuilder,
         params: Params | None,
         headers: Headers | None,
+        timeout: float | None,
         json: JSONPayload | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None,
         *,
+        skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
     ) -> AsyncIterator[Any]:
-        request_builder = await self._prepare_request(request_builder, params, headers)
+        request_builder = await self._prepare_request(
+            request_builder, params, headers, timeout, skip_auth=skip_auth
+        )
         request_builder = await _attach_body(
             request_builder,
             json,
@@ -1117,6 +1201,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> AsyncIterator[bytes]: ...
     @overload
@@ -1126,6 +1212,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
     ) -> AsyncIterator[dict[str, Any]]: ...
@@ -1136,6 +1224,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TLine] | TypeAdapter[TLine] | Decoder[TLine],
         error_for_status: bool = True,
     ) -> AsyncIterator[TLine]: ...
@@ -1145,6 +1235,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
         error_for_status: bool = True,
     ) -> AsyncIterator[Any]:
@@ -1157,10 +1249,12 @@ class HTTPClient:
             self._client.get(path),
             params,
             headers,
+            timeout,
             None,
             None,
             None,
             response_data_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
         )
@@ -1172,6 +1266,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1185,6 +1281,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1199,6 +1297,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1212,6 +1312,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1226,10 +1328,12 @@ class HTTPClient:
             self._client.post(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -1240,10 +1344,14 @@ class HTTPClient:
         dest: Path | None,
         params: Params | None,
         headers: Headers | None,
+        timeout: float | None,
         *,
+        skip_auth: bool,
         error_for_status: bool,
     ) -> bytes | None:
-        request_builder = await self._prepare_request(self._client.get(path), params, headers)
+        request_builder = await self._prepare_request(
+            self._client.get(path), params, headers, timeout, skip_auth=skip_auth
+        )
         request = request_builder.build_streamed()
         try:
             async with request as raw_response:
@@ -1273,6 +1381,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> bytes: ...
     @overload
@@ -1283,6 +1393,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> None: ...
     async def download(
@@ -1292,6 +1404,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> bytes | None:
         """Download `path`'s response body, optimized for large objects (e.g. a presigned GET
@@ -1304,22 +1418,34 @@ class HTTPClient:
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
         """
-        return await self._download(path, dest, params, headers, error_for_status=error_for_status)
+        return await self._download(
+            path,
+            dest,
+            params,
+            headers,
+            timeout,
+            skip_auth=skip_auth,
+            error_for_status=error_for_status,
+        )
 
     async def _send_with_body(
         self,
         request_builder: RequestBuilder,
         params: Params | None,
         headers: Headers | None,
+        timeout: float | None,
         json: JSONPayload | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data],
         *,
+        skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
     ) -> Data:
-        request_builder = await self._prepare_request(request_builder, params, headers)
+        request_builder = await self._prepare_request(
+            request_builder, params, headers, timeout, skip_auth=skip_auth
+        )
         request_builder = await _attach_body(
             request_builder,
             json,
@@ -1337,16 +1463,20 @@ class HTTPClient:
         request_builder: RequestBuilder,
         params: Params | None,
         headers: Headers | None,
+        timeout: float | None,
         json: JSONPayload | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data],
         response_headers_type: type[TypedHeaders] | None,
         *,
+        skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
     ) -> Result[Any, Any]:
-        request_builder = await self._prepare_request(request_builder, params, headers)
+        request_builder = await self._prepare_request(
+            request_builder, params, headers, timeout, skip_auth=skip_auth
+        )
         request_builder = await _attach_body(
             request_builder,
             json,
@@ -1372,6 +1502,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1385,6 +1517,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1399,6 +1533,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1412,6 +1548,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1426,10 +1564,12 @@ class HTTPClient:
             self._client.post(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -1441,6 +1581,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1454,6 +1596,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1468,6 +1612,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1482,6 +1628,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1496,6 +1644,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1511,6 +1661,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1525,6 +1677,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1541,11 +1695,13 @@ class HTTPClient:
             self._client.post(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
             response_headers_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -1557,6 +1713,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1570,6 +1728,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1584,6 +1744,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1597,6 +1759,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1609,10 +1773,12 @@ class HTTPClient:
             self._client.put(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -1624,6 +1790,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1637,6 +1805,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1651,6 +1821,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1665,6 +1837,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1679,6 +1853,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1694,6 +1870,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1708,6 +1886,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1724,11 +1904,13 @@ class HTTPClient:
             self._client.put(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
             response_headers_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -1740,6 +1922,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1753,6 +1937,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1767,6 +1953,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1780,6 +1968,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1792,10 +1982,12 @@ class HTTPClient:
             self._client.patch(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -1807,6 +1999,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1820,6 +2014,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1834,6 +2030,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1848,6 +2046,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1862,6 +2062,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1877,6 +2079,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1891,6 +2095,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -1907,11 +2113,13 @@ class HTTPClient:
             self._client.patch(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
             response_headers_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -1923,6 +2131,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> bytes: ...
     @overload
@@ -1932,6 +2142,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
     ) -> dict[str, Any]: ...
@@ -1942,6 +2154,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
     ) -> TData: ...
@@ -1951,6 +2165,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
@@ -1959,10 +2175,12 @@ class HTTPClient:
             self._client.delete(path),
             params,
             headers,
+            timeout,
             None,
             None,
             None,
             response_data_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
         )
@@ -1974,6 +2192,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> Result[bytes]: ...
     @overload
@@ -1983,6 +2203,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
     ) -> Result[dict[str, Any]]: ...
@@ -1993,6 +2215,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
     ) -> Result[TData]: ...
@@ -2003,6 +2227,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
     ) -> Result[bytes, THeaders]: ...
@@ -2013,6 +2239,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -2024,6 +2252,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -2034,6 +2264,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[Data] = bytes,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
@@ -2046,11 +2278,13 @@ class HTTPClient:
             self._client.delete(path),
             params,
             headers,
+            timeout,
             None,
             None,
             None,
             response_data_type,
             response_headers_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
         )
@@ -2062,6 +2296,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> Result[None]: ...
     @overload
@@ -2071,6 +2307,8 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
     ) -> Result[None, THeaders]: ...
@@ -2080,13 +2318,17 @@ class HTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
     ) -> Result[None, Any]:
         """HEAD `path` — headers-only, no body is ever decoded. Pass
         `response_headers_type` to get the response headers parsed into `result.typed_headers`.
         """
-        request_builder = await self._prepare_request(self._client.head(path), params, headers)
+        request_builder = await self._prepare_request(
+            self._client.head(path), params, headers, timeout, skip_auth=skip_auth
+        )
         raw_response = await _send(request_builder.build())
         if error_for_status:
             await self._check_status(raw_response)
@@ -2158,7 +2400,11 @@ class SyncHTTPClient:
         with sync_client_builder.build() as client:
             yield cls(client, bearer_token, bearer_auth)
 
-    def _apply_bearer_auth(self, request_builder: SyncRequestBuilder) -> SyncRequestBuilder:
+    def _apply_bearer_auth(
+        self, request_builder: SyncRequestBuilder, *, skip_auth: bool
+    ) -> SyncRequestBuilder:
+        if skip_auth:
+            return request_builder
         if self._bearer_auth is not None:
             return request_builder.bearer_auth(self._bearer_auth())
         if self._bearer_token is not None:
@@ -2166,10 +2412,16 @@ class SyncHTTPClient:
         return request_builder
 
     def _prepare_request(
-        self, request_builder: SyncRequestBuilder, params: Params | None, headers: Headers | None
+        self,
+        request_builder: SyncRequestBuilder,
+        params: Params | None,
+        headers: Headers | None,
+        timeout: float | None,
+        *,
+        skip_auth: bool,
     ) -> SyncRequestBuilder:
-        request_builder = self._apply_bearer_auth(request_builder)
-        return _prepare(request_builder, params, headers)
+        request_builder = self._apply_bearer_auth(request_builder, skip_auth=skip_auth)
+        return _prepare(request_builder, params, headers, timeout)
 
     def _check_status(self, raw_response: RawSyncResponse) -> None:
         if raw_response.status < 400:
@@ -2208,6 +2460,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> bytes: ...
     @overload
@@ -2217,6 +2471,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
     ) -> dict[str, Any]: ...
@@ -2227,6 +2483,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
     ) -> TData: ...
@@ -2236,6 +2494,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
@@ -2243,7 +2503,9 @@ class SyncHTTPClient:
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
         """
-        request_builder = self._prepare_request(self._client.get(path), params, headers)
+        request_builder = self._prepare_request(
+            self._client.get(path), params, headers, timeout, skip_auth=skip_auth
+        )
         raw_response = _send_sync(request_builder.build())
         return self._parse(raw_response, response_data_type, error_for_status=error_for_status)
 
@@ -2254,6 +2516,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> Result[bytes]: ...
     @overload
@@ -2263,6 +2527,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
     ) -> Result[dict[str, Any]]: ...
@@ -2273,6 +2539,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
     ) -> Result[TData]: ...
@@ -2283,6 +2551,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
     ) -> Result[bytes, THeaders]: ...
@@ -2293,6 +2563,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -2304,6 +2576,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -2314,6 +2588,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[Data] = bytes,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
@@ -2322,7 +2598,9 @@ class SyncHTTPClient:
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
         """
-        request_builder = self._prepare_request(self._client.get(path), params, headers)
+        request_builder = self._prepare_request(
+            self._client.get(path), params, headers, timeout, skip_auth=skip_auth
+        )
         raw_response = _send_sync(request_builder.build())
         if error_for_status:
             self._check_status(raw_response)
@@ -2339,14 +2617,18 @@ class SyncHTTPClient:
         path: str,
         params: Params | None,
         headers: Headers | None,
+        timeout: float | None,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None,
         id_type: type[Any] | None,
         *,
+        skip_auth: bool,
         allow_missing_id: bool,
         error_for_status: bool,
     ) -> Iterator[SSEEvent[Any, Any]]:
         request_builder = self._client.get(path).header("accept", "text/event-stream")
-        request_builder = self._prepare_request(request_builder, params, headers)
+        request_builder = self._prepare_request(
+            request_builder, params, headers, timeout, skip_auth=skip_auth
+        )
         request = request_builder.build_streamed()
         try:
             with request as raw_response:
@@ -2383,6 +2665,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> Iterator[SSEEvent[str, str]]: ...
     @overload
@@ -2392,6 +2676,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
     ) -> Iterator[SSEEvent[str, str | None]]: ...
@@ -2402,6 +2688,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         id_type: type[TId],
         error_for_status: bool = True,
     ) -> Iterator[SSEEvent[str, TId]]: ...
@@ -2412,6 +2700,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         id_type: type[TId],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
@@ -2423,6 +2713,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
     ) -> Iterator[SSEEvent[dict[str, Any], str]]: ...
@@ -2433,6 +2725,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
         error_for_status: bool = True,
     ) -> Iterator[SSEEvent[TData, str]]: ...
@@ -2443,6 +2737,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
@@ -2454,6 +2750,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
@@ -2465,6 +2763,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         id_type: type[TId],
         error_for_status: bool = True,
@@ -2476,6 +2776,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         id_type: type[TId],
         allow_missing_id: Literal[True],
@@ -2488,6 +2790,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
         id_type: type[TId],
         error_for_status: bool = True,
@@ -2499,6 +2803,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData] | TypeAdapter[TData] | Decoder[TData],
         id_type: type[TId],
         allow_missing_id: Literal[True],
@@ -2510,6 +2816,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
         id_type: type[Any] | None = None,
         allow_missing_id: bool = False,
@@ -2526,8 +2834,10 @@ class SyncHTTPClient:
             path,
             params,
             headers,
+            timeout,
             response_data_type,
             id_type,
+            skip_auth=skip_auth,
             allow_missing_id=allow_missing_id,
             error_for_status=error_for_status,
         )
@@ -2537,15 +2847,19 @@ class SyncHTTPClient:
         request_builder: SyncRequestBuilder,
         params: Params | None,
         headers: Headers | None,
+        timeout: float | None,
         json: JSONPayload | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None,
         *,
+        skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
     ) -> Iterator[Any]:
-        request_builder = self._prepare_request(request_builder, params, headers)
+        request_builder = self._prepare_request(
+            request_builder, params, headers, timeout, skip_auth=skip_auth
+        )
         request_builder = _attach_body_sync(
             request_builder,
             json,
@@ -2586,6 +2900,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> Iterator[bytes]: ...
     @overload
@@ -2595,6 +2911,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
     ) -> Iterator[dict[str, Any]]: ...
@@ -2605,6 +2923,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TLine] | TypeAdapter[TLine] | Decoder[TLine],
         error_for_status: bool = True,
     ) -> Iterator[TLine]: ...
@@ -2614,6 +2934,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[Any] | TypeAdapter[Any] | Decoder[Any] | None = None,
         error_for_status: bool = True,
     ) -> Iterator[Any]:
@@ -2626,10 +2948,12 @@ class SyncHTTPClient:
             self._client.get(path),
             params,
             headers,
+            timeout,
             None,
             None,
             None,
             response_data_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
         )
@@ -2641,6 +2965,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2654,6 +2980,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2668,6 +2996,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2681,6 +3011,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2695,10 +3027,12 @@ class SyncHTTPClient:
             self._client.post(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -2709,10 +3043,14 @@ class SyncHTTPClient:
         dest: Path | None,
         params: Params | None,
         headers: Headers | None,
+        timeout: float | None,
         *,
+        skip_auth: bool,
         error_for_status: bool,
     ) -> bytes | None:
-        request_builder = self._prepare_request(self._client.get(path), params, headers)
+        request_builder = self._prepare_request(
+            self._client.get(path), params, headers, timeout, skip_auth=skip_auth
+        )
         request = request_builder.build_streamed()
         try:
             with request as raw_response:
@@ -2742,6 +3080,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> bytes: ...
     @overload
@@ -2752,6 +3092,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> None: ...
     def download(
@@ -2761,6 +3103,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> bytes | None:
         """Download `path`'s response body, optimized for large objects (e.g. a presigned GET
@@ -2773,22 +3117,34 @@ class SyncHTTPClient:
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
         """
-        return self._download(path, dest, params, headers, error_for_status=error_for_status)
+        return self._download(
+            path,
+            dest,
+            params,
+            headers,
+            timeout,
+            skip_auth=skip_auth,
+            error_for_status=error_for_status,
+        )
 
     def _send_with_body(
         self,
         request_builder: SyncRequestBuilder,
         params: Params | None,
         headers: Headers | None,
+        timeout: float | None,
         json: JSONPayload | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data],
         *,
+        skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
     ) -> Data:
-        request_builder = self._prepare_request(request_builder, params, headers)
+        request_builder = self._prepare_request(
+            request_builder, params, headers, timeout, skip_auth=skip_auth
+        )
         request_builder = _attach_body_sync(
             request_builder,
             json,
@@ -2804,16 +3160,20 @@ class SyncHTTPClient:
         request_builder: SyncRequestBuilder,
         params: Params | None,
         headers: Headers | None,
+        timeout: float | None,
         json: JSONPayload | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data],
         response_headers_type: type[TypedHeaders] | None,
         *,
+        skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
     ) -> Result[Any, Any]:
-        request_builder = self._prepare_request(request_builder, params, headers)
+        request_builder = self._prepare_request(
+            request_builder, params, headers, timeout, skip_auth=skip_auth
+        )
         request_builder = _attach_body_sync(
             request_builder,
             json,
@@ -2839,6 +3199,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2852,6 +3214,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2866,6 +3230,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2879,6 +3245,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2893,10 +3261,12 @@ class SyncHTTPClient:
             self._client.post(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -2908,6 +3278,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2921,6 +3293,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2935,6 +3309,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2949,6 +3325,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2963,6 +3341,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2978,6 +3358,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -2992,6 +3374,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3008,11 +3392,13 @@ class SyncHTTPClient:
             self._client.post(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
             response_headers_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -3024,6 +3410,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3037,6 +3425,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3051,6 +3441,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3064,6 +3456,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3076,10 +3470,12 @@ class SyncHTTPClient:
             self._client.put(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -3091,6 +3487,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3104,6 +3502,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3118,6 +3518,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3132,6 +3534,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3146,6 +3550,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3161,6 +3567,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3175,6 +3583,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3191,11 +3601,13 @@ class SyncHTTPClient:
             self._client.put(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
             response_headers_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -3207,6 +3619,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3220,6 +3634,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3234,6 +3650,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3247,6 +3665,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3259,10 +3679,12 @@ class SyncHTTPClient:
             self._client.patch(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -3274,6 +3696,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3287,6 +3711,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3301,6 +3727,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3315,6 +3743,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3329,6 +3759,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3344,6 +3776,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3358,6 +3792,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         json: JSONPayload | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
@@ -3374,11 +3810,13 @@ class SyncHTTPClient:
             self._client.patch(path),
             params,
             headers,
+            timeout,
             json,
             form,
             content,
             response_data_type,
             response_headers_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
         )
@@ -3390,6 +3828,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> bytes: ...
     @overload
@@ -3399,6 +3839,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
     ) -> dict[str, Any]: ...
@@ -3409,6 +3851,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
     ) -> TData: ...
@@ -3418,6 +3862,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
@@ -3426,10 +3872,12 @@ class SyncHTTPClient:
             self._client.delete(path),
             params,
             headers,
+            timeout,
             None,
             None,
             None,
             response_data_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
         )
@@ -3441,6 +3889,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> Result[bytes]: ...
     @overload
@@ -3450,6 +3900,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
     ) -> Result[dict[str, Any]]: ...
@@ -3460,6 +3912,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData],
         error_for_status: bool = True,
     ) -> Result[TData]: ...
@@ -3470,6 +3924,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
     ) -> Result[bytes, THeaders]: ...
@@ -3480,6 +3936,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -3491,6 +3949,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[TData],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -3501,6 +3961,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_data_type: type[Data] = bytes,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
@@ -3513,11 +3975,13 @@ class SyncHTTPClient:
             self._client.delete(path),
             params,
             headers,
+            timeout,
             None,
             None,
             None,
             response_data_type,
             response_headers_type,
+            skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
         )
@@ -3529,6 +3993,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         error_for_status: bool = True,
     ) -> Result[None]: ...
     @overload
@@ -3538,6 +4004,8 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
     ) -> Result[None, THeaders]: ...
@@ -3547,13 +4015,17 @@ class SyncHTTPClient:
         *,
         params: Params | None = None,
         headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
     ) -> Result[None, Any]:
         """HEAD `path` — headers-only, no body is ever decoded. Pass
         `response_headers_type` to get the response headers parsed into `result.typed_headers`.
         """
-        request_builder = self._prepare_request(self._client.head(path), params, headers)
+        request_builder = self._prepare_request(
+            self._client.head(path), params, headers, timeout, skip_auth=skip_auth
+        )
         raw_response = _send_sync(request_builder.build())
         if error_for_status:
             self._check_status(raw_response)
