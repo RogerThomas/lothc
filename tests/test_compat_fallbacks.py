@@ -13,7 +13,7 @@ sees the blocked imports.
 import builtins
 import importlib
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from types import ModuleType
 
 import pytest
@@ -22,10 +22,16 @@ _blocked_modules = frozenset({"msgspec", "pydantic"})
 _real_import = builtins.__import__
 
 
-def _blocking_import(name: str, *args: object, **kwargs: object) -> object:
+def _blocking_import(
+    name: str,
+    globals: Mapping[str, object] | None = None,  # noqa: A002 — must match __import__'s real signature
+    locals: Mapping[str, object] | None = None,  # noqa: A002
+    fromlist: Sequence[str] | None = (),
+    level: int = 0,
+) -> ModuleType:
     if name.split(".")[0] in _blocked_modules:
         raise ImportError(f"blocked for test: {name}")
-    return _real_import(name, *args, **kwargs)  # type: ignore[arg-type]
+    return _real_import(name, globals, locals, fromlist, level)
 
 
 @pytest.fixture(name="compat_without_optional_deps")
@@ -38,7 +44,10 @@ def _compat_without_optional_deps() -> Iterator[ModuleType]:
     for key in saved_modules:
         del sys.modules[key]
 
-    builtins.__import__ = _blocking_import
+    # `_blocking_import`'s signature matches `__import__`'s exactly — confirmed via mypy/zuban/
+    # basedpyright all accepting this line, and via ty's own error printing both signatures as
+    # textually identical yet still rejecting it. Genuine ty limitation, not a real mismatch.
+    builtins.__import__ = _blocking_import  # ty: ignore[invalid-assignment]
     try:
         yield importlib.import_module("lothc._compat")
     finally:

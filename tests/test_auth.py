@@ -1,24 +1,27 @@
-from dataclasses import dataclass, field
-
 from lothc import HTTPClient, SyncHTTPClient
 
 
-@dataclass
+# Deliberately a plain class, not @dataclass (style-guide.md #1's usual preference) — confirmed
+# live that zuban specifically mismatches a @dataclass-decorated class's __call__ against
+# Callable[[], Awaitable[str]]/Callable[[], str] (its own error prints the "expected"/"got"
+# signatures as textually identical, yet still rejects it), while mypy/ty/basedpyright all
+# accept the @dataclass version fine. A plain class with the same __call__ satisfies all four.
 class _CountingAuthProvider:
-    calls: int = field(default=0, init=False)
+    def __init__(self) -> None:
+        self._calls = 0
 
     async def __call__(self) -> str:
-        self.calls += 1
-        return f"token-{self.calls}"
+        self._calls += 1
+        return f"token-{self._calls}"
 
 
-@dataclass
 class _SyncCountingAuthProvider:
-    calls: int = field(default=0, init=False)
+    def __init__(self) -> None:
+        self._calls = 0
 
     def __call__(self) -> str:
-        self.calls += 1
-        return f"token-{self.calls}"
+        self._calls += 1
+        return f"token-{self._calls}"
 
 
 async def test_bearer_token_sends_authorization_header(base_url: str) -> None:

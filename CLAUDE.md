@@ -120,6 +120,47 @@ Not done yet:
 > `127.0.0.1:8701`, ask the user to start it (or start it yourself in the background) rather than
 > guessing why `example-run` is failing to connect.
 
+### Type-checking `tests/` across all 4 major type checkers
+
+`basedpyright` is this project's own primary checker (see Architecture below), but `tests/`
+(which exercises lothc's public API the way a real consumer would, not lothc's internals) should
+also type-check cleanly under `mypy`, `ty`, and `zuban` — different lothc users reach for
+different tools, and a heavily-`@overload`'d, generic public API can type-check fine under one
+checker's inference rules while tripping up another's:
+
+```
+uv run mypy tests
+uv run ty check tests
+uv run zuban check tests
+uv run basedpyright lothc tests
+```
+
+**The bar for "must actually fix, not suppress"**: does this affect a real lothc *user*, using
+that specific checker, on lothc's *public* API? If yes, it must be genuinely fixed — an ignore
+comment is not acceptable there, because it'd be hiding a real problem a real consumer would hit.
+If the complaint is purely about test-internal scaffolding that no consumer of the published
+package could ever write or run (e.g. a `builtins.__import__` monkeypatch used to simulate a
+missing optional dependency — see `tests/test_compat_fallbacks.py`), a scoped ignore comment for
+that one checker is fine, since nothing outside lothc's own dev-time test suite is affected.
+
+**Always look for a real fix before reaching for an ignore, even on the internal-scaffolding
+side** — confirmed twice in practice that one exists more often than expected:
+- `tests/test_compat_fallbacks.py`'s `builtins.__import__ = _blocking_import` needed a real
+  signature fix (matching `__import__`'s exact parameter names/types instead of a loose
+  `*args, **kwargs`) before three of the four checkers agreed it was fine — only `ty` still
+  disagreed afterward, and its own error message printed the two signatures as textually
+  identical text while still calling them incompatible, confirming a genuine `ty` limitation
+  rather than a real mismatch left to fix. That one got a justified `# ty: ignore[...]`.
+- `tests/test_auth.py`'s callable `bearer_auth` test providers (`_CountingAuthProvider`/
+  `_SyncCountingAuthProvider`) looked like the same situation at first — `zuban` alone rejected a
+  `@dataclass`-decorated class's `__call__` against `Callable[[], Awaitable[str]]`, again with
+  "expected"/"got" printed identically in its own error. But this one *did* have a real fix:
+  dropping `@dataclass` in favor of a plain class with an explicit `__init__` (deviating from
+  style-guide.md's usual `@dataclass` preference, deliberately, with a comment explaining why)
+  satisfied all four checkers with zero suppression at all. Don't stop at "the other three agree
+  it's a tool bug" — check whether a small, unrelated-looking change (here, the class decorator,
+  not the type annotation) removes the disagreement first.
+
 ### Doctests
 
 Prefer doctests for small, self-contained algorithmic functions — they double as inline documentation.
