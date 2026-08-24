@@ -46,3 +46,37 @@ validation at all.
 Re-run this yourself from a checkout of the repo with `task perf` (see
 [Development](development.md), and `CLAUDE.md`'s Benchmarks section for the full set of options)
 — pass `--libs "lothc lothc-msgspec lothc-pydantic"` to isolate just the decode-target comparison.
+
+## Sync sequential
+
+The race above is pooled-concurrency, async-only — it says nothing about a plain blocking client
+making one request at a time, which is its own common case (a script, a cron job, code that
+isn't async at all). `task perf-single-call-sync` runs exactly that: one non-concurrent request
+at a time against each library's blocking sync client, no event loop involved. `aiohttp` and
+`aiosonic` have no sync client so aren't included; `requests` — the classic blocking-only
+library, with no async client of its own — only appears here, never in the race above.
+
+Run `1787583572373`, 10,000 sequential requests (plus a 100-request warm-up, untimed) against the
+same bundled Rust/axum JSON server:
+
+| Library | Total Time | Throughput | Relative | CPU | Peak Py Mem | Min | P50 | P95 | P99 | Max | Mean |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| requests | 3348.958ms | 2986.0 req/s | x1.0 | 3.094s | 1.00MB | 0.285ms | 0.331ms | 0.354ms | 0.515ms | 0.853ms | 0.335ms |
+| niquests | 2866.124ms | 3489.0 req/s | x1.2 | 2.631s | 0.96MB | 0.231ms | 0.278ms | 0.320ms | 0.496ms | 1.159ms | 0.286ms |
+| httpx | 2341.838ms | 4270.1 req/s | x1.4 | 2.160s | 0.75MB | 0.159ms | 0.219ms | 0.331ms | 0.503ms | 14.484ms | 0.234ms |
+| httpx2 | 2045.416ms | 4889.0 req/s | x1.6 | 1.864s | 0.39MB | 0.165ms | 0.202ms | 0.223ms | 0.286ms | 0.756ms | 0.204ms |
+| lothc-pydantic | 826.540ms | 12098.6 req/s | x4.1 | 0.469s | 0.32MB | 0.054ms | 0.081ms | 0.092ms | 0.114ms | 2.815ms | 0.082ms |
+| lothc | 769.966ms | 12987.6 req/s | x4.3 | 0.417s | 0.32MB | 0.046ms | 0.075ms | 0.085ms | 0.131ms | 0.406ms | 0.077ms |
+| lothc-msgspec | 741.640ms | 13483.6 req/s | x4.5 | 0.393s | 0.31MB | 0.045ms | 0.074ms | 0.081ms | 0.087ms | 0.227ms | 0.074ms |
+| pyreqwest | 694.754ms | 14393.6 req/s | x4.8 | 0.348s | 0.32MB | 0.043ms | 0.070ms | 0.076ms | 0.081ms | 0.289ms | 0.069ms |
+
+![Sync-sequential HTTP client throughput race — pyreqwest and lothc finish first, requests and niquests take much longer](assets/perf-race-sync.svg){: .perf-race-img }
+
+Without pooled concurrency to hide it, per-request Python overhead dominates far more starkly:
+`pyreqwest`/`lothc`/`lothc-msgspec`/`lothc-pydantic` are within a few percent of each other and
+roughly 4-5x faster than `httpx`/`httpx2`/`niquests`/`requests`, none of which have a Rust
+transport underneath them.
+
+Re-run this yourself with `task perf-single-call-sync` (see [Development](development.md)) —
+regenerate the chart above from a fresh results file with `task perf-svg -- results/single-call-
+sync-<run_id>.json --out assets/perf-race-sync.svg`.

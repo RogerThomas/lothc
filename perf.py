@@ -18,6 +18,7 @@ import aiosonic
 import httpx
 import httpx2
 import niquests
+import requests
 from aiosonic.pools import PoolConfig
 from msgspec import Struct
 from pydantic import BaseModel
@@ -45,6 +46,7 @@ type Lib = Literal[
     "aiohttp",
     "niquests",
     "aiosonic",
+    "requests",
     "lothc",
     "lothc-msgspec",
     "lothc-pydantic",
@@ -164,6 +166,24 @@ class AiosonicClient:
         await self.client.__aexit__(*args)  # pyright: ignore[reportUnknownMemberType]
 
 
+@dataclass
+class RequestsClient:
+    """Wraps requests.Session so it exposes the same `get(path)` shape as every other
+    client here — requests has no base_url concept of its own."""
+
+    session: requests.Session
+    base_url: str
+
+    def get(self, path: str) -> requests.Response:
+        return self.session.get(self.base_url + path)
+
+    def __enter__(self) -> "RequestsClient":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.session.close()
+
+
 type AnyClient = (
     HTTPClient
     | httpx.AsyncClient
@@ -175,9 +195,15 @@ type AnyClient = (
 )
 
 # aiohttp and aiosonic have no sync client at all — they're async-only libraries — so `sync=True`
-# is never valid for them (see the dispatch in `_run_one`).
+# is never valid for them (see the dispatch in `_run_one`). `requests` is the mirror-image case —
+# sync-only, no async client — so it's excluded from `_parse_libs` instead (see there).
 type AnySyncClient = (
-    SyncHTTPClient | httpx.Client | httpx2.Client | niquests.Session | PyreqwestSyncClient
+    SyncHTTPClient
+    | httpx.Client
+    | httpx2.Client
+    | niquests.Session
+    | PyreqwestSyncClient
+    | RequestsClient
 )
 
 
@@ -246,6 +272,12 @@ def _fetch_one_niquests_sync(client: niquests.Session, path: str) -> None:
 
 def _fetch_one_pyreqwest_sync(client: PyreqwestSyncClient, path: str) -> None:
     resp = client.get(path).build().send()
+    data = resp.json()
+    assert "status" in data
+
+
+def _fetch_one_requests_sync(client: RequestsClient, path: str) -> None:
+    resp = client.get(path)
     data = resp.json()
     assert "status" in data
 
@@ -382,6 +414,10 @@ def _build_sync_client(
 def _build_sync_client(
     lib: Literal["pyreqwest"], url: str
 ) -> AbstractContextManager[PyreqwestSyncClient]: ...
+@overload
+def _build_sync_client(
+    lib: Literal["requests"], url: str
+) -> AbstractContextManager[RequestsClient]: ...
 def _build_sync_client(lib: Lib, url: str) -> AbstractContextManager[AnySyncClient]:
     """Return a sync context manager yielding a ready-to-use blocking client for `lib`. Same lib
     names as `_build_client` (its async counterpart) — sync-vs-async is conveyed by which of the
@@ -400,6 +436,9 @@ def _build_sync_client(lib: Lib, url: str) -> AbstractContextManager[AnySyncClie
 
     if lib == "pyreqwest":
         return PyreqwestSyncClientBuilder().base_url(url).build()
+
+    if lib == "requests":
+        return RequestsClient(requests.Session(), url)
 
     raise ValueError(f"{lib!r} has no sync client")
 
@@ -533,7 +572,13 @@ def _measure_peak_memory_sequential_sync[ClientT](
 
 
 def _parse_libs(libs: str) -> list[Lib]:
-    valid: tuple[Lib, ...] = get_args(Lib.__value__)
+    """Restricted to the libs that actually have an async client — see `_build_client`.
+    `requests` is sync-only (no async client at all — see `RequestsClient`/`_build_sync_client`)
+    and would otherwise slip through as a valid `Lib` value, only to fail confusingly inside
+    `_build_client`'s own fallback `raise`."""
+    valid: tuple[Lib, ...] = tuple(
+        lib for lib in cast("tuple[Lib, ...]", get_args(Lib.__value__)) if lib != "requests"
+    )
     result: list[Lib] = []
     for name in libs.split():
         if name not in valid:
@@ -551,6 +596,7 @@ def _parse_sync_libs(libs: str) -> list[Lib]:
         "httpx2",
         "niquests",
         "pyreqwest",
+        "requests",
         "lothc",
         "lothc-msgspec",
         "lothc-pydantic",
@@ -600,7 +646,7 @@ async def single_call(
 async def single_call_sync(
     url: str = "http://127.0.0.1:3000",
     *,
-    libs: str = ("httpx httpx2 niquests pyreqwest lothc lothc-msgspec lothc-pydantic"),
+    libs: str = ("httpx httpx2 niquests requests pyreqwest lothc lothc-msgspec lothc-pydantic"),
     concurrency: int = 1,
     total_requests: int = 1000,
     warmup: int = 100,
@@ -691,6 +737,16 @@ def _run_sync_lib(
             )
         return timings, total_time, cpu_time, peak_mem_mb
 
+    if lib == "requests":
+        with _build_sync_client(lib, url) as client:
+            timings, total_time, cpu_time = _time_run_sequential_sync(
+                _fetch_one_requests_sync, client, total_requests, warmup
+            )
+            peak_mem_mb = _measure_peak_memory_sequential_sync(
+                _fetch_one_requests_sync, client, total_requests
+            )
+        return timings, total_time, cpu_time, peak_mem_mb
+
     raise ValueError(f"{lib!r} has no sync client (aiohttp/aiosonic/httpx_h2 are async-only)")
 
 
@@ -771,6 +827,12 @@ async def _run_one(
                 peak_mem_mb = await _measure_peak_memory(
                     _fetch_one_aiosonic, client, total_requests, concurrency
                 )
+        elif lib == "requests":
+            # `requests` is sync-only — no async client at all (see `RequestsClient`) — so it
+            # must never reach here in practice (`_parse_libs` excludes it); this branch exists
+            # only so the type checker can narrow the trailing `else` back down to "niquests"
+            # instead of "niquests" | "requests".
+            raise ValueError(f"{lib!r} has no async client (it's sync-only, see _parse_libs)")
         else:
             async with _build_client(lib, url, concurrency) as client:
                 timings, total_time, cpu_time = await _time_run(

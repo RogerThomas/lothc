@@ -50,9 +50,11 @@ dev = [
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
     "pytest-cov>=7.0.0",
+    "requests>=2.34.2",
     "rich>=15.0.0",
     "ruff>=0.15.14",
     "ty>=0.0.74",
+    "types-requests>=2.33.0.20260712",
     "vulture>=2.16",
     "yeetr[uvloop]>=2026.8.14.post1",
     "zuban>=0.9.1",
@@ -77,11 +79,7 @@ packages = ["lothc"]
 # docs/, CLAUDE.md, AGENTS.md, .github/workflows/, uv.lock, ...), none of which an installer needs
 # to build or run the package. An explicit allowlist here, mirroring the wheel's own scoping, is
 # the fix — checked the rebuilt sdist's real file list afterward, not just the config.
-include = [
-    "/lothc",
-    "/README.md",
-    "/LICENSE",
-]
+include = ["/lothc", "/README.md", "/LICENSE"]
 
 #=====================================================================================
 # Tool configurations
@@ -224,7 +222,7 @@ max-branches = 15 # `_apply_form_value`/`_apply_sync_form_value`'s dispatch `mat
 # than pick an arbitrary number just past the current count
 
 [tool.pylint.format]
-max-module-lines = 4100 # _client.py is one deliberately unsplit file (see CLAUDE.md: "split it
+max-module-lines = 5000 # _client.py is one deliberately unsplit file (see CLAUDE.md: "split it
 # once it earns a split") that's grown past its previous bump (3800) to 4038 lines after
 # threading a per-verb `skip_auth` override through every overload of every verb on both clients
 # (mirroring the earlier `timeout` override); bumped again rather than split, since no split has

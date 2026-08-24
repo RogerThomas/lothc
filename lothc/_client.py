@@ -801,6 +801,9 @@ class HTTPClient:
         """GET `path` and decode the body as `response_data_type` (raw `bytes` by default).
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         request_builder = await self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
@@ -898,6 +901,9 @@ class HTTPClient:
         """Like `get`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         request_builder = await self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
@@ -1130,6 +1136,9 @@ class HTTPClient:
         `.event`/`.id` are always populated regardless. `id_type` controls what `.id` becomes
         (defaults to `str`); `allow_missing_id` controls whether a missing `id` field raises
         (the default) or becomes `None`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return self._sse_stream(
             path,
@@ -1244,6 +1253,9 @@ class HTTPClient:
 
         Pass `response_data_type` to switch to newline-buffered NDJSON-style decoding instead —
         each complete line is parsed and decoded as its own value.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return self._line_stream(
             self._client.get(path),
@@ -1323,6 +1335,9 @@ class HTTPClient:
     ) -> AsyncIterator[Any]:
         """Like `stream_get`, but POST a body first — same `json`/`form`/`content` options as
         `post` (at most one), same raw-bytes-by-default / NDJSON-via-`response_data_type` split.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return self._line_stream(
             self._client.post(path),
@@ -1417,6 +1432,9 @@ class HTTPClient:
         file instead — memory then stays O(chunk size) regardless of how large the body is.
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return await self._download(
             path,
@@ -1559,6 +1577,9 @@ class HTTPClient:
     ) -> Data:
         """POST to `path` with at most one of `json`/`form`/`content` (raises `ValueError` if
         more than one is given) and decode the response as `response_data_type`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return await self._send_with_body(
             self._client.post(path),
@@ -1690,6 +1711,9 @@ class HTTPClient:
         """Like `post`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return await self._send_with_body_result(
             self._client.post(path),
@@ -1768,7 +1792,11 @@ class HTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> Data:
-        """PUT to `path`. Same body/decode rules as `post`."""
+        """PUT to `path`. Same body/decode rules as `post`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        """
         return await self._send_with_body(
             self._client.put(path),
             params,
@@ -1899,6 +1927,9 @@ class HTTPClient:
         """Like `put`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return await self._send_with_body_result(
             self._client.put(path),
@@ -1977,7 +2008,11 @@ class HTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> Data:
-        """PATCH `path`. Same body/decode rules as `post`."""
+        """PATCH `path`. Same body/decode rules as `post`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        """
         return await self._send_with_body(
             self._client.patch(path),
             params,
@@ -2108,6 +2143,9 @@ class HTTPClient:
         """Like `patch`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return await self._send_with_body_result(
             self._client.patch(path),
@@ -2170,7 +2208,11 @@ class HTTPClient:
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
-        """DELETE `path` and decode the response as `response_data_type`."""
+        """DELETE `path` and decode the response as `response_data_type`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        """
         return await self._send_with_body(
             self._client.delete(path),
             params,
@@ -2273,6 +2315,9 @@ class HTTPClient:
         """Like `delete`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return await self._send_with_body_result(
             self._client.delete(path),
@@ -2325,6 +2370,9 @@ class HTTPClient:
     ) -> Result[None, Any]:
         """HEAD `path` — headers-only, no body is ever decoded. Pass
         `response_headers_type` to get the response headers parsed into `result.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         request_builder = await self._prepare_request(
             self._client.head(path), params, headers, timeout, skip_auth=skip_auth
@@ -2502,6 +2550,9 @@ class SyncHTTPClient:
         """GET `path` and decode the body as `response_data_type` (raw `bytes` by default).
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         request_builder = self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
@@ -2597,6 +2648,9 @@ class SyncHTTPClient:
         """Like `get`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         request_builder = self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
@@ -2829,6 +2883,9 @@ class SyncHTTPClient:
         `.event`/`.id` are always populated regardless. `id_type` controls what `.id` becomes
         (defaults to `str`); `allow_missing_id` controls whether a missing `id` field raises
         (the default) or becomes `None`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return self._sse_stream(
             path,
@@ -2943,6 +3000,9 @@ class SyncHTTPClient:
 
         Pass `response_data_type` to switch to newline-buffered NDJSON-style decoding instead —
         each complete line is parsed and decoded as its own value.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return self._line_stream(
             self._client.get(path),
@@ -3022,6 +3082,9 @@ class SyncHTTPClient:
     ) -> Iterator[Any]:
         """Like `stream_get`, but POST a body first — same `json`/`form`/`content` options as
         `post` (at most one), same raw-bytes-by-default / NDJSON-via-`response_data_type` split.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return self._line_stream(
             self._client.post(path),
@@ -3116,6 +3179,9 @@ class SyncHTTPClient:
         file instead — memory then stays O(chunk size) regardless of how large the body is.
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return self._download(
             path,
@@ -3256,6 +3322,9 @@ class SyncHTTPClient:
     ) -> Data:
         """POST to `path` with at most one of `json`/`form`/`content` (raises `ValueError` if
         more than one is given) and decode the response as `response_data_type`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return self._send_with_body(
             self._client.post(path),
@@ -3387,6 +3456,9 @@ class SyncHTTPClient:
         """Like `post`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return self._send_with_body_result(
             self._client.post(path),
@@ -3465,7 +3537,11 @@ class SyncHTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> Data:
-        """PUT to `path`. Same body/decode rules as `post`."""
+        """PUT to `path`. Same body/decode rules as `post`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        """
         return self._send_with_body(
             self._client.put(path),
             params,
@@ -3596,6 +3672,9 @@ class SyncHTTPClient:
         """Like `put`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return self._send_with_body_result(
             self._client.put(path),
@@ -3674,7 +3753,11 @@ class SyncHTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
     ) -> Data:
-        """PATCH `path`. Same body/decode rules as `post`."""
+        """PATCH `path`. Same body/decode rules as `post`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        """
         return self._send_with_body(
             self._client.patch(path),
             params,
@@ -3805,6 +3888,9 @@ class SyncHTTPClient:
         """Like `patch`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return self._send_with_body_result(
             self._client.patch(path),
@@ -3867,7 +3953,11 @@ class SyncHTTPClient:
         response_data_type: type[Data] = bytes,
         error_for_status: bool = True,
     ) -> Data:
-        """DELETE `path` and decode the response as `response_data_type`."""
+        """DELETE `path` and decode the response as `response_data_type`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
+        """
         return self._send_with_body(
             self._client.delete(path),
             params,
@@ -3970,6 +4060,9 @@ class SyncHTTPClient:
         """Like `delete`, but return a `Result` carrying the decoded body alongside the response
         status and headers. Pass `response_headers_type` to also get the headers parsed into
         `result.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         return self._send_with_body_result(
             self._client.delete(path),
@@ -4022,6 +4115,9 @@ class SyncHTTPClient:
     ) -> Result[None, Any]:
         """HEAD `path` — headers-only, no body is ever decoded. Pass
         `response_headers_type` to get the response headers parsed into `result.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call.
         """
         request_builder = self._prepare_request(
             self._client.head(path), params, headers, timeout, skip_auth=skip_auth

@@ -23,9 +23,12 @@ class ResultEntry(TypedDict):
 
 
 # Fixed color per library identity, not per finish rank — a library keeps
-# its color across runs and lineups. Slots 1-7 of the validated categorical
-# palette (see the `dataviz` skill's references/palette.md; slot 8, red, is
-# unused), assigned in perf.py's own Lib declaration order. The two
+# its color across runs and lineups. Slots 1-8 of the validated categorical
+# palette (see the `dataviz` skill's references/palette.md), assigned in
+# perf.py's own Lib declaration order — slot 8 (red, #e34948) went to
+# `requests`, the sync-only library added for the sync-sequential comparison
+# (perf.py has no async client for it, so it never appears in the pooled or
+# async-sequential races, only the sync-sequential one). The two
 # lothc-msgspec/lothc-pydantic rows are deliberately NOT two more brand-new
 # categorical hues — they're the same "lothc" identity at different
 # decode-validation depths, so (per the skill's non-negotiables: "never a 9th
@@ -47,6 +50,7 @@ _lib_colors = {
     "lothc": "#00c200",
     "lothc-msgspec": "#009e00",
     "lothc-pydantic": "#007a00",
+    "requests": "#e34948",
 }
 
 _lane_height = 36

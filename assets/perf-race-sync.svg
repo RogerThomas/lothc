@@ -1,0 +1,182 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="448" viewBox="0 0 760 448">
+  <title>pyreqwest throughput race against 7 other HTTP clients</title>
+  <desc>8 HTTP client libraries race to the same finish line, scaled so
+  the slowest (requests) takes 5 seconds and every other
+  library finishes in proportion to how much faster it actually was.
+  pyreqwest finishes in about 1.04s.</desc>
+  <style>
+    text { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+    .title { font-size: 15px; fill: #0b0b0b; font-weight: 600; }
+    .tick { font-size: 10px; fill: #898781; }
+    .name { font-size: 13px; fill: #0b0b0b; font-weight: 600; }
+    .rate { font-size: 10px; fill: #52514e; }
+    .badge { font-size: 12px; font-weight: 700; }
+    .track { fill: #f3f2ef; stroke: #e1e0d9; }
+    .grid { stroke: #e1e0d9; stroke-width: 1; }
+    .playhead { stroke: #0b0b0b; stroke-width: 1.5; opacity: 0.55; }
+
+    /* One 8s loop: the race runs 0-62.500% (0-5s of
+       "race time"), then every bar holds its final state for the remaining
+       3s so the finish badges stay readable before it resets. */
+    #playhead { animation: playhead 8s linear infinite; }
+    #bar-pyreqwest { animation: fill-pyreqwest 8s linear infinite; }
+    #badge-pyreqwest { animation: show-pyreqwest 8s step-end infinite; }
+    @keyframes fill-pyreqwest { 0% { width: 0; } 12.966% { width: 520px; } 100% { width: 520px; } }
+    @keyframes show-pyreqwest { 0% { opacity: 0; } 12.966% { opacity: 1; } 100% { opacity: 1; } }
+    #bar-lothc-msgspec { animation: fill-lothc-msgspec 8s linear infinite; }
+    #badge-lothc-msgspec { animation: show-lothc-msgspec 8s step-end infinite; }
+    @keyframes fill-lothc-msgspec { 0% { width: 0; } 13.841% { width: 520px; } 100% { width: 520px; } }
+    @keyframes show-lothc-msgspec { 0% { opacity: 0; } 13.841% { opacity: 1; } 100% { opacity: 1; } }
+    #bar-lothc { animation: fill-lothc 8s linear infinite; }
+    #badge-lothc { animation: show-lothc 8s step-end infinite; }
+    @keyframes fill-lothc { 0% { width: 0; } 14.370% { width: 520px; } 100% { width: 520px; } }
+    @keyframes show-lothc { 0% { opacity: 0; } 14.370% { opacity: 1; } 100% { opacity: 1; } }
+    #bar-lothc-pydantic { animation: fill-lothc-pydantic 8s linear infinite; }
+    #badge-lothc-pydantic { animation: show-lothc-pydantic 8s step-end infinite; }
+    @keyframes fill-lothc-pydantic { 0% { width: 0; } 15.425% { width: 520px; } 100% { width: 520px; } }
+    @keyframes show-lothc-pydantic { 0% { opacity: 0; } 15.425% { opacity: 1; } 100% { opacity: 1; } }
+    #bar-httpx2 { animation: fill-httpx2 8s linear infinite; }
+    #badge-httpx2 { animation: show-httpx2 8s step-end infinite; }
+    @keyframes fill-httpx2 { 0% { width: 0; } 38.173% { width: 520px; } 100% { width: 520px; } }
+    @keyframes show-httpx2 { 0% { opacity: 0; } 38.173% { opacity: 1; } 100% { opacity: 1; } }
+    #bar-httpx { animation: fill-httpx 8s linear infinite; }
+    #badge-httpx { animation: show-httpx 8s step-end infinite; }
+    @keyframes fill-httpx { 0% { width: 0; } 43.705% { width: 520px; } 100% { width: 520px; } }
+    @keyframes show-httpx { 0% { opacity: 0; } 43.705% { opacity: 1; } 100% { opacity: 1; } }
+    #bar-niquests { animation: fill-niquests 8s linear infinite; }
+    #badge-niquests { animation: show-niquests 8s step-end infinite; }
+    @keyframes fill-niquests { 0% { width: 0; } 53.489% { width: 520px; } 100% { width: 520px; } }
+    @keyframes show-niquests { 0% { opacity: 0; } 53.489% { opacity: 1; } 100% { opacity: 1; } }
+    #bar-requests { animation: fill-requests 8s linear infinite; }
+    #badge-requests { animation: show-requests 8s step-end infinite; }
+    @keyframes fill-requests { 0% { width: 0; } 62.500% { width: 520px; } 100% { width: 520px; } }
+    @keyframes show-requests { 0% { opacity: 0; } 62.500% { opacity: 1; } 100% { opacity: 1; } }
+
+    @keyframes playhead {
+      0% { transform: translateX(0); }
+      62.500% { transform: translateX(520px); }
+      100% { transform: translateX(520px); }
+    }
+  </style>
+
+  <rect width="760" height="448" fill="#fcfcfb" />
+  <text x="20" y="26" class="title">HTTP client throughput race</text>
+
+  <g>
+    <line x1="150" y1="46" x2="670" y2="46" class="grid" />
+    <line x1="150.0" y1="46" x2="150.0" y2="388" class="grid" />
+    <line x1="254.0" y1="46" x2="254.0" y2="388" class="grid" />
+    <line x1="358.0" y1="46" x2="358.0" y2="388" class="grid" />
+    <line x1="462.0" y1="46" x2="462.0" y2="388" class="grid" />
+    <line x1="566.0" y1="46" x2="566.0" y2="388" class="grid" />
+    <line x1="670.0" y1="46" x2="670.0" y2="388" class="grid" />
+    <text x="150.0" y="40" class="tick" text-anchor="middle">0s</text>
+    <text x="254.0" y="40" class="tick" text-anchor="middle">1s</text>
+    <text x="358.0" y="40" class="tick" text-anchor="middle">2s</text>
+    <text x="462.0" y="40" class="tick" text-anchor="middle">3s</text>
+    <text x="566.0" y="40" class="tick" text-anchor="middle">4s</text>
+    <text x="670.0" y="40" class="tick" text-anchor="middle">5s</text>
+    <g id="playhead">
+      <line x1="150" y1="46" x2="150" y2="388" class="playhead" />
+    </g>
+  </g>
+
+  <g>
+    <rect x="150" y="58" width="520" height="26" rx="4" class="track" />
+    <rect id="bar-pyreqwest" x="150" y="58" height="26" rx="4" width="0" fill="#4a3aa7" />
+    <rect x="20" y="71.0" width="10" height="10" rx="2" fill="#4a3aa7" />
+    <text x="36" y="73.0" class="name">pyreqwest</text>
+    <text x="36" y="86.0" class="rate">14,394 req/s</text>
+    <g id="badge-pyreqwest" opacity="0">
+      <text x="680" y="80.0" class="badge" fill="#4a3aa7">
+        &#x2713; 1.04s
+      </text>
+    </g>
+  </g>
+  <g>
+    <rect x="150" y="100" width="520" height="26" rx="4" class="track" />
+    <rect id="bar-lothc-msgspec" x="150" y="100" height="26" rx="4" width="0" fill="#009e00" />
+    <rect x="20" y="113.0" width="10" height="10" rx="2" fill="#009e00" />
+    <text x="36" y="115.0" class="name">lothc-msgspec</text>
+    <text x="36" y="128.0" class="rate">13,484 req/s</text>
+    <g id="badge-lothc-msgspec" opacity="0">
+      <text x="680" y="122.0" class="badge" fill="#009e00">
+        &#x2713; 1.11s
+      </text>
+    </g>
+  </g>
+  <g>
+    <rect x="150" y="142" width="520" height="26" rx="4" class="track" />
+    <rect id="bar-lothc" x="150" y="142" height="26" rx="4" width="0" fill="#00c200" />
+    <rect x="20" y="155.0" width="10" height="10" rx="2" fill="#00c200" />
+    <text x="36" y="157.0" class="name">lothc</text>
+    <text x="36" y="170.0" class="rate">12,988 req/s</text>
+    <g id="badge-lothc" opacity="0">
+      <text x="680" y="164.0" class="badge" fill="#00c200">
+        &#x2713; 1.15s
+      </text>
+    </g>
+  </g>
+  <g>
+    <rect x="150" y="184" width="520" height="26" rx="4" class="track" />
+    <rect id="bar-lothc-pydantic" x="150" y="184" height="26" rx="4" width="0" fill="#007a00" />
+    <rect x="20" y="197.0" width="10" height="10" rx="2" fill="#007a00" />
+    <text x="36" y="199.0" class="name">lothc-pydantic</text>
+    <text x="36" y="212.0" class="rate">12,099 req/s</text>
+    <g id="badge-lothc-pydantic" opacity="0">
+      <text x="680" y="206.0" class="badge" fill="#007a00">
+        &#x2713; 1.23s
+      </text>
+    </g>
+  </g>
+  <g>
+    <rect x="150" y="226" width="520" height="26" rx="4" class="track" />
+    <rect id="bar-httpx2" x="150" y="226" height="26" rx="4" width="0" fill="#1baf7a" />
+    <rect x="20" y="239.0" width="10" height="10" rx="2" fill="#1baf7a" />
+    <text x="36" y="241.0" class="name">httpx2</text>
+    <text x="36" y="254.0" class="rate">4,889 req/s</text>
+    <g id="badge-httpx2" opacity="0">
+      <text x="680" y="248.0" class="badge" fill="#1baf7a">
+        &#x2713; 3.05s
+      </text>
+    </g>
+  </g>
+  <g>
+    <rect x="150" y="268" width="520" height="26" rx="4" class="track" />
+    <rect id="bar-httpx" x="150" y="268" height="26" rx="4" width="0" fill="#2a78d6" />
+    <rect x="20" y="281.0" width="10" height="10" rx="2" fill="#2a78d6" />
+    <text x="36" y="283.0" class="name">httpx</text>
+    <text x="36" y="296.0" class="rate">4,270 req/s</text>
+    <g id="badge-httpx" opacity="0">
+      <text x="680" y="290.0" class="badge" fill="#2a78d6">
+        &#x2713; 3.50s
+      </text>
+    </g>
+  </g>
+  <g>
+    <rect x="150" y="310" width="520" height="26" rx="4" class="track" />
+    <rect id="bar-niquests" x="150" y="310" height="26" rx="4" width="0" fill="#eb6834" />
+    <rect x="20" y="323.0" width="10" height="10" rx="2" fill="#eb6834" />
+    <text x="36" y="325.0" class="name">niquests</text>
+    <text x="36" y="338.0" class="rate">3,489 req/s</text>
+    <g id="badge-niquests" opacity="0">
+      <text x="680" y="332.0" class="badge" fill="#eb6834">
+        &#x2713; 4.28s
+      </text>
+    </g>
+  </g>
+  <g>
+    <rect x="150" y="352" width="520" height="26" rx="4" class="track" />
+    <rect id="bar-requests" x="150" y="352" height="26" rx="4" width="0" fill="#e34948" />
+    <rect x="20" y="365.0" width="10" height="10" rx="2" fill="#e34948" />
+    <text x="36" y="367.0" class="name">requests</text>
+    <text x="36" y="380.0" class="rate">2,986 req/s</text>
+    <g id="badge-requests" opacity="0">
+      <text x="680" y="374.0" class="badge" fill="#e34948">
+        &#x2713; 5.00s
+      </text>
+    </g>
+  </g>
+
+  <text x="20" y="436" class="rate">Benchmarked with perf.py — 10000 requests, concurrency 1, against a tiny JSON server.</text>
+</svg>
