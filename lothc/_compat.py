@@ -62,10 +62,26 @@ class StructTyping(Protocol):
 
 
 class BaseModelTyping(Protocol):
-    """Same reasoning as `StructTyping`, for `pydantic.BaseModel` — `model_config` is declared
-    directly on `BaseModel` itself, so any real subclass structurally satisfies this."""
+    """Same reasoning as `StructTyping`, for `pydantic.BaseModel` — matches on
+    `model_validate_json`'s call shape alone (the same method `_decode_body`/`_decode_error_body`
+    already call), not a `ClassVar`.
 
-    model_config: ClassVar[Any]
+    A `ClassVar[Any] model_config` marker was tried first and rejected: confirmed live that a
+    *subclass* re-declaring `model_config = ConfigDict(...)` without repeating `ClassVar` — the
+    standard, pydantic-docs-recommended way to configure a model, used throughout real code, e.g.
+    `class SSEBase(BaseModel): model_config = ConfigDict(...)` — makes basedpyright and zuban
+    treat that subclass's `model_config` as an *instance* variable, no longer satisfying a
+    `ClassVar`-typed protocol member at all (mypy and ty were unaffected by this specific
+    quirk). That's a real, confirmed regression this exact fix was meant to prevent, not a
+    theoretical one — a genuine consumer's real `BaseModel` subclass stopped satisfying `Data`'s
+    bound. A method-shaped protocol member has no such ambiguity: methods aren't "reassigned"
+    the way a subclass reassigns an inherited class variable, so this is stable across all four
+    checkers regardless of how the model configures itself. Confirmed live, with a subclass that
+    overrides `model_config` exactly as above, that all four checkers resolve it to its own
+    precise type with zero errors."""
+
+    @classmethod
+    def model_validate_json(cls, _json_data: str | bytes, /) -> Any: ...  # noqa: ANN401
 
 
 class TypeAdapterTyping[TData](Protocol):
