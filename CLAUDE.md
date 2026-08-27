@@ -92,9 +92,18 @@ omit auth for one call on both clients), cookie/session
 support (`cookie_store=True`), redirect control (`follow_redirects`/`max_redirects`), proxy config
 (`proxy=`), retries (`max_retries`/`retry_methods`, implemented as a real pyreqwest
 `with_middleware` hook — backoff + `Retry-After` honored, defaults to idempotent verbs
-`get`/`put`/`delete`/`head`, `post`/`patch` require explicit opt-in via `retry_methods`), and typed
+`get`/`put`/`delete`/`head`, `post`/`patch` require explicit opt-in via `retry_methods`), typed
 error bodies (a per-verb `error_type=SomeModel` param, mirroring `response_data_type`, that
-decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it `None`).
+decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it `None`), and
+TLS/mTLS/connection-pool config (`connect_timeout`, `root_certificates`, `identity_pem`,
+`min_tls_version`/`max_tls_version`, `danger_accept_invalid_certs`, `https_only`,
+`max_connections`, `pool_idle_timeout`, `pool_max_idle_per_host`, `pool_timeout` — all
+client-level only, same as redirects/proxy/cookies above), and request metadata
+(`.request: RequestInfo` — method/url/path/host of the request actually sent) on both `Result`
+(`get_result`/`post_result`/`put_result`/`patch_result`/`delete_result`/`head`) and on
+`HTTPResponseError` itself (every verb, including `sse`/`stream_get`/`stream_post`/`download` —
+knowing which request failed matters more than which one succeeded, especially with several in
+flight concurrently).
 
 Not done yet: nothing outstanding right now — see git history/this file's own dev-notes below for
 what's landed and why.
@@ -197,6 +206,15 @@ task example-run       # runs examples/run_http.py against it, showcasing every 
 (`tests/_server.py` — no jero, no ASGI framework), just bound to a fixed port instead of an
 OS-assigned one. `examples/run_http.py` doesn't yet showcase every feature added this session
 (retries, cookies, redirects, proxy, delete/head, streaming) — extend it when that's worth doing.
+
+`task example-server` restarts automatically on a real edit to `examples/server.py` or
+`tests/_server.py`, via go-task's own built-in `watch: true` + `sources:` (Taskfile.yml) — no new
+dependency, and no in-process module reloading (the whole process restarts). go-task's watcher
+uses a content checksum, not mtime, so a no-op `touch` correctly does **not** trigger a restart —
+only confirmed by testing both cases live, not assumed. `examples/server.py`'s `main()` wraps
+`serve_forever()` in `contextlib.suppress(KeyboardInterrupt)`, since that's the signal go-task
+sends the old process to stop it before starting the new one — without it, every restart printed a
+raw `KeyboardInterrupt` traceback to the terminal.
 
 ## Regression benchmarking (asv)
 
@@ -356,6 +374,23 @@ Before writing any code, tell the user that you've read this file AND read and f
 
 ## Development notes
 
+- **`RequestInfo` must be captured *before* `.send()`, not after — a `ConsumedRequest`/
+  `SyncConsumedRequest` genuinely can't be read once sent.** Confirmed live: reading `.url`/
+  `.method` off the built request *after* calling `.send()` on it raises `RuntimeError: Request
+  was already sent` — pyreqwest's own consumed-request type isn't just naming, the object is
+  actually unusable afterward. `_send`/`_send_sync` build the request, call `_request_info(built)`
+  immediately, *then* `await built.send()` — in that order, not `built.send(), _request_info
+  (built)` as a single return-tuple expression (tried first, caught by the real test suite
+  immediately: Python evaluates tuple elements left-to-right, so `.send()` had already consumed
+  the request by the time `_request_info` ran). `_send`/`_send_sync` return `tuple[RawResponse |
+  RawSyncResponse, RequestInfo]` for every caller — originally only the `Result`-returning callers
+  used the second element (others discarded it with `_`), but once `HTTPResponseError` also
+  gained `.request`, *every* caller needs it (to attach to a raised error even on the plain
+  `get`/`post`/etc. path), so the discard case no longer exists at all. **The exact same
+  before-not-after discipline applies to `build_streamed()`'s `StreamRequest`**, used by
+  `_sse_stream`/`_line_stream`/`_download` — `request_info = _request_info(request)` right after
+  `request_builder.build_streamed()`, *before* entering the `async with request as raw_response`/
+  `with request as raw_response` block, never after.
 - **`error_type` decodes from already-fetched bytes, never the live response object.** By the
   time `_check_status` raises, it has already called `.bytes()` once to populate `body_start` —
   a pyreqwest response body can't be read twice, so `error_type`'s decode helper
@@ -433,6 +468,19 @@ Before writing any code, tell the user that you've read this file AND read and f
   new dedicated exception) — it's neither a timeout nor a connection-level network failure, and
   adding a whole new public exception class for one redirect-policy edge case didn't seem justified
   when the existing base already communicates "transport-level failure, no usable response."
+  **Same story, found later, for `pyreqwest.exceptions.BuilderError`** (raised by `.build()`/
+  `.build_streamed()` itself — e.g. `https_only=True` rejecting a plain-http URL) — confirmed live
+  it leaked raw out of `client.get(...)`, since `.build()` was called by each verb *before* handing
+  the result to `_send`/`_send_sync`, outside their try/except entirely. `BuilderError` isn't a
+  `TransportError` subclass either (`BuilderError -> DetailedPyreqwestError -> PyreqwestError ->
+  ValueError`, confirmed via `__mro__`). Fixed properly, not by adding a try/except at each of the
+  16 call sites: `_send`/`_send_sync` now take the unbuilt `RequestBuilder`/`SyncRequestBuilder`
+  and call `.build()` themselves inside the same try, so every one of their callers just got
+  simpler (`_send(request_builder)` instead of `_send(request_builder.build())`); the 6
+  `build_streamed()` call sites (`sse`/`stream_get`/`stream_post`/`download`, both clients) moved
+  their `.build_streamed()` call inside their existing try block instead. `PyreqwestBuilderError`
+  joins the same widened except tuple everywhere and maps to the same plain `HTTPTransportError`,
+  for the same reason `RedirectError` does.
 - **Status errors are separate from transport errors.** `HTTPResponseError` (4xx/5xx with a body_start
   snippet) is a different failure class from `HTTPTransportError` (never got a response at all) —
   don't unify them.
@@ -594,3 +642,43 @@ Before writing any code, tell the user that you've read this file AND read and f
   didn't already cover better. If this ever needs resurrecting, the old `_IsTypedDict`/
   `_validate_typed_dict` design is preserved in this file's own git history, not reinvented from
   scratch.
+- **pyreqwest's `streamed_read_buffer_limit` defaults to 65536 (64KB) and silently defeats
+  real-time streaming below that size — `sse`/`stream_get`/`stream_post` must set it to `1`
+  explicitly.** Found live: `task example-run`'s SSE section showed one huge first delta (the
+  entire stream's real duration) followed by ~25 near-instant deltas, instead of the ~250ms
+  spacing the server actually writes at (`tests/_server.py`'s `_write_sse_events`, one
+  `time.sleep()` per record). Confirmed via a raw pyreqwest repro (bypassing lothc entirely,
+  hand-rolled chunked-transfer-encoding server, no lothc code involved) that this is pyreqwest's
+  own behavior, not a lothc bug: its streamed body reader withholds every received byte
+  internally until either `streamed_read_buffer_limit` bytes have accumulated or the stream hits
+  EOF, at which point everything flushes to Python at once. `RequestBuilder.
+  default_streamed_read_buffer_limit()` confirmed live to be exactly `65536` — small, slowly
+  trickling payloads (an SSE stream of small records, NDJSON lines) never reach that threshold
+  mid-stream, so nothing arrives until the connection closes. Fixed by chaining
+  `.streamed_read_buffer_limit(1)` onto the request builder immediately before `.build_streamed()`
+  at all 4 real-time streaming call sites (`_sse_stream`/`_line_stream` shared by
+  `stream_get`/`stream_post`, both clients) — confirmed via `task example-run` afterward that SSE
+  deltas track the server's real per-event pacing. **Deliberately did NOT touch `download()`'s two
+  `build_streamed()` call sites** — bulk transfer benefits from the larger default buffer (fewer
+  Python/Rust boundary crossings), and has no low-latency-delivery requirement the way
+  `sse`/`stream_get`/`stream_post` do.
+  **`1` does not mean "read one byte at a time" — verified with a 10MB single-burst benchmark**
+  comparing `streamed_read_buffer_limit` at `1` vs `8192` vs `65536` vs `1048576`: chunk count
+  (~200) and average chunk size (~50KB) were essentially identical across all four, with the
+  bytes/chunk boundaries still governed entirely by whatever the OS/socket naturally delivers per
+  read. The parameter only controls whether pyreqwest is willing to hand over already-received
+  bytes immediately (`1`) versus holding them back to accumulate more first — it has no effect on
+  read granularity itself, so there's no meaningful throughput cost to setting it low.
+  `tests/test_sse.py`'s `test_sse_events_arrive_incrementally_not_buffered_until_stream_end` (+
+  sync mirror) is the regression test — it measures `time.perf_counter()` deltas between yielded
+  SSE events and asserts a majority exceed a small floor (0.3ms), rather than asserting on `max()`
+  or the first delta specifically, since either of those flaked (~1-2% of runs) on an occasional
+  single slow scheduler wakeup that isn't the bug reappearing. Confirmed both ways: reverting the
+  `streamed_read_buffer_limit(1)` fix makes it fail immediately (only 1 of 10 deltas clears the
+  floor); 80 consecutive runs of the fixed code passed with zero flakes. `tests/_server.py`'s
+  `_write_sse_events` was shrunk from 25 events/0.25s sleeps (6.25s per full-stream test, and this
+  endpoint alone accounted for ~77s of the whole ~86s suite) to 10 events/1ms sleeps specifically
+  to make this timing assertion affordable to run on every test invocation — `time.perf_counter()`
+  was used over `time.monotonic()` since it's the clock Python's own docs recommend specifically
+  for measuring short durations/benchmarking (higher guaranteed resolution; `monotonic()` is
+  general-purpose and coarser on some platforms), which matters at this test's millisecond scale.

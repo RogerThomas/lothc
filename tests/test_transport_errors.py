@@ -86,3 +86,37 @@ def test_sync_exceeding_max_redirects_raises_transport_error(base_url: str) -> N
         pytest.raises(HTTPTransportError),
     ):
         client.get("redirect-loop")
+
+
+async def test_https_only_against_plain_http_raises_transport_error(base_url: str) -> None:
+    async with HTTPClient.build(base_url=base_url, https_only=True) as client:
+        with pytest.raises(HTTPTransportError):
+            await client.get("anything")
+
+
+def test_sync_https_only_against_plain_http_raises_transport_error(base_url: str) -> None:
+    with (
+        SyncHTTPClient.build(base_url=base_url, https_only=True) as client,
+        pytest.raises(HTTPTransportError),
+    ):
+        client.get("anything")
+
+
+async def test_https_only_against_plain_http_raises_transport_error_for_sse(
+    base_url: str,
+) -> None:
+    async with HTTPClient.build(base_url=base_url, https_only=True) as client:
+        with pytest.raises(HTTPTransportError):
+            async for _ in client.sse("events"):
+                pass
+
+
+def test_sync_https_only_against_plain_http_raises_transport_error_for_sse(
+    base_url: str,
+) -> None:
+    with (
+        SyncHTTPClient.build(base_url=base_url, https_only=True) as client,
+        pytest.raises(HTTPTransportError),
+    ):
+        for _ in client.sse("events"):
+            pass

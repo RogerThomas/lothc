@@ -141,7 +141,11 @@ tasks:
   # - Examples -----------------------------------------------------------------------------------
   # ------------------------------------------------------------------------------------------------
   example-server:
-    desc: Run the stdlib-only example test server on port 8701
+    desc: Run the stdlib-only example test server on port 8701 (restarts on source changes)
+    watch: true
+    sources:
+      - examples/server.py
+      - tests/_server.py
     cmd: uv run yeet ./examples/server.py
 
   example-run:

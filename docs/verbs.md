@@ -66,7 +66,15 @@ result = await client.get_result("items/7", response_data_type=ItemModel)
 result.data  # ItemModel(id=7, name="item-7")
 result.status  # 200
 result.headers  # {"content-type": "application/json", ...}
+result.request.method  # "GET"
+result.request.url  # "https://api.example.com/items/7"
+result.request.path  # "/items/7"
+result.request.host  # "api.example.com"
 ```
+
+`result.request` is the request actually sent — useful for logging, or for telling apart which
+call a `Result` came from when you're juggling several. It reflects the target you asked for, not
+necessarily the one a final response came from if redirects were followed.
 
 Pass `response_headers_type` (a `BaseModel`/`Struct`) to get the *response* headers validated and parsed
 too, via `result.typed_headers`. Header names are lowercased and `-` becomes `_` before matching

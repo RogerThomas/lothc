@@ -58,6 +58,29 @@ async def test_get_error_type_mismatch_raises_validation_error(client: HTTPClien
         await client.get("boom", error_type=UnmatchedErrorBodyModel)
 
 
+async def test_get_error_has_request_info(client: HTTPClient) -> None:
+    with pytest.raises(HTTPResponseError) as exc_info:
+        await client.get("boom")
+    assert exc_info.value.request.method == "GET"
+    assert exc_info.value.request.path == "/boom"
+    assert exc_info.value.request.host == "127.0.0.1"
+
+
+async def test_get_result_error_has_request_info(client: HTTPClient) -> None:
+    with pytest.raises(HTTPResponseError) as exc_info:
+        await client.get_result("boom")
+    assert exc_info.value.request.method == "GET"
+    assert exc_info.value.request.path == "/boom"
+
+
+async def test_sse_error_has_request_info(client: HTTPClient) -> None:
+    with pytest.raises(HTTPResponseError) as exc_info:
+        async for _ in client.sse("boom"):
+            pass
+    assert exc_info.value.request.method == "GET"
+    assert exc_info.value.request.path == "/boom"
+
+
 def test_sync_get_error_type_none_leaves_parsed_body_none(sync_client: SyncHTTPClient) -> None:
     with pytest.raises(HTTPResponseError) as exc_info:
         sync_client.get("boom")
@@ -95,3 +118,26 @@ def test_sync_get_error_type_mismatch_raises_validation_error(
 ) -> None:
     with pytest.raises(ValidationError):
         sync_client.get("boom", error_type=UnmatchedErrorBodyModel)
+
+
+def test_sync_get_error_has_request_info(sync_client: SyncHTTPClient) -> None:
+    with pytest.raises(HTTPResponseError) as exc_info:
+        sync_client.get("boom")
+    assert exc_info.value.request.method == "GET"
+    assert exc_info.value.request.path == "/boom"
+    assert exc_info.value.request.host == "127.0.0.1"
+
+
+def test_sync_get_result_error_has_request_info(sync_client: SyncHTTPClient) -> None:
+    with pytest.raises(HTTPResponseError) as exc_info:
+        sync_client.get_result("boom")
+    assert exc_info.value.request.method == "GET"
+    assert exc_info.value.request.path == "/boom"
+
+
+def test_sync_sse_error_has_request_info(sync_client: SyncHTTPClient) -> None:
+    with pytest.raises(HTTPResponseError) as exc_info:
+        for _ in sync_client.sse("boom"):
+            pass
+    assert exc_info.value.request.method == "GET"
+    assert exc_info.value.request.path == "/boom"

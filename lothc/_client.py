@@ -8,6 +8,7 @@ from collections.abc import (
     Generator,
     Iterator,
     Mapping,
+    Sequence,
 )
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
@@ -20,7 +21,9 @@ from mimetypes import guess_type as _guess_mime_type
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Self, cast, overload
 
-from pyreqwest.client import Client, ClientBuilder, SyncClient, SyncClientBuilder
+from pyreqwest.client import BaseClientBuilder, Client, ClientBuilder, SyncClient, SyncClientBuilder
+from pyreqwest.client.types import TlsVersion
+from pyreqwest.exceptions import BuilderError as PyreqwestBuilderError
 from pyreqwest.exceptions import NetworkError as PyreqwestNetworkError
 from pyreqwest.exceptions import RedirectError as PyreqwestRedirectError
 from pyreqwest.exceptions import RequestTimeoutError as PyreqwestRequestTimeoutError
@@ -30,10 +33,8 @@ from pyreqwest.multipart import FormBuilder, PartBuilder
 from pyreqwest.proxy import ProxyBuilder
 from pyreqwest.request import (
     BaseRequestBuilder,
-    ConsumedRequest,
     Request,
     RequestBuilder,
-    SyncConsumedRequest,
     SyncRequestBuilder,
 )
 from pyreqwest.response import Response as RawResponse
@@ -85,15 +86,33 @@ type AuthProvider = Callable[[], Awaitable[str]]
 type SyncAuthProvider = Callable[[], str]
 
 
+@dataclass(slots=True)
+class RequestInfo:
+    """The request actually sent, attached to `Result.request`/`head`'s result and to
+    `HTTPResponseError.request` — the target you asked for, not necessarily the one a final
+    response came from if redirects were followed.
+    """
+
+    method: str
+    url: str
+    path: str
+    host: str | None
+
+
 class HTTPResponseError(Exception):
     """Raised when a request gets a 4xx/5xx response (`error_for_status=True`, the default).
 
     A response WAS received — for a request that never got one, see `HTTPTransportError`.
+    `.request` is the request actually sent — the target you asked for, not necessarily the one a
+    final response came from if redirects were followed.
     """
 
-    def __init__(self, status: int, body: bytes, parsed_body: Data | None = None) -> None:
+    def __init__(
+        self, status: int, body: bytes, request: RequestInfo, parsed_body: Data | None = None
+    ) -> None:
         self.status = status
         self.body_start = body[:100]
+        self.request = request
         self.parsed_body = parsed_body
         snippet = self.body_start.decode(errors="replace")
         truncation_marker = "…" if len(body) > 100 else ""
@@ -115,13 +134,13 @@ class HTTPTimeoutError(HTTPTransportError):
 
 
 def _translate_transport_error(
-    error: PyreqwestTransportError | PyreqwestRedirectError,
+    error: PyreqwestTransportError | PyreqwestRedirectError | PyreqwestBuilderError,
 ) -> HTTPTransportError:
     if isinstance(error, PyreqwestRequestTimeoutError):
         return HTTPTimeoutError(str(error))
     if isinstance(error, PyreqwestNetworkError):
         return HTTPConnectionError(str(error))
-    if isinstance(error, PyreqwestRedirectError):
+    if isinstance(error, (PyreqwestRedirectError, PyreqwestBuilderError)):
         return HTTPTransportError(str(error))
     # Every real pyreqwest TransportError subclass (verified against the installed version)
     # descends from either RequestTimeoutError or NetworkError, both handled above — this is a
@@ -129,17 +148,29 @@ def _translate_transport_error(
     return HTTPTransportError(str(error))  # pragma: no cover
 
 
-async def _send(request: ConsumedRequest) -> RawResponse:
+def _request_info(request: Request) -> RequestInfo:
+    url = request.url
+    return RequestInfo(method=request.method, url=str(url), path=url.path, host=url.host_str)
+
+
+async def _send(request_builder: RequestBuilder) -> tuple[RawResponse, RequestInfo]:
+    # `.build()` (not just `.send()`) can raise — e.g. `BuilderError` when `https_only=True`
+    # rejects a plain-http URL — so it must be inside this same try, not called by the caller
+    # beforehand, or that exception type leaks past this translation layer entirely.
     try:
-        return await request.send()
-    except (PyreqwestTransportError, PyreqwestRedirectError) as error:
+        built = request_builder.build()
+        request_info = _request_info(built)
+        return await built.send(), request_info
+    except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
         raise _translate_transport_error(error) from error
 
 
-def _send_sync(request: SyncConsumedRequest) -> RawSyncResponse:
+def _send_sync(request_builder: SyncRequestBuilder) -> tuple[RawSyncResponse, RequestInfo]:
     try:
-        return request.send()
-    except (PyreqwestTransportError, PyreqwestRedirectError) as error:
+        built = request_builder.build()
+        request_info = _request_info(built)
+        return built.send(), request_info
+    except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
         raise _translate_transport_error(error) from error
 
 
@@ -607,6 +638,48 @@ def _prepare[TBuilder: BaseRequestBuilder](
     return _apply_timeout(prepared, timeout)
 
 
+def _apply_tls_and_pool_config[TBuilder: BaseClientBuilder](
+    client_builder: TBuilder,
+    *,
+    connect_timeout: float | None,
+    root_certificates: Sequence[bytes] | None,
+    identity_pem: bytes | None,
+    min_tls_version: TlsVersion | None,
+    max_tls_version: TlsVersion | None,
+    danger_accept_invalid_certs: bool,
+    https_only: bool,
+    max_connections: int | None,
+    pool_idle_timeout: float | None,
+    pool_max_idle_per_host: int | None,
+    pool_timeout: float | None,
+) -> TBuilder:
+    """Shared by `HTTPClient.build`/`SyncHTTPClient.build` — `ClientBuilder`/`SyncClientBuilder`
+    both inherit these methods from the same `BaseClientBuilder`, so one function configures
+    either."""
+    if connect_timeout is not None:
+        client_builder = client_builder.connect_timeout(timedelta(seconds=connect_timeout))
+    if root_certificates is not None:
+        for certificate in root_certificates:
+            client_builder = client_builder.add_root_certificate_pem(certificate)
+    if identity_pem is not None:
+        client_builder = client_builder.identity_pem(identity_pem)
+    if min_tls_version is not None:
+        client_builder = client_builder.min_tls_version(min_tls_version)
+    if max_tls_version is not None:
+        client_builder = client_builder.max_tls_version(max_tls_version)
+    client_builder = client_builder.danger_accept_invalid_certs(danger_accept_invalid_certs)
+    client_builder = client_builder.https_only(https_only)
+    if max_connections is not None:
+        client_builder = client_builder.max_connections(max_connections)
+    if pool_idle_timeout is not None:
+        client_builder = client_builder.pool_idle_timeout(timedelta(seconds=pool_idle_timeout))
+    if pool_max_idle_per_host is not None:
+        client_builder = client_builder.pool_max_idle_per_host(pool_max_idle_per_host)
+    if pool_timeout is not None:
+        client_builder = client_builder.pool_timeout(timedelta(seconds=pool_timeout))
+    return client_builder
+
+
 async def _attach_body[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many-return-statements
     request_builder: TBuilder,
     json: JSONPayload | None,
@@ -687,13 +760,15 @@ class Result[TData, THeaders: TypedHeaders | None = None]:
     """The decoded body alongside status/headers, as returned by `get_result()`/`head()`.
 
     `.typed_headers` is `None` unless `response_headers_type` was passed to the call that
-    produced this.
+    produced this. `.request` is the request actually sent — the target you asked for, not
+    necessarily the one a final response came from if redirects were followed.
     """
 
     data: TData
     status: int
     headers: dict[str, str]
     typed_headers: THeaders
+    request: RequestInfo
 
 
 @dataclass
@@ -727,6 +802,17 @@ class HTTPClient:
         proxy: str | None = None,
         max_retries: int = 0,
         retry_methods: frozenset[str] | None = None,
+        connect_timeout: float | None = None,
+        root_certificates: Sequence[bytes] | None = None,
+        identity_pem: bytes | None = None,
+        min_tls_version: TlsVersion | None = None,
+        max_tls_version: TlsVersion | None = None,
+        danger_accept_invalid_certs: bool = False,
+        https_only: bool = False,
+        max_connections: int | None = None,
+        pool_idle_timeout: float | None = None,
+        pool_max_idle_per_host: int | None = None,
+        pool_timeout: float | None = None,
     ) -> AsyncGenerator[Self]:
         """Build an `HTTPClient` as an async context manager.
 
@@ -734,6 +820,14 @@ class HTTPClient:
         every request; `basic_auth` is a `(username, password)` pair — provide at most one of the
         three. `max_retries` enables a real retry middleware (backoff, `Retry-After`-aware); with
         no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`) retry.
+
+        `connect_timeout` bounds only the TCP connect phase (separate from `timeout`, which
+        covers the whole request). `root_certificates` (each a PEM-encoded cert) and
+        `identity_pem` (a PEM bundle containing both a client cert and its private key) cover
+        trusting a custom/internal CA and mTLS respectively. `danger_accept_invalid_certs`
+        disables certificate validation entirely — insecure, for local/test use only.
+        `max_connections`/`pool_idle_timeout`/`pool_max_idle_per_host`/`pool_timeout` tune the
+        underlying connection pool; leave them `None` to keep pyreqwest's own defaults.
         """
         if sum(value is not None for value in (bearer_token, bearer_auth, basic_auth)) > 1:
             raise ValueError(
@@ -755,6 +849,20 @@ class HTTPClient:
         if max_retries > 0:
             middleware = _RetryMiddleware(max_retries, retry_methods or cls._default_retry_methods)
             pyreqwest_client_builder = pyreqwest_client_builder.with_middleware(middleware)
+        pyreqwest_client_builder = _apply_tls_and_pool_config(
+            pyreqwest_client_builder,
+            connect_timeout=connect_timeout,
+            root_certificates=root_certificates,
+            identity_pem=identity_pem,
+            min_tls_version=min_tls_version,
+            max_tls_version=max_tls_version,
+            danger_accept_invalid_certs=danger_accept_invalid_certs,
+            https_only=https_only,
+            max_connections=max_connections,
+            pool_idle_timeout=pool_idle_timeout,
+            pool_max_idle_per_host=pool_max_idle_per_host,
+            pool_timeout=pool_timeout,
+        )
         async with pyreqwest_client_builder.build() as client:
             yield cls(client, bearer_token, bearer_auth, basic_auth)
 
@@ -784,12 +892,14 @@ class HTTPClient:
         request_builder = await self._apply_auth(request_builder, skip_auth=skip_auth)
         return _prepare(request_builder, params, headers, timeout)
 
-    async def _check_status(self, raw_response: RawResponse, error_type: type[Data] | None) -> None:
+    async def _check_status(
+        self, raw_response: RawResponse, error_type: type[Data] | None, request_info: RequestInfo
+    ) -> None:
         if raw_response.status < 400:
             return
         body = (await raw_response.bytes()).to_bytes()
         parsed_body = _decode_error_body(body, error_type) if error_type is not None else None
-        raise HTTPResponseError(raw_response.status, body, parsed_body)
+        raise HTTPResponseError(raw_response.status, body, request_info, parsed_body)
 
     async def _decode_body(self, raw_response: RawResponse, response_data_type: type[Data]) -> Data:
         _validate_response_data_type(response_data_type)
@@ -812,12 +922,13 @@ class HTTPClient:
         self,
         raw_response: RawResponse,
         response_data_type: type[Data],
+        request_info: RequestInfo,
         *,
         error_for_status: bool,
         error_type: type[Data] | None,
     ) -> Data:
         if error_for_status:
-            await self._check_status(raw_response, error_type)
+            await self._check_status(raw_response, error_type, request_info)
         return await self._decode_body(raw_response, response_data_type)
 
     @overload
@@ -882,10 +993,11 @@ class HTTPClient:
         request_builder = await self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
         )
-        raw_response = await _send(request_builder.build())
+        raw_response, request_info = await _send(request_builder)
         return await self._parse(
             raw_response,
             response_data_type,
+            request_info,
             error_for_status=error_for_status,
             error_type=error_type,
         )
@@ -994,16 +1106,16 @@ class HTTPClient:
         request_builder = await self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
         )
-        raw_response = await _send(request_builder.build())
+        raw_response, request_info = await _send(request_builder)
         if error_for_status:
-            await self._check_status(raw_response, error_type)
+            await self._check_status(raw_response, error_type, request_info)
         data = await self._decode_body(raw_response, response_data_type)
         headers = dict(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
             typed_headers = _parse_typed_headers(headers, response_headers_type)
-        return Result(data, raw_response.status, headers, typed_headers)
+        return Result(data, raw_response.status, headers, typed_headers, request_info)
 
     async def _sse_stream(
         self,
@@ -1023,11 +1135,17 @@ class HTTPClient:
         request_builder = await self._prepare_request(
             request_builder, params, headers, timeout, skip_auth=skip_auth
         )
-        request = request_builder.build_streamed()
         try:
+            # pyreqwest's default streamed_read_buffer_limit is 64KB — it withholds received
+            # bytes internally until that fills or the stream ends, which for an SSE stream (each
+            # record a few dozen bytes) means every event arrives in one burst at stream end
+            # instead of as it happens. 1 forces it to hand over whatever it has as soon as it has
+            # it, restoring real-time delivery — SSE's entire point.
+            request = request_builder.streamed_read_buffer_limit(1).build_streamed()
+            request_info = _request_info(request)
             async with request as raw_response:
                 if error_for_status:
-                    await self._check_status(raw_response, error_type)
+                    await self._check_status(raw_response, error_type, request_info)
                 buffer = b""
                 while True:
                     chunk = await raw_response.body_reader.read_chunk()
@@ -1049,7 +1167,7 @@ class HTTPClient:
                         else:
                             decoded = _decode_json_line(parsed_record.data, response_data_type)
                             yield SSEEvent(id=event_id, event=parsed_record.event, data=decoded)
-        except (PyreqwestTransportError, PyreqwestRedirectError) as error:
+        except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
 
     @overload
@@ -1281,11 +1399,15 @@ class HTTPClient:
             content,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
         )
-        request = request_builder.build_streamed()
         try:
+            # See the matching comment in `_sse_stream` — same 64KB-default buffering issue,
+            # same fix. `stream_get`/`stream_post` promise unbuffered/NDJSON-as-it-arrives
+            # delivery, which the pyreqwest default silently defeats otherwise.
+            request = request_builder.streamed_read_buffer_limit(1).build_streamed()
+            request_info = _request_info(request)
             async with request as raw_response:
                 if error_for_status:
-                    await self._check_status(raw_response, error_type)
+                    await self._check_status(raw_response, error_type, request_info)
                 if response_data_type is None:
                     while True:
                         chunk = await raw_response.body_reader.read_chunk()
@@ -1304,7 +1426,7 @@ class HTTPClient:
                             yield _decode_json_line(line.decode(), response_data_type)
                 if buffer.strip():
                     yield _decode_json_line(buffer.decode(), response_data_type)
-        except (PyreqwestTransportError, PyreqwestRedirectError) as error:
+        except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
 
     @overload
@@ -1486,11 +1608,12 @@ class HTTPClient:
         request_builder = await self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
         )
-        request = request_builder.build_streamed()
         try:
+            request = request_builder.build_streamed()
+            request_info = _request_info(request)
             async with request as raw_response:
                 if error_for_status:
-                    await self._check_status(raw_response, error_type)
+                    await self._check_status(raw_response, error_type, request_info)
                 if dest is None:
                     buffer = bytearray()
                     while True:
@@ -1504,7 +1627,7 @@ class HTTPClient:
                         if chunk is None:
                             return None
                         file.write(chunk)
-        except (PyreqwestTransportError, PyreqwestRedirectError) as error:
+        except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
 
     @overload
@@ -1597,10 +1720,11 @@ class HTTPClient:
             content,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
         )
-        raw_response = await _send(request_builder.build())
+        raw_response, request_info = await _send(request_builder)
         return await self._parse(
             raw_response,
             response_data_type,
+            request_info,
             error_for_status=error_for_status,
             error_type=error_type,
         )
@@ -1632,16 +1756,16 @@ class HTTPClient:
             content,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
         )
-        raw_response = await _send(request_builder.build())
+        raw_response, request_info = await _send(request_builder)
         if error_for_status:
-            await self._check_status(raw_response, error_type)
+            await self._check_status(raw_response, error_type, request_info)
         data = await self._decode_body(raw_response, response_data_type)
         response_headers = dict(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
             typed_headers = _parse_typed_headers(response_headers, response_headers_type)
-        return Result(data, raw_response.status, response_headers, typed_headers)
+        return Result(data, raw_response.status, response_headers, typed_headers, request_info)
 
     @overload
     async def post(
@@ -2580,16 +2704,16 @@ class HTTPClient:
         request_builder = await self._prepare_request(
             self._client.head(path), params, headers, timeout, skip_auth=skip_auth
         )
-        raw_response = await _send(request_builder.build())
+        raw_response, request_info = await _send(request_builder)
         if error_for_status:
-            await self._check_status(raw_response, error_type)
+            await self._check_status(raw_response, error_type, request_info)
         response_headers = dict(raw_response.headers)
         typed_headers = (
             None
             if response_headers_type is None
             else _parse_typed_headers(response_headers, response_headers_type)
         )
-        return Result(None, raw_response.status, response_headers, typed_headers)
+        return Result(None, raw_response.status, response_headers, typed_headers, request_info)
 
 
 @dataclass
@@ -2623,6 +2747,17 @@ class SyncHTTPClient:
         proxy: str | None = None,
         max_retries: int = 0,
         retry_methods: frozenset[str] | None = None,
+        connect_timeout: float | None = None,
+        root_certificates: Sequence[bytes] | None = None,
+        identity_pem: bytes | None = None,
+        min_tls_version: TlsVersion | None = None,
+        max_tls_version: TlsVersion | None = None,
+        danger_accept_invalid_certs: bool = False,
+        https_only: bool = False,
+        max_connections: int | None = None,
+        pool_idle_timeout: float | None = None,
+        pool_max_idle_per_host: int | None = None,
+        pool_timeout: float | None = None,
     ) -> Generator[Self]:
         """Build a `SyncHTTPClient` as a context manager.
 
@@ -2630,6 +2765,14 @@ class SyncHTTPClient:
         request; `basic_auth` is a `(username, password)` pair — provide at most one of the
         three. `max_retries` enables a real retry middleware (backoff, `Retry-After`-aware); with
         no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`) retry.
+
+        `connect_timeout` bounds only the TCP connect phase (separate from `timeout`, which
+        covers the whole request). `root_certificates` (each a PEM-encoded cert) and
+        `identity_pem` (a PEM bundle containing both a client cert and its private key) cover
+        trusting a custom/internal CA and mTLS respectively. `danger_accept_invalid_certs`
+        disables certificate validation entirely — insecure, for local/test use only.
+        `max_connections`/`pool_idle_timeout`/`pool_max_idle_per_host`/`pool_timeout` tune the
+        underlying connection pool; leave them `None` to keep pyreqwest's own defaults.
         """
         if sum(value is not None for value in (bearer_token, bearer_auth, basic_auth)) > 1:
             raise ValueError(
@@ -2652,6 +2795,20 @@ class SyncHTTPClient:
             retry_methods = retry_methods or cls._default_retry_methods
             middleware = _SyncRetryMiddleware(max_retries, retry_methods)
             sync_client_builder = sync_client_builder.with_middleware(middleware)
+        sync_client_builder = _apply_tls_and_pool_config(
+            sync_client_builder,
+            connect_timeout=connect_timeout,
+            root_certificates=root_certificates,
+            identity_pem=identity_pem,
+            min_tls_version=min_tls_version,
+            max_tls_version=max_tls_version,
+            danger_accept_invalid_certs=danger_accept_invalid_certs,
+            https_only=https_only,
+            max_connections=max_connections,
+            pool_idle_timeout=pool_idle_timeout,
+            pool_max_idle_per_host=pool_max_idle_per_host,
+            pool_timeout=pool_timeout,
+        )
         with sync_client_builder.build() as client:
             yield cls(client, bearer_token, bearer_auth, basic_auth)
 
@@ -2681,12 +2838,17 @@ class SyncHTTPClient:
         request_builder = self._apply_auth(request_builder, skip_auth=skip_auth)
         return _prepare(request_builder, params, headers, timeout)
 
-    def _check_status(self, raw_response: RawSyncResponse, error_type: type[Data] | None) -> None:
+    def _check_status(
+        self,
+        raw_response: RawSyncResponse,
+        error_type: type[Data] | None,
+        request_info: RequestInfo,
+    ) -> None:
         if raw_response.status < 400:
             return
         body = raw_response.bytes().to_bytes()
         parsed_body = _decode_error_body(body, error_type) if error_type is not None else None
-        raise HTTPResponseError(raw_response.status, body, parsed_body)
+        raise HTTPResponseError(raw_response.status, body, request_info, parsed_body)
 
     def _decode_body(self, raw_response: RawSyncResponse, response_data_type: type[Data]) -> Data:
         _validate_response_data_type(response_data_type)
@@ -2706,12 +2868,13 @@ class SyncHTTPClient:
         self,
         raw_response: RawSyncResponse,
         response_data_type: type[Data],
+        request_info: RequestInfo,
         *,
         error_for_status: bool,
         error_type: type[Data] | None,
     ) -> Data:
         if error_for_status:
-            self._check_status(raw_response, error_type)
+            self._check_status(raw_response, error_type, request_info)
         return self._decode_body(raw_response, response_data_type)
 
     @overload
@@ -2776,10 +2939,11 @@ class SyncHTTPClient:
         request_builder = self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
         )
-        raw_response = _send_sync(request_builder.build())
+        raw_response, request_info = _send_sync(request_builder)
         return self._parse(
             raw_response,
             response_data_type,
+            request_info,
             error_for_status=error_for_status,
             error_type=error_type,
         )
@@ -2888,16 +3052,16 @@ class SyncHTTPClient:
         request_builder = self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
         )
-        raw_response = _send_sync(request_builder.build())
+        raw_response, request_info = _send_sync(request_builder)
         if error_for_status:
-            self._check_status(raw_response, error_type)
+            self._check_status(raw_response, error_type, request_info)
         data = self._decode_body(raw_response, response_data_type)
         headers = dict(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
             typed_headers = _parse_typed_headers(headers, response_headers_type)
-        return Result(data, raw_response.status, headers, typed_headers)
+        return Result(data, raw_response.status, headers, typed_headers, request_info)
 
     def _sse_stream(
         self,
@@ -2917,11 +3081,16 @@ class SyncHTTPClient:
         request_builder = self._prepare_request(
             request_builder, params, headers, timeout, skip_auth=skip_auth
         )
-        request = request_builder.build_streamed()
         try:
+            # See the matching comment in `HTTPClient._sse_stream` — pyreqwest's default
+            # streamed_read_buffer_limit (64KB) withholds received bytes until that fills or the
+            # stream ends, so an SSE stream of small records arrives in one burst at stream end
+            # instead of as it happens. 1 forces it to hand over whatever it has immediately.
+            request = request_builder.streamed_read_buffer_limit(1).build_streamed()
+            request_info = _request_info(request)
             with request as raw_response:
                 if error_for_status:
-                    self._check_status(raw_response, error_type)
+                    self._check_status(raw_response, error_type, request_info)
                 buffer = b""
                 while True:
                     chunk = raw_response.body_reader.read_chunk()
@@ -2943,7 +3112,7 @@ class SyncHTTPClient:
                         else:
                             decoded = _decode_json_line(parsed_record.data, response_data_type)
                             yield SSEEvent(id=event_id, event=parsed_record.event, data=decoded)
-        except (PyreqwestTransportError, PyreqwestRedirectError) as error:
+        except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
 
     @overload
@@ -3175,11 +3344,15 @@ class SyncHTTPClient:
             content,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
         )
-        request = request_builder.build_streamed()
         try:
+            # See the matching comment in `HTTPClient._sse_stream` — same 64KB-default buffering
+            # issue, same fix. `stream_get`/`stream_post` promise unbuffered/NDJSON-as-it-arrives
+            # delivery, which the pyreqwest default silently defeats otherwise.
+            request = request_builder.streamed_read_buffer_limit(1).build_streamed()
+            request_info = _request_info(request)
             with request as raw_response:
                 if error_for_status:
-                    self._check_status(raw_response, error_type)
+                    self._check_status(raw_response, error_type, request_info)
                 if response_data_type is None:
                     while True:
                         chunk = raw_response.body_reader.read_chunk()
@@ -3198,7 +3371,7 @@ class SyncHTTPClient:
                             yield _decode_json_line(line.decode(), response_data_type)
                 if buffer.strip():
                     yield _decode_json_line(buffer.decode(), response_data_type)
-        except (PyreqwestTransportError, PyreqwestRedirectError) as error:
+        except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
 
     @overload
@@ -3380,11 +3553,12 @@ class SyncHTTPClient:
         request_builder = self._prepare_request(
             self._client.get(path), params, headers, timeout, skip_auth=skip_auth
         )
-        request = request_builder.build_streamed()
         try:
+            request = request_builder.build_streamed()
+            request_info = _request_info(request)
             with request as raw_response:
                 if error_for_status:
-                    self._check_status(raw_response, error_type)
+                    self._check_status(raw_response, error_type, request_info)
                 if dest is None:
                     buffer = bytearray()
                     while True:
@@ -3398,7 +3572,7 @@ class SyncHTTPClient:
                         if chunk is None:
                             return None
                         file.write(chunk)
-        except (PyreqwestTransportError, PyreqwestRedirectError) as error:
+        except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
 
     @overload
@@ -3491,10 +3665,11 @@ class SyncHTTPClient:
             content,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
         )
-        raw_response = _send_sync(request_builder.build())
+        raw_response, request_info = _send_sync(request_builder)
         return self._parse(
             raw_response,
             response_data_type,
+            request_info,
             error_for_status=error_for_status,
             error_type=error_type,
         )
@@ -3526,16 +3701,16 @@ class SyncHTTPClient:
             content,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
         )
-        raw_response = _send_sync(request_builder.build())
+        raw_response, request_info = _send_sync(request_builder)
         if error_for_status:
-            self._check_status(raw_response, error_type)
+            self._check_status(raw_response, error_type, request_info)
         data = self._decode_body(raw_response, response_data_type)
         response_headers = dict(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
             typed_headers = _parse_typed_headers(response_headers, response_headers_type)
-        return Result(data, raw_response.status, response_headers, typed_headers)
+        return Result(data, raw_response.status, response_headers, typed_headers, request_info)
 
     @overload
     def post(
@@ -4474,13 +4649,13 @@ class SyncHTTPClient:
         request_builder = self._prepare_request(
             self._client.head(path), params, headers, timeout, skip_auth=skip_auth
         )
-        raw_response = _send_sync(request_builder.build())
+        raw_response, request_info = _send_sync(request_builder)
         if error_for_status:
-            self._check_status(raw_response, error_type)
+            self._check_status(raw_response, error_type, request_info)
         response_headers = dict(raw_response.headers)
         typed_headers = (
             None
             if response_headers_type is None
             else _parse_typed_headers(response_headers, response_headers_type)
         )
-        return Result(None, raw_response.status, response_headers, typed_headers)
+        return Result(None, raw_response.status, response_headers, typed_headers, request_info)

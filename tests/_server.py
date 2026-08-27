@@ -8,6 +8,7 @@ this module is the one canonical server implementation for both. Endpoints: `/it
 
 import email.policy
 import json
+import time
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import sleep
@@ -71,7 +72,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Connection", "close")
         self.end_headers()
-        for index in range(25):
+        for index in range(10):
             data = json.dumps({"msg": f"hello {index}", "now": index * 100})
             record = "event: tick\n"
             if not omit_id:
@@ -79,6 +80,9 @@ class TestAppHandler(BaseHTTPRequestHandler):
             record += f"data: {data}\n\n"
             self.wfile.write(record.encode())
             self.wfile.flush()
+            # Small but real, so a test can assert events arrive incrementally rather than all
+            # at once (see test_sse_events_arrive_incrementally in test_sse.py).
+            time.sleep(0.001)
 
     def _handle_read_item(self, item_id: str) -> None:
         self._write_json(200, {"id": int(item_id), "name": f"item-{item_id}"})

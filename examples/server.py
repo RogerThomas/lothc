@@ -4,6 +4,7 @@ the automated test suite runs against (`tests/_server.py`), bound to a fixed por
 OS-assigned one, so `run_http.py`'s default `base_url` finds it without extra wiring.
 """
 
+import contextlib
 import importlib.util
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,5 +23,7 @@ def main(port: int = 8701) -> None:
 
     server = ThreadingHTTPServer(("127.0.0.1", port), test_app_handler)
     print(f"Serving on http://127.0.0.1:{port}/")
-    with server:
+    # `task example-server`'s watch mode (see Taskfile.yml) sends KeyboardInterrupt to restart on
+    # a source change — not a real error, so don't print a traceback for it.
+    with server, contextlib.suppress(KeyboardInterrupt):
         server.serve_forever()
