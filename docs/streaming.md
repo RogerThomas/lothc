@@ -92,13 +92,18 @@ for chunk in sync_client.stream_get("download/large-file", interruptible=True):
     handle_chunk(chunk)  # Ctrl-C now works while waiting for the next chunk
 ```
 
-!!! warning "Abandoning an interruptible stream always leaks a thread and a socket"
+!!! warning "Abandoning an interruptible stream before EOF always leaks a thread and a socket"
 
     There is no cancellation path — dropping or exiting a streamed response does **not** cancel
     an in-flight read on the worker thread, it blocks until that read resolves one way or
-    another. So abandoning an interruptible stream (Ctrl-C, or breaking out of the loop early)
-    always leaves the worker thread — and its open socket — parked until the peer closes the
-    connection or a timeout fires; the process exiting is what actually reclaims it. This is
-    fine for a short-lived CLI, which is exactly why the default stays `False` for everything
-    else: a long-lived server process that routinely abandons streams should avoid this flag, or
-    pair it with a short `timeout`/`connect_timeout` so a leaked connection is bounded.
+    another. So abandoning an interruptible stream before it reaches EOF — an early `break`, or
+    the generator getting garbage-collected — always leaves the worker thread and its open
+    socket parked until the peer closes the connection or a timeout fires; process exit is what
+    actually reclaims it.
+
+    Ctrl-C itself is rarely the exposure here: a long-lived process has no controlling terminal
+    to receive it from, and when it does, SIGINT there is usually aimed at killing the whole
+    process anyway, which reclaims the leak along with everything else. The real risk is code
+    that repeatedly breaks out of an interruptible stream early while the process stays up —
+    pair that with a short `timeout`/`connect_timeout` so each leaked connection is bounded,
+    rather than assuming avoiding Ctrl-C is the mitigation.

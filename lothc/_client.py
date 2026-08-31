@@ -3425,11 +3425,14 @@ class SyncHTTPClient:
         `interruptible=True` runs the blocking read loop on a daemon worker thread so Ctrl-C
         works while waiting between events (the default `False` leaves Ctrl-C dead in that
         wait — see the `interruptible` section of `docs/sse.md`). Abandoning an interruptible
-        stream (Ctrl-C, or an early `break`) always leaks the worker thread and its open
-        socket until the connection dies — there is no cancellation path. Fine for a
-        short-lived CLI (process exit reclaims everything); avoid it in a long-lived server
-        process that routinely abandons streams, or pair it with a short `timeout`/
-        `connect_timeout` so a leaked connection is bounded.
+        stream before it reaches EOF (an early `break`, or the generator getting
+        garbage-collected) always leaks the worker thread and its open socket until the
+        connection dies — there is no cancellation path. Ctrl-C itself is rarely the exposure
+        in a long-lived process — it has no controlling terminal to receive it from, and when
+        it does, SIGINT there usually kills the whole process anyway, reclaiming the leak with
+        it. The real risk is code that repeatedly breaks out of an interruptible stream early
+        while the process stays up — pair that with a short `timeout`/`connect_timeout` so
+        each leaked connection is bounded.
         """
         return self._sse_stream(
             path,
@@ -3564,11 +3567,14 @@ class SyncHTTPClient:
         `interruptible=True` runs the blocking read loop on a daemon worker thread so Ctrl-C
         works while waiting between chunks (the default `False` leaves Ctrl-C dead in that
         wait — see the `interruptible` section of `docs/streaming.md`). Abandoning an
-        interruptible stream (Ctrl-C, or an early `break`) always leaks the worker thread and
-        its open socket until the connection dies — there is no cancellation path. Fine for a
-        short-lived CLI (process exit reclaims everything); avoid it in a long-lived server
-        process that routinely abandons streams, or pair it with a short `timeout`/
-        `connect_timeout` so a leaked connection is bounded.
+        interruptible stream before it reaches EOF (an early `break`, or the generator getting
+        garbage-collected) always leaks the worker thread and its open socket until the
+        connection dies — there is no cancellation path. Ctrl-C itself is rarely the exposure
+        in a long-lived process — it has no controlling terminal to receive it from, and when
+        it does, SIGINT there usually kills the whole process anyway, reclaiming the leak with
+        it. The real risk is code that repeatedly breaks out of an interruptible stream early
+        while the process stays up — pair that with a short `timeout`/`connect_timeout` so
+        each leaked connection is bounded.
         """
         return self._line_stream(
             self._client.get(path),
@@ -3667,11 +3673,14 @@ class SyncHTTPClient:
         `interruptible=True` runs the blocking read loop on a daemon worker thread so Ctrl-C
         works while waiting between chunks (the default `False` leaves Ctrl-C dead in that
         wait — see the `interruptible` section of `docs/streaming.md`). Abandoning an
-        interruptible stream (Ctrl-C, or an early `break`) always leaks the worker thread and
-        its open socket until the connection dies — there is no cancellation path. Fine for a
-        short-lived CLI (process exit reclaims everything); avoid it in a long-lived server
-        process that routinely abandons streams, or pair it with a short `timeout`/
-        `connect_timeout` so a leaked connection is bounded.
+        interruptible stream before it reaches EOF (an early `break`, or the generator getting
+        garbage-collected) always leaks the worker thread and its open socket until the
+        connection dies — there is no cancellation path. Ctrl-C itself is rarely the exposure
+        in a long-lived process — it has no controlling terminal to receive it from, and when
+        it does, SIGINT there usually kills the whole process anyway, reclaiming the leak with
+        it. The real risk is code that repeatedly breaks out of an interruptible stream early
+        while the process stays up — pair that with a short `timeout`/`connect_timeout` so
+        each leaked connection is bounded.
         """
         return self._line_stream(
             self._client.post(path),
