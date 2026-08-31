@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, cast
 
 import pytest
@@ -139,12 +140,25 @@ async def test_stream_get_unsupported_response_data_type_raises_type_error(
         ]
 
 
+@pytest.mark.parametrize("interruptible", [False, True])
 def test_sync_stream_get_without_response_data_type_reconstructs_exact_bytes(
-    sync_client: SyncHTTPClient,
+    sync_client: SyncHTTPClient, *, interruptible: bool
 ) -> None:
-    chunks = list(sync_client.stream_get("ndjson", params={"count": 3}))
+    chunks = list(
+        sync_client.stream_get("ndjson", params={"count": 3}, interruptible=interruptible)
+    )
 
     assert b"".join(chunks) == b'{"i": 0}\n{"i": 1}\n{"i": 2}'
+
+
+def test_sync_stream_post_interruptible_decodes_typed_lines(sync_client: SyncHTTPClient) -> None:
+    lines = list(
+        sync_client.stream_post(
+            "ndjson-echo", json={"n": 3}, response_data_type=Decoder(Line), interruptible=True
+        )
+    )
+
+    assert lines == [Line(i=0), Line(i=1), Line(i=2)]
 
 
 def test_sync_stream_get_raw_bytes_mode_error_for_status_false_suppresses_raise(
@@ -165,8 +179,21 @@ def test_sync_stream_get_skips_blank_lines_between_ndjson_records(
     assert lines == [{"i": 0}, {"i": 1}, {"i": 2}]
 
 
+@pytest.mark.parametrize("interruptible", [False, True])
 def test_sync_stream_get_transport_error_mid_stream_raises_connection_error(
-    sync_client: SyncHTTPClient,
+    sync_client: SyncHTTPClient, *, interruptible: bool
 ) -> None:
     with pytest.raises(HTTPConnectionError):
-        list(sync_client.stream_get("truncated"))
+        list(sync_client.stream_get("truncated", interruptible=interruptible))
+
+
+def _consume_one_chunk_then_break(sync_client: SyncHTTPClient) -> None:
+    for _ in sync_client.stream_get("ndjson", params={"count": 3}, interruptible=True):
+        break
+
+
+def test_sync_stream_get_interruptible_early_break_does_not_hang(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(_consume_one_chunk_then_break, sync_client).result(timeout=5)

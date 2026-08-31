@@ -158,3 +158,34 @@ stream mixing different event shapes decodes natively:
 4xx/5xx response raises `HTTPResponseError` immediately rather than partway through iteration. Once
 streaming has started, a dropped connection raises the usual `HTTPTransportError` family. See
 [Error handling](errors.md).
+
+## Ctrl-C-interruptible streaming (sync only) — `interruptible`
+
+On `SyncHTTPClient` only, a blocking wait for the next event is dead to Ctrl-C: CPython only
+converts `SIGINT` into `KeyboardInterrupt` on the main thread while it's executing Python
+bytecode, and the wait between SSE events happens inside a blocking Rust call with no bytecode
+running at all. `HTTPClient.sse()` (async) doesn't have this problem — the event loop's
+selector is already signal-interruptible — so `interruptible` only exists on the sync client.
+
+Pass `interruptible=True` to fix this: the read loop runs on a daemon worker thread instead,
+and the calling thread only ever does short, signal-interruptible waits on a queue, so Ctrl-C
+fires within roughly 0.2 seconds instead of never:
+
+```python
+for event in sync_client.sse("events", interruptible=True):
+    ...  # Ctrl-C now works while waiting for the next event
+```
+
+!!! warning "Abandoning an interruptible stream always leaks a thread and a socket"
+
+    There is no cancellation path — dropping or exiting a streamed response does **not** cancel
+    an in-flight read on the worker thread, it blocks until that read resolves one way or
+    another. So abandoning an interruptible stream (Ctrl-C, or breaking out of the loop early)
+    always leaves the worker thread — and its open socket — parked until the peer closes the
+    connection or a timeout fires; the process exiting is what actually reclaims it. This is
+    fine for a short-lived CLI, which is exactly why the default stays `False` for everything
+    else: a long-lived server process that routinely abandons streams should avoid this flag, or
+    pair it with a short `timeout`/`connect_timeout` so a leaked connection is bounded.
+
+The same flag, with the same behavior and the same caveat, is also available on
+[`stream_get`/`stream_post`](streaming.md#ctrl-c-interruptible-streaming-sync-only-interruptible).

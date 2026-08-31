@@ -1,4 +1,5 @@
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from msgspec import Struct
@@ -29,8 +30,9 @@ async def test_sse_yields_typed_events_via_decoder(client: HTTPClient) -> None:
     assert events[0].event == "tick"
 
 
-def test_sync_sse_yields_raw_events(sync_client: SyncHTTPClient) -> None:
-    events = list(sync_client.sse("events"))
+@pytest.mark.parametrize("interruptible", [False, True])
+def test_sync_sse_yields_raw_events(sync_client: SyncHTTPClient, *, interruptible: bool) -> None:
+    events = list(sync_client.sse("events", interruptible=interruptible))
 
     assert len(events) == 10
     assert events[0].event == "tick"
@@ -174,11 +176,30 @@ def test_sync_sse_yields_typed_events_via_struct_class(sync_client: SyncHTTPClie
     assert events[0].data == TickEvent(msg="hello 0", now=0)
 
 
+@pytest.mark.parametrize("interruptible", [False, True])
 def test_sync_sse_transport_error_mid_stream_raises_connection_error(
-    sync_client: SyncHTTPClient,
+    sync_client: SyncHTTPClient, *, interruptible: bool
 ) -> None:
     with pytest.raises(HTTPConnectionError):
-        list(sync_client.sse("truncated"))
+        list(sync_client.sse("truncated", interruptible=interruptible))
+
+
+def test_sync_sse_interruptible_error_for_status_false_suppresses_raise(
+    sync_client: SyncHTTPClient,
+) -> None:
+    events = list(sync_client.sse("boom", error_for_status=False, interruptible=True))
+
+    assert events == []
+
+
+def _consume_one_event_then_break(sync_client: SyncHTTPClient) -> None:
+    for _ in sync_client.sse("events", interruptible=True):
+        break
+
+
+def test_sync_sse_interruptible_early_break_does_not_hang(sync_client: SyncHTTPClient) -> None:
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(_consume_one_event_then_break, sync_client).result(timeout=5)
 
 
 def test_sync_sse_events_arrive_incrementally_not_buffered_until_stream_end(

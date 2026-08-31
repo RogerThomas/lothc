@@ -73,3 +73,32 @@ The raw-chunks default applies here too — omit `response_data_type` to get unb
 `error_for_status` (default `True`) is checked once, before the first chunk is yielded — a
 4xx/5xx response raises `HTTPResponseError` immediately rather than partway through the stream. See
 [Error handling](errors.md).
+
+## Ctrl-C-interruptible streaming (sync only) — `interruptible`
+
+On `SyncHTTPClient` only, a blocking wait for the next chunk is dead to Ctrl-C: CPython only
+converts `SIGINT` into `KeyboardInterrupt` on the main thread while it's executing Python
+bytecode, and the wait between chunks happens inside a blocking Rust call with no bytecode
+running at all. The async client doesn't have this problem — the event loop's selector is
+already signal-interruptible — so `interruptible` only exists on `stream_get`/`stream_post` on
+`SyncHTTPClient` (and on `sse()`, see [SSE](sse.md#ctrl-c-interruptible-streaming-sync-only-interruptible)).
+
+Pass `interruptible=True` to fix this: the read loop runs on a daemon worker thread instead,
+and the calling thread only ever does short, signal-interruptible waits on a queue, so Ctrl-C
+fires within roughly 0.2 seconds instead of never:
+
+```python
+for chunk in sync_client.stream_get("download/large-file", interruptible=True):
+    handle_chunk(chunk)  # Ctrl-C now works while waiting for the next chunk
+```
+
+!!! warning "Abandoning an interruptible stream always leaks a thread and a socket"
+
+    There is no cancellation path — dropping or exiting a streamed response does **not** cancel
+    an in-flight read on the worker thread, it blocks until that read resolves one way or
+    another. So abandoning an interruptible stream (Ctrl-C, or breaking out of the loop early)
+    always leaves the worker thread — and its open socket — parked until the peer closes the
+    connection or a timeout fires; the process exiting is what actually reclaims it. This is
+    fine for a short-lived CLI, which is exactly why the default stays `False` for everything
+    else: a long-lived server process that routinely abandons streams should avoid this flag, or
+    pair it with a short `timeout`/`connect_timeout` so a leaked connection is bounded.

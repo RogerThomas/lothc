@@ -1,4 +1,6 @@
 import asyncio
+import queue
+import threading
 import time
 from collections.abc import (
     AsyncGenerator,
@@ -36,6 +38,7 @@ from pyreqwest.request import (
     Request,
     RequestBuilder,
     SyncRequestBuilder,
+    SyncStreamRequest,
 )
 from pyreqwest.response import Response as RawResponse
 from pyreqwest.response import SyncResponse as RawSyncResponse
@@ -738,6 +741,109 @@ def _attach_body_sync[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many
     if content is not None:
         return request_builder.body_bytes(content)
     return request_builder
+
+
+# Discriminated union of what a worker thread hands back to the polling consumer thread via
+# the Queue in `_interruptible_chunk_iter` — a decoded chunk, EOF, or a forwarded exception.
+type _StreamQueueItem = (
+    tuple[Literal["chunk"], bytes]
+    | tuple[Literal["eof"], None]
+    | tuple[Literal["error"], Exception]
+)
+
+
+def _drain_stream_chunks(
+    request: SyncStreamRequest,
+    check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None,
+    error_type: type[Data] | None,
+    request_info: RequestInfo,
+    item_queue: queue.Queue[_StreamQueueItem],
+) -> None:
+    """Worker-thread target for `_interruptible_chunk_iter` — owns the entire
+    `with request as raw_response:` lifecycle itself (entry, status check, read loop, and its
+    own eventual exit), never the calling thread. Confirmed via spike: dropping/exiting a
+    streamed response does NOT cancel an in-flight `read_chunk()` on another thread — it
+    blocks the calling thread until that read resolves. So the thread that does the blocking
+    reads must also be the one that enters and exits this context manager, sequentially, or
+    cleanup itself becomes the new hang.
+    """
+    try:
+        with request as raw_response:
+            if check_status is not None:
+                check_status(raw_response, error_type, request_info)
+            while True:
+                chunk = raw_response.body_reader.read_chunk()
+                if chunk is None:
+                    item_queue.put(("eof", None))
+                    return
+                item_queue.put(("chunk", bytes(chunk)))
+    except Exception as error:  # noqa: BLE001 — forwarded to the consumer thread below, not swallowed — pylint: disable=broad-except
+        item_queue.put(("error", error))
+
+
+def _interruptible_chunk_iter(
+    request: SyncStreamRequest,
+    check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None,
+    error_type: type[Data] | None,
+    request_info: RequestInfo,
+    *,
+    poll_timeout: float = 0.2,
+) -> Iterator[bytes]:
+    """Yield a streamed response's chunks with Ctrl-C-interruptible waits between them.
+
+    `read_chunk()` blocks the calling thread with no way to interrupt it from Python — CPython
+    only converts SIGINT into `KeyboardInterrupt` on the main thread while it's executing
+    Python bytecode. Running the read loop on a daemon worker thread (via
+    `_drain_stream_chunks`) and having the main thread only ever do timed `Queue.get()` calls
+    keeps the main thread in interruptible Python bytecode the whole time, so Ctrl-C fires
+    within roughly `poll_timeout`.
+
+    Abandoning iteration (an early `break`, or the generator being garbage-collected) leaves
+    the worker thread parked in `read_chunk()` — there is no cancellation path, see
+    `_drain_stream_chunks`'s docstring. This is a deliberate, documented leak: one thread and
+    one open socket per abandonment, reclaimed only when the peer closes the connection, a
+    timeout fires, or the process exits.
+    """
+    item_queue: queue.Queue[_StreamQueueItem] = queue.Queue()
+    worker = threading.Thread(
+        target=_drain_stream_chunks,
+        args=(request, check_status, error_type, request_info, item_queue),
+        daemon=True,
+    )
+    worker.start()
+    while True:
+        try:
+            item = item_queue.get(timeout=poll_timeout)
+        except queue.Empty:
+            continue
+        match item:
+            case ("chunk", bytes_chunk):
+                yield bytes_chunk
+            case ("eof", None):
+                return
+            case ("error", error):
+                raise error.with_traceback(error.__traceback__)
+
+
+def _sync_stream_chunks(
+    request: SyncStreamRequest,
+    check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None,
+    error_type: type[Data] | None,
+    request_info: RequestInfo,
+    *,
+    interruptible: bool,
+) -> Iterator[bytes]:
+    if interruptible:
+        yield from _interruptible_chunk_iter(request, check_status, error_type, request_info)
+        return
+    with request as raw_response:
+        if check_status is not None:
+            check_status(raw_response, error_type, request_info)
+        while True:
+            chunk = raw_response.body_reader.read_chunk()
+            if chunk is None:
+                return
+            yield bytes(chunk)
 
 
 def _parse_typed_headers(
@@ -3076,6 +3182,7 @@ class SyncHTTPClient:
         allow_missing_id: bool,
         error_for_status: bool,
         error_type: type[Data] | None,
+        interruptible: bool,
     ) -> Iterator[SSEEvent[Any, Any]]:
         request_builder = self._client.get(path).header("accept", "text/event-stream")
         request_builder = self._prepare_request(
@@ -3088,30 +3195,27 @@ class SyncHTTPClient:
             # instead of as it happens. 1 forces it to hand over whatever it has immediately.
             request = request_builder.streamed_read_buffer_limit(1).build_streamed()
             request_info = _request_info(request)
-            with request as raw_response:
-                if error_for_status:
-                    self._check_status(raw_response, error_type, request_info)
-                buffer = b""
-                while True:
-                    chunk = raw_response.body_reader.read_chunk()
-                    if chunk is None:
-                        return
-                    buffer += bytes(chunk).replace(b"\r\n", b"\n")
-                    while b"\n\n" in buffer:
-                        record, buffer = buffer.split(b"\n\n", 1)
-                        parsed_record = _parse_sse_record(record.decode())
-                        if parsed_record is None:
-                            continue
-                        event_id = _coerce_sse_id(
-                            parsed_record.id, id_type, allow_missing_id=allow_missing_id
+            check_status = self._check_status if error_for_status else None
+            buffer = b""
+            for chunk in _sync_stream_chunks(
+                request, check_status, error_type, request_info, interruptible=interruptible
+            ):
+                buffer += chunk.replace(b"\r\n", b"\n")
+                while b"\n\n" in buffer:
+                    record, buffer = buffer.split(b"\n\n", 1)
+                    parsed_record = _parse_sse_record(record.decode())
+                    if parsed_record is None:
+                        continue
+                    event_id = _coerce_sse_id(
+                        parsed_record.id, id_type, allow_missing_id=allow_missing_id
+                    )
+                    if response_data_type is None:
+                        yield SSEEvent(
+                            id=event_id, event=parsed_record.event, data=parsed_record.data
                         )
-                        if response_data_type is None:
-                            yield SSEEvent(
-                                id=event_id, event=parsed_record.event, data=parsed_record.data
-                            )
-                        else:
-                            decoded = _decode_json_line(parsed_record.data, response_data_type)
-                            yield SSEEvent(id=event_id, event=parsed_record.event, data=decoded)
+                    else:
+                        decoded = _decode_json_line(parsed_record.data, response_data_type)
+                        yield SSEEvent(id=event_id, event=parsed_record.event, data=decoded)
         except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
 
@@ -3126,6 +3230,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[SSEEvent[str, str]]: ...
     @overload
     def sse(
@@ -3139,6 +3244,7 @@ class SyncHTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[SSEEvent[str, str | None]]: ...
     @overload
     def sse[TId](
@@ -3152,6 +3258,7 @@ class SyncHTTPClient:
         id_type: type[TId],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[SSEEvent[str, TId]]: ...
     @overload
     def sse[TId](
@@ -3166,6 +3273,7 @@ class SyncHTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[SSEEvent[str, TId | None]]: ...
     @overload
     def sse(
@@ -3179,6 +3287,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[SSEEvent[dict[str, Any], str]]: ...
     @overload
     def sse[TData](
@@ -3192,6 +3301,7 @@ class SyncHTTPClient:
         response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[SSEEvent[TData, str]]: ...
     @overload
     def sse(
@@ -3206,6 +3316,7 @@ class SyncHTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[SSEEvent[dict[str, Any], str | None]]: ...
     @overload
     def sse[TData](
@@ -3220,6 +3331,7 @@ class SyncHTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[SSEEvent[TData, str | None]]: ...
     @overload
     def sse[TId](
@@ -3234,6 +3346,7 @@ class SyncHTTPClient:
         id_type: type[TId],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[SSEEvent[dict[str, Any], TId]]: ...
     @overload
     def sse[TId](
@@ -3249,6 +3362,7 @@ class SyncHTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[SSEEvent[dict[str, Any], TId | None]]: ...
     @overload
     def sse[TData, TId](
@@ -3263,6 +3377,7 @@ class SyncHTTPClient:
         id_type: type[TId],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[SSEEvent[TData, TId]]: ...
     @overload
     def sse[TData, TId](
@@ -3278,6 +3393,7 @@ class SyncHTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[SSEEvent[TData, TId | None]]: ...
     def sse(
         self,
@@ -3292,6 +3408,7 @@ class SyncHTTPClient:
         allow_missing_id: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[SSEEvent[Any, Any]]:
         """Open `path` as a Server-Sent Events stream, yielding one `SSEEvent` per event.
 
@@ -3304,6 +3421,15 @@ class SyncHTTPClient:
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
         decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
         `None`.
+
+        `interruptible=True` runs the blocking read loop on a daemon worker thread so Ctrl-C
+        works while waiting between events (the default `False` leaves Ctrl-C dead in that
+        wait — see the `interruptible` section of `docs/sse.md`). Abandoning an interruptible
+        stream (Ctrl-C, or an early `break`) always leaks the worker thread and its open
+        socket until the connection dies — there is no cancellation path. Fine for a
+        short-lived CLI (process exit reclaims everything); avoid it in a long-lived server
+        process that routinely abandons streams, or pair it with a short `timeout`/
+        `connect_timeout` so a leaked connection is bounded.
         """
         return self._sse_stream(
             path,
@@ -3316,6 +3442,7 @@ class SyncHTTPClient:
             allow_missing_id=allow_missing_id,
             error_for_status=error_for_status,
             error_type=error_type,
+            interruptible=interruptible,
         )
 
     def _line_stream(
@@ -3333,6 +3460,7 @@ class SyncHTTPClient:
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
         error_type: type[Data] | None,
+        interruptible: bool,
     ) -> Iterator[Any]:
         request_builder = self._prepare_request(
             request_builder, params, headers, timeout, skip_auth=skip_auth
@@ -3350,27 +3478,22 @@ class SyncHTTPClient:
             # delivery, which the pyreqwest default silently defeats otherwise.
             request = request_builder.streamed_read_buffer_limit(1).build_streamed()
             request_info = _request_info(request)
-            with request as raw_response:
-                if error_for_status:
-                    self._check_status(raw_response, error_type, request_info)
-                if response_data_type is None:
-                    while True:
-                        chunk = raw_response.body_reader.read_chunk()
-                        if chunk is None:
-                            return
-                        yield bytes(chunk)
-                buffer = b""
-                while True:
-                    chunk = raw_response.body_reader.read_chunk()
-                    if chunk is None:
-                        break
-                    buffer += bytes(chunk)
-                    while b"\n" in buffer:
-                        line, buffer = buffer.split(b"\n", 1)
-                        if line:
-                            yield _decode_json_line(line.decode(), response_data_type)
-                if buffer.strip():
-                    yield _decode_json_line(buffer.decode(), response_data_type)
+            check_status = self._check_status if error_for_status else None
+            chunks = _sync_stream_chunks(
+                request, check_status, error_type, request_info, interruptible=interruptible
+            )
+            if response_data_type is None:
+                yield from chunks
+                return
+            buffer = b""
+            for chunk in chunks:
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if line:
+                        yield _decode_json_line(line.decode(), response_data_type)
+            if buffer.strip():
+                yield _decode_json_line(buffer.decode(), response_data_type)
         except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
 
@@ -3385,6 +3508,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[bytes]: ...
     @overload
     def stream_get(
@@ -3398,6 +3522,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[dict[str, Any]]: ...
     @overload
     def stream_get[TLine](
@@ -3411,6 +3536,7 @@ class SyncHTTPClient:
         response_data_type: type[TLine] | TypeAdapterTyping[TLine] | DecoderTyping[TLine],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[TLine]: ...
     def stream_get(
         self,
@@ -3423,6 +3549,7 @@ class SyncHTTPClient:
         response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[Any]:
         """Stream GET `path`'s response as raw `bytes` chunks (unbuffered, safe for binary).
 
@@ -3433,6 +3560,15 @@ class SyncHTTPClient:
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
         decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
         `None`.
+
+        `interruptible=True` runs the blocking read loop on a daemon worker thread so Ctrl-C
+        works while waiting between chunks (the default `False` leaves Ctrl-C dead in that
+        wait — see the `interruptible` section of `docs/streaming.md`). Abandoning an
+        interruptible stream (Ctrl-C, or an early `break`) always leaks the worker thread and
+        its open socket until the connection dies — there is no cancellation path. Fine for a
+        short-lived CLI (process exit reclaims everything); avoid it in a long-lived server
+        process that routinely abandons streams, or pair it with a short `timeout`/
+        `connect_timeout` so a leaked connection is bounded.
         """
         return self._line_stream(
             self._client.get(path),
@@ -3447,6 +3583,7 @@ class SyncHTTPClient:
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
             error_type=error_type,
+            interruptible=interruptible,
         )
 
     @overload
@@ -3464,6 +3601,7 @@ class SyncHTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[bytes]: ...
     @overload
     def stream_post(
@@ -3481,6 +3619,7 @@ class SyncHTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[dict[str, Any]]: ...
     @overload
     def stream_post[TLine](
@@ -3498,6 +3637,7 @@ class SyncHTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[TLine]: ...
     def stream_post(
         self,
@@ -3514,6 +3654,7 @@ class SyncHTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        interruptible: bool = False,
     ) -> Iterator[Any]:
         """Like `stream_get`, but POST a body first — same `json`/`form`/`content` options as
         `post` (at most one), same raw-bytes-by-default / NDJSON-via-`response_data_type` split.
@@ -3522,6 +3663,15 @@ class SyncHTTPClient:
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
         decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
         `None`.
+
+        `interruptible=True` runs the blocking read loop on a daemon worker thread so Ctrl-C
+        works while waiting between chunks (the default `False` leaves Ctrl-C dead in that
+        wait — see the `interruptible` section of `docs/streaming.md`). Abandoning an
+        interruptible stream (Ctrl-C, or an early `break`) always leaks the worker thread and
+        its open socket until the connection dies — there is no cancellation path. Fine for a
+        short-lived CLI (process exit reclaims everything); avoid it in a long-lived server
+        process that routinely abandons streams, or pair it with a short `timeout`/
+        `connect_timeout` so a leaked connection is bounded.
         """
         return self._line_stream(
             self._client.post(path),
@@ -3536,6 +3686,7 @@ class SyncHTTPClient:
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
             error_type=error_type,
+            interruptible=interruptible,
         )
 
     def _download(
