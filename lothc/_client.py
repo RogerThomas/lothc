@@ -1,4 +1,5 @@
 import asyncio
+import codecs
 import queue
 import threading
 import time
@@ -12,7 +13,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import aclosing, asynccontextmanager, closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -404,10 +405,55 @@ class SSEEvent[TData, TId = str]:
     data: TData
 
 
-def _parse_sse_record(record: str) -> SSEEvent[str, str | None] | None:
+@dataclass(slots=True)
+class _SSERecord:
+    """One parsed SSE record (the lines between two blank lines), before dispatch.
+
+    `data` is `None` when the record carried no `data:` line at all — such a record dispatches no
+    event, but its `id:`/`retry:` fields still take effect (WHATWG "process the field" rules).
+    `id` is `None` when there was no `id:` line; an explicit empty `id:` is `""` (it resets the
+    stream's last-event-id buffer). `retry_ms` is `None` unless a well-formed `retry:` was seen.
+    """
+
+    data: str | None
+    event: str
+    id: str | None
+    retry_ms: int | None
+
+
+@dataclass(slots=True)
+class _SSEStreamState:
+    """Per-`sse()`-call state that has to survive across reconnects.
+
+    `retry_delay` starts at the caller's `reconnect_delay` and is overwritten whenever the server
+    sends a `retry:` field. `last_event_id` is the spec's last-event-id buffer: it persists
+    across events (an event with no `id:` line inherits it) and is sent back as
+    `Last-Event-ID` on every reconnect. `status` is the most recent connection's response
+    status, so the reconnect loop can tell a 204 ("stop, don't reconnect") from any other
+    clean close.
+    """
+
+    retry_delay: float
+    last_event_id: str | None = None
+    status: int | None = None
+
+
+def _parse_sse_record(record: str) -> _SSERecord:
+    r"""Parse one blank-line-delimited SSE record per the WHATWG event-stream field rules.
+
+    >>> _parse_sse_record("event: tick\nid: 7\ndata: a\ndata: b")
+    _SSERecord(data='a\nb', event='tick', id='7', retry_ms=None)
+    >>> _parse_sse_record(": comment only\nretry: 250")
+    _SSERecord(data=None, event='message', id=None, retry_ms=250)
+    >>> _parse_sse_record("retry: soon\nid: bad\x00null\nid:")
+    _SSERecord(data=None, event='message', id='', retry_ms=None)
+    >>> _parse_sse_record("data")
+    _SSERecord(data='', event='message', id=None, retry_ms=None)
+    """
     data_lines: list[str] = []
     event = "message"
     event_id: str | None = None
+    retry_ms: int | None = None
     for line in record.split("\n"):
         if not line or line.startswith(":"):
             continue
@@ -417,11 +463,35 @@ def _parse_sse_record(record: str) -> SSEEvent[str, str | None] | None:
             data_lines.append(value)
         elif field == "event":
             event = value
-        elif field == "id":
+        elif field == "id" and "\x00" not in value:
             event_id = value
-    if not data_lines:
-        return None
-    return SSEEvent(id=event_id, event=event, data="\n".join(data_lines))
+        elif field == "retry" and value.isascii() and value.isdigit():
+            retry_ms = int(value)
+    data = "\n".join(data_lines) if data_lines else None
+    return _SSERecord(data=data, event=event, id=event_id, retry_ms=retry_ms)
+
+
+def _split_sse_records(buffer: bytes) -> tuple[list[bytes], bytes]:
+    r"""Split off every complete record in `buffer`, returning them plus the unconsumed tail.
+
+    Normalizes all three line terminators the spec allows (`\r\n`, `\n`, `\r`) to `\n` first,
+    so a record boundary is always exactly `\n\n` afterwards. A trailing lone `\r` is held back
+    unconsumed rather than normalized — it may be the first half of a `\r\n` whose `\n` hasn't
+    arrived yet, and normalizing it now would fabricate a bogus record boundary when it does.
+
+    >>> _split_sse_records(b"data: a\n\ndata: b\r\n\r\ndata: c")
+    ([b'data: a', b'data: b'], b'data: c')
+    >>> _split_sse_records(b"data: a\r\rdata: b\r")
+    ([b'data: a'], b'data: b\r')
+    >>> _split_sse_records(b"data: b\r\n\r\n")
+    ([b'data: b'], b'')
+    >>> _split_sse_records(b"")
+    ([], b'')
+    """
+    pending_cr = b"\r" if buffer.endswith(b"\r") else b""
+    normalized = buffer.removesuffix(b"\r").replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    *records, tail = normalized.split(b"\n\n")
+    return records, tail + pending_cr
 
 
 def _coerce_sse_id(raw_id: str | None, id_type: type[Any] | None, *, allow_missing_id: bool) -> Any:  # noqa: ANN401 — pylint: disable=line-too-long
@@ -431,6 +501,44 @@ def _coerce_sse_id(raw_id: str | None, id_type: type[Any] | None, *, allow_missi
             return None
         raise ValueError(f"SSE event missing required 'id' field (id_type={real_type!r})")
     return raw_id if real_type is str else real_type(raw_id)
+
+
+def _verify_sse_response(state: _SSEStreamState, status: int, content_type: str | None) -> None:
+    """Record the connection's status and enforce the spec's "must be text/event-stream" rule.
+
+    Only a 2xx that isn't a 204 is held to that rule: a 204 is the spec's explicit "stop
+    reconnecting" signal and has no body to type, and a 4xx/5xx here means the caller passed
+    `error_for_status=False` and will simply get no events from a body that isn't a stream.
+    """
+    state.status = status
+    if status == 204 or not 200 <= status < 300:
+        return
+    media_type = (content_type or "").partition(";")[0].strip().lower()
+    if media_type != "text/event-stream":
+        raise ValueError(
+            f"SSE response has Content-Type {content_type!r}, expected 'text/event-stream'"
+        )
+
+
+@dataclass(slots=True)
+class _SyncSSEResponseCheck:
+    """Adapter so the sync chunk iterators' single `check_status` hook also runs
+    `_verify_sse_response` — the response object only ever exists on whichever thread owns the
+    read loop (see `_drain_stream_chunks`), so status/content-type have to be captured there."""
+
+    _check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None
+    _state: _SSEStreamState
+
+    def __call__(
+        self,
+        raw_response: RawSyncResponse,
+        error_type: type[Data] | None,
+        request_info: RequestInfo,
+    ) -> None:
+        if self._check_status is not None:
+            self._check_status(raw_response, error_type, request_info)
+        content_type = raw_response.headers.get("content-type")
+        _verify_sse_response(self._state, raw_response.status, content_type)
 
 
 def _validate_response_data_type(response_data_type: object) -> None:
@@ -482,6 +590,40 @@ def _decode_json_line(
     if issubclass(response_data_type, BaseModel):
         return response_data_type.model_validate_json(data)
     raise TypeError(f"Unsupported response_data_type: {response_data_type!r}")
+
+
+def _dispatch_sse_record(
+    record: bytes,
+    state: _SSEStreamState,
+    response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
+    id_type: type[Any] | None,
+    *,
+    allow_missing_id: bool,
+) -> SSEEvent[Any, Any] | None:
+    """Apply one record's `retry:`/`id:` fields to `state`, then build its event (if it has data).
+
+    `.id` comes from the *persisted* last-event-id buffer, not this record alone — per spec an
+    event with no `id:` line carries the most recent id seen on the stream, and the buffer is
+    only cleared by an explicit empty `id:` line.
+    """
+    parsed_record = _parse_sse_record(record.decode())
+    if parsed_record.retry_ms is not None:
+        state.retry_delay = parsed_record.retry_ms / 1000
+    if parsed_record.id is not None:
+        state.last_event_id = parsed_record.id or None
+    if parsed_record.data is None:
+        return None
+    event_id = _coerce_sse_id(state.last_event_id, id_type, allow_missing_id=allow_missing_id)
+    if response_data_type is None:
+        return SSEEvent(id=event_id, event=parsed_record.event, data=parsed_record.data)
+    decoded = _decode_json_line(parsed_record.data, response_data_type)
+    return SSEEvent(id=event_id, event=parsed_record.event, data=decoded)
+
+
+def _sse_reconnect_budget_exhausted(
+    max_reconnects: int | None, consecutive_reconnects: int
+) -> bool:
+    return max_reconnects is not None and consecutive_reconnects >= max_reconnects
 
 
 def _build_sync_file_part(content: bytes | Path | BufferedIOBase) -> PartBuilder:
@@ -645,6 +787,7 @@ def _apply_tls_and_pool_config[TBuilder: BaseClientBuilder](
     client_builder: TBuilder,
     *,
     connect_timeout: float | None,
+    read_timeout: float | None,
     root_certificates: Sequence[bytes] | None,
     identity_pem: bytes | None,
     min_tls_version: TlsVersion | None,
@@ -661,6 +804,8 @@ def _apply_tls_and_pool_config[TBuilder: BaseClientBuilder](
     either."""
     if connect_timeout is not None:
         client_builder = client_builder.connect_timeout(timedelta(seconds=connect_timeout))
+    if read_timeout is not None:
+        client_builder = client_builder.read_timeout(timedelta(seconds=read_timeout))
     if root_certificates is not None:
         for certificate in root_certificates:
             client_builder = client_builder.add_root_certificate_pem(certificate)
@@ -885,6 +1030,10 @@ class HTTPClient:
     """
 
     _default_retry_methods: ClassVar[frozenset[str]] = frozenset({"GET", "PUT", "DELETE", "HEAD"})
+    # `sse()` swaps the client's total `timeout` for this per-request one whenever the caller
+    # doesn't pass their own: pyreqwest has no "no timeout" override, and a total timeout on an
+    # open-ended stream just kills every healthy stream at the 30s mark. A year is "never".
+    _sse_default_timeout: ClassVar[float] = 365 * 24 * 60 * 60
 
     _client: Client
     _bearer_token: str | None = None
@@ -909,6 +1058,7 @@ class HTTPClient:
         max_retries: int = 0,
         retry_methods: frozenset[str] | None = None,
         connect_timeout: float | None = None,
+        read_timeout: float | None = None,
         root_certificates: Sequence[bytes] | None = None,
         identity_pem: bytes | None = None,
         min_tls_version: TlsVersion | None = None,
@@ -928,7 +1078,9 @@ class HTTPClient:
         no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`) retry.
 
         `connect_timeout` bounds only the TCP connect phase (separate from `timeout`, which
-        covers the whole request). `root_certificates` (each a PEM-encoded cert) and
+        covers the whole request); `read_timeout` bounds the idle gap between two consecutive
+        body chunks (the right knob for a long-lived `sse()` stream, which `timeout` never
+        applies to). `root_certificates` (each a PEM-encoded cert) and
         `identity_pem` (a PEM bundle containing both a client cert and its private key) cover
         trusting a custom/internal CA and mTLS respectively. `danger_accept_invalid_certs`
         disables certificate validation entirely — insecure, for local/test use only.
@@ -958,6 +1110,7 @@ class HTTPClient:
         pyreqwest_client_builder = _apply_tls_and_pool_config(
             pyreqwest_client_builder,
             connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
             root_certificates=root_certificates,
             identity_pem=identity_pem,
             min_tls_version=min_tls_version,
@@ -1223,7 +1376,57 @@ class HTTPClient:
             typed_headers = _parse_typed_headers(headers, response_headers_type)
         return Result(data, raw_response.status, headers, typed_headers, request_info)
 
-    async def _sse_stream(
+    async def _sse_connection(
+        self,
+        request_builder: RequestBuilder,
+        state: _SSEStreamState,
+        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
+        id_type: type[Any] | None,
+        *,
+        allow_missing_id: bool,
+        error_for_status: bool,
+        error_type: type[Data] | None,
+    ) -> AsyncGenerator[SSEEvent[Any, Any]]:
+        """One connection's worth of an SSE stream: yields its events, returns on clean EOF."""
+        try:
+            # pyreqwest's default streamed_read_buffer_limit is 64KB — it withholds received
+            # bytes internally until that fills or the stream ends, which for an SSE stream (each
+            # record a few dozen bytes) means every event arrives in one burst at stream end
+            # instead of as it happens. 1 forces it to hand over whatever it has as soon as it has
+            # it, restoring real-time delivery — SSE's entire point.
+            request = request_builder.streamed_read_buffer_limit(1).build_streamed()
+            request_info = _request_info(request)
+            async with request as raw_response:
+                if error_for_status:
+                    await self._check_status(raw_response, error_type, request_info)
+                _verify_sse_response(
+                    state, raw_response.status, raw_response.headers.get("content-type")
+                )
+                buffer = b""
+                strip_bom = True
+                while True:
+                    chunk = await raw_response.body_reader.read_chunk()
+                    if chunk is None:
+                        return
+                    buffer += chunk
+                    if strip_bom and len(buffer) >= len(codecs.BOM_UTF8):
+                        buffer = buffer.removeprefix(codecs.BOM_UTF8)
+                        strip_bom = False
+                    records, buffer = _split_sse_records(buffer)
+                    for record in records:
+                        event = _dispatch_sse_record(
+                            record,
+                            state,
+                            response_data_type,
+                            id_type,
+                            allow_missing_id=allow_missing_id,
+                        )
+                        if event is not None:
+                            yield event
+        except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
+            raise _translate_transport_error(error) from error
+
+    async def _sse_stream(  # pylint: disable=too-many-locals
         self,
         path: str,
         params: Params | None,
@@ -1236,45 +1439,49 @@ class HTTPClient:
         allow_missing_id: bool,
         error_for_status: bool,
         error_type: type[Data] | None,
+        max_reconnects: int | None,
+        reconnect_delay: float,
+        reconnect_on_close: bool,
     ) -> AsyncIterator[SSEEvent[Any, Any]]:
-        request_builder = self._client.get(path).header("accept", "text/event-stream")
-        request_builder = await self._prepare_request(
-            request_builder, params, headers, timeout, skip_auth=skip_auth
-        )
-        try:
-            # pyreqwest's default streamed_read_buffer_limit is 64KB — it withholds received
-            # bytes internally until that fills or the stream ends, which for an SSE stream (each
-            # record a few dozen bytes) means every event arrives in one burst at stream end
-            # instead of as it happens. 1 forces it to hand over whatever it has as soon as it has
-            # it, restoring real-time delivery — SSE's entire point.
-            request = request_builder.streamed_read_buffer_limit(1).build_streamed()
-            request_info = _request_info(request)
-            async with request as raw_response:
-                if error_for_status:
-                    await self._check_status(raw_response, error_type, request_info)
-                buffer = b""
-                while True:
-                    chunk = await raw_response.body_reader.read_chunk()
-                    if chunk is None:
-                        return
-                    buffer += bytes(chunk).replace(b"\r\n", b"\n")
-                    while b"\n\n" in buffer:
-                        record, buffer = buffer.split(b"\n\n", 1)
-                        parsed_record = _parse_sse_record(record.decode())
-                        if parsed_record is None:
-                            continue
-                        event_id = _coerce_sse_id(
-                            parsed_record.id, id_type, allow_missing_id=allow_missing_id
-                        )
-                        if response_data_type is None:
-                            yield SSEEvent(
-                                id=event_id, event=parsed_record.event, data=parsed_record.data
-                            )
-                        else:
-                            decoded = _decode_json_line(parsed_record.data, response_data_type)
-                            yield SSEEvent(id=event_id, event=parsed_record.event, data=decoded)
-        except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
-            raise _translate_transport_error(error) from error
+        state = _SSEStreamState(retry_delay=reconnect_delay)
+        consecutive_reconnects = 0
+        effective_timeout = timeout if timeout is not None else self._sse_default_timeout
+        while True:
+            request_builder = self._client.get(path).header("accept", "text/event-stream")
+            request_builder = await self._prepare_request(
+                request_builder, params, headers, effective_timeout, skip_auth=skip_auth
+            )
+            if state.last_event_id is not None:
+                request_builder = request_builder.header("last-event-id", state.last_event_id)
+            connection = self._sse_connection(
+                request_builder,
+                state,
+                response_data_type,
+                id_type,
+                allow_missing_id=allow_missing_id,
+                error_for_status=error_for_status,
+                error_type=error_type,
+            )
+            try:
+                # `aclosing` so an early `break` by the caller closes this connection right
+                # here, not whenever the event loop's async-generator finalizer gets around to it.
+                async with aclosing(connection) as events:
+                    async for event in events:
+                        consecutive_reconnects = 0
+                        yield event
+            except HTTPTransportError:
+                if _sse_reconnect_budget_exhausted(max_reconnects, consecutive_reconnects):
+                    raise
+            else:
+                # A clean close: a 204 is the spec's explicit "stop, don't reconnect"; any other
+                # clean close ends the stream too unless the caller opted into browser-style
+                # reconnect-on-close — which still respects the reconnect budget.
+                if state.status == 204 or not reconnect_on_close:
+                    return
+                if _sse_reconnect_budget_exhausted(max_reconnects, consecutive_reconnects):
+                    return
+            consecutive_reconnects += 1
+            await asyncio.sleep(state.retry_delay)
 
     @overload
     def sse(
@@ -1287,6 +1494,9 @@ class HTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
     ) -> AsyncIterator[SSEEvent[str, str]]: ...
     @overload
     def sse(
@@ -1300,6 +1510,9 @@ class HTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
     ) -> AsyncIterator[SSEEvent[str, str | None]]: ...
     @overload
     def sse[TId](
@@ -1313,6 +1526,9 @@ class HTTPClient:
         id_type: type[TId],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
     ) -> AsyncIterator[SSEEvent[str, TId]]: ...
     @overload
     def sse[TId](
@@ -1327,6 +1543,9 @@ class HTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
     ) -> AsyncIterator[SSEEvent[str, TId | None]]: ...
     @overload
     def sse(
@@ -1340,6 +1559,9 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
     ) -> AsyncIterator[SSEEvent[dict[str, Any], str]]: ...
     @overload
     def sse[TData](
@@ -1353,6 +1575,9 @@ class HTTPClient:
         response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
     ) -> AsyncIterator[SSEEvent[TData, str]]: ...
     @overload
     def sse(
@@ -1367,6 +1592,9 @@ class HTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
     ) -> AsyncIterator[SSEEvent[dict[str, Any], str | None]]: ...
     @overload
     def sse[TData](
@@ -1381,6 +1609,9 @@ class HTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
     ) -> AsyncIterator[SSEEvent[TData, str | None]]: ...
     @overload
     def sse[TId](
@@ -1395,6 +1626,9 @@ class HTTPClient:
         id_type: type[TId],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
     ) -> AsyncIterator[SSEEvent[dict[str, Any], TId]]: ...
     @overload
     def sse[TId](
@@ -1410,6 +1644,9 @@ class HTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
     ) -> AsyncIterator[SSEEvent[dict[str, Any], TId | None]]: ...
     @overload
     def sse[TData, TId](
@@ -1424,6 +1661,9 @@ class HTTPClient:
         id_type: type[TId],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
     ) -> AsyncIterator[SSEEvent[TData, TId]]: ...
     @overload
     def sse[TData, TId](
@@ -1439,6 +1679,9 @@ class HTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
     ) -> AsyncIterator[SSEEvent[TData, TId | None]]: ...
     def sse(
         self,
@@ -1453,6 +1696,9 @@ class HTTPClient:
         allow_missing_id: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
     ) -> AsyncIterator[SSEEvent[Any, Any]]:
         """Open `path` as a Server-Sent Events stream, yielding one `SSEEvent` per event.
 
@@ -1461,10 +1707,20 @@ class HTTPClient:
         (defaults to `str`); `allow_missing_id` controls whether a missing `id` field raises
         (the default) or becomes `None`.
 
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        The client's `timeout` never applies here — an SSE stream is open-ended, and a total
+        request timeout would kill every healthy stream on schedule. `timeout` bounds one
+        connection attempt only; use `read_timeout` on `build()` to detect a stalled stream.
+        `skip_auth` omits the `Authorization` header (and skips invoking `bearer_auth`) for this
+        call; `error_type` decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead
+        of leaving it `None`.
+
+        A dropped connection (transport error or timeout) reconnects automatically, after
+        `reconnect_delay` seconds — or the server's own `retry:` value once it has sent one —
+        with a `Last-Event-ID` header carrying the last id seen, so a spec-compliant server
+        resumes where it left off. `max_reconnects` caps *consecutive* reconnects that yield no
+        event (`None` for unlimited, `0` to disable — the error is raised instead). A clean close
+        ends the stream, unless `reconnect_on_close=True` (browser `EventSource` behavior); a 204
+        always ends it.
         """
         return self._sse_stream(
             path,
@@ -1477,6 +1733,9 @@ class HTTPClient:
             allow_missing_id=allow_missing_id,
             error_for_status=error_for_status,
             error_type=error_type,
+            max_reconnects=max_reconnects,
+            reconnect_delay=reconnect_delay,
+            reconnect_on_close=reconnect_on_close,
         )
 
     async def _line_stream(
@@ -2830,6 +3089,10 @@ class SyncHTTPClient:
     """
 
     _default_retry_methods: ClassVar[frozenset[str]] = frozenset({"GET", "PUT", "DELETE", "HEAD"})
+    # `sse()` swaps the client's total `timeout` for this per-request one whenever the caller
+    # doesn't pass their own: pyreqwest has no "no timeout" override, and a total timeout on an
+    # open-ended stream just kills every healthy stream at the 30s mark. A year is "never".
+    _sse_default_timeout: ClassVar[float] = 365 * 24 * 60 * 60
 
     _client: SyncClient
     _bearer_token: str | None = None
@@ -2854,6 +3117,7 @@ class SyncHTTPClient:
         max_retries: int = 0,
         retry_methods: frozenset[str] | None = None,
         connect_timeout: float | None = None,
+        read_timeout: float | None = None,
         root_certificates: Sequence[bytes] | None = None,
         identity_pem: bytes | None = None,
         min_tls_version: TlsVersion | None = None,
@@ -2873,7 +3137,9 @@ class SyncHTTPClient:
         no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`) retry.
 
         `connect_timeout` bounds only the TCP connect phase (separate from `timeout`, which
-        covers the whole request). `root_certificates` (each a PEM-encoded cert) and
+        covers the whole request); `read_timeout` bounds the idle gap between two consecutive
+        body chunks (the right knob for a long-lived `sse()` stream, which `timeout` never
+        applies to). `root_certificates` (each a PEM-encoded cert) and
         `identity_pem` (a PEM bundle containing both a client cert and its private key) cover
         trusting a custom/internal CA and mTLS respectively. `danger_accept_invalid_certs`
         disables certificate validation entirely — insecure, for local/test use only.
@@ -2904,6 +3170,7 @@ class SyncHTTPClient:
         sync_client_builder = _apply_tls_and_pool_config(
             sync_client_builder,
             connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
             root_certificates=root_certificates,
             identity_pem=identity_pem,
             min_tls_version=min_tls_version,
@@ -3169,7 +3436,53 @@ class SyncHTTPClient:
             typed_headers = _parse_typed_headers(headers, response_headers_type)
         return Result(data, raw_response.status, headers, typed_headers, request_info)
 
-    def _sse_stream(
+    def _sse_connection(
+        self,
+        request_builder: SyncRequestBuilder,
+        state: _SSEStreamState,
+        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
+        id_type: type[Any] | None,
+        *,
+        allow_missing_id: bool,
+        error_for_status: bool,
+        error_type: type[Data] | None,
+        interruptible: bool,
+    ) -> Generator[SSEEvent[Any, Any]]:
+        """One connection's worth of an SSE stream: yields its events, returns on clean EOF."""
+        try:
+            # See the matching comment in `HTTPClient._sse_connection` — pyreqwest's default
+            # streamed_read_buffer_limit (64KB) withholds received bytes until that fills or the
+            # stream ends, so an SSE stream of small records arrives in one burst at stream end
+            # instead of as it happens. 1 forces it to hand over whatever it has immediately.
+            request = request_builder.streamed_read_buffer_limit(1).build_streamed()
+            request_info = _request_info(request)
+            response_check = _SyncSSEResponseCheck(
+                self._check_status if error_for_status else None, state
+            )
+            buffer = b""
+            strip_bom = True
+            for chunk in _sync_stream_chunks(
+                request, response_check, error_type, request_info, interruptible=interruptible
+            ):
+                buffer += chunk
+                if strip_bom and len(buffer) >= len(codecs.BOM_UTF8):
+                    buffer = buffer.removeprefix(codecs.BOM_UTF8)
+                    strip_bom = False
+                records, buffer = _split_sse_records(buffer)
+                for record in records:
+                    event = _dispatch_sse_record(
+                        record,
+                        state,
+                        response_data_type,
+                        id_type,
+                        allow_missing_id=allow_missing_id,
+                    )
+                    if event is not None:
+                        yield event
+        except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
+            raise _translate_transport_error(error) from error
+
+    def _sse_stream(  # pylint: disable=too-many-locals
         self,
         path: str,
         params: Params | None,
@@ -3182,42 +3495,49 @@ class SyncHTTPClient:
         allow_missing_id: bool,
         error_for_status: bool,
         error_type: type[Data] | None,
+        max_reconnects: int | None,
+        reconnect_delay: float,
+        reconnect_on_close: bool,
         interruptible: bool,
     ) -> Iterator[SSEEvent[Any, Any]]:
-        request_builder = self._client.get(path).header("accept", "text/event-stream")
-        request_builder = self._prepare_request(
-            request_builder, params, headers, timeout, skip_auth=skip_auth
-        )
-        try:
-            # See the matching comment in `HTTPClient._sse_stream` — pyreqwest's default
-            # streamed_read_buffer_limit (64KB) withholds received bytes until that fills or the
-            # stream ends, so an SSE stream of small records arrives in one burst at stream end
-            # instead of as it happens. 1 forces it to hand over whatever it has immediately.
-            request = request_builder.streamed_read_buffer_limit(1).build_streamed()
-            request_info = _request_info(request)
-            check_status = self._check_status if error_for_status else None
-            buffer = b""
-            for chunk in _sync_stream_chunks(
-                request, check_status, error_type, request_info, interruptible=interruptible
-            ):
-                buffer += chunk.replace(b"\r\n", b"\n")
-                while b"\n\n" in buffer:
-                    record, buffer = buffer.split(b"\n\n", 1)
-                    parsed_record = _parse_sse_record(record.decode())
-                    if parsed_record is None:
-                        continue
-                    event_id = _coerce_sse_id(
-                        parsed_record.id, id_type, allow_missing_id=allow_missing_id
-                    )
-                    if response_data_type is None:
-                        yield SSEEvent(
-                            id=event_id, event=parsed_record.event, data=parsed_record.data
-                        )
-                    else:
-                        decoded = _decode_json_line(parsed_record.data, response_data_type)
-                        yield SSEEvent(id=event_id, event=parsed_record.event, data=decoded)
-        except (PyreqwestTransportError, PyreqwestRedirectError, PyreqwestBuilderError) as error:
-            raise _translate_transport_error(error) from error
+        state = _SSEStreamState(retry_delay=reconnect_delay)
+        consecutive_reconnects = 0
+        effective_timeout = timeout if timeout is not None else self._sse_default_timeout
+        while True:
+            request_builder = self._client.get(path).header("accept", "text/event-stream")
+            request_builder = self._prepare_request(
+                request_builder, params, headers, effective_timeout, skip_auth=skip_auth
+            )
+            if state.last_event_id is not None:
+                request_builder = request_builder.header("last-event-id", state.last_event_id)
+            connection = self._sse_connection(
+                request_builder,
+                state,
+                response_data_type,
+                id_type,
+                allow_missing_id=allow_missing_id,
+                error_for_status=error_for_status,
+                error_type=error_type,
+                interruptible=interruptible,
+            )
+            try:
+                # `closing` so an early `break` by the caller closes this connection right here,
+                # not whenever the generator happens to be garbage-collected.
+                with closing(connection) as events:
+                    for event in events:
+                        consecutive_reconnects = 0
+                        yield event
+            except HTTPTransportError:
+                if _sse_reconnect_budget_exhausted(max_reconnects, consecutive_reconnects):
+                    raise
+            else:
+                # See the matching comment in `HTTPClient._sse_stream`.
+                if state.status == 204 or not reconnect_on_close:
+                    return
+                if _sse_reconnect_budget_exhausted(max_reconnects, consecutive_reconnects):
+                    return
+            consecutive_reconnects += 1
+            time.sleep(state.retry_delay)
 
     @overload
     def sse(
@@ -3230,6 +3550,9 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
         interruptible: bool = False,
     ) -> Iterator[SSEEvent[str, str]]: ...
     @overload
@@ -3244,6 +3567,9 @@ class SyncHTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
         interruptible: bool = False,
     ) -> Iterator[SSEEvent[str, str | None]]: ...
     @overload
@@ -3258,6 +3584,9 @@ class SyncHTTPClient:
         id_type: type[TId],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
         interruptible: bool = False,
     ) -> Iterator[SSEEvent[str, TId]]: ...
     @overload
@@ -3273,6 +3602,9 @@ class SyncHTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
         interruptible: bool = False,
     ) -> Iterator[SSEEvent[str, TId | None]]: ...
     @overload
@@ -3287,6 +3619,9 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
         interruptible: bool = False,
     ) -> Iterator[SSEEvent[dict[str, Any], str]]: ...
     @overload
@@ -3301,6 +3636,9 @@ class SyncHTTPClient:
         response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
         interruptible: bool = False,
     ) -> Iterator[SSEEvent[TData, str]]: ...
     @overload
@@ -3316,6 +3654,9 @@ class SyncHTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
         interruptible: bool = False,
     ) -> Iterator[SSEEvent[dict[str, Any], str | None]]: ...
     @overload
@@ -3331,6 +3672,9 @@ class SyncHTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
         interruptible: bool = False,
     ) -> Iterator[SSEEvent[TData, str | None]]: ...
     @overload
@@ -3346,6 +3690,9 @@ class SyncHTTPClient:
         id_type: type[TId],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
         interruptible: bool = False,
     ) -> Iterator[SSEEvent[dict[str, Any], TId]]: ...
     @overload
@@ -3362,6 +3709,9 @@ class SyncHTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
         interruptible: bool = False,
     ) -> Iterator[SSEEvent[dict[str, Any], TId | None]]: ...
     @overload
@@ -3377,6 +3727,9 @@ class SyncHTTPClient:
         id_type: type[TId],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
         interruptible: bool = False,
     ) -> Iterator[SSEEvent[TData, TId]]: ...
     @overload
@@ -3393,6 +3746,9 @@ class SyncHTTPClient:
         allow_missing_id: Literal[True],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
         interruptible: bool = False,
     ) -> Iterator[SSEEvent[TData, TId | None]]: ...
     def sse(
@@ -3408,6 +3764,9 @@ class SyncHTTPClient:
         allow_missing_id: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
         interruptible: bool = False,
     ) -> Iterator[SSEEvent[Any, Any]]:
         """Open `path` as a Server-Sent Events stream, yielding one `SSEEvent` per event.
@@ -3417,10 +3776,20 @@ class SyncHTTPClient:
         (defaults to `str`); `allow_missing_id` controls whether a missing `id` field raises
         (the default) or becomes `None`.
 
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        The client's `timeout` never applies here — an SSE stream is open-ended, and a total
+        request timeout would kill every healthy stream on schedule. `timeout` bounds one
+        connection attempt only; use `read_timeout` on `build()` to detect a stalled stream.
+        `skip_auth` omits the `Authorization` header (and skips invoking `bearer_auth`) for this
+        call; `error_type` decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead
+        of leaving it `None`.
+
+        A dropped connection (transport error or timeout) reconnects automatically, after
+        `reconnect_delay` seconds — or the server's own `retry:` value once it has sent one —
+        with a `Last-Event-ID` header carrying the last id seen, so a spec-compliant server
+        resumes where it left off. `max_reconnects` caps *consecutive* reconnects that yield no
+        event (`None` for unlimited, `0` to disable — the error is raised instead). A clean close
+        ends the stream, unless `reconnect_on_close=True` (browser `EventSource` behavior); a 204
+        always ends it.
 
         `interruptible=True` runs the blocking read loop on a daemon worker thread so Ctrl-C
         works while waiting between events (the default `False` leaves Ctrl-C dead in that
@@ -3445,6 +3814,9 @@ class SyncHTTPClient:
             allow_missing_id=allow_missing_id,
             error_for_status=error_for_status,
             error_type=error_type,
+            max_reconnects=max_reconnects,
+            reconnect_delay=reconnect_delay,
+            reconnect_on_close=reconnect_on_close,
             interruptible=interruptible,
         )
 

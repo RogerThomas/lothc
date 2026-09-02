@@ -212,14 +212,16 @@ disable = [
 ]
 
 [tool.pylint.design]
-max-locals = 27 # one real case (the streaming line-buffering generator) legitimately needs a
+max-locals = 28 # one real case (the streaming line-buffering generator) legitimately needs a
 # couple more than pylint's default 15 — matches this project's own mccabe complexity ceiling
 # ([tool.ruff.lint.mccabe] max-complexity = 15) in spirit, just a different metric. Bumped again,
 # 20 -> 21, after `_sse_stream`/its sync mirror gained a 21st local (the new `error_type` param,
 # threaded through for typed error bodies), then 21 -> 27 after `build`/its sync mirror gained
 # the TLS/connection-pool config params (`connect_timeout`, `root_certificates`, `identity_pem`,
 # `min_tls_version`, `max_tls_version`, `danger_accept_invalid_certs`, `https_only`,
-# `max_connections`, `pool_idle_timeout`, `pool_max_idle_per_host`, `pool_timeout`)
+# `max_connections`, `pool_idle_timeout`, `pool_max_idle_per_host`, `pool_timeout`), then
+# 27 -> 28 after `build`/its sync mirror gained `read_timeout` (the idle-gap stall detector for
+# `sse()`)
 max-branches = 15 # `_apply_form_value`/`_apply_sync_form_value`'s dispatch `match` statements
 # (Form/File redesign: str/int/bytes/three File-tuple shapes/bare Path/BufferedIOBase/list/dict-
 # or-model/tuple-repeat) need 13, one over pylint's default 12 — bumped to 15 to match this
@@ -227,8 +229,10 @@ max-branches = 15 # `_apply_form_value`/`_apply_sync_form_value`'s dispatch `mat
 # than pick an arbitrary number just past the current count
 
 [tool.pylint.format]
-max-module-lines = 5000 # _client.py is one deliberately unsplit file (see CLAUDE.md: "split it
+max-module-lines = 5500 # _client.py is one deliberately unsplit file (see CLAUDE.md: "split it
 # once it earns a split") that's grown past its previous bump (3800) to 4038 lines after
 # threading a per-verb `skip_auth` override through every overload of every verb on both clients
 # (mirroring the earlier `timeout` override); bumped again rather than split, since no split has
-# actually been decided on
+# actually been decided on. 5000 -> 5500 after `sse()` gained spec-compliant reconnect
+# (`max_reconnects`/`reconnect_delay`/`reconnect_on_close` on all 26 overload sites, plus the
+# shared reconnect/parsing helpers), landing at ~5200

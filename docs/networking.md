@@ -57,6 +57,7 @@ since a TLS/connection identity belongs to the underlying connection, not a sing
 async with HTTPClient.build(
     base_url="https://api.example.com/",
     connect_timeout=5.0,  # bounds only the TCP connect phase, separate from `timeout`
+    read_timeout=60.0,  # max idle gap between body chunks — the stall detector for `sse()`
     max_connections=50,
     pool_idle_timeout=30.0,  # None (default) leaves pyreqwest's own 90s default in place
     pool_max_idle_per_host=10,
@@ -68,3 +69,8 @@ async with HTTPClient.build(
 `connect_timeout` is distinct from `timeout` — it only bounds the initial TCP connect, not the
 whole request, so it's useful for "fail fast on a dead host" without capping how long a slow
 (but alive) download is allowed to take.
+
+`read_timeout` is distinct from both — it bounds the *idle gap between two consecutive body
+chunks*, not the whole request. A body that keeps trickling never trips it; one that stalls does.
+That makes it the one timeout that's actually meaningful for an open-ended `sse()` stream, which
+the total `timeout` deliberately doesn't apply to — see [SSE → Timeouts](sse.md#timeouts).

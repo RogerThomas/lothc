@@ -6,6 +6,7 @@ this module is the one canonical server implementation for both. Endpoints: `/it
 (multipart), plus cookie/redirect/retry/streaming scenarios used by their own tests.
 """
 
+import contextlib
 import email.policy
 import json
 import time
@@ -65,24 +66,107 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self._counters[key] = self._counters.get(key, 0) + 1
         return self._counters[key]
 
-    def _write_sse_events(self, query: str) -> None:
-        omit_id = parse_qs(query).get("omit", [""])[0] == "id"
+    def _start_sse_response(self, *, chunked: bool = False) -> None:
         self.close_connection = True
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Connection", "close")
+        if chunked:
+            self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
-        for index in range(10):
-            data = json.dumps({"msg": f"hello {index}", "now": index * 100})
-            record = "event: tick\n"
-            if not omit_id:
-                record += f"id: {index}\n"
-            record += f"data: {data}\n\n"
+
+    def _write_sse_chunk(self, record: str) -> None:
+        # One chunked-transfer frame per record; never sending the terminating zero-length
+        # frame afterwards (see `_handle_truncated`) is what turns a plain close into a real
+        # transport error on the client, which is what an SSE reconnect test needs.
+        body = record.encode()
+        self.wfile.write(f"{len(body):x}\r\n".encode() + body + b"\r\n")
+        self.wfile.flush()
+
+    def _write_sse_events(self, query: str) -> None:
+        params = parse_qs(query)
+        omit_id = params.get("omit", [""])[0] == "id"
+        # Small but real by default, so a test can assert events arrive incrementally rather
+        # than all at once (see test_sse_events_arrive_incrementally in test_sse.py).
+        interval = float(params.get("interval", ["0.001"])[0])
+        count = int(params.get("count", ["10"])[0])
+        self._start_sse_response()
+        # A client that gives up mid-stream (e.g. its `read_timeout` fired) makes the next write
+        # here fail — that's the client's business, not a server error worth a traceback.
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            for index in range(count):
+                data = json.dumps({"msg": f"hello {index}", "now": index * 100})
+                record = "event: tick\n"
+                if not omit_id:
+                    record += f"id: {index}\n"
+                record += f"data: {data}\n\n"
+                self.wfile.write(record.encode())
+                self.wfile.flush()
+                time.sleep(interval)
+
+    def _write_sse_truncated(self) -> None:
+        self._start_sse_response(chunked=True)
+        self._write_sse_chunk("id: 0\ndata: first\n\n")
+
+    def _write_sse_reconnect(self, query: str) -> None:
+        # First connection: a `retry:` hint, two events, then the connection dies mid-stream.
+        # Every later connection: two more events, each echoing the `Last-Event-ID` header the
+        # client sent, then a clean close.
+        attempt = self._bump_counter(parse_qs(query)["key"][0])
+        last_event_id = self.headers.get("Last-Event-ID")
+        if attempt == 1:
+            self._start_sse_response(chunked=True)
+            self._write_sse_chunk("retry: 20\n\n")
+            for index in range(2):
+                self._write_sse_chunk(f"id: {index}\ndata: {json.dumps({'last': None})}\n\n")
+            return
+        self._start_sse_response()
+        for index in range(2, 4):
+            self.wfile.write(
+                f"id: {index}\ndata: {json.dumps({'last': last_event_id})}\n\n".encode()
+            )
+        self.wfile.flush()
+
+    def _write_sse_close_count(self, query: str) -> None:
+        # Exercises `reconnect_on_close`: the first `events` connections each send exactly one
+        # event (its id is the connection number, its data echoes `Last-Event-ID`) then close
+        # cleanly; every connection after that closes cleanly with no events at all.
+        params = parse_qs(query)
+        attempt = self._bump_counter(params["key"][0])
+        events = int(params.get("events", ["1"])[0])
+        last_event_id = self.headers.get("Last-Event-ID")
+        self._start_sse_response()
+        if attempt <= events:
+            record = f"id: {attempt}\ndata: {json.dumps({'last': last_event_id})}\n\n"
             self.wfile.write(record.encode())
             self.wfile.flush()
-            # Small but real, so a test can assert events arrive incrementally rather than all
-            # at once (see test_sse_events_arrive_incrementally in test_sse.py).
-            time.sleep(0.001)
+
+    def _write_sse_no_content(self) -> None:
+        self.close_connection = True
+        self.send_response(204)
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    def _write_sse_wrong_content_type(self) -> None:
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(b"data: not-a-stream\n\n")
+        self.wfile.flush()
+
+    def _write_sse_spec_edge_cases(self) -> None:
+        # Everything the WHATWG event-stream format allows that a naive parser gets wrong: a
+        # leading UTF-8 BOM, bare-CR line terminators, a data-less record whose `id:` must still
+        # persist onto the next event, and an explicit empty `id:` that resets that buffer.
+        self._start_sse_response()
+        self.wfile.write(b"\xef\xbb\xbf")
+        self.wfile.write(b"id: 7\r\r")
+        self.wfile.write(b"data: a\r\n\r\n")
+        self.wfile.write(b"data: b\n\n")
+        self.wfile.write(b"id\ndata: c\n\n")
+        self.wfile.flush()
 
     def _handle_read_item(self, item_id: str) -> None:
         self._write_json(200, {"id": int(item_id), "name": f"item-{item_id}"})
@@ -271,6 +355,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
             return
         query_routes = {
             "/events": self._write_sse_events,
+            "/events-reconnect": self._write_sse_reconnect,
+            "/events-close-count": self._write_sse_close_count,
             "/flaky": self._handle_flaky,
             "/retry-after": self._handle_retry_after,
             "/retry-after-custom": self._handle_retry_after_custom,
@@ -285,6 +371,10 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/slow": self._handle_slow,
             "/echo-headers": self._handle_echo_headers,
             "/events-weird": self._write_sse_weird,
+            "/events-truncated": self._write_sse_truncated,
+            "/events-no-content": self._write_sse_no_content,
+            "/events-wrong-content-type": self._write_sse_wrong_content_type,
+            "/events-spec-edge-cases": self._write_sse_spec_edge_cases,
             "/boom": self._handle_boom,
             "/set-cookie": self._handle_set_cookie,
             "/read-cookie": self._handle_read_cookie,

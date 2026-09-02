@@ -44,3 +44,12 @@
 .md-uv-run--copied {
   color: var(--md-accent-fg-color);
 }
+
+/* Benchmark tables: a numeric cell must never wrap mid-value ("3559.2" / "req/s" on separate
+   lines, "Peak Py" / "Mem" split across two). Material already wraps every table in a
+   horizontally-scrolling `.md-typeset__scrollwrap`, so forcing nowrap just makes a too-wide
+   table scroll sideways instead of squashing its columns. */
+.md-typeset table:not([class]) th,
+.md-typeset table:not([class]) td {
+  white-space: nowrap;
+}

@@ -27,6 +27,7 @@ from pyreqwest.client import ClientBuilder
 from pyreqwest.client import SyncClient as PyreqwestSyncClient
 from pyreqwest.client import SyncClientBuilder as PyreqwestSyncClientBuilder
 from rich.console import Console
+from rich.measure import Measurement
 from rich.table import Table
 
 from lothc import HTTPClient, SyncHTTPClient
@@ -859,41 +860,59 @@ async def _run_one(
     }
 
 
+def _print_table_unwrapped(console: Console, table: Table) -> None:
+    """Print `table` at its natural width so no cell is ever wrapped or ellipsised.
+
+    rich sizes a table to the console it's printed on and, when that's too narrow, either
+    wraps cell text onto extra lines or (with `no_wrap`) truncates it with an ellipsis — both
+    make a numeric results table unreadable. Non-TTY runs (e.g. `docker compose run`, CI logs)
+    are the worst case: rich assumes 80 columns there. Measuring against an effectively
+    unbounded width and printing through a console at least that wide sidesteps both.
+    """
+    natural_width = Measurement.get(console, console.options.update_width(10_000), table).maximum
+    original_width = console.width
+    console.width = max(original_width, natural_width)
+    try:
+        console.print(table)
+    finally:
+        console.width = original_width
+
+
 def _print_results_table(results: list[Stats], *, title: str = "Perf Comparison") -> None:
     ordered = sorted(results, key=lambda r: r["throughput"])
     slowest = ordered[0]["throughput"]
 
     table = Table(title=title)
-    table.add_column("Library", style="cyan")
-    table.add_column("Total Time", justify="right")
-    table.add_column("Throughput", justify="right", style="bold green")
-    table.add_column("Relative", justify="right", style="bold yellow")
-    table.add_column("CPU", justify="right", style="blue")
-    table.add_column("Peak Py Mem", justify="right", style="blue")
-    table.add_column("Min", justify="right")
-    table.add_column("P50", justify="right")
-    table.add_column("P95", justify="right")
-    table.add_column("P99", justify="right")
-    table.add_column("Max", justify="right")
-    table.add_column("Mean", justify="right", style="magenta")
+    table.add_column("Library", style="cyan", no_wrap=True)
+    table.add_column("Total Time (s)", justify="right", no_wrap=True)
+    table.add_column("Throughput (req/s)", justify="right", style="bold green", no_wrap=True)
+    table.add_column("Relative (x)", justify="right", style="bold yellow", no_wrap=True)
+    table.add_column("CPU (s)", justify="right", style="blue", no_wrap=True)
+    table.add_column("Peak Py Mem (MB)", justify="right", style="blue", no_wrap=True)
+    table.add_column("Min (ms)", justify="right", no_wrap=True)
+    table.add_column("P50 (ms)", justify="right", no_wrap=True)
+    table.add_column("P95 (ms)", justify="right", no_wrap=True)
+    table.add_column("P99 (ms)", justify="right", no_wrap=True)
+    table.add_column("Max (ms)", justify="right", no_wrap=True)
+    table.add_column("Mean (ms)", justify="right", style="magenta", no_wrap=True)
 
     for r in ordered:
         table.add_row(
             r["lib"],
-            f"{r['total_time'] * 1000:.3f}ms",
-            f"{r['throughput']:.1f} req/s",
-            f"x{r['throughput'] / slowest:.1f}",
-            f"{r['cpu_time']:.3f}s",
-            f"{r['peak_mem_mb']:.2f}MB",
-            f"{r['min'] * 1000:.3f}ms",
-            f"{r['p50'] * 1000:.3f}ms",
-            f"{r['p95'] * 1000:.3f}ms",
-            f"{r['p99'] * 1000:.3f}ms",
-            f"{r['max'] * 1000:.3f}ms",
-            f"{r['mean'] * 1000:.3f}ms",
+            f"{r['total_time']:.2f}",
+            f"{r['throughput']:,.0f}",
+            f"{r['throughput'] / slowest:.2f}",
+            f"{r['cpu_time']:.2f}",
+            f"{r['peak_mem_mb']:.2f}",
+            f"{r['min'] * 1000:.2f}",
+            f"{r['p50'] * 1000:.2f}",
+            f"{r['p95'] * 1000:.2f}",
+            f"{r['p99'] * 1000:.2f}",
+            f"{r['max'] * 1000:.2f}",
+            f"{r['mean'] * 1000:.2f}",
         )
 
-    console.print(table)
+    _print_table_unwrapped(console, table)
     if any(r["lib"] == "httpx_h2" for r in results):
         console.print(
             "[dim]Note: httpx_h2 negotiates HTTP/2 only over TLS/ALPN or h2c — "

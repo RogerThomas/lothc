@@ -20,17 +20,17 @@ to `response_data_type` at all — `httpx`/`httpx2`/`aiohttp`/`niquests`/`aioson
 object of your own type is something you'd write and maintain yourself on top of any of them,
 because it isn't a feature those clients offer — it's a first-class, built-in part of lothc.
 
-| Library | Total Time | Throughput | Relative | CPU | Peak Py Mem | Min | P50 | P95 | P99 | Max | Mean |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| httpx | 9.174s | 1090.1 req/s | x1.0 | 9.173s | 2.33MB | 2.784ms | 66.683ms | 253.075ms | 393.300ms | 838.985ms | 91.340ms |
-| httpx2 | 2.810s | 3559.2 req/s | x3.3 | 2.806s | 2.52MB | 6.397ms | 27.509ms | 30.830ms | 32.644ms | 58.358ms | 27.944ms |
-| niquests | 2.645s | 3780.5 req/s | x3.5 | 2.645s | 9.00MB | 8.840ms | 25.515ms | 29.509ms | 47.664ms | 54.387ms | 26.289ms |
-| aiosonic | 0.556s | 17990.3 req/s | x16.5 | 0.556s | 1.17MB | 1.273ms | 6.119ms | 8.528ms | 10.117ms | 13.427ms | 5.522ms |
-| aiohttp | 0.397s | 25186.8 req/s | x23.1 | 0.397s | 1.33MB | 0.722ms | 4.360ms | 6.113ms | 7.540ms | 9.149ms | 3.942ms |
-| lothc-pydantic | 0.204s | 48955.4 req/s | x44.9 | 0.204s | 0.63MB | 1.195ms | 2.017ms | 2.141ms | 2.856ms | 3.103ms | 2.023ms |
-| lothc | 0.199s | 50346.8 req/s | x46.2 | 0.199s | 0.63MB | 0.507ms | 1.953ms | 2.510ms | 2.973ms | 3.367ms | 1.961ms |
-| lothc-msgspec | 0.189s | 52915.6 req/s | x48.5 | 0.189s | 0.63MB | 0.392ms | 2.012ms | 2.535ms | 2.974ms | 3.202ms | 1.867ms |
-| pyreqwest | 0.183s | 54555.5 req/s | x50.0 | 0.183s | 0.51MB | 0.775ms | 1.913ms | 2.427ms | 2.608ms | 3.041ms | 1.811ms |
+| Library | Total Time (s) | Throughput (req/s) | Relative (x) | CPU (s) | Peak Py Mem (MB) | Min (ms) | P50 (ms) | P95 (ms) | P99 (ms) | Max (ms) | Mean (ms) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| httpx | 9.17 | 1,090 | 1.00 | 9.17 | 2.33 | 2.78 | 66.68 | 253.07 | 393.30 | 838.99 | 91.34 |
+| httpx2 | 2.81 | 3,559 | 3.30 | 2.81 | 2.52 | 6.40 | 27.51 | 30.83 | 32.64 | 58.36 | 27.94 |
+| niquests | 2.65 | 3,780 | 3.50 | 2.65 | 9.00 | 8.84 | 25.52 | 29.51 | 47.66 | 54.39 | 26.29 |
+| aiosonic | 0.56 | 17,990 | 16.50 | 0.56 | 1.17 | 1.27 | 6.12 | 8.53 | 10.12 | 13.43 | 5.52 |
+| aiohttp | 0.40 | 25,187 | 23.10 | 0.40 | 1.33 | 0.72 | 4.36 | 6.11 | 7.54 | 9.15 | 3.94 |
+| lothc-pydantic | 0.20 | 48,955 | 44.90 | 0.20 | 0.63 | 1.20 | 2.02 | 2.14 | 2.86 | 3.10 | 2.02 |
+| lothc | 0.20 | 50,347 | 46.20 | 0.20 | 0.63 | 0.51 | 1.95 | 2.51 | 2.97 | 3.37 | 1.96 |
+| lothc-msgspec | 0.19 | 52,916 | 48.50 | 0.19 | 0.63 | 0.39 | 2.01 | 2.54 | 2.97 | 3.20 | 1.87 |
+| pyreqwest | 0.18 | 54,556 | 50.00 | 0.18 | 0.51 | 0.78 | 1.91 | 2.43 | 2.61 | 3.04 | 1.81 |
 
 Sorted slowest to fastest (`x` = throughput relative to the slowest library, `httpx`, in this run).
 
@@ -59,16 +59,16 @@ client of its own — only appears here, never in the race above.
 10,000 sequential requests (plus a 100-request warm-up, untimed) against the same bundled
 Rust/axum JSON server:
 
-| Library | Total Time | Throughput | Relative | CPU | Peak Py Mem | Min | P50 | P95 | P99 | Max | Mean |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| requests | 3348.958ms | 2986.0 req/s | x1.0 | 3.094s | 1.00MB | 0.285ms | 0.331ms | 0.354ms | 0.515ms | 0.853ms | 0.335ms |
-| niquests | 2866.124ms | 3489.0 req/s | x1.2 | 2.631s | 0.96MB | 0.231ms | 0.278ms | 0.320ms | 0.496ms | 1.159ms | 0.286ms |
-| httpx | 2341.838ms | 4270.1 req/s | x1.4 | 2.160s | 0.75MB | 0.159ms | 0.219ms | 0.331ms | 0.503ms | 14.484ms | 0.234ms |
-| httpx2 | 2045.416ms | 4889.0 req/s | x1.6 | 1.864s | 0.39MB | 0.165ms | 0.202ms | 0.223ms | 0.286ms | 0.756ms | 0.204ms |
-| lothc-pydantic | 826.540ms | 12098.6 req/s | x4.1 | 0.469s | 0.32MB | 0.054ms | 0.081ms | 0.092ms | 0.114ms | 2.815ms | 0.082ms |
-| lothc | 769.966ms | 12987.6 req/s | x4.3 | 0.417s | 0.32MB | 0.046ms | 0.075ms | 0.085ms | 0.131ms | 0.406ms | 0.077ms |
-| lothc-msgspec | 741.640ms | 13483.6 req/s | x4.5 | 0.393s | 0.31MB | 0.045ms | 0.074ms | 0.081ms | 0.087ms | 0.227ms | 0.074ms |
-| pyreqwest | 694.754ms | 14393.6 req/s | x4.8 | 0.348s | 0.32MB | 0.043ms | 0.070ms | 0.076ms | 0.081ms | 0.289ms | 0.069ms |
+| Library | Total Time (s) | Throughput (req/s) | Relative (x) | CPU (s) | Peak Py Mem (MB) | Min (ms) | P50 (ms) | P95 (ms) | P99 (ms) | Max (ms) | Mean (ms) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| requests | 3.35 | 2,986 | 1.00 | 3.09 | 1.00 | 0.28 | 0.33 | 0.35 | 0.52 | 0.85 | 0.34 |
+| niquests | 2.87 | 3,489 | 1.20 | 2.63 | 0.96 | 0.23 | 0.28 | 0.32 | 0.50 | 1.16 | 0.29 |
+| httpx | 2.34 | 4,270 | 1.40 | 2.16 | 0.75 | 0.16 | 0.22 | 0.33 | 0.50 | 14.48 | 0.23 |
+| httpx2 | 2.05 | 4,889 | 1.60 | 1.86 | 0.39 | 0.17 | 0.20 | 0.22 | 0.29 | 0.76 | 0.20 |
+| lothc-pydantic | 0.83 | 12,099 | 4.10 | 0.47 | 0.32 | 0.05 | 0.08 | 0.09 | 0.11 | 2.81 | 0.08 |
+| lothc | 0.77 | 12,988 | 4.30 | 0.42 | 0.32 | 0.05 | 0.07 | 0.09 | 0.13 | 0.41 | 0.08 |
+| lothc-msgspec | 0.74 | 13,484 | 4.50 | 0.39 | 0.31 | 0.04 | 0.07 | 0.08 | 0.09 | 0.23 | 0.07 |
+| pyreqwest | 0.69 | 14,394 | 4.80 | 0.35 | 0.32 | 0.04 | 0.07 | 0.08 | 0.08 | 0.29 | 0.07 |
 
 ![Sync-sequential HTTP client throughput race — pyreqwest and lothc finish first, requests and niquests take much longer](assets/perf-race-sync.svg){: .perf-race-img }
 

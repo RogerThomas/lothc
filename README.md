@@ -86,7 +86,7 @@ validate yourself. See [Benchmarks](docs/benchmarks.md) for what that costs (usu
 | **Every verb** | `get`/`get_result`, `post`, `put`, `patch`, `delete`, `head`, `download` — see [Verbs](docs/verbs.md). |
 | **Typed params, headers & forms** | A `BaseModel`/`Struct` for query params or headers (with `None`-field omission), or a real multipart body via `form=`. |
 | **Precise static types** | Every verb is paired `@overload`s, not a cast-laden generic — your editor knows the exact return type. |
-| **SSE & streaming** | Typed SSE decode (discriminated unions included), plus raw or NDJSON-typed `stream_get`/`stream_post` — see [SSE](docs/sse.md) / [Streaming](docs/streaming.md). |
+| **SSE & streaming** | Spec-compliant SSE — automatic reconnect with `Last-Event-ID`, server `retry:` honored, typed decode (discriminated unions included) — plus raw or NDJSON-typed `stream_get`/`stream_post` — see [SSE](docs/sse.md) / [Streaming](docs/streaming.md). |
 | **Retries with real backoff** | `max_retries`/`retry_methods`, a genuine pyreqwest middleware hook, `Retry-After`-aware — see [Retries](docs/retries.md). |
 | **Authentication** | Static `bearer_token`, a per-request-refreshed `bearer_auth`, or `default_headers` for anything else — see [Authentication](docs/auth.md). |
 | **Cookies, redirects, proxy** | `cookie_store`, `follow_redirects`/`max_redirects`, `proxy=` — see [Networking](docs/networking.md). |

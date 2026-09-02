@@ -81,7 +81,7 @@ the fixed sdist.
 Done: query params (typed + raw), per-request headers (typed + raw), timeouts (client-level, plus
 a per-verb `timeout=` override on every verb on both clients), transport error
 wrapping (`HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError`), `put`/`patch`/`delete`/`head`, SSE (with
-`TypeAdapter`/`Decoder` support), `stream_get`/`stream_post` (raw chunks by default — unbuffered, safe
+`TypeAdapter`/`Decoder` support, spec-compliant reconnect — see the SSE dev note below), `stream_get`/`stream_post` (raw chunks by default — unbuffered, safe
 for arbitrary binary content; pass `response_data_type` to switch to newline-buffered NDJSON-style typed
 decoding instead — the buffering is conditional on that param, not always-on), `download` (see the
 large-object note below), the `Data` decode-target
@@ -97,7 +97,7 @@ error bodies (a per-verb `error_type=SomeModel` param, mirroring `response_data_
 decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it `None`), and
 TLS/mTLS/connection-pool config (`connect_timeout`, `root_certificates`, `identity_pem`,
 `min_tls_version`/`max_tls_version`, `danger_accept_invalid_certs`, `https_only`,
-`max_connections`, `pool_idle_timeout`, `pool_max_idle_per_host`, `pool_timeout` — all
+`max_connections`, `pool_idle_timeout`, `pool_max_idle_per_host`, `pool_timeout`, `read_timeout` — all
 client-level only, same as redirects/proxy/cookies above), and request metadata
 (`.request: RequestInfo` — method/url/path/host of the request actually sent) on both `Result`
 (`get_result`/`post_result`/`put_result`/`patch_result`/`delete_result`/`head`) and on
@@ -374,6 +374,58 @@ Before writing any code, tell the user that you've read this file AND read and f
 
 ## Development notes
 
+- **`sse()` never lets the client's total `timeout` touch the stream, and reconnects per the
+  WHATWG EventSource model.** Found in real use: every SSE stream died with `HTTPTimeoutError`
+  at exactly the client's `timeout` (30s by default) — reqwest's `timeout` runs from connect
+  until the body *finishes*, and an SSE body never does. Reproduced live (0.3s timeout, 0.1s
+  event spacing: 3 events then `ReadTimeoutError`), and confirmed pyreqwest has no "no timeout"
+  per-request override — `RequestBuilder.timeout()` takes only a `timedelta` — but a
+  per-request value *does* replace the client's (a 1-year and a 100-year `timedelta` both
+  accepted and both let the stream outlive a 0.3s client timeout). So `_sse_stream` passes
+  `_sse_default_timeout` (one year, a `ClassVar` on both clients) whenever the caller gives no
+  `timeout=`; an explicit `timeout=` bounds one connection attempt. `read_timeout` (new on
+  `build()`, plumbed through `_apply_tls_and_pool_config` like `connect_timeout`) is
+  reqwest's idle-gap-between-chunks timeout — confirmed live it lets a 0.1s-spaced stream run
+  indefinitely at 0.3s and kills a 0.5s-spaced one — and is the right stall detector for SSE.
+  It surfaces as `ReadTimeoutError`, a `RequestTimeoutError` subclass (checked via `__mro__`),
+  so `_translate_transport_error` already maps it to `HTTPTimeoutError` with no change.
+  The retry middleware (`max_retries`) was useless here by construction: it wraps `send()`,
+  which returns once headers arrive, so nothing that happens mid-body can ever reach it.
+  Reconnect lives in `_sse_stream` itself (both clients), which is now a loop over
+  `_sse_connection` (one connection's worth of events) with shared per-call `_SSEStreamState`
+  (`last_event_id` buffer, current `retry_delay`, last response `status`). On
+  `HTTPTransportError` it sleeps `state.retry_delay` and reconnects with a `Last-Event-ID`
+  header, unless `max_reconnects` *consecutive* reconnects have yielded no event (reset to 0 on
+  every event — so a flaky-but-alive server is reconnected to indefinitely, a dead one fails
+  fast; `None` = unlimited, `0` = raise on first drop). A clean close returns unless
+  `reconnect_on_close=True`; a 204 always returns (spec). `_SSEStreamState.status` exists
+  purely for that 204 check — on the sync side the response object only ever exists on the
+  read-loop's thread (`_drain_stream_chunks`, when `interruptible=True`), so status and
+  content-type are captured there via `_SyncSSEResponseCheck`, an adapter that slots into
+  `_sync_stream_chunks`'s existing single `check_status` hook rather than widening that
+  signature. Inner generators are wrapped in `contextlib.aclosing`/`closing` so a caller's
+  `break` closes the live connection right then, not at GC/loop-shutdown time.
+  Spec field semantics fixed in the same pass, all shared module-level helpers with doctests:
+  `id:` persists across events (an event with no `id:` line inherits the buffer; an explicit
+  empty `id:` clears it; a value containing NUL is ignored) — this is what `allow_missing_id`
+  now means, "no id ever seen", not "this record lacked one"; `retry:` (digits only, ms) is
+  honored and overrides `reconnect_delay` for the rest of the call; data-less records still
+  apply their `id:`/`retry:` (the old `_parse_sse_record` returned `None` for them, dropping
+  those fields on the floor — my own repro's opening `retry: 100` record was silently
+  discarded); all three line terminators (`\r\n`, `\n`, bare `\r`) via `_split_sse_records`,
+  which holds back a trailing lone `\r` so a `\r\n` split across two chunks can't fabricate a
+  record boundary (the old per-chunk `.replace(b"\r\n", b"\n")` had exactly that bug latent
+  in it); a leading UTF-8 BOM is stripped once per connection. Stop conditions: a 2xx (other
+  than 204) whose `Content-Type` isn't `text/event-stream` raises `ValueError` (the existing
+  precedent for "the stream itself is malformed", cf. the missing-id error) — checked only on
+  2xx so `error_for_status=False` against a 500 still just yields nothing as before. This is
+  why `tests/test_sse.py`'s truncation tests moved off the generic `/truncated` endpoint
+  (`application/octet-stream`) onto `/events-truncated`. Test-server reconnect endpoints
+  (`/events-reconnect`, `/events-close-count`) key their per-connection counter on a `key`
+  query param (a `uuid4` per test) exactly like `/flaky` does, and simulate a *dropped*
+  connection the same way `/truncated` does — chunked transfer encoding with no terminating
+  zero-length frame — since a plain server-side close is a *clean* EOF to the client, which is
+  a different code path (`reconnect_on_close`) from the transport error a drop produces.
 - **`RequestInfo` must be captured *before* `.send()`, not after — a `ConsumedRequest`/
   `SyncConsumedRequest` genuinely can't be read once sent.** Confirmed live: reading `.url`/
   `.method` off the built request *after* calling `.send()` on it raises `RuntimeError: Request

@@ -60,6 +60,12 @@ async for event in client.sse("events", allow_missing_id=True):
 - **`allow_missing_id=True`** — a missing `id:` becomes `None` instead of raising; the coercion
   type still applies when `id:` *is* present.
 
+"Missing" follows the spec's *last event ID buffer* semantics, not "this record had no `id:`
+line": once the server has sent an `id:`, every later event inherits it until the server sends a
+new one, and only an explicit empty `id:` line clears it. So a server that sends `id:` on some
+events but not others never trips `allow_missing_id=False` — only a stream that has sent no `id:`
+at all yet does. The same buffer is what goes out as `Last-Event-ID` on a reconnect (below).
+
 A conversion failure (e.g. `int("not-a-number")`) propagates as whatever exception that type's
 constructor raises — it isn't wrapped, same as every other decode-library error in lothc.
 
@@ -152,12 +158,67 @@ stream mixing different event shapes decodes natively:
     in turn — see the
     [pydantic docs on discriminated unions](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions).
 
+## Timeouts
+
+The client's `timeout` **does not apply to `sse()`**. It's a total-request timeout — connect
+through end of body — and an SSE body is open-ended, so applying it would kill every healthy
+stream on schedule (with the default `timeout=30.0`, at the 30 second mark, as `HTTPTimeoutError`).
+`sse()` overrides it per request instead. Two knobs remain:
+
+- **`read_timeout`** on `build()` — the maximum idle gap between two consecutive chunks. This is
+  the right way to detect a stalled stream: a server that stops sending (without closing) trips it,
+  a server that keeps sending never does, however long the stream lives. Client-level, like
+  `connect_timeout` — see [Cookies, redirects, proxy & TLS](networking.md#connection-pooling).
+- **`timeout=`** on the `sse()` call itself — bounds one *connection attempt*, not the whole
+  stream. Rarely what you want; `read_timeout` usually is.
+
+Either one firing is a transport error, which the reconnect logic below handles like any other
+dropped connection.
+
+## Reconnecting — `max_reconnects`, `reconnect_delay`, `reconnect_on_close`
+
+A dropped connection (a transport error mid-stream, or a timeout) reconnects automatically,
+following the [WHATWG EventSource](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+processing model — the caller's loop never sees the seam:
+
+- The client waits `reconnect_delay` seconds (default `3.0`, the browser default) before
+  reconnecting. If the server has sent a `retry:` field (milliseconds), that value replaces the
+  caller's for the rest of the stream — the server knows its own restart time better than you do.
+- The reconnect request carries a `Last-Event-ID` header with the last id seen, so a
+  spec-compliant server resumes from the right place instead of replaying (or skipping) events.
+- `max_reconnects` (default `5`) caps **consecutive reconnects that yield no event** — the "server
+  is down" case. Every event received resets the count, so a flaky server that drops the
+  connection every few minutes is reconnected to indefinitely, while a dead one fails after
+  `max_reconnects` attempts and the transport error is raised. `None` means unlimited (browser
+  behavior); `0` disables reconnecting entirely and raises on the first drop.
+- A **clean close** ends the stream — `sse()` returns and the loop finishes — unless
+  `reconnect_on_close=True`, in which case a clean close reconnects too (again, browser behavior;
+  a server that always closes after a burst of events is reconnected to for as long as you keep
+  iterating). The same `max_reconnects` budget applies.
+- A **204** response always ends the stream, regardless of `reconnect_on_close` — it's the spec's
+  explicit "stop, and don't reconnect" signal.
+
+```python
+async for event in client.sse(
+    "events",
+    max_reconnects=None,  # keep reconnecting for as long as we iterate
+    reconnect_on_close=True,  # even when the server closes cleanly
+):
+    ...
+```
+
+Records without a `data:` line dispatch no event, but their `id:` and `retry:` fields still take
+effect — a server can prime the reconnect delay or the last-event-id before sending anything.
+
 ## Errors
 
-`error_for_status` (default `True`) is checked once, before the first event is yielded — a
-4xx/5xx response raises `HTTPResponseError` immediately rather than partway through iteration. Once
-streaming has started, a dropped connection raises the usual `HTTPTransportError` family. See
-[Error handling](errors.md).
+`error_for_status` (default `True`) is checked once per connection, before its first event is
+yielded — a 4xx/5xx response raises `HTTPResponseError` immediately rather than partway through
+iteration, and (per spec) is never reconnected. A 2xx response whose `Content-Type` isn't
+`text/event-stream` raises `ValueError` — it isn't a stream, and parsing it as one would just
+silently yield nothing. Once streaming has started, a dropped connection reconnects as described
+above; only once the reconnect budget is exhausted does the usual `HTTPTransportError` family
+propagate. See [Error handling](errors.md).
 
 ## Ctrl-C-interruptible streaming (sync only) — `interruptible`
 

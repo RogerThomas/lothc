@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import cast
 
 from rich.console import Console
+from rich.measure import Measurement
 from rich.table import Table
 
 _IMPROVED_THRESHOLD = 0.98
@@ -79,11 +80,29 @@ def _format_ratio(ratio: float | None) -> str:
     return f"{ratio:.2f}x"
 
 
+def _print_table_unwrapped(console: Console, table: Table) -> None:
+    """Print `table` at its natural width so no cell is ever wrapped or ellipsised.
+
+    rich sizes a table to the console it's printed on and, when that's too narrow, either
+    wraps cell text onto extra lines or (with `no_wrap`) truncates it with an ellipsis — both
+    make a numeric results table unreadable. Non-TTY runs (e.g. `docker compose run`, CI logs)
+    are the worst case: rich assumes 80 columns there. Measuring against an effectively
+    unbounded width and printing through a console at least that wide sidesteps both.
+    """
+    natural_width = Measurement.get(console, console.options.update_width(10_000), table).maximum
+    original_width = console.width
+    console.width = max(original_width, natural_width)
+    try:
+        console.print(table)
+    finally:
+        console.width = original_width
+
+
 def _add_row(
     table: Table, label: str, before: dict[str, float] | None, after: dict[str, float]
 ) -> None:
-    time_str = f"{after['time'] * 1000:.2f}ms"
-    mem_str = f"{after['peakmem'] / (1024 * 1024):.1f}MB"
+    time_str = f"{after['time'] * 1000:.2f}"
+    mem_str = f"{after['peakmem'] / (1024 * 1024):.2f}"
     time_ratio = after["time"] / before["time"] if before and before["time"] else None
     mem_ratio = after["peakmem"] / before["peakmem"] if before and before["peakmem"] else None
     table.add_row(label, time_str, _format_ratio(time_ratio), mem_str, _format_ratio(mem_ratio))
@@ -126,12 +145,12 @@ def main(
 
     before = history[against]
     table = Table(title=f"bench-check: {against} → {current_hash}")
-    table.add_column("Benchmark", style="cyan")
-    table.add_column("Time", justify="right")
-    table.add_column("Time Δ", justify="right")
-    table.add_column("Peak Mem", justify="right")
-    table.add_column("Mem Δ", justify="right")
+    table.add_column("Benchmark", style="cyan", no_wrap=True)
+    table.add_column("Time (ms)", justify="right", no_wrap=True)
+    table.add_column("Time Δ", justify="right", no_wrap=True)
+    table.add_column("Peak Mem (MB)", justify="right", no_wrap=True)
+    table.add_column("Mem Δ", justify="right", no_wrap=True)
     for label, after in results.items():
         _add_row(table, label, before.get(label), after)
     console.print(f"lothc hash: [bold cyan]{current_hash}[/bold cyan]")
-    console.print(table)
+    _print_table_unwrapped(console, table)
