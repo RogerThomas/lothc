@@ -475,14 +475,22 @@ Before writing any code, tell the user that you've read this file AND read and f
   `functools.partial(HTTPClient.build, ...)`. Confirmed on all four checkers that the bare
   classmethod and a `partial` of it are both assignable. (19) `_decode_token_response` is gone:
   `TokenResponseTyping` is now a union of two private Protocols that each inherit `_compat.py`'s
-  structural `StructTyping`/`BaseModelTyping` plus the three token fields, so
-  `type[TokenResponseTyping]` is itself a valid `response_data_type=` and `_post_model` calls
-  `client.post(..., response_data_type=token_response)` directly — zero casts on all four
-  checkers with the test suite's real pydantic and msgspec models, and a model missing
-  `expires_in` is rejected at the call site by all four. (20) A `token_cache_path` whose parent
-  directory doesn't exist is a `FileNotFoundError` at construction (`_validate_provider_config`),
-  not a failure on the first write. pylint `max-attributes` went 13 → 15 for the extra
-  `_default_expires_in`/`_client_factory`/`_lock_loop` attributes.
+  structural `StructTyping`/`BaseModelTyping` plus `_TokenFieldsTyping` (`access_token`,
+  `expires_in` only), so `type[TokenResponseTyping]` is itself a valid `response_data_type=` and
+  `_post_model` calls `client.post(..., response_data_type=token_response)` directly — zero casts
+  on all four checkers with the test suite's real pydantic and msgspec models, and a model
+  missing `expires_in` is rejected at the call site by all four. (20) A `token_cache_path` whose
+  parent directory doesn't exist is a `FileNotFoundError` at construction
+  (`_validate_provider_config`), not a failure on the first write. pylint `max-attributes` went
+  13 → 15 for the extra `_default_expires_in`/`_client_factory`/`_lock_loop` attributes. (21)
+  `refresh_token` is deliberately NOT part of `_TokenFieldsTyping` — RFC 6749 §5.1 makes it
+  OPTIONAL, and the first cut of this protocol required it anyway, forcing every
+  `token_response=` model to declare `refresh_token: str | None = None` even for an API that
+  never issues one at all. `_token_from_model` reads it with
+  `getattr(model, "refresh_token", None)` instead, so a model that omits the field entirely is
+  just as valid as one that declares it; `getattr`'s typeshed overload returns `Any | None`,
+  which basedpyright's strict mode accepts with no cast and no `reportAny` hit (this project
+  doesn't enable that rule).
 - **`sse()` never lets the client's total `timeout` touch the stream, and reconnects per the
   WHATWG EventSource model.** Found in real use: every SSE stream died with `HTTPTimeoutError`
   at exactly the client's `timeout` (30s by default) — reqwest's `timeout` runs from connect

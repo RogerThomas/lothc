@@ -74,6 +74,13 @@ class _MsgspecOptionalExpiresTokenResponse(msgspec.Struct):
     refresh_token: str | None = msgspec.field(default=None, name="refreshToken")
 
 
+# No `refresh_token` field at all — an API that never issues one shouldn't force one onto the
+# model just to satisfy `token_response=`.
+class _NoRefreshFieldTokenResponse(BaseModel):
+    access_token: str = Field(alias="accessToken")
+    expires_in: int = Field(alias="expiresInSeconds")
+
+
 def _headers(result: dict[str, Any]) -> dict[str, str]:
     return {h["name"].lower(): h["value"] for h in result["headers"]}
 
@@ -414,6 +421,38 @@ async def test_custom_msgspec_models_send_json_token_request(
         "clientSecret": "client-secret",
         "grantType": "client_credentials",
     }
+
+
+async def test_custom_pydantic_model_with_no_refresh_token_field_works(base_url: str) -> None:
+    key = str(uuid4())
+    provider = OAuthProvider(
+        token_url=f"{base_url}oauth/token-custom?key={key}",
+        client_id="client-id",
+        client_secret="client-secret",
+        token_request=_TokenRequest,
+        token_response=_NoRefreshFieldTokenResponse,
+    )
+
+    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+        bearer = await _bearer(api)
+
+    assert bearer == "Bearer token-1"
+
+
+def test_sync_custom_pydantic_model_with_no_refresh_token_field_works(base_url: str) -> None:
+    key = str(uuid4())
+    provider = SyncOAuthProvider(
+        token_url=f"{base_url}oauth/token-custom?key={key}",
+        client_id="client-id",
+        client_secret="client-secret",
+        token_request=_TokenRequest,
+        token_response=_NoRefreshFieldTokenResponse,
+    )
+
+    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+        bearer = _sync_bearer(api)
+
+    assert bearer == "Bearer token-1"
 
 
 async def test_custom_models_refresh_with_token_refresh_request(

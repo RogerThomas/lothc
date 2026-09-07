@@ -194,8 +194,10 @@ them. The contract is on the *attribute* names, never the *wire* names:
 
 - `token_request` must be constructible as `Cls(client_id=..., client_secret=...)`; any other
   field it declares (`grant_type`, `audience`, ...) needs a default.
-- `token_response` must expose `.access_token: str`, `.expires_in: int` (or `int | None`, with
-  `default_expires_in` covering the `None`) and `.refresh_token: str | None`.
+- `token_response` must expose `.access_token: str` and `.expires_in: int` (or `int | None`,
+  with `default_expires_in` covering the `None`). `.refresh_token` is read if present
+  (`getattr(..., "refresh_token", None)`) but isn't required — an API that never issues one
+  needs no field for it at all.
 - `token_refresh_request`, optional, must be constructible as `Cls(refresh_token=...)`. Without
   it, renewal always means minting a fresh token, even if the response carried a
   `refresh_token` — lothc has no way to know how this API spells a refresh request.
@@ -218,10 +220,8 @@ class TokenRequest(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str = Field(alias="accessToken")
     expires_in: int = Field(alias="expiresIn")
-    # This API never returns a refresh token. The attribute is still required by the contract,
-    # so declare it with a `None` default; leave `token_refresh_request` out and renewal simply
-    # mints a fresh token every time.
-    refresh_token: str | None = Field(default=None, alias="refreshToken")
+    # This API never returns a refresh token, so there's no field for it at all — leave
+    # `token_refresh_request` out too, and renewal simply mints a fresh token every time.
 
 
 OAuthProvider(
@@ -259,12 +259,18 @@ class TokenRequest(msgspec.Struct):
 class TokenResponse(msgspec.Struct):
     access_token: str = msgspec.field(name="accessToken")
     expires_in: int = msgspec.field(name="expiresIn")
-    refresh_token: str | None = msgspec.field(default=None, name="refreshToken")
 ```
 
-If the API does issue refresh tokens, add a third model for the refresh call:
+If the API does issue refresh tokens, declare `refresh_token` on the response model (it's
+read if present, see above) and add a third model for the refresh call:
 
 ```python
+class TokenResponse(BaseModel):
+    access_token: str = Field(alias="accessToken")
+    expires_in: int = Field(alias="expiresIn")
+    refresh_token: str | None = Field(default=None, alias="refreshToken")
+
+
 class TokenRefreshRequest(BaseModel):
     model_config = ConfigDict(validate_by_name=True, serialize_by_alias=True)
 

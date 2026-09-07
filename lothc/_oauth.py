@@ -48,15 +48,19 @@ type TokenRefreshRequestTyping = Callable[..., JSONPayload]
 
 
 class _TokenFieldsTyping(Protocol):
-    """The three attributes every `token_response=` class must expose. `expires_in` may be
-    `None` (the model declares it optional) — `default_expires_in` then fills it in."""
+    """The two attributes every `token_response=` class must expose. `expires_in` may be
+    `None` (the model declares it optional) — `default_expires_in` then fills it in.
+
+    `refresh_token` is deliberately NOT a required member here: an API that never issues one
+    (there is no obligation to under RFC 6749 §5.1 — it's OPTIONAL) shouldn't force every
+    `token_response=` model to declare a field it will always leave `None`. `_token_from_model`
+    reads it with `getattr(..., "refresh_token", None)` instead, so a model that omits the field
+    entirely is just as valid as one that declares it."""
 
     @property
     def access_token(self) -> str: ...
     @property
     def expires_in(self) -> int | None: ...
-    @property
-    def refresh_token(self) -> str | None: ...
 
 
 class _StructTokenResponseTyping(StructTyping, _TokenFieldsTyping, Protocol): ...
@@ -200,7 +204,8 @@ def _token_from_model(
     model: TokenResponseTyping, default_expires_in: float | None, now: float
 ) -> _CachedToken:
     expires_in = _resolve_expires_in(model.expires_in, default_expires_in)
-    return _token_from_expires_in(model.access_token, expires_in, model.refresh_token, now)
+    refresh_token = getattr(model, "refresh_token", None)
+    return _token_from_expires_in(model.access_token, expires_in, refresh_token, now)
 
 
 def _carry_refresh_token(refreshed: _CachedToken, previous: _CachedToken) -> _CachedToken:

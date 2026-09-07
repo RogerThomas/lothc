@@ -41,7 +41,7 @@ OAuthProvider(
     client_auth="basic",  # "basic" (HTTP Basic header, RFC default) | "body" (form fields)
     token_request=None,  # non-RFC APIs: class constructible as Cls(client_id=, client_secret=)
     token_refresh_request=None,  # optional, Cls(refresh_token=); without it renewal always mints
-    token_response=None,  # class with .access_token / .expires_in / .refresh_token (str | None)
+    token_response=None,  # class with .access_token / .expires_in; .refresh_token read if present, not required
     refresh_leeway=300.0,  # renew once fewer than this many seconds remain (clamped to expires_in / 2)
     default_expires_in=None,  # lifetime to assume when the response has no expires_in; else error
     token_cache_path=None,  # Path: JSON, atomic replace, 0600, keyed on token_url + client_id + scope;
@@ -55,7 +55,9 @@ RFC path (no models): form-encoded `grant_type=client_credentials`/`grant_type=r
 Basic header built by lothc with each half `quote(..., safe="")`-encoded (RFC 6749 §2.3.1).
 Model path: request instance sent as `json=`, `client_auth` ignored, `token_request` +
 `token_response` both or neither; `token_response` needs `.access_token: str`,
-`.expires_in: int | None`, `.refresh_token: str | None`. Aliased pydantic request models need
+`.expires_in: int | None` — `.refresh_token` is read via `getattr(..., "refresh_token", None)`
+if the model declares it, but an API that never issues one needs no field for it at all.
+Aliased pydantic request models need
 `ConfigDict(validate_by_name=True, serialize_by_alias=True)` (lothc's `json=` dumps without
 `by_alias`); msgspec `field(name=...)` needs nothing. Renewal: refresh if a `refresh_token` is
 held and refreshing is possible (a refresh response without one keeps the old one), 400 on
