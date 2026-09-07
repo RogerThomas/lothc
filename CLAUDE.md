@@ -103,7 +103,13 @@ client-level only, same as redirects/proxy/cookies above), and request metadata
 (`get_result`/`post_result`/`put_result`/`patch_result`/`delete_result`/`head`) and on
 `HTTPResponseError` itself (every verb, including `sse`/`stream_get`/`stream_post`/`download` —
 knowing which request failed matters more than which one succeeded, especially with several in
-flight concurrently).
+flight concurrently), and OAuth 2 client credentials (`OAuthProvider`/`SyncOAuthProvider` in
+`lothc/_oauth.py`, a ready-made `bearer_auth` provider: RFC 6749 form-encoded mint/refresh with
+`client_auth="basic"|"body"` + `scope`, or a non-RFC JSON endpoint described by the user's own
+`token_request`/`token_refresh_request`/`token_response` pydantic/msgspec classes; leeway-based
+renewal (`refresh_leeway`, default 300s), refresh-then-fallback-to-mint on a 4xx, one renewal
+under concurrency via a lock, and an optional `token_cache_path` — atomic `0600` JSON, keyed on
+`token_url` + `client_id` — see the OAuth dev note below).
 
 Not done yet: nothing outstanding right now — see git history/this file's own dev-notes below for
 what's landed and why.
@@ -340,7 +346,11 @@ benchmarks here:
 Everything lives in `lothc/_client.py` (one file, deliberately — split it once it earns a split).
 `lothc/__init__.py` re-exports the public surface. `lothc/_compat.py` isolates the optional
 pydantic/msgspec imports (`TYPE_CHECKING` block + runtime `try/except ImportError` with stub
-fallback classes).
+fallback classes). `lothc/_oauth.py` (`OAuthProvider`/`SyncOAuthProvider`) is a separate module
+not because `_client.py` earned a split, but because it's a utility built *on* the client — it
+imports `HTTPClient`/`SyncHTTPClient` and opens a short-lived one per token request — and plugs
+into the existing `bearer_auth` slot as a plain callable; the clients themselves gained no new
+parameter for it and know nothing about it.
 
 ### The two clients
 
@@ -374,6 +384,56 @@ Before writing any code, tell the user that you've read this file AND read and f
 
 ## Development notes
 
+- **`OAuthProvider`/`SyncOAuthProvider` (`lothc/_oauth.py`) — the non-obvious findings.**
+  (1) lothc's `form=` is multipart only (`request_builder.multipart(...)`), there is no
+  urlencoded form option, so the RFC 6749 token request is sent as
+  `content=urllib.parse.urlencode({...})` with an explicit per-request
+  `headers={"content-type": "application/x-www-form-urlencoded"}` — confirmed via the test
+  server recording exactly that content type. (2) `_attach_body` encodes a pydantic `json=`
+  payload via `model_dump(mode="json")` with no `by_alias=True`, so an *aliased* pydantic
+  request model needs `model_config = ConfigDict(validate_by_name=True,
+  serialize_by_alias=True)` (`validate_by_name` so lothc can construct it as
+  `Cls(client_id=..., client_secret=...)`, `serialize_by_alias` so the aliases go over the
+  wire); confirmed against a real non-RFC endpoint — with the config: 200, without it: `400
+  "clientID must not be blank"`. msgspec `field(name=...)` needs nothing. `_attach_body` was
+  deliberately left alone: this is documented in `docs/auth.md` instead, since it applies to any
+  aliased pydantic `json=` payload, not just this one. (3) Both provider classes are plain
+  classes with an explicit keyword-only `__init__`, not `@dataclass(kw_only=True)` — the plan's
+  own decision procedure: written as a dataclass first, then `uv run zuban check tests` on a test
+  passing one as `bearer_auth=` produced `Argument "bearer_auth" to "build" of "HTTPClient" has
+  incompatible type "OAuthProvider"; expected "Callable[[], Awaitable[str]] | None"  [arg-type]`
+  (and the sync mirror) while basedpyright/mypy/ty all accepted it — the exact zuban quirk
+  `tests/test_auth.py`'s `_CountingAuthProvider` already documents. The plain class passes all
+  four. (4) `TokenRequestTyping`/`TokenRefreshRequestTyping` are `Callable[..., JSONPayload]`
+  aliases, not `Protocol`s with the exact `(*, client_id: str, client_secret: str)` keyword
+  signature: that Protocol was tried first and confirmed live to accept a msgspec `Struct` on all
+  four checkers but to reject an aliased pydantic model on basedpyright, mypy AND zuban (ty
+  accepted) — pydantic's `Field(alias=...)` is a `dataclass_transform` field specifier, so the
+  checkers synthesize the constructor as `(*, clientID: str, clientSecret: str, ...)` (verbatim
+  from basedpyright: `Extra parameter "clientID" / Missing keyword parameter "client_id"`), even
+  though `validate_by_name=True` makes `Cls(client_id=...)` work at runtime. Since an aliased
+  request model *is* the model path's main use case, `...` keeps the return-type check (must be a
+  valid `json=` payload) and leaves kwargs to the runtime. `TokenResponseTyping` stays a real
+  property-based Protocol — attribute reads have no such alias problem. A request-only pydantic
+  model can also use `Field(serialization_alias=...)` + `ConfigDict(serialize_by_alias=True)`
+  with no `validate_by_name` at all, confirmed on all four checkers and at runtime. (5)
+  `_CachedToken.expires_at` is wall-clock `time.time()`, never `time.monotonic()`, because it's
+  persisted to the cache file and read back by a later process where a monotonic reading is
+  meaningless. In the file it's an ISO 8601 UTC string at whole-second precision (`2026-09-08T10:56:40Z`, floored), not the raw epoch float — the file's only reader is a human checking why a token did or didn't renew; `_format_expires_at`/`_parse_expires_at` convert at the boundary and the in-memory value stays a float for the timestamp compare. A naive timestamp in the file is rejected as unusable (→ re-mint) rather than guessed at. (6) `client_auth` is ignored on the model path: the request model carries the
+  credentials, and sending them a second time as HTTP Basic would be wrong for an API that
+  doesn't speak RFC 6749 in the first place. (7) No subclass override hooks (e.g. a public
+  `mint()`/`refresh()` to override) were added, deliberately: `__call__` would then have to call
+  those public methods, which style-guide.md §10 forbids; the private `_mint`/`_refresh` split is
+  the extension seam if that's ever wanted, a decision for later. (8) The cache write is plain
+  sync file IO inside the async `__call__` — a few hundred bytes, once per token lifetime — via
+  `tempfile.mkstemp` (which is exactly `O_EXCL` + `0600` in the same directory) then
+  `Path.replace`. (9) pylint's `max-attributes` was bumped 7 → 13 in `pyproject.toml` for these
+  two classes (11 keyword-only options + token + lock), and `S105` joined `S106` in the tests
+  per-file-ignores — both hardcoded-password false positives on literal test values like
+  `"token-1"`. Test server: `POST /oauth/token` (RFC), `/oauth/token-custom` (JSON, camelCase),
+  `/oauth/token-boom` (500), each recording what it received per `key` into a `_token_requests`
+  ClassVar, read back via `GET /oauth/token-requests?key=` so `tests/test_oauth.py` asserts wire
+  shape through a public endpoint, never via provider internals.
 - **`sse()` never lets the client's total `timeout` touch the stream, and reconnects per the
   WHATWG EventSource model.** Found in real use: every SSE stream died with `HTTPTimeoutError`
   at exactly the client's `timeout` (30s by default) — reqwest's `timeout` runs from connect

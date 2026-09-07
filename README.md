@@ -88,7 +88,7 @@ validate yourself. See [Benchmarks](docs/benchmarks.md) for what that costs (usu
 | **Precise static types** | Every verb is paired `@overload`s, not a cast-laden generic — your editor knows the exact return type. |
 | **SSE & streaming** | Spec-compliant SSE — automatic reconnect with `Last-Event-ID`, server `retry:` honored, typed decode (discriminated unions included) — plus raw or NDJSON-typed `stream_get`/`stream_post` — see [SSE](docs/sse.md) / [Streaming](docs/streaming.md). |
 | **Retries with real backoff** | `max_retries`/`retry_methods`, a genuine pyreqwest middleware hook, `Retry-After`-aware — see [Retries](docs/retries.md). |
-| **Authentication** | Static `bearer_token`, a per-request-refreshed `bearer_auth`, or `default_headers` for anything else — see [Authentication](docs/auth.md). |
+| **Authentication** | Static `bearer_token`, a per-request-refreshed `bearer_auth`, `basic_auth`, or `default_headers` for anything else — plus a ready-made OAuth 2 client-credentials provider (`OAuthProvider`: mint, leeway-based renewal, refresh-then-mint fallback, optional on-disk token cache) — see [Authentication](docs/auth.md). |
 | **Cookies, redirects, proxy** | `cookie_store`, `follow_redirects`/`max_redirects`, `proxy=` — see [Networking](docs/networking.md). |
 | **A real error hierarchy** | `HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError` for no response, `HTTPResponseError` for 4xx/5xx — see [Error handling](docs/errors.md). |
 | **Everything optional** | pydantic, msgspec — works with neither, either, or both installed. |

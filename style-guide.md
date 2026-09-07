@@ -15,6 +15,7 @@
 - [8. Use `create_autospec` for mocking in tests](#8-use-create_autospec-for-mocking-in-tests)
 - [9. Almost never use globals](#9-almost-never-use-globals)
 - [10. Public methods should never call other public methods](#10-public-methods-should-never-call-other-public-methods)
+- [11. Keep `try`/`except` blocks as small as possible](#11-keep-tryexcept-blocks-as-small-as-possible)
 
 <!-- mdformat-toc end -->
 
@@ -157,6 +158,8 @@ Also, prefer inlining these simple test values directly at the call site rather 
 
 Private methods and functions (those prefixed with `_`) should be defined before the public methods that call them. This improves code readability by following a logical flow where dependencies are defined before their usage.
 
+**All of a class's private methods go in one block, before any public method** — not merely somewhere above the caller. When adding a private to an existing class, put it with the other privates rather than next to the public method that uses it. Interleaving the two (public, private, public) is what this rule exists to prevent, and satisfying "before its caller" locally is not enough.
+
 Note: This differs from languages like Java where private methods are typically placed after public methods. PEP 8 doesn't specify ordering for private vs public methods, so this is a deliberate, project-specific convention for Python development here.
 
 **Good**
@@ -193,6 +196,21 @@ class DocumentProcessor:
     def _extract_metadata(self, doc: bytes) -> dict:
         # Private extraction logic
         return {}
+```
+
+**Also bad** — the private is above its caller, but sits between two public methods:
+
+```Python
+class DocumentProcessor:
+    def process_document(self, doc: bytes) -> dict:
+        return {}
+
+    def _extract_metadata(self, doc: bytes) -> dict:
+        # Private extraction logic
+        return {}
+
+    def summarise_document(self, doc: bytes) -> str:
+        return str(self._extract_metadata(doc))
 ```
 
 ## 6. Never test private methods/functions — public interface only<a name="6-never-test-private-methodsfunctions--public-interface-only"></a>
@@ -362,4 +380,49 @@ class Example:
     def public1(self) -> None:
         thing = self.thing()  # Should call a private method instead
         ...
+```
+
+## 11. Keep `try`/`except` blocks as small as possible<a name="11-keep-tryexcept-blocks-as-small-as-possible"></a>
+
+Only wrap the line(s) that can actually raise the exception being handled — not surrounding code that can't. A wider `try` block risks catching an unrelated error and mishandling it as if it were the expected one, and makes it unclear which line is actually expected to fail.
+
+**Good**
+
+```Python
+try:
+    value = lookup["key"]
+except KeyError:
+    ...
+```
+
+**Bad** — `logger.info` is inside the `try`, so a bug in it would be caught as if it were the `KeyError`:
+
+```Python
+try:
+    value = lookup["key"]
+    logger.info(f"Got {value}")
+except KeyError:
+    ...
+```
+
+If you genuinely need to catch a broad exception (e.g. `except Exception`) around code that can't be reduced to a line or two, extract that code into a helper function and wrap the call to it, rather than wrapping the code inline. This keeps the `try` block itself minimal while still covering everything the operation can raise.
+
+**Good**
+
+```Python
+try:
+    helper_func()
+except Exception:
+    ...
+```
+
+**Bad**
+
+```Python
+try:
+    lots()
+    of()
+    code()
+except Exception:
+    ...
 ```

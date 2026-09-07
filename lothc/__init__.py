@@ -18,6 +18,13 @@ from ._client import (
     SyncHTTPClient,
     TypedHeaders,
 )
+from ._oauth import (
+    OAuthProvider,
+    SyncOAuthProvider,
+    TokenRefreshRequestTyping,
+    TokenRequestTyping,
+    TokenResponseTyping,
+)
 
 __all__ = [
     "AuthProvider",
@@ -31,11 +38,16 @@ __all__ = [
     "HTTPTransportError",
     "Headers",
     "JSONPayload",
+    "OAuthProvider",
     "Params",
     "RequestInfo",
     "Result",
     "SSEEvent",
     "SyncAuthProvider",
     "SyncHTTPClient",
+    "SyncOAuthProvider",
+    "TokenRefreshRequestTyping",
+    "TokenRequestTyping",
+    "TokenResponseTyping",
     "TypedHeaders",
 ]

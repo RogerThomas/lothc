@@ -23,8 +23,38 @@ async with HTTPClient.build(
 ```
 
 `bearer_token: str` (static) xor `bearer_auth: Callable[[], Awaitable[str]]` (sync client:
-`Callable[[], str]`) — resolved fresh per request, at most one of the two. `default_headers`
+`Callable[[], str]`) — resolved fresh per request, at most one of the two (see OAuth below for a
+ready-made `bearer_auth`). `default_headers`
 sent on every request. `cookie_store=True` = in-memory jar. `proxy: str | None`.
+
+## OAuth 2 client credentials (`lothc/_oauth.py`)
+
+`OAuthProvider` (async) / `SyncOAuthProvider` (sync) are ready-made `bearer_auth` providers —
+pass an instance as `bearer_auth=`, no new client parameter. All keyword-only:
+
+```python
+OAuthProvider(
+    token_url=...,
+    client_id=...,
+    client_secret=...,
+    scope=None,  # RFC path only
+    client_auth="basic",  # "basic" (HTTP Basic header, RFC default) | "body" (form fields)
+    token_request=None,  # non-RFC APIs: class constructible as Cls(client_id=, client_secret=)
+    token_refresh_request=None,  # optional, Cls(refresh_token=); without it renewal always mints
+    token_response=None,  # class with .access_token / .expires_in / .refresh_token (str | None)
+    refresh_leeway=300.0,  # renew once fewer than this many seconds remain
+    token_cache_path=None,  # Path: JSON, atomic replace, 0600, keyed on token_url + client_id
+    timeout=30.0,  # for the token-endpoint client only
+)
+```
+
+RFC path (no models): form-encoded `grant_type=client_credentials`/`grant_type=refresh_token`.
+Model path: request instance sent as `json=`, `client_auth` ignored, `token_request` +
+`token_response` both or neither. Aliased pydantic request models need
+`ConfigDict(validate_by_name=True, serialize_by_alias=True)` (lothc's `json=` dumps without
+`by_alias`); msgspec `field(name=...)` needs nothing. Renewal: refresh if a `refresh_token` is
+held and refreshing is possible, 4xx on refresh → mint; 5xx/transport/decode errors propagate.
+One renewal under concurrency (lock).
 
 ## Decode targets (`response_data_type`, default `bytes`)
 

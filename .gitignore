@@ -27,3 +27,7 @@ run_*.py
 /.asv/
 /asv_bench/_data/
 /asv_bench/.quick_check_history.json
+
+# Local OAuth smoke-test script + its token cache (holds a live token)
+tmp.py
+tmp.json
