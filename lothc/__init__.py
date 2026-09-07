@@ -20,6 +20,7 @@ from ._client import (
 )
 from ._oauth import (
     OAuthProvider,
+    OAuthTokenError,
     SyncOAuthProvider,
     TokenRefreshRequestTyping,
     TokenRequestTyping,
@@ -39,6 +40,7 @@ __all__ = [
     "Headers",
     "JSONPayload",
     "OAuthProvider",
+    "OAuthTokenError",
     "Params",
     "RequestInfo",
     "Result",

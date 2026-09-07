@@ -355,8 +355,19 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self._token_requests.setdefault(key, []).append({
             "content_type": self.headers.get("Content-Type"),
             "authorization": self.headers.get("Authorization"),
+            "headers": {name.lower(): value for name, value in self.headers.items()},
             "body": body,
         })
+
+    @staticmethod
+    def _refresh_failure_status(params: dict[str, list[str]]) -> int | None:
+        # `refresh_status=<int>` fails a refresh with that status; `refresh_fails=1` is the
+        # RFC's own `400 invalid_grant`. Neither → the refresh succeeds.
+        if "refresh_status" in params:
+            return int(params["refresh_status"][0])
+        if params.get("refresh_fails", ["0"])[0] == "1":
+            return 400
+        return None
 
     def _handle_oauth_token(self, query: str) -> None:
         # RFC 6749 token endpoint: form-encoded body, standard JSON response. Credentials are
@@ -369,15 +380,18 @@ class TestAppHandler(BaseHTTPRequestHandler):
         }
         self._record_token_request(key, form)
         attempt = self._bump_counter(key)
-        if form["grant_type"] == "refresh_token" and params.get("refresh_fails", ["0"])[0] == "1":
-            self._write_json(400, {"error": "invalid_grant"})
+        is_refresh = form["grant_type"] == "refresh_token"
+        refresh_failure_status = self._refresh_failure_status(params)
+        if is_refresh and refresh_failure_status is not None:
+            self._write_json(refresh_failure_status, {"error": "invalid_grant"})
             return
-        payload: dict[str, object] = {
-            "access_token": f"token-{attempt}",
-            "token_type": "Bearer",
-            "expires_in": int(params.get("expires_in", ["3600"])[0]),
-        }
-        if params.get("with_refresh", ["0"])[0] == "1":
+        payload: dict[str, object] = {"access_token": f"token-{attempt}", "token_type": "Bearer"}
+        if params.get("omit_expires_in", ["0"])[0] != "1":
+            payload["expires_in"] = int(params.get("expires_in", ["3600"])[0])
+        # `refresh_omits_token=1`: the refresh response has no `refresh_token` key at all (RFC
+        # 6749 §6 allows this — the old one stays valid); a mint still includes one.
+        omits_refresh_token = is_refresh and params.get("refresh_omits_token", ["0"])[0] == "1"
+        if params.get("with_refresh", ["0"])[0] == "1" and not omits_refresh_token:
             payload["refresh_token"] = f"refresh-{attempt}"
         self._write_json(200, payload)
 
@@ -387,10 +401,9 @@ class TestAppHandler(BaseHTTPRequestHandler):
         key = params["key"][0]
         self._record_token_request(key, self._read_json_body())
         attempt = self._bump_counter(key)
-        payload: dict[str, object] = {
-            "accessToken": f"token-{attempt}",
-            "expiresInSeconds": int(params.get("expires_in", ["3600"])[0]),
-        }
+        payload: dict[str, object] = {"accessToken": f"token-{attempt}"}
+        if params.get("omit_expires_in", ["0"])[0] != "1":
+            payload["expiresInSeconds"] = int(params.get("expires_in", ["3600"])[0])
         if params.get("with_refresh", ["0"])[0] == "1":
             payload["refreshToken"] = f"refresh-{attempt}"
         self._write_json(200, payload)

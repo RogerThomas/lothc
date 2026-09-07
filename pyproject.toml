@@ -214,10 +214,11 @@ disable = [
 ]
 
 [tool.pylint.design]
-max-attributes = 13 # `OAuthProvider`/`SyncOAuthProvider` (lothc/_oauth.py) store every one of
-# their 11 keyword-only constructor options as a private attribute plus the cached token and the
-# lock — 13, over pylint's default 7. Grouping the options into a config DTO would just move the
-# same 11 names one attribute access further away from the code that reads them, for no gain
+max-attributes = 15 # `OAuthProvider`/`SyncOAuthProvider` (lothc/_oauth.py) store every one of
+# their 12 keyword-only constructor options as a private attribute plus the cached token, the
+# lock and (async only) the loop the lock belongs to — 15, over pylint's default 7. Grouping the
+# options into a config DTO would just move the same 12 names one attribute access further away
+# from the code that reads them, for no gain
 max-locals = 28 # one real case (the streaming line-buffering generator) legitimately needs a
 # couple more than pylint's default 15 — matches this project's own mccabe complexity ceiling
 # ([tool.ruff.lint.mccabe] max-complexity = 15) in spirit, just a different metric. Bumped again,

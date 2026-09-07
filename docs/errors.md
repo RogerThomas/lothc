@@ -56,3 +56,30 @@ A validation error from whichever decode library you picked (`pydantic.Validatio
 `msgspec.ValidationError`) is never wrapped, on either the success (`response_data_type`) or
 error (`error_type`) path — it propagates as-is, since choosing that library is opting into its
 own exception too.
+
+## `OAuthTokenError`
+
+The one exception to the rule above. `OAuthProvider`/`SyncOAuthProvider` (see
+[Authentication](auth.md#oauth-2-client-credentials)) run *inside* whatever request needed the
+token, so a failure at the token endpoint would otherwise surface as a failure of that unrelated
+call — an `HTTPResponseError` whose `.status` is really the auth server's, a
+`pydantic.ValidationError` from a token response you never asked that call to decode. Every
+failure to obtain a token is therefore raised as `OAuthTokenError`, with the original exception as
+`__cause__` and the endpoint in `.token_url`:
+
+```python
+from lothc import HTTPClient, HTTPResponseError, OAuthProvider, OAuthTokenError
+
+async with HTTPClient.build(base_url=..., bearer_auth=OAuthProvider(...)) as client:
+    try:
+        await client.get("items/7")
+    except OAuthTokenError as e:
+        print(e.token_url)  # the token endpoint, not "items/7"
+        if isinstance(e.__cause__, HTTPResponseError):
+            print(e.__cause__.status)  # what the token endpoint answered
+    except HTTPResponseError as e:
+        print(e.status)  # an error from "items/7" itself
+```
+
+A `response_data_type`/`error_type` decode error is never wrapped because it already belongs to
+the call that raised it; a token decode error is wrapped because it doesn't.

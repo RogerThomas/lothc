@@ -86,11 +86,18 @@ async with HTTPClient.build(
 
 The defaults do exactly what the RFC says: `POST token_url` as
 `application/x-www-form-urlencoded` with `grant_type=client_credentials`, the client credentials
-as an HTTP Basic `Authorization` header (the RFC's preferred placement), and the standard
+as an HTTP Basic `Authorization` header (the RFC's preferred placement, with each half
+percent-encoded first per [§2.3.1](https://www.rfc-editor.org/rfc/rfc6749#section-2.3.1), so a
+secret containing `:`, `%`, `+` or a space survives the trip), and the standard
 `access_token`/`expires_in`/`refresh_token` JSON fields decoded from the response. Two optional
 knobs on that request: `scope="read:things write:things"` adds a `scope` field, and
 `client_auth="body"` puts `client_id`/`client_secret` in the form body instead of the header,
 for servers that only accept them there.
+
+`expires_in` is only RECOMMENDED by the RFC, and some servers leave it out. Pass
+`default_expires_in=3600.0` to tell lothc how long such a token should be trusted for; without
+it, a response with no `expires_in` is an error (`OAuthTokenError`, see below) rather than a
+token cached forever.
 
 ### Token lifecycle
 
@@ -98,19 +105,42 @@ for servers that only accept them there.
   sent one) and an absolute expiry, `now + expires_in`.
 - Every later request is a timestamp compare, no lock, no HTTP — until fewer than
   `refresh_leeway` seconds (default `300.0`, i.e. five minutes) remain, at which point the token
-  is treated as already expired and renewed.
+  is treated as already expired and renewed. The leeway is clamped to half the token's own
+  lifetime, so a server that hands out 60-second tokens gets a 30-second leeway rather than a
+  token that's "expired" the moment it arrives and re-minted on every call.
 - Renewal prefers a refresh: if the last response carried a `refresh_token`, it sends
-  `grant_type=refresh_token`. If it didn't, or the refresh is rejected with a 4xx (a `400
-  invalid_grant` because the refresh token itself expired or was revoked), it falls back to
-  minting a fresh token with the client-credentials grant. Either way the new response replaces
-  the whole cached triple. A 5xx from the token endpoint, a transport error, or a decode error
-  is not a fallback case — it propagates from the request that triggered the renewal, as an
-  `HTTPResponseError`/`HTTPTransportError`/the decode library's own exception respectively.
+  `grant_type=refresh_token`. If it didn't, or the refresh is rejected with a `400` (an
+  `invalid_grant` because the refresh token itself expired or was revoked), it falls back to
+  minting a fresh token with the client-credentials grant. A refresh response that omits
+  `refresh_token` keeps the one it was refreshed with, as the RFC allows. Any other failure to
+  obtain a token — a `401`/`403`/`429` on the refresh, a 5xx from the token endpoint, a
+  transport error, a decode error, a payload with no `access_token` — is not a fallback case: it
+  is raised from the request that triggered the renewal as an `OAuthTokenError`, with the
+  original exception (`HTTPResponseError`, `HTTPTransportError`, the decode library's own error,
+  ...) as its `__cause__` and the token endpoint in `.token_url`. See
+  [Error handling](errors.md#oauthtokenerror) for why this one is wrapped when nothing else in
+  lothc is.
 - Concurrent requests that all land inside the leeway window share one renewal (a lock); the
   rest wait for it and reuse its result rather than each hitting the token endpoint.
 
-`timeout` (default `30.0`) bounds each token request; it's separate from the API client's own
-`timeout`.
+Each token request goes through its own short-lived client, built by calling `client_factory`
+with no arguments (default `HTTPClient.build`). Anything the token endpoint needs that the API
+client doesn't — a shorter timeout, a proxy, a private CA, an mTLS identity — goes through a
+`functools.partial` of `build`:
+
+```python
+from functools import partial
+
+OAuthProvider(
+    token_url="https://auth.example.com/oauth/token",
+    client_id="my-client-id",
+    client_secret="my-client-secret",
+    client_factory=partial(HTTPClient.build, timeout=5.0, proxy="http://proxy.internal:3128"),
+)
+```
+
+The credentials never need to be part of the factory: the provider builds the `Authorization`
+header itself, per request.
 
 ### Persisting the token across restarts
 
@@ -137,18 +167,23 @@ the expiry is an ISO 8601 UTC timestamp at whole-second precision, not an epoch 
 {
   "token_url": "https://auth.example.com/oauth/token",
   "client_id": "my-client-id",
+  "scope": null,
   "access_token": "eyJ...",
   "refresh_token": null,
-  "expires_at": "2026-09-08T10:56:40Z"
+  "expires_at": "2026-09-08T10:56:40Z",
+  "expires_in": 3600
 }
 ```
 
 On construction the file is read back, so a restarted process picks up where the
 last one left off: a still-valid token is used as-is, one inside the leeway window is renewed via
-the cached refresh token. The file also records `token_url` and `client_id`; a mismatch on either
-reads as "no cache", so one client is never handed another client's token. A corrupt or
-unreadable file is never fatal — it's ignored and overwritten on the next mint. The parent
-directory must already exist.
+the cached refresh token (`expires_in`, the lifetime the token was issued with, is what the
+leeway clamp above is computed from). The file also records `token_url`, `client_id` and `scope`;
+a mismatch on any of them reads as "no cache", so one client is never handed another client's
+token, or a token minted for a different set of scopes. A corrupt or unreadable file is never
+fatal — it's ignored and overwritten on the next mint. The parent directory is the one thing
+checked up front: if it doesn't exist, constructing the provider raises `FileNotFoundError`
+immediately rather than failing on the first write.
 
 ### Non-RFC token endpoints
 
@@ -159,8 +194,8 @@ them. The contract is on the *attribute* names, never the *wire* names:
 
 - `token_request` must be constructible as `Cls(client_id=..., client_secret=...)`; any other
   field it declares (`grant_type`, `audience`, ...) needs a default.
-- `token_response` must expose `.access_token: str`, `.expires_in: int` and
-  `.refresh_token: str | None`.
+- `token_response` must expose `.access_token: str`, `.expires_in: int` (or `int | None`, with
+  `default_expires_in` covering the `None`) and `.refresh_token: str | None`.
 - `token_refresh_request`, optional, must be constructible as `Cls(refresh_token=...)`. Without
   it, renewal always means minting a fresh token, even if the response carried a
   `refresh_token` — lothc has no way to know how this API spells a refresh request.
@@ -250,7 +285,8 @@ OAuthProvider(
 ### Sync
 
 `SyncOAuthProvider` is the mirror for `SyncHTTPClient` — same constructor, same lifecycle, a
-plain `def __call__`:
+plain `def __call__`, and a `client_factory` defaulting to `SyncHTTPClient.build` (so
+`partial(SyncHTTPClient.build, timeout=5.0)` is the sync spelling of the example above):
 
 ```python
 from lothc import SyncHTTPClient, SyncOAuthProvider

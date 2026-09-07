@@ -107,9 +107,12 @@ flight concurrently), and OAuth 2 client credentials (`OAuthProvider`/`SyncOAuth
 `lothc/_oauth.py`, a ready-made `bearer_auth` provider: RFC 6749 form-encoded mint/refresh with
 `client_auth="basic"|"body"` + `scope`, or a non-RFC JSON endpoint described by the user's own
 `token_request`/`token_refresh_request`/`token_response` pydantic/msgspec classes; leeway-based
-renewal (`refresh_leeway`, default 300s), refresh-then-fallback-to-mint on a 4xx, one renewal
-under concurrency via a lock, and an optional `token_cache_path` — atomic `0600` JSON, keyed on
-`token_url` + `client_id` — see the OAuth dev note below).
+renewal (`refresh_leeway`, default 300s, clamped to half the token's lifetime;
+`default_expires_in` for servers that omit `expires_in`), refresh-then-fallback-to-mint on a 400
+only (anything else is an `OAuthTokenError`), one renewal under concurrency via a lock, a
+`client_factory` (default `HTTPClient.build`) for the token endpoint's own client config, and an
+optional `token_cache_path` — atomic `0600` JSON, keyed on `token_url` + `client_id` + `scope` —
+see the OAuth dev note below).
 
 Not done yet: nothing outstanding right now — see git history/this file's own dev-notes below for
 what's landed and why.
@@ -434,6 +437,52 @@ Before writing any code, tell the user that you've read this file AND read and f
   `/oauth/token-boom` (500), each recording what it received per `key` into a `_token_requests`
   ClassVar, read back via `GET /oauth/token-requests?key=` so `tests/test_oauth.py` asserts wire
   shape through a public endpoint, never via provider internals.
+  **Code-review round, all behaviour changes:** (10) `refresh_leeway` is clamped to
+  `expires_in / 2` — a 300s default against a 60s token was "expired at birth", re-minting on
+  every call; `_CachedToken.expires_in` (the issued lifetime) exists and is persisted to the
+  cache file as `"expires_in"` purely so that clamp survives a restart. Tests that need "stale on
+  the very next call" use `expires_in=0` (lifetime 0 → leeway 0 → `now >= expires_at` at any
+  later-or-equal instant), not the old `expires_in=1000, refresh_leeway=2000` trick, which the
+  clamp neutralises. (11) A refresh response without `refresh_token` keeps the one it was
+  refreshed with (RFC 6749 §6 — `_carry_refresh_token`), instead of silently degrading the next
+  renewal to a mint. (12) `scope` joined `token_url`/`client_id` in the cache guard and payload.
+  (13) `OAuthProvider`'s `asyncio.Lock` is created lazily per running loop (`_get_lock`, keyed
+  on `asyncio.get_running_loop()` identity), not in `__init__`: reproduced live on 3.14.7 that
+  one provider used across two `asyncio.run()` calls raised `RuntimeError: <asyncio.locks.Lock
+  object ...> is bound to a different event loop` from `Lock.acquire` — `asyncio.Lock` binds to
+  the first loop it's awaited on, and a module-level provider legitimately outlives an
+  `asyncio.run()`. `tests/test_oauth.py::test_provider_can_be_reused_across_event_loops` is a
+  plain `def` for exactly this reason. (14) The Basic header is built by lothc
+  (`_basic_authorization_header`), not by passing `basic_auth=` to the internal client: RFC 6749
+  §2.3.1 wants each half `application/x-www-form-urlencoded`-encoded *before* the `:` join and
+  base64 — `quote(..., safe="")`, matching authlib's `encode_client_secret_basic`, NOT
+  `quote_plus` (space → `%20`, not `+`). (15) `default_expires_in` covers servers that omit
+  `expires_in` (§5.1 only RECOMMENDS it); neither present → `ValueError`, wrapped per (17).
+  `TokenResponseTyping.expires_in` widened to `int | None` — a model declaring plain `int` still
+  satisfies a read-only property protocol member covariantly, confirmed on all four checkers.
+  (16) The refresh→mint fallback is 400-only (`invalid_grant`); a 401/403/429 propagates, and if
+  the fallback mint itself fails it's raised `from` the refresh error so both appear in the
+  traceback (`_mint_after_rejected_refresh`). (17) `OAuthTokenError` (`.token_url`, original as
+  `__cause__`) wraps everything `_renew` raises — the try in `__call__` covers that one line —
+  and is the one place lothc wraps a decode library's error: the `bearer_auth` call runs *inside*
+  the user's unrelated verb call, so an unwrapped `HTTPResponseError`/`ValidationError` there is
+  misattributed to that call (the reviewer's own `if e.status == 404` misread), whereas a
+  `response_data_type` error already belongs to the call that raised it. The cache write is
+  deliberately outside that try: a disk error is not a token-acquisition failure. (18)
+  `client_factory: Callable[[], AbstractAsyncContextManager[HTTPClient]] = HTTPClient.build`
+  replaced `timeout`: called with no arguments (possible only because of (14) — the provider no
+  longer needs to pass `basic_auth=`), so timeout/proxy/TLS/mTLS for the token endpoint are all a
+  `functools.partial(HTTPClient.build, ...)`. Confirmed on all four checkers that the bare
+  classmethod and a `partial` of it are both assignable. (19) `_decode_token_response` is gone:
+  `TokenResponseTyping` is now a union of two private Protocols that each inherit `_compat.py`'s
+  structural `StructTyping`/`BaseModelTyping` plus the three token fields, so
+  `type[TokenResponseTyping]` is itself a valid `response_data_type=` and `_post_model` calls
+  `client.post(..., response_data_type=token_response)` directly — zero casts on all four
+  checkers with the test suite's real pydantic and msgspec models, and a model missing
+  `expires_in` is rejected at the call site by all four. (20) A `token_cache_path` whose parent
+  directory doesn't exist is a `FileNotFoundError` at construction (`_validate_provider_config`),
+  not a failure on the first write. pylint `max-attributes` went 13 → 15 for the extra
+  `_default_expires_in`/`_client_factory`/`_lock_loop` attributes.
 - **`sse()` never lets the client's total `timeout` touch the stream, and reconnects per the
   WHATWG EventSource model.** Found in real use: every SSE stream died with `HTTPTimeoutError`
   at exactly the client's `timeout` (30s by default) — reqwest's `timeout` runs from connect
