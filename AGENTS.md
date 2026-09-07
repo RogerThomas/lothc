@@ -23,8 +23,46 @@ async with HTTPClient.build(
 ```
 
 `bearer_token: str` (static) xor `bearer_auth: Callable[[], Awaitable[str]]` (sync client:
-`Callable[[], str]`) — resolved fresh per request, at most one of the two. `default_headers`
+`Callable[[], str]`) — resolved fresh per request, at most one of the two (see OAuth below for a
+ready-made `bearer_auth`). `default_headers`
 sent on every request. `cookie_store=True` = in-memory jar. `proxy: str | None`.
+
+## OAuth 2 client credentials (`lothc/_oauth.py`)
+
+`OAuthProvider` (async) / `SyncOAuthProvider` (sync) are ready-made `bearer_auth` providers —
+pass an instance as `bearer_auth=`, no new client parameter. All keyword-only:
+
+```python
+OAuthProvider(
+    token_url=...,
+    client_id=...,
+    client_secret=...,
+    scope=None,  # RFC path only
+    client_auth="basic",  # "basic" (HTTP Basic header, RFC default) | "body" (form fields)
+    token_request=None,  # non-RFC APIs: class constructible as Cls(client_id=, client_secret=)
+    token_refresh_request=None,  # optional, Cls(refresh_token=); without it renewal always mints
+    token_response=None,  # class with .access_token / .expires_in / .refresh_token (str | None)
+    refresh_leeway=300.0,  # renew once fewer than this many seconds remain (clamped to expires_in / 2)
+    default_expires_in=None,  # lifetime to assume when the response has no expires_in; else error
+    token_cache_path=None,  # Path: JSON, atomic replace, 0600, keyed on token_url + client_id + scope;
+    # parent dir must exist at construction (FileNotFoundError)
+    client_factory=HTTPClient.build,  # called with NO args per token request; partial(...) for
+    # timeout/proxy/TLS. Sync: SyncHTTPClient.build
+)
+```
+
+RFC path (no models): form-encoded `grant_type=client_credentials`/`grant_type=refresh_token`,
+Basic header built by lothc with each half `quote(..., safe="")`-encoded (RFC 6749 §2.3.1).
+Model path: request instance sent as `json=`, `client_auth` ignored, `token_request` +
+`token_response` both or neither; `token_response` needs `.access_token: str`,
+`.expires_in: int | None`, `.refresh_token: str | None`. Aliased pydantic request models need
+`ConfigDict(validate_by_name=True, serialize_by_alias=True)` (lothc's `json=` dumps without
+`by_alias`); msgspec `field(name=...)` needs nothing. Renewal: refresh if a `refresh_token` is
+held and refreshing is possible (a refresh response without one keeps the old one), 400 on
+refresh → mint; anything else (401/403/429, 5xx, transport, decode, malformed payload) →
+`OAuthTokenError` (`.token_url`, original as `__cause__`) from the user's API call. One renewal
+under concurrency (lock; the async lock is per-event-loop, so a provider survives repeated
+`asyncio.run()`).
 
 ## Decode targets (`response_data_type`, default `bytes`)
 

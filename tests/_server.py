@@ -3,7 +3,8 @@
 `examples/server.py` (used for manual smoke-testing) reuses this same handler on a fixed port —
 this module is the one canonical server implementation for both. Endpoints: `/items`
 (GET/POST/PUT/PATCH/DELETE/HEAD), `/echo-headers`, `/slow`, `/events` (SSE), `/boom`, `/upload`
-(multipart), plus cookie/redirect/retry/streaming scenarios used by their own tests.
+(multipart), `/oauth/token*` (OAuth 2 token endpoints), plus cookie/redirect/retry/streaming
+scenarios used by their own tests.
 """
 
 import contextlib
@@ -34,6 +35,11 @@ class TestAppHandler(BaseHTTPRequestHandler):
     # Per-key hit counters for the flaky/retry-after endpoints below — shared
     # across request threads for the lifetime of the test server.
     _counters: ClassVar[dict[str, int]] = {}
+    # Per-key record of every request the /oauth/token* endpoints received (content type,
+    # Authorization header, parsed body), read back via GET /oauth/token-requests so tests can
+    # assert the wire shape of a token request through a public endpoint, never via provider
+    # internals.
+    _token_requests: ClassVar[dict[str, list[dict[str, object]]]] = {}
 
     def _write_json(
         self, status: int, payload: object, extra_headers: dict[str, str] | None = None
@@ -345,6 +351,71 @@ class TestAppHandler(BaseHTTPRequestHandler):
     def _handle_boom(self) -> None:
         self._write_json(500, _server_error_body)
 
+    def _record_token_request(self, key: str, body: object) -> None:
+        self._token_requests.setdefault(key, []).append({
+            "content_type": self.headers.get("Content-Type"),
+            "authorization": self.headers.get("Authorization"),
+            "headers": {name.lower(): value for name, value in self.headers.items()},
+            "body": body,
+        })
+
+    @staticmethod
+    def _refresh_failure_status(params: dict[str, list[str]]) -> int | None:
+        # `refresh_status=<int>` fails a refresh with that status; `refresh_fails=1` is the
+        # RFC's own `400 invalid_grant`. Neither → the refresh succeeds.
+        if "refresh_status" in params:
+            return int(params["refresh_status"][0])
+        if params.get("refresh_fails", ["0"])[0] == "1":
+            return 400
+        return None
+
+    def _handle_oauth_token(self, query: str) -> None:
+        # RFC 6749 token endpoint: form-encoded body, standard JSON response. Credentials are
+        # deliberately NOT validated here — tests assert the recorded header/body instead.
+        params = parse_qs(query)
+        key = params["key"][0]
+        length = int(self.headers.get("Content-Length", "0"))
+        form = {
+            name: values[0] for name, values in parse_qs(self.rfile.read(length).decode()).items()
+        }
+        self._record_token_request(key, form)
+        attempt = self._bump_counter(key)
+        is_refresh = form["grant_type"] == "refresh_token"
+        refresh_failure_status = self._refresh_failure_status(params)
+        if is_refresh and refresh_failure_status is not None:
+            self._write_json(refresh_failure_status, {"error": "invalid_grant"})
+            return
+        payload: dict[str, object] = {"access_token": f"token-{attempt}", "token_type": "Bearer"}
+        if params.get("omit_expires_in", ["0"])[0] != "1":
+            payload["expires_in"] = int(params.get("expires_in", ["3600"])[0])
+        # `refresh_omits_token=1`: the refresh response has no `refresh_token` key at all (RFC
+        # 6749 §6 allows this — the old one stays valid); a mint still includes one.
+        omits_refresh_token = is_refresh and params.get("refresh_omits_token", ["0"])[0] == "1"
+        if params.get("with_refresh", ["0"])[0] == "1" and not omits_refresh_token:
+            payload["refresh_token"] = f"refresh-{attempt}"
+        self._write_json(200, payload)
+
+    def _handle_oauth_token_custom(self, query: str) -> None:
+        # A non-RFC token endpoint: JSON body in, renamed camelCase fields out.
+        params = parse_qs(query)
+        key = params["key"][0]
+        self._record_token_request(key, self._read_json_body())
+        attempt = self._bump_counter(key)
+        payload: dict[str, object] = {"accessToken": f"token-{attempt}"}
+        if params.get("omit_expires_in", ["0"])[0] != "1":
+            payload["expiresInSeconds"] = int(params.get("expires_in", ["3600"])[0])
+        if params.get("with_refresh", ["0"])[0] == "1":
+            payload["refreshToken"] = f"refresh-{attempt}"
+        self._write_json(200, payload)
+
+    def _handle_oauth_token_boom(self, query: str) -> None:
+        self._record_token_request(parse_qs(query)["key"][0], None)
+        self._write_json(500, _server_error_body)
+
+    def _handle_oauth_token_requests(self, query: str) -> None:
+        key = parse_qs(query)["key"][0]
+        self._write_json(200, {"requests": self._token_requests.get(key, [])})
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/items":
@@ -363,6 +434,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/connection-flaky": self._handle_connection_flaky,
             "/ndjson": self._handle_ndjson,
             "/ndjson-blank-line": self._handle_ndjson_with_blank_line,
+            "/oauth/token-requests": self._handle_oauth_token_requests,
         }
         if parsed.path in query_routes:
             query_routes[parsed.path](parsed.query)
@@ -413,6 +485,12 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self._handle_upload()
         elif parsed.path == "/echo-body":
             self._handle_echo_body()
+        elif parsed.path == "/oauth/token":
+            self._handle_oauth_token(parsed.query)
+        elif parsed.path == "/oauth/token-custom":
+            self._handle_oauth_token_custom(parsed.query)
+        elif parsed.path == "/oauth/token-boom":
+            self._handle_oauth_token_boom(parsed.query)
         else:
             self._write_json(404, _not_found_body)
 
