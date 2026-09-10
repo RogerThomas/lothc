@@ -108,13 +108,16 @@ class MockRequest:
     body: bytes | None
 
 
-@dataclass
+@dataclass(slots=True)
 class MockResponse:
     """The response a `match_request_with_response` custom handler returns — lothc's own plain
     description (`data`/`headers`/`status`, encoded the same way `add_*_response` encodes them),
     not pyreqwest's `Response`/`SyncResponse`/`ResponseBuilder`. lothc never exposes pyreqwest's
     own response types in its public API; `LOTHCMock.match_request_with_response` builds the real
-    pyreqwest response internally from this."""
+    pyreqwest response internally from this. `slots=True` per `style-guide.md` §7 (a DTO, like its
+    sibling `MockRequest`) — not `frozen=True`, matching `MockRequest`'s own reasoning: `data`/
+    `headers` can hold a mutable `dict`, so a frozen dataclass couldn't deliver real immutability
+    here either."""
 
     data: Data = b""
     headers: Headers | None = None
@@ -210,11 +213,23 @@ def _mock_request_from(request: Request) -> MockRequest:
     )
 
 
-def _encode_response_data(mock: _MockTyping, data: Data) -> None:
+def _apply_data(
+    data: Data, *, with_bytes: Callable[[bytes], object], with_json: Callable[[Any], object]
+) -> None:
+    """Shared `isinstance(data, bytes)` dispatch for `_encode_response_data`/`_apply_mock_response`
+    — the two objects they each mutate (pyreqwest's `Mock`/`ResponseBuilder`) name their
+    bytes/JSON-body setters differently (`with_body_bytes`/`with_body_json` vs `body_bytes`/
+    `body_json`), so the dispatch itself is shared via these two bound-method callbacks rather
+    than a common Protocol — both objects mutate themselves in place and return `self` (confirmed
+    live for `ResponseBuilder`), so discarding the return value here is safe for both."""
     if isinstance(data, bytes):
-        mock.with_body_bytes(data)
+        with_bytes(data)
     else:
-        mock.with_body_json(_encode_json_payload(data))
+        with_json(_encode_json_payload(data))
+
+
+def _encode_response_data(mock: _MockTyping, data: Data) -> None:
+    _apply_data(data, with_bytes=mock.with_body_bytes, with_json=mock.with_body_json)
 
 
 def _query_param_match_values(
@@ -238,11 +253,17 @@ def _query_param_match_values(
 
 def _apply_mock_response(builder: ResponseBuilder, mock_response: MockResponse) -> ResponseBuilder:
     builder = builder.status(mock_response.status)
+    # `data` before `headers`, deliberately: pyreqwest's `.body_json()` sets its own Content-Type
+    # by *appending* a header value (confirmed live — its own `.header()` docstring says "Append
+    # single header value (multiple allowed)"), while `.headers()` *merges with same-key replace*
+    # (confirmed live: calling it after `.body_json()` correctly replaces the auto-set
+    # Content-Type; calling it before left both values on the wire — two Content-Type headers for
+    # one response). Applying `data` first means a caller's own `headers={"content-type": ...}`
+    # always wins over `.body_json()`'s default, matching real request precedence.
+    _apply_data(mock_response.data, with_bytes=builder.body_bytes, with_json=builder.body_json)
     if mock_response.headers is not None:
         builder = builder.headers(_encode_headers(mock_response.headers))
-    if isinstance(mock_response.data, bytes):
-        return builder.body_bytes(mock_response.data)
-    return builder.body_json(_encode_json_payload(mock_response.data))
+    return builder
 
 
 async def _call_async_matcher(
@@ -410,21 +431,37 @@ class LOTHCMocker:
 
     def _add_response(
         self,
-        mock: _MockTyping,
+        verb: Callable[..., _MockTyping],
         *,
+        path: PathMatcher | None,
+        url: UrlMatcher | None,
         params: Params | None,
         data: Data,
         headers: Headers | None,
         status: int,
     ) -> LOTHCMock:
-        lothc_mock = LOTHCMock(mock)
-        if params is not None:
-            for name, value in _query_param_match_values(_encode_params(params)).items():
+        # Validate/encode everything that can raise BEFORE calling `verb(...)` — pyreqwest
+        # registers a `Mock` the instant that call returns, so raising after it would leave a
+        # bare, unconfigured `Mock` behind: its response builder defaults to status 200/empty
+        # body, so it would silently match ANY later request to this method/path (confirmed
+        # live) — not "no mock got registered", which is what a caller raised past would expect.
+        query_matches = (
+            _query_param_match_values(_encode_params(params)) if params is not None else None
+        )
+        if headers is not None:
+            _encode_headers(headers)
+        if not isinstance(data, bytes):
+            _encode_json_payload(data)
+
+        lothc_mock = LOTHCMock(verb(path=path, url=url))
+        if query_matches is not None:
+            for name, value in query_matches.items():
                 lothc_mock.match_query_param(name, value)
         lothc_mock.with_status(status)
+        # `data` before `headers` — see `_apply_mock_response`'s comment for why.
+        lothc_mock.with_data(data)
         if headers is not None:
             lothc_mock.with_headers(headers)
-        lothc_mock.with_data(data)
         return lothc_mock
 
     def mock(
@@ -450,7 +487,9 @@ class LOTHCMocker:
         status: int = 200,
     ) -> LOTHCMock:
         return self._add_response(
-            self._client_mocker.get(path=path, url=url),
+            self._client_mocker.get,
+            path=path,
+            url=url,
             params=params,
             data=data,
             headers=headers,
@@ -468,7 +507,9 @@ class LOTHCMocker:
         status: int = 200,
     ) -> LOTHCMock:
         return self._add_response(
-            self._client_mocker.post(path=path, url=url),
+            self._client_mocker.post,
+            path=path,
+            url=url,
             params=params,
             data=data,
             headers=headers,
@@ -486,7 +527,9 @@ class LOTHCMocker:
         status: int = 200,
     ) -> LOTHCMock:
         return self._add_response(
-            self._client_mocker.put(path=path, url=url),
+            self._client_mocker.put,
+            path=path,
+            url=url,
             params=params,
             data=data,
             headers=headers,
@@ -504,7 +547,9 @@ class LOTHCMocker:
         status: int = 200,
     ) -> LOTHCMock:
         return self._add_response(
-            self._client_mocker.patch(path=path, url=url),
+            self._client_mocker.patch,
+            path=path,
+            url=url,
             params=params,
             data=data,
             headers=headers,
@@ -522,7 +567,9 @@ class LOTHCMocker:
         status: int = 200,
     ) -> LOTHCMock:
         return self._add_response(
-            self._client_mocker.delete(path=path, url=url),
+            self._client_mocker.delete,
+            path=path,
+            url=url,
             params=params,
             data=data,
             headers=headers,
@@ -540,7 +587,9 @@ class LOTHCMocker:
     ) -> LOTHCMock:
         # No `data=` — lothc's `head()` never decodes a body (`Result[None]`, see `_client.py`).
         return self._add_response(
-            self._client_mocker.head(path=path, url=url),
+            self._client_mocker.head,
+            path=path,
+            url=url,
             params=params,
             data=b"",
             headers=headers,

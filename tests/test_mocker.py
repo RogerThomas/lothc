@@ -156,6 +156,21 @@ def test_add_get_response_with_none_param_raises_like_a_real_request(
         lothc_mocker.add_get_response(path="/items", params=cast(Any, {"flag": None}))
 
 
+async def test_add_get_response_raising_does_not_register_an_orphaned_mock(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    """A `Mock` is registered with pyreqwest the instant the verb method (`.get()`/etc.) is
+    called — if `add_get_response` raised *after* that (e.g. from invalid `params=`), the bare,
+    unconfigured `Mock` would be left behind, silently matching ANY later request to this
+    method/path (its response builder defaults to status 200/empty body). Confirmed live this was
+    happening before `_add_response` was reordered to validate everything first."""
+    with pytest.raises(ValueError, match="Invalid query value"):
+        lothc_mocker.add_get_response(path="/items", params=cast(Any, {"flag": None}))
+
+    with pytest.raises(AssertionError, match="No mock rule matched"):
+        await client.get("items")
+
+
 def test_mock_request_is_not_frozen_and_not_hashable() -> None:
     """`MockRequest` deliberately isn't `frozen=True` — see its docstring for why (a mutable
     `dict` field can't be made genuinely immutable/hashable by `frozen=True` alone)."""

@@ -135,13 +135,19 @@ async def test_add_get_response_matches_on_params(
     assert item == {"page": 2}
 ```
 
-`params=` — same `Params` type a real call's `params=` takes — matches a rule only against
-requests sent with those exact query params, the same way `path=` narrows by URL path.
+`params=` — same `Params` type a real call's `params=` takes — narrows a rule to requests that
+include at least those query params with those exact values. It's a subset match, not an exact
+one: a real request sending extra, unlisted query params still matches.
+
+`add_*_response`'s own `headers=` is not a matcher at all — it only sets the mocked *response's*
+headers. Narrowing on the request's own headers (or body) needs the separate `match_header`/
+`match_body_json` methods below.
 
 ## Narrowing and asserting on a mock
 
-For anything `params=`/`headers=` can't express as an exact match (a regex, a custom predicate),
-every `add_*_response` call returns a `LOTHCMock` that can be narrowed further with
+For anything `params=` can't express (a regex, "any value", a custom predicate, requiring no
+*extra* params), or to narrow on the request's headers/body at all, every `add_*_response` call
+returns a `LOTHCMock` that can be narrowed further with
 `match_query`/`match_query_param`/`match_header`/`match_body_json`/`match_request` (a matcher only
 narrows which requests a rule applies to — it never changes the response), and asserted on
 afterwards with `assert_called`/`get_requests`/`get_call_count`:

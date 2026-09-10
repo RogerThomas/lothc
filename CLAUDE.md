@@ -741,6 +741,42 @@ Before writing any code, tell the user that you've read this file AND read and f
   `hash(MockRequest(...))` now raises a direct, expected `TypeError: unhashable type: 'MockRequest'`
   instead (confirmed live: a non-frozen dataclass with the default `eq=True` already sets
   `__hash__ = None`, Python's own standard "mutable + eq" convention).
+  **Fourth round, same area, same strict read-only review constraint — two genuine bugs this
+  time, not just design nits:** (1) `LOTHCMocker._add_response` called the verb registration
+  method (`self._client_mocker.get(...)`/etc.) *before* validating/encoding `params=`/`headers=`/
+  `data=` — but pyreqwest registers a `Mock` into `ClientMocker._mocks` the instant that call
+  returns, so a subsequent `ValueError` (e.g. from an invalid `params=`) left a bare, unconfigured
+  `Mock` behind. Confirmed live this orphaned mock's response builder defaults to status
+  200/empty body and silently matches *any* later request to that method/path — a real, working
+  mock that shouldn't exist, not "no mock registered" as `add_get_response`'s own `ValueError`
+  implies. Fixed by reordering: `_add_response` now takes the *unbound* verb method (`self.
+  _client_mocker.get`, not `self._client_mocker.get(path=path, url=url)`) plus `path=`/`url=` as
+  separate kwargs, runs every encoding step that can raise first, and only calls `verb(path=path,
+  url=url)` — the actual pyreqwest registration — once all of that has succeeded. Regression test:
+  `test_add_get_response_raising_does_not_register_an_orphaned_mock`. (2) `_apply_mock_response`
+  applied `headers=` before `data=`, which — for a non-bytes `data=` alongside a caller-supplied
+  `headers={"content-type": ...}` — produced two `Content-Type` header values on the wire:
+  pyreqwest's `ResponseBuilder.headers()` merges with same-key *replace* semantics (confirmed live:
+  calling it after `.body_json()` correctly overwrites the auto-set Content-Type), but `.body_json()`
+  sets its own Content-Type by *appending* (per its own `.header()` docstring: "Append single
+  header value (multiple allowed)") — so calling `.headers()` first only for `.body_json()` to
+  append a second value afterward left both on the wire. Fixed by reordering to `data` then
+  `headers` in both `_apply_mock_response` and `LOTHCMocker._add_response`, so a caller's explicit
+  `headers=` always wins. Not directly testable through lothc's own public API (`Result.headers`
+  already collapses to the first wire value the same way `MockRequest.headers` does above, and the
+  first value happened to already be the correct one even before this fix) — verified instead by
+  calling pyreqwest's real `ResponseBuilder` directly in both orderings and reading `.headers.
+  getall("content-type")`. Also fixed, smaller: `MockResponse` was missing `slots=True`
+  (`MockRequest`, its sibling DTO, already had it — `style-guide.md` §7); `_encode_response_data`/
+  `_apply_mock_response` each independently reimplemented the same `isinstance(data, bytes)`
+  bytes-vs-JSON dispatch — collapsed into one shared `_apply_data`, taking the two objects'
+  differently-named setters (`with_body_bytes`/`with_body_json` vs `body_bytes`/`body_json`) as
+  bound-method callbacks rather than forcing a common Protocol onto two genuinely different APIs;
+  and two `docs/testing.md` claims were wrong — `params=` was described as an exact match when
+  it's actually a subset match (extra, unlisted query params on the real request still match,
+  confirmed live), and prose implied `add_*_response`'s own `headers=` narrows which requests
+  match, when it only sets the mocked response's headers and has no matching effect at all (only
+  the separate `match_header` method matches on a request's headers) — both corrected.
 - **Status errors are separate from transport errors.** `HTTPResponseError` (4xx/5xx with a body_start
   snippet) is a different failure class from `HTTPTransportError` (never got a response at all) —
   don't unify them.

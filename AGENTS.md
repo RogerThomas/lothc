@@ -19,7 +19,8 @@ real pyreqwest response internally.
 `Url` (the `url=` matcher's type) were still pyreqwest's own types, re-exported rather than
 wrapped — rejected as insufficient (a re-export still means the *class itself* is pyreqwest's,
 even if the import path isn't). Fixed properly: `MockRequest` (`lothc/testing.py`) is a plain,
-frozen, slotted dataclass (`method`/`path`/`query_string`/`headers`/`body`) built by
+slotted dataclass (`method`/`path`/`query_string`/`headers`/`body` — see the "Testing" section
+below for why it's deliberately not `frozen=True`) built by
 `_mock_request_from` from pyreqwest's real `Request` at the one point a mock actually receives
 one — `match_request`/`match_request_with_response` handlers get a `MockRequest`, `get_requests()`
 returns `list[MockRequest]`, and `url=` matching is narrowed to `str | re.Pattern[str]` only
