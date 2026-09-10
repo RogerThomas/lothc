@@ -722,47 +722,61 @@ def _build_sync_form(form: Form, *, infer_mime_type_from_file_extension: bool) -
     return form_builder
 
 
-def _apply_params[TBuilder: BaseRequestBuilder](
-    request_builder: TBuilder, params: Params | None
-) -> TBuilder:
+def _encode_params(params: Params) -> dict[str, str | int | float | bool]:
+    """Turns any `Params` (`Mapping[str, str | int | float | bool]`, pydantic `BaseModel`, or
+    msgspec `Struct`) into a plain dict the way a real request's query string would be encoded
+    (non-`None` values only) — shared by `_apply_params` and `lothc.testing`'s mock query
+    matching."""
     match params:
-        case None:
-            return request_builder
         case BaseModel():
-            values = {
+            return {
                 name: value
                 for name, value in params.model_dump(mode="json").items()
                 if value is not None
             }
         case Struct():
             builtins = cast(dict[str, Any], msgspec.to_builtins(params))
-            values = {name: value for name, value in builtins.items() if value is not None}
+            return {name: value for name, value in builtins.items() if value is not None}
         case _:
             # basedpyright can't narrow a `match` fallback past `BaseModelTyping`/`StructTyping`
             # (structural Protocols — see _compat.py's `StructTyping` docstring) the way it can
             # narrow a sequential `issubclass` chain, so it still sees them as possible here even
             # though the two `case` patterns above already excluded any real BaseModel/Struct.
-            values = cast("Mapping[str, str | int | float | bool]", params)
-    return request_builder.query(values)
+            return dict(cast("Mapping[str, str | int | float | bool]", params))
 
 
-def _apply_headers[TBuilder: BaseRequestBuilder](
-    request_builder: TBuilder, headers: Headers | None
+def _apply_params[TBuilder: BaseRequestBuilder](
+    request_builder: TBuilder, params: Params | None
 ) -> TBuilder:
+    if params is None:
+        return request_builder
+    return request_builder.query(_encode_params(params))
+
+
+def _encode_headers(headers: Headers) -> dict[str, str]:
+    """Turns any `Headers` (`Mapping[str, str]`, pydantic `BaseModel`, or msgspec `Struct`) into a
+    plain `dict[str, str]` the way a real request's headers would be encoded (`_` -> `-`,
+    non-`None` values only) — shared by `_apply_headers` and `lothc.testing`'s mock-response
+    header encoding."""
     match headers:
-        case None:
-            return request_builder
         case BaseModel():
             dumped = headers.model_dump(mode="json")
         case Struct():
             dumped = cast(dict[str, Any], msgspec.to_builtins(headers))
         case _:
             # Same basedpyright match-fallback narrowing gap as `_apply_params` above.
-            return request_builder.headers(dict(cast("Mapping[str, str]", headers)))
-    normalized = {
+            return dict(cast("Mapping[str, str]", headers))
+    return {
         name.replace("_", "-"): str(value) for name, value in dumped.items() if value is not None
     }
-    return request_builder.headers(normalized)
+
+
+def _apply_headers[TBuilder: BaseRequestBuilder](
+    request_builder: TBuilder, headers: Headers | None
+) -> TBuilder:
+    if headers is None:
+        return request_builder
+    return request_builder.headers(_encode_headers(headers))
 
 
 def _apply_timeout[TBuilder: BaseRequestBuilder](
@@ -828,6 +842,17 @@ def _apply_tls_and_pool_config[TBuilder: BaseClientBuilder](
     return client_builder
 
 
+def _encode_json_payload(payload: JSONPayload) -> Any:  # noqa: ANN401
+    """Turns any `JSONPayload` (`dict`, pydantic `BaseModel`, or msgspec `Struct`) into a plain
+    JSON-able value the way a real request body would be encoded — shared by `_attach_body`/
+    `_attach_body_sync` and `lothc.testing`'s mock-response encoding, so both stay in sync."""
+    if isinstance(payload, BaseModel):
+        return payload.model_dump(mode="json")
+    if isinstance(payload, Struct):
+        return msgspec.to_builtins(payload)
+    return payload
+
+
 async def _attach_body[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many-return-statements
     request_builder: TBuilder,
     json: JSONPayload | None,
@@ -839,12 +864,8 @@ async def _attach_body[TBuilder: BaseRequestBuilder](  # pylint: disable=too-man
     provided_bodies = [body for body in (json, form, content) if body is not None]
     if len(provided_bodies) > 1:
         raise ValueError("Provide at most one of 'json', 'form' or 'content'")
-    if isinstance(json, BaseModel):
-        return request_builder.body_json(json.model_dump(mode="json"))
-    if isinstance(json, Struct):
-        return request_builder.body_json(msgspec.to_builtins(json))
     if json is not None:
-        return request_builder.body_json(json)
+        return request_builder.body_json(_encode_json_payload(json))
     if form is not None:
         return request_builder.multipart(
             await _build_form(
@@ -869,12 +890,8 @@ def _attach_body_sync[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many
     provided_bodies = [body for body in (json, form, content) if body is not None]
     if len(provided_bodies) > 1:
         raise ValueError("Provide at most one of 'json', 'form' or 'content'")
-    if isinstance(json, BaseModel):
-        return request_builder.body_json(json.model_dump(mode="json"))
-    if isinstance(json, Struct):
-        return request_builder.body_json(msgspec.to_builtins(json))
     if json is not None:
-        return request_builder.body_json(json)
+        return request_builder.body_json(_encode_json_payload(json))
     if form is not None:
         return request_builder.multipart(
             _build_sync_form(

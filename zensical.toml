@@ -18,6 +18,7 @@ nav = [
   { "SSE" = "sse.md" },
   { "Retries" = "retries.md" },
   { "Authentication" = "auth.md" },
+  { "Testing" = "testing.md" },
   { "Cookies, redirects, proxy & TLS" = "networking.md" },
   { "Error handling" = "errors.md" },
   { "Development" = "development.md" },

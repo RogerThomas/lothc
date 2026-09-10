@@ -30,6 +30,22 @@ Issues = "https://github.com/RogerThomas/lothc/issues"
 [project.optional-dependencies]
 pydantic = ["pydantic>=2.12.5"]
 msgspec = ["msgspec>=0.19.0"]
+# Pins the pytest version lothc/testing.py's `lothc_mocker` fixture is tested against — pyreqwest
+# is already a hard dependency and ships its own `client_mocker` fixture that this one wraps, so
+# no extra transport-mocking dependency is needed here. NOTE: this extra does NOT gate whether the
+# fixture loads — see the [project.entry-points.pytest11] comment below.
+testing = ["pytest>=9.0.2"]
+
+# Registers lothc/testing.py as a pytest plugin (the `lothc_mocker` fixture) — pytest discovers
+# this automatically, no conftest.py import needed in a consumer's own test suite. Standard PEP
+# 621 entry points have no extras-marker mechanism (unlike `optional-dependencies` itself), so
+# this loads in ANY environment with pytest present, whether or not `lothc[testing]` was
+# installed — confirmed by inspecting a built wheel's entry_points.txt. Importing lothc/testing.py
+# is always safe (pyreqwest, its only non-pytest import, is a hard dependency), so this is a
+# deliberate tradeoff: zero-config discovery for the common case (pytest already in the consumer's
+# dev deps) over a hard extras gate, which entry points can't express anyway.
+[project.entry-points.pytest11]
+lothc = "lothc.testing"
 
 [dependency-groups]
 dev = [

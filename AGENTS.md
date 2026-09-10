@@ -3,6 +3,19 @@
 Typed HTTP client on pyreqwest. `HTTPClient` (async) / `SyncHTTPClient` (sync) — identical API,
 mirror methods 1:1 (drop `await`, `async with` → `with`, async iterators → sync iterators).
 
+## Design rule: never expose pyreqwest internals
+
+lothc's public API (including `lothc.testing`) must never require a caller to import from
+`pyreqwest` directly, or hand them a pyreqwest type to construct. pyreqwest is an implementation
+detail; every user-facing type is lothc's own (`Data`, `Params`, `Headers`, `MockResponse`, ...).
+Caught in review: `lothc.testing`'s `match_request_with_response` custom-handler escape hatch used
+to require building a response via pyreqwest's own `ResponseBuilder().status(...).body_json(...)
+.build()`/`.build_sync()` — fixed by adding `MockResponse` (a plain dataclass, no builder pattern —
+this project doesn't use that pattern anywhere else) that the handler returns instead; lothc builds
+the real pyreqwest response internally. `Request` (the handler/matcher's parameter type, and
+`get_requests()`'s return type) is a known, currently-unaddressed exception to this rule — still
+pyreqwest's own type, not yet wrapped.
+
 ## Build
 
 ```python
@@ -115,3 +128,29 @@ tuple[str, bytes] | Path | BufferedIOBase`. `content`: raw `str | bytes` body.
 `max_retries` (default `0` = off), `retry_methods` (default `{GET,PUT,DELETE,HEAD}` — `POST`/
 `PATCH` need explicit opt-in). Exponential backoff; retries on transport error or status in
 `{429,500,502,503,504}`; honors `Retry-After`.
+
+## Testing (`lothc[testing]`, `lothc/testing.py`)
+
+`lothc_mocker: LOTHCMocker` pytest fixture (auto-registered `pytest11` entry point — no
+`conftest.py` wiring, works identically for `HTTPClient`/`SyncHTTPClient`). Thin adapter over
+pyreqwest's own `client_mocker` plugin — see the design rule above for what "thin adapter" means
+in practice.
+
+- `add_get_response`/`add_post_response`/`add_put_response`/`add_patch_response`/
+  `add_delete_response`/`add_head_response(*, path=None, url=None, params=None, data=b"",
+  headers=None, status=200) -> LOTHCMock` — `params`/`data`/`headers` are lothc's own
+  `Params`/`Data`/`Headers` types (`dict` or `BaseModel`/`Struct`, same class you'd reuse for
+  `response_data_type=`/`response_headers_type=` on the real call), encoded exactly the way a real
+  request would be. `params=` narrows by exact query-param match; no `data=` on `add_head_response`.
+- `LOTHCMock`: `.match_query`/`.match_query_param`/`.match_header`/`.match_body_json`/
+  `.match_request(predicate)` narrow further (chainable); `.assert_called(count=/min_count=/
+  max_count=)`, `.get_requests()`, `.get_call_count()`, `.reset_requests()`.
+- `LOTHCMocker.mock(method=None, *, path=None, url=None) -> LOTHCMock` — bare rule, no canned
+  response yet; the only way to reach `.match_request_with_response(handler)` (a canned response
+  and a custom handler are mutually exclusive on one rule — raises `ValueError` either order).
+  `handler`: `async def` (for `HTTPClient`) or plain `def` (for `SyncHTTPClient`) — dispatch is via
+  `inspect.iscoroutinefunction`, not overloads — taking `Request`, returning `MockResponse | None`
+  (`None` = decline, fall through to the next mock).
+- `LOTHCMocker.strict(enabled=True)` raises `AssertionError` on an unmatched request (pyreqwest's
+  own default is silent passthrough to the real network — lothc's default is `strict=False` too,
+  opt in explicitly). `.clear()`, `.get_requests()`, `.get_call_count()`, `.reset_requests()`.

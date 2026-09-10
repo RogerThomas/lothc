@@ -1,0 +1,336 @@
+import pytest
+from msgspec import Struct
+from pydantic import BaseModel
+from pyreqwest.pytest_plugin.mock import ClientMocker
+from pyreqwest.request import Request
+
+from lothc import HTTPClient, HTTPResponseError, SyncHTTPClient
+from lothc.testing import LOTHCMocker, MockResponse
+
+# Every method `_MockTyping`/`_ClientMockerTyping` (lothc/testing.py) declare against pyreqwest's
+# real `Mock`/`ClientMocker` — kept in sync manually so a future pyreqwest rename/removal fails
+# this test loudly instead of surfacing as a runtime AttributeError the first time a consumer
+# hits the changed method (the `cast` at the fixture boundary hides this from type checkers).
+_MOCK_METHODS = (
+    "with_status",
+    "with_headers",
+    "with_body_bytes",
+    "with_body_json",
+    "match_query",
+    "match_query_param",
+    "match_header",
+    "match_body_json",
+    "match_request",
+    "match_request_with_response",
+    "assert_called",
+    "get_requests",
+    "get_call_count",
+    "reset_requests",
+)
+_CLIENT_MOCKER_METHODS = (
+    "mock",
+    "get",
+    "post",
+    "put",
+    "patch",
+    "delete",
+    "head",
+    "strict",
+    "get_requests",
+    "get_call_count",
+    "clear",
+    "reset_requests",
+)
+
+
+class ItemModel(BaseModel):
+    id: int
+    name: str
+
+
+class ItemStruct(Struct):
+    id: int
+    name: str
+
+
+class ItemHeaders(BaseModel):
+    x_total_count: int
+
+
+async def test_add_get_response_returns_raw_bytes_by_default(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/items/7", data=b'{"id": 7, "name": "item-7"}')
+
+    body = await client.get("items/7")
+
+    assert body == b'{"id": 7, "name": "item-7"}'
+
+
+async def test_add_get_response_encodes_pydantic_model(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/items/7", data=ItemModel(id=7, name="item-7"))
+
+    item = await client.get("items/7", response_data_type=ItemModel)
+
+    assert item == ItemModel(id=7, name="item-7")
+
+
+async def test_add_get_response_encodes_msgspec_struct(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/items/7", data=ItemStruct(id=7, name="item-7"))
+
+    item = await client.get("items/7", response_data_type=ItemStruct)
+
+    assert item == ItemStruct(id=7, name="item-7")
+
+
+async def test_add_post_response_encodes_dict(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_post_response(path="/items", data={"id": 7, "name": "item-7"})
+
+    item = await client.post("items", response_data_type=dict)
+
+    assert item == {"id": 7, "name": "item-7"}
+
+
+async def test_add_get_response_with_status_raises_http_response_error(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/items/7", status=404, data=b"not found")
+
+    with pytest.raises(HTTPResponseError) as exc_info:
+        await client.get("items/7")
+
+    assert exc_info.value.status == 404
+    assert exc_info.value.body_start == b"not found"
+
+
+async def test_add_get_response_with_headers(client: HTTPClient, lothc_mocker: LOTHCMocker) -> None:
+    lothc_mocker.add_get_response(path="/items/7", headers={"x-custom": "header-value"})
+
+    result = await client.get_result("items/7")
+
+    assert result.headers["x-custom"] == "header-value"
+
+
+async def test_add_get_response_matches_on_params(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    matching = lothc_mocker.add_get_response(path="/items", params={"page": "2"}, data={"page": 2})
+    other_page = lothc_mocker.add_get_response(
+        path="/items", params={"page": "1"}, data={"page": 1}
+    )
+
+    item = await client.get("items", params={"page": "2"}, response_data_type=dict)
+
+    assert item == {"page": 2}
+    matching.assert_called(count=1)
+    other_page.assert_called(count=0)
+
+
+async def test_add_get_response_reuses_a_typed_headers_class(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    """The same `ItemHeaders` class works as both `add_get_response(headers=...)` (encoding an
+    instance into `x-total-count`, mirroring a real request's `headers=`) and
+    `response_headers_type=` (decoding the mocked response's headers back into an instance)."""
+    lothc_mocker.add_get_response(path="/items", headers=ItemHeaders(x_total_count=1))
+
+    result = await client.get_result("items", response_headers_type=ItemHeaders)
+
+    assert result.typed_headers == ItemHeaders(x_total_count=1)
+
+
+async def test_mock_assert_called_counts_matched_requests(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items/7")
+
+    await client.get("items/7")
+    await client.get("items/7")
+
+    mock.assert_called(count=2)
+
+
+async def test_strict_by_default_raises_for_unmatched_request(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    with pytest.raises(AssertionError):
+        await client.get("items/7")
+
+    assert lothc_mocker.get_call_count() == 0
+
+
+async def test_strict_enabled_false_falls_through_to_the_real_call(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.strict(enabled=False)
+
+    item = await client.get("items/7", response_data_type=dict)
+
+    assert item == {"id": 7, "name": "item-7"}
+
+
+@pytest.mark.lothc_mocker(strict=False)
+async def test_lothc_mocker_marker_disables_strict(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    item = await client.get("items/7", response_data_type=dict)
+
+    assert item == {"id": 7, "name": "item-7"}
+    assert lothc_mocker.get_call_count() == 0
+
+
+def test_add_get_response_returns_raw_bytes_by_default_sync(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/items/7", data=b'{"id": 7, "name": "item-7"}')
+
+    body = sync_client.get("items/7")
+
+    assert body == b'{"id": 7, "name": "item-7"}'
+
+
+def test_add_post_response_encodes_dict_sync(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_post_response(path="/items", data={"id": 7, "name": "item-7"})
+
+    item = sync_client.post("items", response_data_type=dict)
+
+    assert item == {"id": 7, "name": "item-7"}
+
+
+def test_add_head_response_with_status(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_head_response(path="/items/7", status=204)
+
+    result = sync_client.head("items/7")
+
+    assert result.status == 204
+
+
+async def test_match_request_with_response_raises_after_add_response(
+    lothc_mocker: LOTHCMocker,
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items/7")
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        mock.match_request_with_response(lambda _request: None)
+
+
+async def _handler_computes_item_from_path(request: Request) -> MockResponse:
+    item_id = int(request.url.path.removeprefix("/items/"))
+    return MockResponse(status=201, data={"id": item_id})
+
+
+async def test_match_request_with_response_computes_from_the_request(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.mock("GET").match_request_with_response(_handler_computes_item_from_path)
+
+    item = await client.get("items/42", response_data_type=dict)
+
+    assert item == {"id": 42}
+
+
+def _sync_handler_computes_item_from_path(request: Request) -> MockResponse:
+    item_id = int(request.url.path.removeprefix("/items/"))
+    return MockResponse(status=201, data={"id": item_id})
+
+
+def test_match_request_with_response_works_for_sync_client(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.mock("GET").match_request_with_response(_sync_handler_computes_item_from_path)
+
+    item = sync_client.get("items/42", response_data_type=dict)
+
+    assert item == {"id": 42}
+
+
+async def _handler_declines(_request: Request) -> MockResponse | None:
+    return None
+
+
+async def test_match_request_with_response_returning_none_falls_through(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.mock("GET", path="/items/7").match_request_with_response(_handler_declines)
+    lothc_mocker.add_get_response(path="/items/7", data={"id": 7})
+
+    item = await client.get("items/7", response_data_type=dict)
+
+    assert item == {"id": 7}
+
+
+def test_with_status_raises_after_match_request_with_response(lothc_mocker: LOTHCMocker) -> None:
+    mock = lothc_mocker.mock("GET", path="/items/7")
+    mock.match_request_with_response(lambda _request: None)
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        mock.with_status(200)
+
+
+async def test_match_query_and_match_body_json_narrow_a_mock(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    narrow = lothc_mocker.add_get_response(path="/items", data={"matched": True})
+    narrow.match_query({"page": "2"}).match_body_json({"any": "thing"})
+    wide = lothc_mocker.add_get_response(path="/items", data={"matched": False})
+
+    item = await client.get("items", params={"page": "2"}, response_data_type=dict)
+
+    assert item == {"matched": False}  # match_body_json requires a body a GET never sends
+    narrow.assert_called(count=0)
+    wide.assert_called(count=1)
+
+
+async def _matches_flag_header(request: Request) -> bool:
+    return request.headers.get("x-flag") == "1"
+
+
+async def test_match_request_uses_a_custom_predicate(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items/7", data={"ok": True})
+    mock.match_request(_matches_flag_header)
+
+    item = await client.get("items/7", headers={"x-flag": "1"}, response_data_type=dict)
+
+    assert item == {"ok": True}
+    mock.assert_called(count=1)
+
+
+async def test_clear_removes_all_registered_mocks(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/items/7")
+    lothc_mocker.clear()
+    lothc_mocker.strict()
+
+    with pytest.raises(AssertionError):
+        await client.get("items/7")
+
+
+def test_pyreqwest_client_mocker_protocol_surface(client_mocker: ClientMocker) -> None:
+    """Existence-only smoke test for `_MOCK_METHODS`/`_CLIENT_MOCKER_METHODS` (lothc/testing.py's
+    `_MockTyping`/`_ClientMockerTyping`) — catches a method being renamed or removed on
+    pyreqwest's real `Mock`/`ClientMocker`. Deliberately does NOT check parameter signatures (a
+    renamed/removed *parameter* on a method that still exists isn't caught here) — the tests
+    above call every one of these methods through the real public API with real arguments, which
+    is what would actually catch that."""
+    for name in _CLIENT_MOCKER_METHODS:
+        assert callable(getattr(client_mocker, name))
+
+    # pyreqwest's own dirty_equals-related stub gap (see lothc/testing.py's module docstring)
+    # leaks an Unknown into `.get`'s own inferred signature here, since this calls pyreqwest's
+    # raw API directly rather than through lothc's re-typed Protocol wrapper.
+    mock = client_mocker.get(path="/items/7")  # pyright: ignore[reportUnknownMemberType]
+    for name in _MOCK_METHODS:
+        assert callable(getattr(mock, name))

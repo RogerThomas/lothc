@@ -995,6 +995,9 @@ msgspec = [
 pydantic = [
     { name = "pydantic" },
 ]
+testing = [
+    { name = "pytest" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -1033,8 +1036,9 @@ requires-dist = [
     { name = "msgspec", marker = "extra == 'msgspec'", specifier = ">=0.19.0" },
     { name = "pydantic", marker = "extra == 'pydantic'", specifier = ">=2.12.5" },
     { name = "pyreqwest", specifier = ">=0.12.2" },
+    { name = "pytest", marker = "extra == 'testing'", specifier = ">=9.0.2" },
 ]
-provides-extras = ["msgspec", "pydantic"]
+provides-extras = ["msgspec", "pydantic", "testing"]
 
 [package.metadata.requires-dev]
 dev = [

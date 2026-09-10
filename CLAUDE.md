@@ -112,10 +112,15 @@ renewal (`refresh_leeway`, default 300s, clamped to half the token's lifetime;
 only (anything else is an `OAuthTokenError`), one renewal under concurrency via a lock, a
 `client_factory` (default `HTTPClient.build`) for the token endpoint's own client config, and an
 optional `token_cache_path` — atomic `0600` JSON, keyed on `token_url` + `client_id` + `scope` —
-see the OAuth dev note below).
+see the OAuth dev note below), and a pytest mocking plugin (`lothc[testing]`, `lothc/testing.py` —
+the `lothc_mocker` fixture, a thin adapter over pyreqwest's own `client_mocker` plugin; see the
+"Never expose pyreqwest internals" dev note below for its one deliberate design rule).
 
-Not done yet: nothing outstanding right now — see git history/this file's own dev-notes below for
-what's landed and why.
+Not done yet: `lothc.testing`'s `Request` type (the parameter to `match_request`/
+`match_request_with_response`, and `get_requests()`'s return type) is still pyreqwest's own
+`pyreqwest.request.Request`, not a lothc-native wrapper — a known, currently-accepted exception to
+the "never expose pyreqwest internals" rule, not yet addressed. Otherwise nothing else outstanding
+right now — see git history/this file's own dev-notes below for what's landed and why.
 
 ## Testing
 
@@ -650,6 +655,32 @@ Before writing any code, tell the user that you've read this file AND read and f
   their `.build_streamed()` call inside their existing try block instead. `PyreqwestBuilderError`
   joins the same widened except tuple everywhere and maps to the same plain `HTTPTransportError`,
   for the same reason `RedirectError` does.
+- **`lothc.testing` must never expose pyreqwest internals in its public API — no pyreqwest type a
+  caller has to import or construct, and no builder pattern (this project doesn't use that pattern
+  anywhere else).** Same spirit as "never leak the backend's exception types" above, generalized:
+  pyreqwest is `lothc.testing`'s implementation detail too, not something its users should need to
+  know exists. Caught in review: `LOTHCMock.match_request_with_response`'s custom-handler escape
+  hatch originally required building the response via pyreqwest's own `ResponseBuilder().status(...)
+  .body_json(...).build()` (async) / `.build_sync()` (sync) directly in the caller's own handler
+  body — a real regression from the rest of this module's design, which already routes `data=`/
+  `headers=`/`params=` through lothc's own `Data`/`Headers`/`Params` types on the `add_*_response`
+  path. Fixed by adding `MockResponse` (`lothc/testing.py`) — a plain `@dataclass` (`data`/
+  `headers`/`status`, same fields and same `_encode_json_payload`/`_encode_headers` encoding
+  `add_*_response` already uses), not a builder. A `match_request_with_response` handler now
+  returns `MockResponse | None` (`None` = decline, fall through to the next mock) instead of
+  pyreqwest's `Response`/`SyncResponse`; `_wrap_custom_handler` adapts it into whichever shape
+  pyreqwest's real `Mock.match_request_with_response` actually needs internally, so pyreqwest's
+  response types never reach a caller. The async-vs-sync split on the handler itself (`async def`
+  for a `HTTPClient` test, plain `def` for `SyncHTTPClient`) is inherent, not a pyreqwest leak —
+  the same reason `HTTPClient`/`SyncHTTPClient` are two classes throughout lothc — and is genuinely
+  unavoidable: a single `LOTHCMocker`/`ClientMocker` patches both transports, so this module has no
+  way to know ahead of registration time which one a given handler will be invoked by; it dispatches
+  on `inspect.iscoroutinefunction(handler)`, mirroring the exact constraint pyreqwest's own raw
+  `CustomHandler` union already imposes. **Known, currently-accepted exception to this rule:**
+  `Request` (the type passed to `match_request`/`match_request_with_response`, and returned by
+  `get_requests()`) is still pyreqwest's own `pyreqwest.request.Request` — wrapping it would mean
+  proxying `.method`/`.url`/`.headers`/`.body` reading too, a larger task left for later, tracked
+  under "Not done yet" above rather than silently left undocumented.
 - **Status errors are separate from transport errors.** `HTTPResponseError` (4xx/5xx with a body_start
   snippet) is a different failure class from `HTTPTransportError` (never got a response at all) —
   don't unify them.
