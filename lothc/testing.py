@@ -14,9 +14,11 @@ matcher/handler receives lothc's own `MockRequest` (a plain snapshot: `method`/`
 `list[MockRequest]`; `url=` matching takes `str | re.Pattern[str]` only (pyreqwest's own
 `Url`-object alternative is dropped — a `str` already matches the exact URL, so nothing real is
 lost); and `match_request_with_response` returns `MockResponse`, not pyreqwest's `Response`/
-`SyncResponse`/`ResponseBuilder`. `_wrap_custom_handler`/`_wrap_custom_matcher` are the only two
-places this module still touches pyreqwest's real `Request` type at all — converting it to
-`MockRequest` via `_mock_request_from` before a caller's own code ever sees it.
+`SyncResponse`/`ResponseBuilder`. Two private helpers still touch pyreqwest's real types
+internally, never at the boundary a caller reaches: `_wrap_custom_handler`/`_wrap_custom_matcher`
+convert a real `Request` to `MockRequest` via `_mock_request_from` before a caller's own code ever
+sees it, and `_query_param_match_values` uses pyreqwest's own `Url.parse_with_params` to derive
+`params=`'s query-string encoding rather than reimplementing it by hand.
 
 `ClientMocker`/`Mock` (and the `Matcher`/`PathMatcher`/`QueryMatcher`/`JsonMatcher` type aliases
 their methods are typed against) are re-typed here as local Protocols (`_ClientMockerTyping`/
@@ -36,9 +38,9 @@ behaviour, all three reusing `_client.py`'s own encoding helpers so a mock alway
 exactly the way a real request would encode the same value: `params=` accepts lothc's `Params`
 union (via `_encode_params`, shared with `_apply_params`) and is applied as an exact
 `match_query_param` per key — narrowing which requests an `add_*_response` rule matches, the same
-way a real call's `params=` would build the query string (each value stringified via
-`_query_param_str`, matching pyreqwest's own encoding — e.g. `True` becomes `"true"`, not Python's
-`str(True)` == `"True"`, confirmed live against a real `RequestBuilder.query()` call); `data=`
+way a real call's `params=` would build the query string (each value's match string derived via
+`_query_param_match_values` from pyreqwest's own real encoder, not reimplemented by hand — e.g.
+`True` becomes `"true"`, not Python's `str(True)` == `"True"`, confirmed live); `data=`
 accepts lothc's `Data` union (`bytes | dict | BaseModel | Struct`, via `_encode_json_payload`,
 shared with `_attach_body`/`_attach_body_sync`); and `headers=` accepts lothc's `Headers` union
 (`Mapping[str, str] | BaseModel | Struct`, via `_encode_headers`, shared with `_apply_headers`).
@@ -58,6 +60,7 @@ from re import Pattern
 from typing import Any, Literal, Protocol, Self, cast
 
 import pytest
+from pyreqwest.http import Url
 from pyreqwest.pytest_plugin.mock import ClientMocker
 from pyreqwest.request import Request
 from pyreqwest.response import Response, ResponseBuilder, SyncResponse
@@ -81,13 +84,22 @@ type QueryMatcher = dict[str, Matcher | list[str]] | Matcher
 type JsonMatcher = Any
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class MockRequest:
     """The request a `match_request`/`match_request_with_response` handler receives, or
     `get_requests()` returns — lothc's own snapshot (`method`/`path`/`query_string`/`headers`/
     `body`), built from pyreqwest's real `Request` by `_mock_request_from` but never itself
     pyreqwest's type. `body` is already the fully-read bytes — pyreqwest's own mock middleware
-    reads any streamed body into bytes before a mock rule ever sees the request."""
+    reads any streamed body into bytes before a mock rule ever sees the request.
+
+    Deliberately not `frozen=True`: `headers` holds a plain `dict`, which a frozen dataclass can't
+    make genuinely immutable or hashable anyway (confirmed live — `frozen=True` here still let
+    `.headers[...] = ...` mutate in place, and `hash(...)` still raised from deep inside dataclass
+    machinery); a plain mutable dataclass is the honest shape, matching `hash(MockRequest(...))`
+    raising a direct, expected `TypeError` instead. `headers` is single-value-per-key — matching
+    every other place lothc reads real headers (`Result.headers`, see `_client.py`) — so a
+    genuinely repeated header collapses to its first value, same as pyreqwest's own
+    `HeaderMap.__getitem__`/`dict(HeaderMap(...))` already do."""
 
     method: str
     path: str
@@ -205,14 +217,23 @@ def _encode_response_data(mock: _MockTyping, data: Data) -> None:
         mock.with_body_json(_encode_json_payload(data))
 
 
-def _query_param_str(value: str | int | float | bool) -> str:  # noqa: FBT001
-    """Matches pyreqwest's own query-string encoding, confirmed live against a real
-    `RequestBuilder.query()` call — a `bool` becomes lowercase `"true"`/`"false"`, not Python's
-    `str(True)` == `"True"`. Using plain `str()` here would make `add_*_response(params={"flag":
-    True})` never match a real `params={"flag": True})` call in strict mode (the default)."""
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return str(value)
+def _query_param_match_values(
+    params: Mapping[str, str | int | float | bool],
+) -> dict[str, str]:
+    """The exact string each `params` value matches against in `match_query_param`, derived from
+    pyreqwest's own real URL/query encoder (`Url.parse_with_params` + `.query_dict_multi_value`)
+    rather than a hand-reimplementation of it — reimplementing risked silently diverging from
+    pyreqwest for any type it encodes differently from Python's own `str()` (confirmed live for
+    `bool`: `str(True)` == `"True"` vs pyreqwest's real `"true"`), and would only ever be caught by
+    manually re-discovering the next such mismatch. This also means an invalid value (e.g. `None`
+    — not a valid `Params` value, but nothing stops it arriving at runtime) raises the exact same
+    `ValueError` a real request would, confirmed live, instead of silently registering a mock that
+    a real call could never actually produce. `_encode_params`'s value union never includes a list
+    (`Params` is `Mapping[str, str | int | float | bool] | BaseModel | Struct`, one scalar per
+    key), so `query_dict_multi_value`'s per-key result is always the plain `str` case, never the
+    `list[str]` one it also allows for genuinely repeated query keys."""
+    encoded = Url.parse_with_params("http://mock.invalid/", params).query_dict_multi_value
+    return {name: value if isinstance(value, str) else value[0] for name, value in encoded.items()}
 
 
 def _apply_mock_response(builder: ResponseBuilder, mock_response: MockResponse) -> ResponseBuilder:
@@ -398,8 +419,8 @@ class LOTHCMocker:
     ) -> LOTHCMock:
         lothc_mock = LOTHCMock(mock)
         if params is not None:
-            for name, value in _encode_params(params).items():
-                lothc_mock.match_query_param(name, _query_param_str(value))
+            for name, value in _query_param_match_values(_encode_params(params)).items():
+                lothc_mock.match_query_param(name, value)
         lothc_mock.with_status(status)
         if headers is not None:
             lothc_mock.with_headers(headers)

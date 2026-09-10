@@ -152,9 +152,12 @@ of this fixture's public surface, not even re-exported.
   headers=None, status=200) -> LOTHCMock` — `params`/`data`/`headers` are lothc's own
   `Params`/`Data`/`Headers` types (`dict` or `BaseModel`/`Struct`, same class you'd reuse for
   `response_data_type=`/`response_headers_type=` on the real call), encoded exactly the way a real
-  request would be (`params=`'s values stringified matching pyreqwest's own encoding — a `bool`
-  becomes lowercase `true`/`false`, not Python's `str(True)`). `params=` narrows by exact
-  query-param match; no `data=` on `add_head_response`. `url=` is `str | re.Pattern[str]` only.
+  request would be — `params=`'s match values are derived from pyreqwest's own real encoder
+  (`_query_param_match_values`, via `Url.parse_with_params(...).query_dict_multi_value`), not
+  hand-reimplemented, so a `bool` becomes lowercase `true`/`false` (not Python's `str(True)`) and
+  an invalid value (e.g. `None`) raises the same `ValueError` a real request would rather than
+  silently registering an unreachable mock. `params=` narrows by exact query-param match; no
+  `data=` on `add_head_response`. `url=` is `str | re.Pattern[str]` only.
 - `LOTHCMock`: `.match_query`/`.match_query_param`/`.match_header`/`.match_body_json`/
   `.match_request(predicate)` narrow further (chainable); `.assert_called(count=/min_count=/
   max_count=)`, `.get_requests() -> list[MockRequest]`, `.get_call_count()`, `.reset_requests()`.
@@ -165,10 +168,12 @@ of this fixture's public surface, not even re-exported.
   `SyncHTTPClient`) — dispatch is via `inspect.iscoroutinefunction`, not overloads — taking
   `MockRequest`, returning `MockResponse | None` (`None` = decline, fall through to the next
   mock). `match_request`'s predicate takes `MockRequest` too, same async/plain split.
-- `MockRequest` (frozen, slotted dataclass): `.method`/`.path`/`.query_string`/`.headers`
-  (`Mapping[str, str]`)/`.body` (`bytes | None`) — lothc's own snapshot of the request a
-  handler/predicate/`get_requests()` sees, built by `_mock_request_from`. Never pyreqwest's
-  `Request`.
+- `MockRequest` (slotted, **not** frozen — a mutable `headers` dict field means `frozen=True`
+  couldn't deliver real immutability/hashability anyway): `.method`/`.path`/`.query_string`/
+  `.headers` (`Mapping[str, str]`, first-value-only for a repeated header, matching
+  `Result.headers`'s own convention elsewhere)/`.body` (`bytes | None`) — lothc's own snapshot of
+  the request a handler/predicate/`get_requests()` sees, built by `_mock_request_from`. Never
+  pyreqwest's `Request`.
 - `LOTHCMocker.strict(enabled=True)` raises `AssertionError` on an unmatched request — this is the
   fixture's *default* (pyreqwest's own `client_mocker` defaults to silent passthrough instead; the
   `lothc_mocker` fixture explicitly overrides that). Opt out per-test with

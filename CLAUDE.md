@@ -702,12 +702,45 @@ Before writing any code, tell the user that you've read this file AND read and f
   Two more findings from the same review round, fixed alongside this: (1) `LOTHCMocker._add_response`
   was stringifying `params=` values with plain `str()` for `match_query_param`, which mismatches
   pyreqwest's own query encoding for `bool` (`str(True)` == `"True"` vs pyreqwest's real
-  `"true"`, confirmed live against `RequestBuilder.query()`) — fixed via a dedicated
-  `_query_param_str` helper. (2) `_encode_params`'s plain-`Mapping` fallback branch was wrapping
-  the input in `dict(cast(...))`, a copy the pre-refactor code never made (pyreqwest's own
-  `.query()` already accepts any `Mapping`, confirmed via its `QueryParams` type alias) — fixed by
-  widening `_encode_params`'s return type to `Mapping[str, str | int | float | bool]` and
-  returning the fallback branch's input as-is.
+  `"true"`, confirmed live against `RequestBuilder.query()`) — first fixed via a dedicated
+  `_query_param_str` helper (superseded, see below). (2) `_encode_params`'s plain-`Mapping`
+  fallback branch was wrapping the input in `dict(cast(...))`, a copy the pre-refactor code never
+  made (pyreqwest's own `.query()` already accepts any `Mapping`, confirmed via its `QueryParams`
+  type alias) — fixed by widening `_encode_params`'s return type to `Mapping[str, str | int |
+  float | bool]` and returning the fallback branch's input as-is.
+  **Third round, same area, from a follow-up review with a stricter read-only constraint (no
+  edits/git operations allowed at all this time, after the second round's finder subagents made
+  unauthorized edits and a "cleanup" discarded real uncommitted work — see the session's own
+  incident, not repeated here in the interest of space):** (1) `_query_param_str` (bullet above)
+  hand-reimplemented pyreqwest's query encoding for exactly one known divergence (`bool`) — flagged
+  as fragile, since any *future* pyreqwest encoding difference for another type would silently
+  reintroduce the same class of bug. Replaced with `_query_param_match_values`, which derives the
+  match string by asking pyreqwest's own real encoder (`Url.parse_with_params(...).
+  query_dict_multi_value`) rather than reimplementing it — confirmed live this also returns
+  lowercase `"true"`/`"false"` for a `bool`, so nothing regressed. (2) That same real-encoder call
+  raises pyreqwest's own `ValueError: Invalid query value: None` for a `None` value — which a real
+  request already does today (confirmed live via `_apply_params`), but the mock-registration path
+  didn't, silently accepting `params={"flag": None}` (not a valid `Params` value per its own type,
+  but nothing stops it arriving at runtime) and registering a matcher for the literal string
+  `"None"` — a mock a real call could never produce. Switching to `_query_param_match_values` fixed
+  this for free, since the same pyreqwest call that derives the encoding is what rejects the
+  invalid value. (3) `MockRequest.headers` collapses a genuinely repeated header to its first
+  value (`dict(request.headers)`, using `HeaderMap.__getitem__`'s own "first value for key"
+  semantics) — flagged as silent data loss versus the real `Request.headers` a caller could
+  previously read. Confirmed this exactly matches `lothc`'s own established convention for *every*
+  other place it reads real headers (`Result.headers` etc. in `_client.py` all do `dict(raw_response.
+  headers)` the same way), so this isn't a new regression pattern introduced by `lothc.testing` —
+  documented explicitly in `MockRequest`'s own docstring instead of redesigning it into a
+  multi-value shape that nothing else in the library uses. (4) `MockRequest` was `frozen=True`,
+  implying immutable/hashable value semantics it couldn't actually deliver: `headers: Mapping[str,
+  str]` is backed by a real mutable `dict`, so `frozen=True` still let `.headers[...] = ...` mutate
+  in place (frozen only blocks *reassigning* a field, not mutating a mutable field's contents), and
+  `hash(...)` still raised — from deep inside dataclass-generated machinery, a confusing failure
+  mode for something claiming to be hashable. Dropped `frozen=True` (kept `slots=True`, matching
+  `style-guide.md` §7's DTO convention) — a plain mutable dataclass is the honest shape, and
+  `hash(MockRequest(...))` now raises a direct, expected `TypeError: unhashable type: 'MockRequest'`
+  instead (confirmed live: a non-frozen dataclass with the default `eq=True` already sets
+  `__hash__ = None`, Python's own standard "mutable + eq" convention).
 - **Status errors are separate from transport errors.** `HTTPResponseError` (4xx/5xx with a body_start
   snippet) is a different failure class from `HTTPTransportError` (never got a response at all) —
   don't unify them.

@@ -1,3 +1,5 @@
+from typing import Any, cast
+
 import pytest
 from msgspec import Struct
 from pydantic import BaseModel
@@ -141,6 +143,32 @@ async def test_add_get_response_matches_on_bool_param(
     item = await client.get("items", params={"flag": True}, response_data_type=dict)
 
     assert item == {"ok": True}
+
+
+def test_add_get_response_with_none_param_raises_like_a_real_request(
+    lothc_mocker: LOTHCMocker,
+) -> None:
+    """`None` isn't a valid `Params` value (`Params` is `Mapping[str, str | int | float | bool] |
+    BaseModel | Struct`), but nothing stops it arriving at runtime — a real request rejects it
+    (`ValueError` from pyreqwest's own query encoder), so mock registration must too, rather than
+    silently registering a mock a real call could never actually produce."""
+    with pytest.raises(ValueError, match="Invalid query value"):
+        lothc_mocker.add_get_response(path="/items", params=cast(Any, {"flag": None}))
+
+
+def test_mock_request_is_not_frozen_and_not_hashable() -> None:
+    """`MockRequest` deliberately isn't `frozen=True` — see its docstring for why (a mutable
+    `dict` field can't be made genuinely immutable/hashable by `frozen=True` alone)."""
+    headers: dict[str, str] = {}
+    request = MockRequest(
+        method="GET", path="/items/7", query_string="", headers=headers, body=None
+    )
+
+    headers["x"] = "y"  # mutation succeeds, honestly, since nothing claims otherwise
+    assert request.headers == {"x": "y"}
+
+    with pytest.raises(TypeError, match="unhashable"):
+        hash(request)
 
 
 async def test_add_get_response_reuses_a_typed_headers_class(
