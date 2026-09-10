@@ -11,18 +11,15 @@ examples below:
 uv add 'lothc[testing]' pytest-asyncio --dev
 ```
 
-This gets you the `lothc_mocker` pytest fixture. It intercepts every request a `HTTPClient` or
-`SyncHTTPClient` sends during a test — no real network call happens, and no changes are needed to
-how the client under test is built. Every example on this page is a complete, runnable file —
-paste the setup block below into a `test_lothc_mocker.py` (or your `conftest.py` for just the
-fixtures), then any test function under it, and `pytest` will run it as-is.
+`lothc_mocker` itself works as soon as `pytest` is installed alongside `lothc` — the extra above
+just pins a tested pytest version, it doesn't gate the fixture.
 
-!!! note
-
-    The `lothc_mocker` fixture is registered as a pytest plugin and auto-loads in **any** project
-    that has both `lothc` and pytest installed — not only when the `testing` extra is installed.
-    Standard Python packaging has no way to make a `pytest11` entry point conditional on an extra
-    (unlike a regular dependency). The extra above only pins pytest's version; it isn't a gate.
+`lothc_mocker` intercepts every request a `HTTPClient` or `SyncHTTPClient` sends during a test — no
+real network call happens, and no changes are needed to how the client under test is built. Every
+example on this page is a complete, runnable file — paste the setup block below into a
+`test_lothc_mocker.py` (or your `conftest.py` for just the fixtures), then any test function under
+it, and `pytest` will run it as-is. Nothing on this page ever imports from `pyreqwest` — every type
+you touch (`MockRequest`, `MockResponse`, `LOTHCMock`, `LOTHCMocker`) is lothc's own.
 
 ## Setup
 
@@ -35,10 +32,9 @@ import re
 import pytest
 import pytest_asyncio
 from pydantic import BaseModel
-from pyreqwest.request import Request
 
 from lothc import HTTPClient, HTTPConnectionError, HTTPResponseError, SyncHTTPClient
-from lothc.testing import LOTHCMocker, MockResponse
+from lothc.testing import LOTHCMocker, MockRequest, MockResponse
 
 
 @pytest_asyncio.fixture(name="client")
@@ -140,7 +136,7 @@ async def test_add_get_response_matches_on_params(
 ```
 
 `params=` — same `Params` type a real call's `params=` takes — matches a rule only against
-requests sent with those exact query params, the same way `path=`/`url=` narrow by URL.
+requests sent with those exact query params, the same way `path=` narrows by URL path.
 
 ## Narrowing and asserting on a mock
 
@@ -160,6 +156,24 @@ async def test_match_header_narrows_a_mock(client: HTTPClient, lothc_mocker: LOT
 
     assert item == {"ok": True}
     mock.assert_called(count=1)
+```
+
+`mock.get_requests()`/`lothc_mocker.get_requests()` return `list[MockRequest]` — lothc's own
+snapshot type (`method`/`path`/`query_string`/`headers`/`body`), not pyreqwest's `Request`:
+
+```python
+@pytest.mark.asyncio
+async def test_get_requests_returns_mock_request_snapshots(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items/7", data={"ok": True})
+
+    await client.get("items/7", headers={"x-flag": "1"})
+
+    [seen] = mock.get_requests()
+    assert seen.method == "GET"
+    assert seen.path == "/items/7"
+    assert seen.headers["x-flag"] == "1"
 ```
 
 `lothc_mocker` is **strict by default** — any request that matches no registered mock raises
@@ -209,44 +223,45 @@ separate classes throughout lothc, not one. What the handler *returns* isn't spl
 plain `MockResponse` (`data`/`headers`/`status`, same fields and same encoding as
 `add_*_response`) either way, or `None` to decline and let a later mock try to match instead —
 lothc never hands you pyreqwest's own response types to build this, `MockResponse` is a plain
-dataclass, no builder.
-
-This is also the one place `request` is genuinely useful — reading it is the reason to reach for a
-custom handler instead of `add_*_response`, whose `data=` is fixed once at registration time. Here
-the handler computes its response from `request.url.path` instead of returning a hardcoded value,
-so it works for *any* item ID without registering a separate mock per ID:
+dataclass, no builder. The handler's own parameter is `MockRequest`, the same snapshot type
+`get_requests()` returns — reading it is the reason to reach for a custom handler instead of
+`add_*_response`, whose `data=` is fixed once at registration time. Here the handler computes its
+response from `request.path` instead of returning a hardcoded value, so it works for *any* item ID
+without registering a separate mock per ID:
 
 ```python
-async def handler(request: Request) -> MockResponse:
-    item_id = int(request.url.path.removeprefix("/items/"))
-    return MockResponse(status=200, data={"id": item_id})
+def _item_id_from_request(request: MockRequest) -> int:
+    return int(request.path.removeprefix("/items/"))
+
+
+async def _handler(request: MockRequest) -> MockResponse:
+    return MockResponse(status=200, data={"id": _item_id_from_request(request)})
 
 
 @pytest.mark.asyncio
 async def test_custom_handler_computes_response_from_the_request(
     client: HTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
-    lothc_mocker.mock("GET").match_request_with_response(handler)
+    lothc_mocker.mock("GET").match_request_with_response(_handler)
 
     item = await client.get("items/42", response_data_type=dict)
 
     assert item == {"id": 42}
 
 
-def sync_handler(request: Request) -> MockResponse:
-    item_id = int(request.url.path.removeprefix("/items/"))
-    return MockResponse(status=200, data={"id": item_id})
+def _sync_handler(request: MockRequest) -> MockResponse:
+    return MockResponse(status=200, data={"id": _item_id_from_request(request)})
 
 
 def test_sync_custom_handler_computes_response_from_the_request(
     sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
-    lothc_mocker.mock("GET").match_request_with_response(sync_handler)
+    lothc_mocker.mock("GET").match_request_with_response(_sync_handler)
 
     item = sync_client.get("items/42", response_data_type=dict)
 
     assert item == {"id": 42}
 ```
 
-`request` also exposes `.method`, `.headers` (e.g. `request.headers.get("x-request-id")`), and
-`.body` — anything a real handler would need to branch on.
+`request` also exposes `.method`, `.query_string`, and `.body` (`bytes | None`) — anything a real
+handler would need to branch on.

@@ -2,10 +2,9 @@ import pytest
 from msgspec import Struct
 from pydantic import BaseModel
 from pyreqwest.pytest_plugin.mock import ClientMocker
-from pyreqwest.request import Request
 
 from lothc import HTTPClient, HTTPResponseError, SyncHTTPClient
-from lothc.testing import LOTHCMocker, MockResponse
+from lothc.testing import LOTHCMocker, MockRequest, MockResponse
 
 # Every method `_MockTyping`/`_ClientMockerTyping` (lothc/testing.py) declare against pyreqwest's
 # real `Mock`/`ClientMocker` — kept in sync manually so a future pyreqwest rename/removal fails
@@ -132,6 +131,18 @@ async def test_add_get_response_matches_on_params(
     other_page.assert_called(count=0)
 
 
+async def test_add_get_response_matches_on_bool_param(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    """pyreqwest encodes a bool query param as lowercase `true`/`false`, not Python's
+    `str(True)` == `"True"` — confirmed live against a real `RequestBuilder.query()` call."""
+    lothc_mocker.add_get_response(path="/items", params={"flag": True}, data={"ok": True})
+
+    item = await client.get("items", params={"flag": True}, response_data_type=dict)
+
+    assert item == {"ok": True}
+
+
 async def test_add_get_response_reuses_a_typed_headers_class(
     client: HTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
@@ -185,6 +196,16 @@ async def test_lothc_mocker_marker_disables_strict(
     assert lothc_mocker.get_call_count() == 0
 
 
+@pytest.mark.lothc_mocker(False)  # noqa: FBT003 -- testing the positional-arg form on purpose
+async def test_lothc_mocker_marker_disables_strict_positional(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    item = await client.get("items/7", response_data_type=dict)
+
+    assert item == {"id": 7, "name": "item-7"}
+    assert lothc_mocker.get_call_count() == 0
+
+
 def test_add_get_response_returns_raw_bytes_by_default_sync(
     sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
@@ -224,9 +245,12 @@ async def test_match_request_with_response_raises_after_add_response(
         mock.match_request_with_response(lambda _request: None)
 
 
-async def _handler_computes_item_from_path(request: Request) -> MockResponse:
-    item_id = int(request.url.path.removeprefix("/items/"))
-    return MockResponse(status=201, data={"id": item_id})
+def _item_id_from_request(request: MockRequest) -> int:
+    return int(request.path.removeprefix("/items/"))
+
+
+async def _handler_computes_item_from_path(request: MockRequest) -> MockResponse:
+    return MockResponse(status=201, data={"id": _item_id_from_request(request)})
 
 
 async def test_match_request_with_response_computes_from_the_request(
@@ -239,9 +263,8 @@ async def test_match_request_with_response_computes_from_the_request(
     assert item == {"id": 42}
 
 
-def _sync_handler_computes_item_from_path(request: Request) -> MockResponse:
-    item_id = int(request.url.path.removeprefix("/items/"))
-    return MockResponse(status=201, data={"id": item_id})
+def _sync_handler_computes_item_from_path(request: MockRequest) -> MockResponse:
+    return MockResponse(status=201, data={"id": _item_id_from_request(request)})
 
 
 def test_match_request_with_response_works_for_sync_client(
@@ -254,7 +277,7 @@ def test_match_request_with_response_works_for_sync_client(
     assert item == {"id": 42}
 
 
-async def _handler_declines(_request: Request) -> MockResponse | None:
+async def _handler_declines(_request: MockRequest) -> MockResponse | None:
     return None
 
 
@@ -291,7 +314,7 @@ async def test_match_query_and_match_body_json_narrow_a_mock(
     wide.assert_called(count=1)
 
 
-async def _matches_flag_header(request: Request) -> bool:
+async def _matches_flag_header(request: MockRequest) -> bool:
     return request.headers.get("x-flag") == "1"
 
 
@@ -305,6 +328,20 @@ async def test_match_request_uses_a_custom_predicate(
 
     assert item == {"ok": True}
     mock.assert_called(count=1)
+
+
+async def test_get_requests_returns_mock_request_snapshots(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items/7", data={"ok": True})
+
+    await client.get("items/7", headers={"x-flag": "1"})
+
+    [seen] = mock.get_requests()
+    assert isinstance(seen, MockRequest)
+    assert seen.method == "GET"
+    assert seen.path == "/items/7"
+    assert seen.headers["x-flag"] == "1"
 
 
 async def test_clear_removes_all_registered_mocks(

@@ -116,11 +116,10 @@ see the OAuth dev note below), and a pytest mocking plugin (`lothc[testing]`, `l
 the `lothc_mocker` fixture, a thin adapter over pyreqwest's own `client_mocker` plugin; see the
 "Never expose pyreqwest internals" dev note below for its one deliberate design rule).
 
-Not done yet: `lothc.testing`'s `Request` type (the parameter to `match_request`/
-`match_request_with_response`, and `get_requests()`'s return type) is still pyreqwest's own
-`pyreqwest.request.Request`, not a lothc-native wrapper — a known, currently-accepted exception to
-the "never expose pyreqwest internals" rule, not yet addressed. Otherwise nothing else outstanding
-right now — see git history/this file's own dev-notes below for what's landed and why.
+Not done yet: nothing outstanding right now — see git history/this file's own dev-notes below for
+what's landed and why. (`lothc.testing`'s `Request`/`Url` re-export was flagged here as a known
+partial exception to "never expose pyreqwest internals" in an earlier pass; fully resolved since —
+see that dev note below. No pyreqwest type appears in `lothc.testing`'s public API anymore.)
 
 ## Testing
 
@@ -676,11 +675,39 @@ Before writing any code, tell the user that you've read this file AND read and f
   unavoidable: a single `LOTHCMocker`/`ClientMocker` patches both transports, so this module has no
   way to know ahead of registration time which one a given handler will be invoked by; it dispatches
   on `inspect.iscoroutinefunction(handler)`, mirroring the exact constraint pyreqwest's own raw
-  `CustomHandler` union already imposes. **Known, currently-accepted exception to this rule:**
-  `Request` (the type passed to `match_request`/`match_request_with_response`, and returned by
-  `get_requests()`) is still pyreqwest's own `pyreqwest.request.Request` — wrapping it would mean
-  proxying `.method`/`.url`/`.headers`/`.body` reading too, a larger task left for later, tracked
-  under "Not done yet" above rather than silently left undocumented.
+  `CustomHandler` union already imposes.
+  **Second round, same rule, pushed further:** an intermediate fix re-exported pyreqwest's real
+  `Request`/`Url` classes from `lothc.testing` (`from lothc.testing import Request`, never
+  `from pyreqwest.request import Request`) so a caller's own import statement never named
+  `pyreqwest` — rejected as insufficient on review: the *class itself* was still pyreqwest's, a
+  re-export is not a wrapper, "never expose pyreqwest internals" means the type too, not just the
+  import path. Fixed properly instead: `MockRequest` (`lothc/testing.py`) is a plain, frozen,
+  `slots=True` dataclass — `method: str`, `path: str`, `query_string: str`,
+  `headers: Mapping[str, str]`, `body: bytes | None` — built by `_mock_request_from` from
+  pyreqwest's real `Request` at the one seam a mock rule actually receives one.
+  `match_request_with_response`'s handler and `match_request`'s predicate now both take
+  `MockRequest`, not `Request`; `get_requests()` (on both `LOTHCMock` and `LOTHCMocker`) returns
+  `list[MockRequest]`. `_wrap_custom_handler`/`_wrap_custom_matcher` are the only two places this
+  module still touches pyreqwest's `Request` at all, converting it immediately before any
+  caller-supplied code runs. `body` is read via `request.body.copy_bytes().to_bytes()` — always
+  already-materialized bytes by the time a mock handler runs, never a live stream: confirmed by
+  reading pyreqwest's own `ClientMocker._create_middleware`/`_create_sync_middleware` source, both
+  of which read any streamed body into bytes *before* handing the request to any mock rule.
+  `url=` matching (`mock()`/`get()`/etc.) is narrowed from `Matcher | Url` to `Matcher` (`str |
+  re.Pattern[str]`) only — pyreqwest's own `Url`-object alternative is dropped entirely rather than
+  wrapped, since a plain `str` already matches the exact URL (confirmed via pyreqwest's own
+  `pytest_plugin/types.py`: its `UrlMatcher` is `Matcher | Url` with `Matcher` already including
+  `str`), so there's no real capability lost and no second wrapper type needed. **No pyreqwest
+  type is left anywhere in `lothc.testing`'s public API after this — not even as a re-export.**
+  Two more findings from the same review round, fixed alongside this: (1) `LOTHCMocker._add_response`
+  was stringifying `params=` values with plain `str()` for `match_query_param`, which mismatches
+  pyreqwest's own query encoding for `bool` (`str(True)` == `"True"` vs pyreqwest's real
+  `"true"`, confirmed live against `RequestBuilder.query()`) — fixed via a dedicated
+  `_query_param_str` helper. (2) `_encode_params`'s plain-`Mapping` fallback branch was wrapping
+  the input in `dict(cast(...))`, a copy the pre-refactor code never made (pyreqwest's own
+  `.query()` already accepts any `Mapping`, confirmed via its `QueryParams` type alias) — fixed by
+  widening `_encode_params`'s return type to `Mapping[str, str | int | float | bool]` and
+  returning the fallback branch's input as-is.
 - **Status errors are separate from transport errors.** `HTTPResponseError` (4xx/5xx with a body_start
   snippet) is a different failure class from `HTTPTransportError` (never got a response at all) —
   don't unify them.

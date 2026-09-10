@@ -722,11 +722,12 @@ def _build_sync_form(form: Form, *, infer_mime_type_from_file_extension: bool) -
     return form_builder
 
 
-def _encode_params(params: Params) -> dict[str, str | int | float | bool]:
+def _encode_params(params: Params) -> Mapping[str, str | int | float | bool]:
     """Turns any `Params` (`Mapping[str, str | int | float | bool]`, pydantic `BaseModel`, or
-    msgspec `Struct`) into a plain dict the way a real request's query string would be encoded
-    (non-`None` values only) — shared by `_apply_params` and `lothc.testing`'s mock query
-    matching."""
+    msgspec `Struct`) into a plain `Mapping` the way a real request's query string would be
+    encoded (non-`None` values only) — shared by `_apply_params` and `lothc.testing`'s mock query
+    matching. A plain-`Mapping` input is returned as-is (no copy) — pyreqwest's own `.query()`
+    already accepts any `Mapping`, so there's nothing to gain from forcing a fresh `dict`."""
     match params:
         case BaseModel():
             return {
@@ -742,7 +743,7 @@ def _encode_params(params: Params) -> dict[str, str | int | float | bool]:
             # (structural Protocols — see _compat.py's `StructTyping` docstring) the way it can
             # narrow a sequential `issubclass` chain, so it still sees them as possible here even
             # though the two `case` patterns above already excluded any real BaseModel/Struct.
-            return dict(cast("Mapping[str, str | int | float | bool]", params))
+            return cast("Mapping[str, str | int | float | bool]", params)
 
 
 def _apply_params[TBuilder: BaseRequestBuilder](
