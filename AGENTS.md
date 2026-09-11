@@ -126,8 +126,10 @@ under concurrency (lock; the async lock is per-event-loop, so a provider survive
   return, O(chunk size) memory regardless of body size)
 
 `params`/`headers`: `dict`/`Mapping[str, str]`, or `BaseModel`/`Struct` (`None` fields omitted).
-`json`: `dict` | `BaseModel` | `Struct`. `form`: `dict[str, int | bytes | str | File]`, `File =
-tuple[str, bytes] | Path | BufferedIOBase`. `content`: raw `str | bytes` body.
+`params`'s value may also be a `list[...]`/`tuple[...]` of `str | int | float | bool` — sends that
+key once per element, verbatim (e.g. `{"tag": ["a", "b"]}` → `?tag=a&tag=b`); lothc has no opinion
+on what an element means. `json`: `dict` | `BaseModel` | `Struct`. `form`: `dict[str, int | bytes | str |
+File]`, `File = tuple[str, bytes] | Path | BufferedIOBase`. `content`: raw `str | bytes` body.
 
 ## Errors
 
@@ -157,8 +159,10 @@ of this fixture's public surface, not even re-exported.
   (`_query_param_match_values`, via `Url.parse_with_params(...).query_dict_multi_value`), not
   hand-reimplemented, so a `bool` becomes lowercase `true`/`false` (not Python's `str(True)`) and
   an invalid value (e.g. `None`) raises the same `ValueError` a real request would rather than
-  silently registering an unreachable mock. `params=` narrows by exact query-param match; no
-  `data=` on `add_head_response`. `url=` is `str | re.Pattern[str]` only.
+  silently registering an unreachable mock. `params=` narrows by exact query-param match — a
+  `list[...]`/`tuple[...]` value (a genuinely repeated query key, same convention as the real
+  `params=`) narrows on the full, order-sensitive list of values for that key; no `data=` on
+  `add_head_response`. `url=` is `str | re.Pattern[str]` only.
 - `LOTHCMock`: `.match_query`/`.match_query_param`/`.match_header`/`.match_body_json`/
   `.match_request(predicate)` narrow further (chainable); `.assert_called(count=/min_count=/
   max_count=)`, `.get_requests() -> list[MockRequest]`, `.get_call_count()`, `.reset_requests()`.

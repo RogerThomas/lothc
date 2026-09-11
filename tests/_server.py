@@ -2,9 +2,9 @@
 
 `examples/server.py` (used for manual smoke-testing) reuses this same handler on a fixed port —
 this module is the one canonical server implementation for both. Endpoints: `/items`
-(GET/POST/PUT/PATCH/DELETE/HEAD), `/echo-headers`, `/slow`, `/events` (SSE), `/boom`, `/upload`
-(multipart), `/oauth/token*` (OAuth 2 token endpoints), plus cookie/redirect/retry/streaming
-scenarios used by their own tests.
+(GET/POST/PUT/PATCH/DELETE/HEAD), `/echo-headers`, `/echo-query`, `/slow`, `/events` (SSE),
+`/boom`, `/upload` (multipart), `/oauth/token*` (OAuth 2 token endpoints), plus
+cookie/redirect/retry/streaming scenarios used by their own tests.
 """
 
 import contextlib
@@ -348,6 +348,11 @@ class TestAppHandler(BaseHTTPRequestHandler):
         headers = [{"name": name, "value": value} for name, value in self.headers.items()]
         self._write_json(200, {"headers": headers})
 
+    def _handle_echo_query(self, query: str) -> None:
+        # parse_qs already returns every value as a list (even a single-value key), so a
+        # genuinely repeated key round-trips as a multi-element list with no extra handling.
+        self._write_json(200, {"query": parse_qs(query)})
+
     def _handle_boom(self) -> None:
         self._write_json(500, _server_error_body)
 
@@ -435,6 +440,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/ndjson": self._handle_ndjson,
             "/ndjson-blank-line": self._handle_ndjson_with_blank_line,
             "/oauth/token-requests": self._handle_oauth_token_requests,
+            "/echo-query": self._handle_echo_query,
         }
         if parsed.path in query_routes:
             query_routes[parsed.path](parsed.query)

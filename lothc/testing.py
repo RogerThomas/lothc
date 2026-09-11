@@ -36,11 +36,14 @@ matcher support is dropped from these signatures accordingly.
 `params=`/`data=`/`headers=`'s encoding are the places this module has real lothc-specific
 behaviour, all three reusing `_client.py`'s own encoding helpers so a mock always matches/responds
 exactly the way a real request would encode the same value: `params=` accepts lothc's `Params`
-union (via `_encode_params`, shared with `_apply_params`) and is applied as an exact
-`match_query_param` per key — narrowing which requests an `add_*_response` rule matches, the same
-way a real call's `params=` would build the query string (each value's match string derived via
-`_query_param_match_values` from pyreqwest's own real encoder, not reimplemented by hand — e.g.
-`True` becomes `"true"`, not Python's `str(True)` == `"True"`, confirmed live); `data=`
+union (via `_encode_params`, shared with `_apply_params` — including a `list[...]`/`tuple[...]`
+value meaning a genuinely repeated query key, see `Params`'s own doc comment in `_client.py`) and
+is applied via a single `match_query(dict)` call — narrowing which requests an `add_*_response`
+rule matches, the same way a real call's `params=` would build the query string (each key's match
+value derived via `_query_param_match_values` from pyreqwest's own real encoder, not reimplemented
+by hand — e.g. `True` becomes `"true"`, not Python's `str(True)` == `"True"`, confirmed live; a
+repeated key's match value is a `list[str]`, matched against pyreqwest's own order-sensitive
+`query_dict_multi_value` for the real request); `data=`
 accepts lothc's `Data` union (`bytes | dict | BaseModel | Struct`, via `_encode_json_payload`,
 shared with `_attach_body`/`_attach_body_sync`); and `headers=` accepts lothc's `Headers` union
 (`Mapping[str, str] | BaseModel | Struct`, via `_encode_headers`, shared with `_apply_headers`).
@@ -295,9 +298,19 @@ def _encode_response_data(mock: _MockTyping, data: Data) -> None:
 
 
 def _query_param_match_values(
-    params: Mapping[str, str | int | float | bool],
-) -> dict[str, str]:
-    """The exact string each `params` value matches against in `match_query_param`, derived from
+    params: Mapping[
+        str,
+        str
+        | int
+        | float
+        | bool
+        | list[str | int | float | bool]
+        | tuple[str | int | float | bool, ...],
+    ],
+) -> dict[str, str | list[str]]:
+    """The exact value(s) each `params` key matches against in `mock.match_query` (a `list[str]`
+    for a key whose `Params` value was itself a list/tuple — i.e. a genuinely repeated query key,
+    see `Params`'s own doc comment in `_client.py` — a plain `str` otherwise), derived from
     pyreqwest's own real URL/query encoder (`Url.parse_with_params` + `.query_dict_multi_value`)
     rather than a hand-reimplementation of it — reimplementing risked silently diverging from
     pyreqwest for any type it encodes differently from Python's own `str()` (confirmed live for
@@ -305,13 +318,14 @@ def _query_param_match_values(
     manually re-discovering the next such mismatch. This also means an invalid value (e.g. `None`
     — not a valid `Params` value, but nothing stops it arriving at runtime) raises the exact same
     `ValueError` a real request would, confirmed live, instead of silently registering a mock that
-    a real call could never actually produce. `_encode_params`'s value union never includes a list
-    (`Params` is `Mapping[str, str | int | float | bool] | BaseModel | Struct`, one scalar per
-    key), so `query_dict_multi_value`'s per-key result is always the plain `str` case here in
-    practice — `_first_value_per_key` still handles the `list[str]` case generically, the same way
-    it does for `MockRequest.query`, rather than assuming it never occurs."""
-    encoded = Url.parse_with_params("http://mock.invalid/", params).query_dict_multi_value
-    return _first_value_per_key(encoded)
+    a real call could never actually produce. Deliberately NOT collapsed through
+    `_first_value_per_key` the way `MockRequest.query` is — collapsing here would silently narrow
+    an exact multi-value match (e.g. `params={"tag": ["a", "b"]}`) down to matching only `tag`'s
+    first value, matching requests it shouldn't. `Url.parse_with_params` already accepts a
+    `Mapping` whose value is a list/tuple directly (confirmed live — unlike pyreqwest's own
+    `RequestBuilder.query()`, which rejects that shape; see `_client.py`'s `_query_pairs`), so no
+    pre-flattening is needed on this side."""
+    return Url.parse_with_params("http://mock.invalid/", params).query_dict_multi_value
 
 
 def _apply_mock_response(builder: ResponseBuilder, mock_response: MockResponse) -> ResponseBuilder:
@@ -541,8 +555,11 @@ class LOTHCMocker:
 
         mock = verb(path=path, url=url)
         if query_matches is not None:
-            for name, value in query_matches.items():
-                mock.match_query_param(name, value)
+            # dict is invariant in its value type, so dict[str, str | list[str]] (what
+            # _query_param_match_values actually returns) isn't assignable to QueryMatcher's
+            # dict[str, Matcher | list[str]] even though str satisfies Matcher — the values
+            # themselves are never mutated here, so the cast is safe.
+            mock.match_query(cast("QueryMatcher", query_matches))
         mock.with_status(status)
         # `data` before `headers` — see `_apply_mock_response`'s comment for why.
         _apply_encoded(

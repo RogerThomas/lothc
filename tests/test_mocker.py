@@ -165,6 +165,44 @@ async def test_add_get_response_matches_on_bool_param(
     assert item == {"ok": True}
 
 
+async def test_add_get_response_matches_on_a_repeated_query_param(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    """A `list[...]` `params` value (a genuinely repeated query key) narrows on the full,
+    order-sensitive list of values for that key, not just its first value."""
+    matching = lothc_mocker.add_get_response(
+        path="/items", params={"tag": ["a", "b"]}, data={"ok": True}
+    )
+
+    item = await client.get("items", params={"tag": ["a", "b"]}, response_data_type=dict)
+
+    assert item == {"ok": True}
+    matching.assert_called(count=1)
+
+
+async def test_add_get_response_matches_on_a_repeated_query_param_as_tuple(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    """A `tuple[...]` `params` value narrows the same way `list[...]` does — both mean "repeat
+    this key"."""
+    lothc_mocker.add_get_response(path="/items", params={"tag": ("a", "b")}, data={"ok": True})
+
+    item = await client.get("items", params={"tag": ("a", "b")}, response_data_type=dict)
+
+    assert item == {"ok": True}
+
+
+async def test_add_get_response_does_not_match_a_different_repeated_query_param_order(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items", params={"tag": ["a", "b"]}, data={})
+
+    with pytest.raises(AssertionError, match="No mock rule matched"):
+        await client.get("items", params={"tag": ["b", "a"]})
+
+    mock.assert_called(count=0)
+
+
 def test_add_get_response_with_none_param_raises_like_a_real_request(
     lothc_mocker: LOTHCMocker,
 ) -> None:

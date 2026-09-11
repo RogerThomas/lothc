@@ -133,11 +133,24 @@ async def test_add_get_response_matches_on_params(
     item = await client.get("items", params={"page": "2"}, response_data_type=dict)
 
     assert item == {"page": 2}
+
+
+@pytest.mark.asyncio
+async def test_add_get_response_matches_on_a_repeated_query_param(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/items", params={"tag": ["a", "b"]}, data={"ok": True})
+
+    item = await client.get("items", params={"tag": ["a", "b"]}, response_data_type=dict)
+
+    assert item == {"ok": True}
 ```
 
 `params=` — same `Params` type a real call's `params=` takes — narrows a rule to requests that
 include at least those query params with those exact values. It's a subset match, not an exact
-one: a real request sending extra, unlisted query params still matches.
+one: a real request sending extra, unlisted query params still matches. A `list[...]`/`tuple[...]`
+value (a genuinely repeated query key, same convention as the real `params=`) narrows on the full,
+order-sensitive list of values for that key.
 
 `add_*_response`'s own `headers=` is not a matcher at all — it only sets the mocked *response's*
 headers. Narrowing on the request's own headers (or body) needs the separate `match_header`/

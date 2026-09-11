@@ -411,6 +411,16 @@ the skill covers *how* to write new code that matches it.
   *instance* level**, not the class level. `JSONPayload` (not `Json`) was named that way
   deliberately to avoid a case-only collision with the former `JSON` response-decode class
   (removed).
+- **`Params`'s `list[...]`/`tuple[...]` value means "repeat this query key once per element"** (e.g.
+  `{"tag": ["a", "b"]}` → `?tag=a&tag=b`) — a plain `list`, not a tuple like `Form` uses for the
+  same idea, since `Params` has no prior bare-list meaning to disambiguate from. pyreqwest's own
+  `RequestBuilder.query()` rejects a `Mapping` whose value is a list (`BuilderError: unsupported
+  value`, confirmed live) even though its declared stub type allows it and `Url.parse_with_params`
+  genuinely does accept it — `_query_pairs` flattens to a flat list of pairs first, the one shape
+  that actually works. `lothc.testing`'s mock side narrows via a single `mock.match_query(dict)`
+  call instead of a `match_query_param` loop, since pyreqwest's own `query_dict_multi_value`
+  already returns the right per-key `str | list[str]` shape and `match_query`'s dict form is
+  exact-order-sensitive on a `list[str]` value.
 - **`bearer_token`/`bearer_auth`/`basic_auth` — not `auth_token`/`auth`.** Named precisely because
   each maps to exactly one pyreqwest mechanism (`.bearer_auth()`/`.basic_auth()`); keep this
   precise if a fourth mechanism is ever added. `_apply_auth` (was `_apply_bearer_auth`) applies

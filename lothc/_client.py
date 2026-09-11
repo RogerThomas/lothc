@@ -84,7 +84,20 @@ type File = (
 # marker as `tuple` and the JSON-array marker as `list` is what makes the two unambiguous.
 type _FormValue = str | int | bytes | list[Any] | JSONPayload | File
 type Form = dict[str, _FormValue | tuple[_FormValue, ...]]
-type Params = Mapping[str, str | int | float | bool] | BaseModelTyping | StructTyping
+# A list[...]/tuple[...] value in Params (unlike Form's list-vs-tuple split, above) means "repeat
+# this query key once per element, verbatim" — e.g. {"tag": ["a", "b"]} sends ?tag=a&tag=b. Both
+# spellings are accepted, unlike Form, because Params has no existing meaning for a bare list the
+# way Form does (there a bare list[Any] already means "JSON-encode this value", which is why Form
+# needs list vs tuple to mean two different things) — there's nothing to disambiguate here, so
+# both are just "a sequence of values for this key." Deliberately NOT `Sequence[...]` — `str`
+# itself is a `Sequence[str]`, so an `isinstance` check against `Sequence` would silently explode
+# a scalar string value into one query param per character; `list | tuple` has no such trap.
+# lothc has no concept of what an element "means" (it's never itself a key=value pair to lothc);
+# it's just another scalar occurrence of that key, exactly as the caller wrote it.
+type _QueryValue = (
+    str | int | float | bool | list[str | int | float | bool] | tuple[str | int | float | bool, ...]
+)
+type Params = Mapping[str, _QueryValue] | BaseModelTyping | StructTyping
 type Headers = Mapping[str, str] | BaseModelTyping | StructTyping
 type AuthProvider = Callable[[], Awaitable[str]]
 type SyncAuthProvider = Callable[[], str]
@@ -722,12 +735,15 @@ def _build_sync_form(form: Form, *, infer_mime_type_from_file_extension: bool) -
     return form_builder
 
 
-def _encode_params(params: Params) -> Mapping[str, str | int | float | bool]:
-    """Turns any `Params` (`Mapping[str, str | int | float | bool]`, pydantic `BaseModel`, or
-    msgspec `Struct`) into a plain `Mapping` the way a real request's query string would be
-    encoded (non-`None` values only) — shared by `_apply_params` and `lothc.testing`'s mock query
-    matching. A plain-`Mapping` input is returned as-is (no copy) — pyreqwest's own `.query()`
-    already accepts any `Mapping`, so there's nothing to gain from forcing a fresh `dict`."""
+def _encode_params(params: Params) -> Mapping[str, _QueryValue]:
+    """Turns any `Params` (`Mapping[str, _QueryValue]`, pydantic `BaseModel`, or msgspec `Struct`)
+    into a plain `Mapping` the way a real request's query string would be encoded (non-`None`
+    values only) — shared by `_apply_params` and `lothc.testing`'s mock query matching. A
+    plain-`Mapping` input is returned as-is (no copy) — nothing here mutates it, and both real
+    callers either flatten it into a fresh structure of their own (`_apply_params`'s
+    `_query_pairs`) or hand it straight to pyreqwest's own `Url.parse_with_params`
+    (`lothc.testing`'s `_query_param_match_values`), so there's nothing to gain from forcing a
+    fresh `dict` here too."""
     match params:
         case BaseModel():
             return {
@@ -743,7 +759,27 @@ def _encode_params(params: Params) -> Mapping[str, str | int | float | bool]:
             # (structural Protocols — see _compat.py's `StructTyping` docstring) the way it can
             # narrow a sequential `issubclass` chain, so it still sees them as possible here even
             # though the two `case` patterns above already excluded any real BaseModel/Struct.
-            return cast("Mapping[str, str | int | float | bool]", params)
+            return cast("Mapping[str, _QueryValue]", params)
+
+
+def _query_pairs(params: Mapping[str, _QueryValue]) -> list[tuple[str, str | int | float | bool]]:
+    """Expands an `_encode_params`-normalized `Params` mapping into the flat list-of-pairs shape
+    pyreqwest's `RequestBuilder.query()` actually needs to produce a repeated query key on the
+    wire — confirmed live that `.query()` raises `pyreqwest.exceptions.BuilderError: unsupported
+    value` if a `Mapping`'s own value is itself a `list`/`tuple`, even though
+    `Url.parse_with_params` (used by `lothc.testing`'s own `_query_param_match_values` instead)
+    happily accepts that exact shape (either spelling) and expands it correctly — a genuine
+    inconsistency between the two pyreqwest APIs, not something to build on. A flat
+    `Sequence[tuple[str, QueryPrimitive]]` works for `.query()`, so that's the shape used here. A
+    `list`/`tuple` value means "repeat this query param once per element" — see `Params`'s own
+    doc comment above."""
+    pairs: list[tuple[str, str | int | float | bool]] = []
+    for name, value in params.items():
+        if isinstance(value, list | tuple):
+            pairs.extend((name, item) for item in value)
+        else:
+            pairs.append((name, value))
+    return pairs
 
 
 def _apply_params[TBuilder: BaseRequestBuilder](
@@ -751,7 +787,7 @@ def _apply_params[TBuilder: BaseRequestBuilder](
 ) -> TBuilder:
     if params is None:
         return request_builder
-    return request_builder.query(_encode_params(params))
+    return request_builder.query(_query_pairs(_encode_params(params)))
 
 
 def _encode_headers(headers: Headers) -> dict[str, str]:
