@@ -50,9 +50,12 @@ shared with `_attach_body`/`_attach_body_sync`); and `headers=` accepts lothc's 
 The same typed params/headers class used for a real request, or for a `response_headers_type=`
 decode on the read side, can be constructed once and passed straight into `add_*_response(...)`.
 The import below is the one deliberate `reportPrivateUsage` suppression in this module: these
-three encoding helpers keep this file's otherwise-universal `_`-prefix-for-module-private-functions
-convention rather than losing it to cross-module sharing, since basedpyright's module-boundary
-check has no way to express "private to the package, shared between two of its own files."
+three encoding helpers and the `_QueryValue` type alias (`_query_param_match_values`'s own
+parameter type, kept as one import rather than an inline duplicate of `Params`'s value union so
+the two can't silently drift apart) keep this file's otherwise-universal
+`_`-prefix-for-module-private-functions convention rather than losing it to cross-module sharing,
+since basedpyright's module-boundary check has no way to express "private to the package, shared
+between two of its own files."
 """
 
 import functools
@@ -75,6 +78,7 @@ from ._client import (
     _encode_headers,  # pyright: ignore[reportPrivateUsage]
     _encode_json_payload,  # pyright: ignore[reportPrivateUsage]
     _encode_params,  # pyright: ignore[reportPrivateUsage]
+    _QueryValue,  # pyright: ignore[reportPrivateUsage]
 )
 
 __all__ = ["LOTHCMock", "LOTHCMocker", "MockRequest", "MockResponse"]
@@ -297,17 +301,7 @@ def _encode_response_data(mock: _MockTyping, data: Data) -> None:
     _apply_data(data, with_bytes=mock.with_body_bytes, with_json=mock.with_body_json)
 
 
-def _query_param_match_values(
-    params: Mapping[
-        str,
-        str
-        | int
-        | float
-        | bool
-        | list[str | int | float | bool]
-        | tuple[str | int | float | bool, ...],
-    ],
-) -> dict[str, str | list[str]]:
+def _query_param_match_values(params: Mapping[str, _QueryValue]) -> dict[str, str | list[str]]:
     """The exact value(s) each `params` key matches against in `mock.match_query` (a `list[str]`
     for a key whose `Params` value was itself a list/tuple — i.e. a genuinely repeated query key,
     see `Params`'s own doc comment in `_client.py` — a plain `str` otherwise), derived from
@@ -324,7 +318,23 @@ def _query_param_match_values(
     first value, matching requests it shouldn't. `Url.parse_with_params` already accepts a
     `Mapping` whose value is a list/tuple directly (confirmed live — unlike pyreqwest's own
     `RequestBuilder.query()`, which rejects that shape; see `_client.py`'s `_query_pairs`), so no
-    pre-flattening is needed on this side."""
+    pre-flattening is needed on this side.
+
+    An empty `list`/`tuple` value is rejected explicitly, unlike every other value here — confirmed
+    live that `Url.parse_with_params` silently drops a key entirely when its value is `[]`/`()`,
+    so `mock.match_query({})` would register a matcher with nothing to check for that key: not "no
+    narrowing was requested" (an error, like `None` gets) or "this key must be absent" (not
+    something `match_query`'s dict form can express), but the mock silently matching ANY query
+    string at all, including ones with no relation to the intended key — the opposite of what a
+    caller registering a `params=` narrowing would expect, and far worse to leave silent than a
+    real request's own, more benign handling of an empty list (it simply omits the key)."""
+    for name, value in params.items():
+        if isinstance(value, list | tuple) and not value:
+            raise ValueError(
+                f"Invalid query value for {name!r}: an empty list/tuple has no query-string "
+                "representation to narrow a mock against — it would register a mock that matches "
+                "any query string at all instead of none. Omit the key from params= instead."
+            )
     return Url.parse_with_params("http://mock.invalid/", params).query_dict_multi_value
 
 

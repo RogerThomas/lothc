@@ -214,6 +214,17 @@ def test_add_get_response_with_none_param_raises_like_a_real_request(
         lothc_mocker.add_get_response(path="/items", params=cast(Any, {"flag": None}))
 
 
+def test_add_get_response_with_empty_list_param_raises_instead_of_matching_anything(
+    lothc_mocker: LOTHCMocker,
+) -> None:
+    """An empty `list`/`tuple` `params` value has no query-string representation to narrow a mock
+    against — `Url.parse_with_params` silently drops the key entirely, which would otherwise
+    register a mock that matches ANY query string instead of none (confirmed live before this
+    check was added)."""
+    with pytest.raises(ValueError, match="Invalid query value"):
+        lothc_mocker.add_get_response(path="/items", params={"tag": []})
+
+
 async def test_add_get_response_raising_does_not_register_an_orphaned_mock(
     client: HTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
