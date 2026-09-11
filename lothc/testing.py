@@ -420,7 +420,7 @@ class LOTHCMock:
     either side here goes through `_commit`, so the guard can't be bypassed by a future setter
     that forgets to check it — `_commit` raises lothc's own clear `ValueError` for both orderings
     instead of leaking pyreqwest's internal `AssertionError`."""
-    _last_encoded_headers: Mapping[str, str] | None = None
+    _last_encoded_headers: dict[str, str] | None = None
     """Set by `with_headers`, re-applied by `with_data` — see `with_data`'s own comment for why:
     this is what makes `.with_headers(...).with_data(...)` (the natural order to chain them in)
     produce the correct single Content-Type header on the wire, not just `add_*_response`'s own

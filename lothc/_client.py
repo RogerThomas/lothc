@@ -754,13 +754,20 @@ def _apply_params[TBuilder: BaseRequestBuilder](
     return request_builder.query(_encode_params(params))
 
 
-def _encode_headers(headers: Headers) -> Mapping[str, str]:
+def _encode_headers(headers: Headers) -> dict[str, str]:
     """Turns any `Headers` (`Mapping[str, str]`, pydantic `BaseModel`, or msgspec `Struct`) into a
-    plain `Mapping[str, str]` the way a real request's headers would be encoded (`_` -> `-`,
+    plain `dict[str, str]` the way a real request's headers would be encoded (`_` -> `-`,
     non-`None` values only) — shared by `_apply_headers` and `lothc.testing`'s mock-response
-    header encoding. A plain-`Mapping` input is returned as-is (no copy), same reasoning as
-    `_encode_params` above: pyreqwest's own `.headers()` accepts any `Mapping` (not just `dict`),
-    so there's nothing to gain from forcing a fresh `dict`."""
+    header encoding. Deliberately NOT symmetric with `_encode_params`'s no-copy fallback above,
+    despite looking like the same situation: `_encode_params`'s result is always used once,
+    immediately, then discarded (`_apply_params`/`_query_param_match_values`), so returning the
+    caller's own `Mapping` unchanged is safe. `_encode_headers`'s result is not always used that
+    way — `lothc.testing`'s `LOTHCMock.with_headers` stores it (`_last_encoded_headers`) to
+    re-apply later from `with_data`, so an uncopied fallback would alias the caller's own mutable
+    `dict` and let a mutation between `.with_headers(...)` and `.with_data(...)` silently change
+    the mocked response's headers (confirmed live — a no-copy version of this fallback introduced
+    exactly that bug before being caught by review). Always copy here, even though
+    `_apply_headers`'s own use of the result doesn't itself need one."""
     match headers:
         case BaseModel():
             dumped = headers.model_dump(mode="json")
@@ -768,7 +775,7 @@ def _encode_headers(headers: Headers) -> Mapping[str, str]:
             dumped = cast(dict[str, Any], msgspec.to_builtins(headers))
         case _:
             # Same basedpyright match-fallback narrowing gap as `_apply_params` above.
-            return cast("Mapping[str, str]", headers)
+            return dict(cast("Mapping[str, str]", headers))
     return {
         name.replace("_", "-"): str(value) for name, value in dumped.items() if value is not None
     }

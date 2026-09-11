@@ -428,6 +428,24 @@ async def test_with_headers_then_with_data_content_type_not_duplicated(
     assert result.headers["content-type"] == "text/plain"
 
 
+async def test_with_headers_snapshots_the_dict_instead_of_aliasing_it(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    """`with_headers` must encode a defensive snapshot, not alias the caller's own `dict` — a
+    caller mutating their `headers` dict after `.with_headers(...)` (here between it and
+    `.with_data(...)`, the natural place to do it) must not silently change the mocked response.
+    Confirmed live this genuinely leaked through when `_encode_headers`'s fallback branch returned
+    the caller's `Mapping` unchanged instead of copying it."""
+    headers = {"x-custom": "initial"}
+    mock = lothc_mocker.mock("GET", path="/items").with_headers(headers)
+    headers["x-custom"] = "mutated-after-the-fact"
+    mock.with_data({"a": 1})
+
+    result = await client.get_result("items")
+
+    assert result.headers["x-custom"] == "initial"
+
+
 async def test_match_query_and_match_body_json_narrow_a_mock(
     client: HTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
@@ -466,9 +484,18 @@ class _MatchesFlagHeader:
 async def test_match_request_accepts_an_async_callable_object(
     client: HTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
-    """Same `iscoroutinefunction` misclassification as
-    `test_match_request_with_response_accepts_an_async_callable_object`, for `match_request`'s
-    own async/sync split via `_wrap_custom_matcher`."""
+    """An async-callable-object predicate works correctly end-to-end for `match_request` — but,
+    confirmed live, this does NOT actually exercise `_wrap_custom_matcher`'s `_is_async_callable`
+    fix the way `test_match_request_with_response_accepts_an_async_callable_object` exercises
+    `_wrap_custom_handler`'s: pyreqwest's own async `Mock._matches_custom` unconditionally awaits
+    whatever its matcher call returns if it's an `Awaitable`, regardless of whether *this
+    module's* dispatch classified the matcher as sync or async — so reverting `_is_async_callable`
+    to plain `inspect.iscoroutinefunction` here still calls the async `__call__`, gets back an
+    un-awaited (but not-yet-run) coroutine, and pyreqwest awaits it anyway, running the predicate's
+    real logic and getting the correct answer either way. This test is still worth keeping as
+    end-to-end coverage for the *feature* (an async-callable-object predicate is a legitimate
+    thing to pass), just not as a regression guard for the dispatch fix itself — that guard is the
+    handler-side test."""
     mock = lothc_mocker.add_get_response(path="/items/7", data={"ok": True})
     mock.match_request(_MatchesFlagHeader())
 
@@ -492,6 +519,22 @@ async def test_get_requests_returns_mock_request_snapshots(
     assert seen.query_string == "page=2"
     assert seen.query == {"page": "2"}
     assert seen.headers["x-flag"] == "1"
+
+
+async def test_get_requests_collapses_a_repeated_query_key_to_its_first_value(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    """`MockRequest.query`'s whole reason to exist (per its own docstring) is collapsing a
+    genuinely repeated query key to its first value, same as `.headers` already does — exercises
+    `_first_value_per_key`'s `list[str]` branch, which nothing else here reaches (`params=` only
+    ever sends one scalar per key)."""
+    mock = lothc_mocker.add_get_response(path="/items", data={"ok": True})
+
+    await client.get("items?tag=a&tag=b")
+
+    [seen] = mock.get_requests()
+    assert seen.query_string == "tag=a&tag=b"
+    assert seen.query == {"tag": "a"}
 
 
 async def test_clear_removes_all_registered_mocks(
