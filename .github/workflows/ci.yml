@@ -20,7 +20,12 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run basedpyright .
-      - run: uv run pytest tests --cov --cov-config=pyproject.toml --cov-report=xml
+      # `coverage run` (process-level), not `pytest --cov` — the latter starts tracing after
+      # pytest's own plugins (incl. lothc.testing, an auto-loaded pytest11 plugin) already
+      # imported, so their module-level code always showed as uncovered. Real coverage was 97%,
+      # not ~79%.
+      - run: uv run coverage run --rcfile=pyproject.toml -m pytest tests
+      - run: uv run coverage xml
       # Uploaded from every matrix version so Codecov merges them into one accurate report,
       # rather than the last-finishing job's coverage silently overwriting the others'.
       - uses: codecov/codecov-action@v7
