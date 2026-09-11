@@ -64,6 +64,26 @@ async def test_get_with_raw_dict_params(client: HTTPClient) -> None:
     assert result == {"q": "pikachu", "page": 2, "items": [{"id": 2, "name": "pikachu-match"}]}
 
 
+async def test_get_with_repeated_query_param(client: HTTPClient) -> None:
+    """A `list[...]` `params` value sends that key once per element, verbatim — see `Params`'s
+    own doc comment in `lothc/_client.py`."""
+    result = await client.get(
+        "echo-query", params={"tag": ["a", "b"], "limit": 10}, response_data_type=dict
+    )
+    assert result == {"query": {"tag": ["a", "b"], "limit": ["10"]}}
+
+
+async def test_get_with_repeated_query_param_as_tuple(client: HTTPClient) -> None:
+    """A `tuple[...]` value works exactly like `list[...]` — both spell "repeat this key"."""
+    result = await client.get("echo-query", params={"tag": ("a", "b")}, response_data_type=dict)
+    assert result == {"query": {"tag": ["a", "b"]}}
+
+
+async def test_get_with_scalar_query_params_still_works(client: HTTPClient) -> None:
+    result = await client.get("echo-query", params={"page": "2"}, response_data_type=dict)
+    assert result == {"query": {"page": ["2"]}}
+
+
 async def test_get_with_pydantic_params_omits_none_fields(client: HTTPClient) -> None:
     result = await client.get(
         "items", params=SearchParamsModel(q="pikachu", page=1), response_data_type=dict
@@ -169,6 +189,13 @@ def test_sync_get_decodes_msgspec_struct(sync_client: SyncHTTPClient) -> None:
 def test_sync_get_decodes_plain_dict(sync_client: SyncHTTPClient) -> None:
     item = sync_client.get("items/7", response_data_type=dict)
     assert item == {"id": 7, "name": "item-7"}
+
+
+def test_sync_get_with_repeated_query_param(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.get(
+        "echo-query", params={"tag": ["a", "b"], "limit": 10}, response_data_type=dict
+    )
+    assert result == {"query": {"tag": ["a", "b"], "limit": ["10"]}}
 
 
 def test_sync_get_raises_response_error_for_status(sync_client: SyncHTTPClient) -> None:

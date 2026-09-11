@@ -56,6 +56,17 @@ result = await client.get(
 `headers` works the same way for outgoing request headers — pass a `BaseModel`/`Struct` instead
 of a `dict[str, str]` and get the same `None`-omission for free.
 
+### Repeated query params
+
+A `list`/`tuple` of `str | int | float | bool` in `params` sends that key once per element,
+verbatim — lothc has no opinion on what an element means (it's never a `key=value` pair to lothc,
+just another occurrence of the key):
+
+```python
+await client.get("items", params={"tag": ["ready", "pending"], "limit": 10})
+# -> ?tag=ready&tag=pending&limit=10
+```
+
 ## GET, with status and headers — `get_result`
 
 Same signature as `get`, but returns a `Result` carrying the decoded body alongside the status
