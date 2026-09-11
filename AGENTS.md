@@ -19,7 +19,7 @@ real pyreqwest response internally.
 `Url` (the `url=` matcher's type) were still pyreqwest's own types, re-exported rather than
 wrapped — rejected as insufficient (a re-export still means the *class itself* is pyreqwest's,
 even if the import path isn't). Fixed properly: `MockRequest` (`lothc/testing.py`) is a plain,
-slotted dataclass (`method`/`path`/`query_string`/`headers`/`body` — see the "Testing" section
+slotted dataclass (`method`/`path`/`query_string`/`query`/`headers`/`body` — see the "Testing" section
 below for why it's deliberately not `frozen=True`) built by
 `_mock_request_from` from pyreqwest's real `Request` at the one point a mock actually receives
 one — `match_request`/`match_request_with_response` handlers get a `MockRequest`, `get_requests()`
@@ -170,7 +170,7 @@ of this fixture's public surface, not even re-exported.
   `MockRequest`, returning `MockResponse | None` (`None` = decline, fall through to the next
   mock). `match_request`'s predicate takes `MockRequest` too, same async/plain split.
 - `MockRequest` (slotted, **not** frozen — a mutable `headers` dict field means `frozen=True`
-  couldn't deliver real immutability/hashability anyway): `.method`/`.path`/`.query_string`/
+  couldn't deliver real immutability/hashability anyway): `.method`/`.path`/`.query_string`/`.query`/
   `.headers` (`Mapping[str, str]`, first-value-only for a repeated header, matching
   `Result.headers`'s own convention elsewhere)/`.body` (`bytes | None`) — lothc's own snapshot of
   the request a handler/predicate/`get_requests()` sees, built by `_mock_request_from`. Never

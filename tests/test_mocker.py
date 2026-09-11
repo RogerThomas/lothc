@@ -118,6 +118,26 @@ async def test_add_get_response_with_headers(client: HTTPClient, lothc_mocker: L
     assert result.headers["x-custom"] == "header-value"
 
 
+async def test_add_get_response_with_data_and_headers_together(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    """`add_*_response` always applies `data=` before `headers=` internally (see `_add_response`'s
+    own comment) so a caller's own `headers={"content-type": ...}` wins over `.body_json()`'s
+    default Content-Type rather than leaving two Content-Type values on the wire — this is the
+    same invariant `test_with_headers_then_with_data_content_type_not_duplicated` exercises for
+    the chainable `with_headers`/`with_data` API, covered here for `add_*_response`'s own (data-
+    then-headers) call order instead, since neither call order was previously exercised together
+    with both `data=` and `headers=` passed in the same call."""
+    lothc_mocker.add_get_response(
+        path="/items/7", data={"id": 7}, headers={"content-type": "text/plain"}
+    )
+
+    result = await client.get_result("items/7", response_data_type=dict)
+
+    assert result.data == {"id": 7}
+    assert result.headers["content-type"] == "text/plain"
+
+
 async def test_add_get_response_matches_on_params(
     client: HTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
@@ -176,7 +196,7 @@ def test_mock_request_is_not_frozen_and_not_hashable() -> None:
     `dict` field can't be made genuinely immutable/hashable by `frozen=True` alone)."""
     headers: dict[str, str] = {}
     request = MockRequest(
-        method="GET", path="/items/7", query_string="", headers=headers, body=None
+        method="GET", path="/items/7", query_string="", query={}, headers=headers, body=None
     )
 
     headers["x"] = "y"  # mutation succeeds, honestly, since nothing claims otherwise
@@ -263,6 +283,20 @@ def test_lothc_mocker_marker_non_bool_value_raises(request: pytest.FixtureReques
         request.getfixturevalue("lothc_mocker")
 
 
+@pytest.mark.lothc_mocker(True, False)  # noqa: FBT003 -- extra positional arg, on purpose
+def test_lothc_mocker_marker_too_many_positional_args_raises(
+    request: pytest.FixtureRequest,
+) -> None:
+    with pytest.raises(TypeError, match="at most one positional argument"):
+        request.getfixturevalue("lothc_mocker")
+
+
+@pytest.mark.lothc_mocker(strikt=False)  # pyright: ignore[reportCallIssue] -- misspelled on purpose
+def test_lothc_mocker_marker_unknown_kwarg_raises(request: pytest.FixtureRequest) -> None:
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        request.getfixturevalue("lothc_mocker")
+
+
 def test_add_get_response_returns_raw_bytes_by_default_sync(
     sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
@@ -330,6 +364,24 @@ def test_match_request_with_response_works_for_sync_client(
     lothc_mocker.mock("GET").match_request_with_response(_sync_handler_computes_item_from_path)
 
     item = sync_client.get("items/42", response_data_type=dict)
+
+    assert item == {"id": 42}
+
+
+class _AsyncCallableHandler:
+    async def __call__(self, request: MockRequest) -> MockResponse:
+        return MockResponse(status=201, data={"id": _item_id_from_request(request)})
+
+
+async def test_match_request_with_response_accepts_an_async_callable_object(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    """`inspect.iscoroutinefunction()` alone misclassifies a callable *object* whose `__call__` is
+    `async def` as sync (confirmed live) — `_wrap_custom_handler` checks `__call__` too, so this
+    still dispatches through the async path instead of returning an un-awaited coroutine."""
+    lothc_mocker.mock("GET").match_request_with_response(_AsyncCallableHandler())
+
+    item = await client.get("items/42", response_data_type=dict)
 
     assert item == {"id": 42}
 
@@ -406,17 +458,39 @@ async def test_match_request_uses_a_custom_predicate(
     mock.assert_called(count=1)
 
 
+class _MatchesFlagHeader:
+    async def __call__(self, request: MockRequest) -> bool:
+        return request.headers.get("x-flag") == "1"
+
+
+async def test_match_request_accepts_an_async_callable_object(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    """Same `iscoroutinefunction` misclassification as
+    `test_match_request_with_response_accepts_an_async_callable_object`, for `match_request`'s
+    own async/sync split via `_wrap_custom_matcher`."""
+    mock = lothc_mocker.add_get_response(path="/items/7", data={"ok": True})
+    mock.match_request(_MatchesFlagHeader())
+
+    item = await client.get("items/7", headers={"x-flag": "1"}, response_data_type=dict)
+
+    assert item == {"ok": True}
+    mock.assert_called(count=1)
+
+
 async def test_get_requests_returns_mock_request_snapshots(
     client: HTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
     mock = lothc_mocker.add_get_response(path="/items/7", data={"ok": True})
 
-    await client.get("items/7", headers={"x-flag": "1"})
+    await client.get("items/7", params={"page": "2"}, headers={"x-flag": "1"})
 
     [seen] = mock.get_requests()
     assert isinstance(seen, MockRequest)
     assert seen.method == "GET"
     assert seen.path == "/items/7"
+    assert seen.query_string == "page=2"
+    assert seen.query == {"page": "2"}
     assert seen.headers["x-flag"] == "1"
 
 

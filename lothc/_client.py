@@ -754,11 +754,13 @@ def _apply_params[TBuilder: BaseRequestBuilder](
     return request_builder.query(_encode_params(params))
 
 
-def _encode_headers(headers: Headers) -> dict[str, str]:
+def _encode_headers(headers: Headers) -> Mapping[str, str]:
     """Turns any `Headers` (`Mapping[str, str]`, pydantic `BaseModel`, or msgspec `Struct`) into a
-    plain `dict[str, str]` the way a real request's headers would be encoded (`_` -> `-`,
+    plain `Mapping[str, str]` the way a real request's headers would be encoded (`_` -> `-`,
     non-`None` values only) — shared by `_apply_headers` and `lothc.testing`'s mock-response
-    header encoding."""
+    header encoding. A plain-`Mapping` input is returned as-is (no copy), same reasoning as
+    `_encode_params` above: pyreqwest's own `.headers()` accepts any `Mapping` (not just `dict`),
+    so there's nothing to gain from forcing a fresh `dict`."""
     match headers:
         case BaseModel():
             dumped = headers.model_dump(mode="json")
@@ -766,7 +768,7 @@ def _encode_headers(headers: Headers) -> dict[str, str]:
             dumped = cast(dict[str, Any], msgspec.to_builtins(headers))
         case _:
             # Same basedpyright match-fallback narrowing gap as `_apply_params` above.
-            return dict(cast("Mapping[str, str]", headers))
+            return cast("Mapping[str, str]", headers)
     return {
         name.replace("_", "-"): str(value) for name, value in dumped.items() if value is not None
     }

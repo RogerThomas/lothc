@@ -10,7 +10,7 @@ and the streaming verbs call in `_client.py`), so it transparently intercepts ev
 
 **No pyreqwest type is ever part of this module's public API — not even re-exported.** A custom
 matcher/handler receives lothc's own `MockRequest` (a plain snapshot: `method`/`path`/
-`query_string`/`headers`/`body`), never pyreqwest's `Request`; `get_requests()` returns
+`query_string`/`query`/`headers`/`body`), never pyreqwest's `Request`; `get_requests()` returns
 `list[MockRequest]`; `url=` matching takes `str | re.Pattern[str]` only (pyreqwest's own
 `Url`-object alternative is dropped — a `str` already matches the exact URL, so nothing real is
 lost); and `match_request_with_response` returns `MockResponse`, not pyreqwest's `Response`/
@@ -87,10 +87,10 @@ type JsonMatcher = Any
 @dataclass(slots=True)
 class MockRequest:
     """The request a `match_request`/`match_request_with_response` handler receives, or
-    `get_requests()` returns — lothc's own snapshot (`method`/`path`/`query_string`/`headers`/
-    `body`), built from pyreqwest's real `Request` by `_mock_request_from` but never itself
-    pyreqwest's type. `body` is already the fully-read bytes — pyreqwest's own mock middleware
-    reads any streamed body into bytes before a mock rule ever sees the request.
+    `get_requests()` returns — lothc's own snapshot (`method`/`path`/`query_string`/`query`/
+    `headers`/`body`), built from pyreqwest's real `Request` by `_mock_request_from` but never
+    itself pyreqwest's type. `body` is already the fully-read bytes — pyreqwest's own mock
+    middleware reads any streamed body into bytes before a mock rule ever sees the request.
 
     Deliberately not `frozen=True`: `headers` holds a plain `dict`, which a frozen dataclass can't
     make genuinely immutable or hashable anyway (confirmed live — `frozen=True` here still let
@@ -99,11 +99,17 @@ class MockRequest:
     raising a direct, expected `TypeError` instead. `headers` is single-value-per-key — matching
     every other place lothc reads real headers (`Result.headers`, see `_client.py`) — so a
     genuinely repeated header collapses to its first value, same as pyreqwest's own
-    `HeaderMap.__getitem__`/`dict(HeaderMap(...))` already do."""
+    `HeaderMap.__getitem__`/`dict(HeaderMap(...))` already do. `query` is `query_string` already
+    parsed into the same single-value-per-key shape, via `_first_value_per_key` — the same
+    collapsing helper `_query_param_match_values` uses on the encode side, so a genuinely repeated
+    query key collapses the same way a genuinely repeated header does. `query_string` stays
+    alongside it (not replaced) for anyone who wants the raw, unparsed string — e.g. to match it
+    with a regex."""
 
     method: str
     path: str
     query_string: str
+    query: Mapping[str, str]
     headers: Mapping[str, str]
     body: bytes | None
 
@@ -194,7 +200,24 @@ class _ClientMockerTyping(Protocol):
     def reset_requests(self) -> None: ...
 
 
+def _first_value_per_key(values: Mapping[str, str | list[str]]) -> dict[str, str]:
+    """Collapses one of pyreqwest's real `query_dict_multi_value` results (a plain `str`, or a
+    `list[str]` for a genuinely repeated key) down to one value per key, first value wins — the
+    same single-value-per-key convention `MockRequest.headers`/`Result.headers` already use for
+    headers (see `_client.py`), applied here to query params too."""
+    return {name: value if isinstance(value, str) else value[0] for name, value in values.items()}
+
+
 def _mock_request_from(request: Request) -> MockRequest:
+    # Runs once per call site that needs a `MockRequest` from a given real `Request` — so chaining
+    # `.match_request(...)` and `.match_request_with_response(...)` on the same `LOTHCMock` runs
+    # this twice for one incoming request (once when pyreqwest calls the matcher, once when it
+    # calls the handler). Deliberately not cached across the two: the only cheap way to do that
+    # would hand both the matcher and the handler the exact same `MockRequest` instance, and since
+    # it's plain mutable (not frozen — see its own docstring), a matcher that mutated it would
+    # silently leak that mutation into the handler's copy too. The work itself (one dict copy of
+    # headers, one already-necessary bytes conversion) is cheap enough that avoiding it isn't
+    # worth that coupling.
     body = request.body
     body_bytes = None
     if body is not None:
@@ -204,28 +227,67 @@ def _mock_request_from(request: Request) -> MockRequest:
         # can (for a still-streaming body), so this stays a real check, not an assumed invariant.
         raw = body.copy_bytes()
         body_bytes = raw.to_bytes() if raw is not None else None
+    url = request.url
     return MockRequest(
         method=request.method,
-        path=request.url.path,
-        query_string=request.url.query_string or "",
+        path=url.path,
+        query_string=url.query_string or "",
+        query=_first_value_per_key(url.query_dict_multi_value),
         headers=dict(request.headers),
         body=body_bytes,
     )
 
 
+def _is_async_callable(func: Callable[..., Any]) -> bool:
+    """`inspect.iscoroutinefunction()` alone only recognizes a real `async def` function/method —
+    confirmed live, it misclassifies a callable *object* whose `__call__` is `async def` as sync,
+    which then runs through the sync-dispatch branch below and returns an un-awaited (always
+    truthy) coroutine instead of the real `bool`/`MockResponse | None`, with no error surfaced
+    beyond an "never awaited" warning. Checking `__call__` too catches that case in addition to
+    the ordinary function/bound-method one `iscoroutinefunction` already handles."""
+    # B004 objects to getattr(x, "__call__", ...) as an unreliable callable() check, but this
+    # isn't testing callability at all — it's fetching __call__ itself to check whether *that* is
+    # a coroutine function, which callable() can't tell us.
+    bound_call = getattr(func, "__call__", None)  # noqa: B004
+    return inspect.iscoroutinefunction(func) or inspect.iscoroutinefunction(bound_call)
+
+
+def _encode_for_dispatch(data: Data) -> tuple[bool, bytes | Any]:
+    """Whether `data` is raw bytes, plus the value to hand to whichever setter matches that —
+    already-encoded for the non-bytes case (via `_encode_json_payload`), so a caller that needs to
+    encode now but apply later (`_add_response`, to validate before registering a mock — see its
+    own comment) never re-encodes at apply time."""
+    if isinstance(data, bytes):
+        return True, data
+    return False, _encode_json_payload(data)
+
+
+def _apply_encoded(
+    *,
+    is_bytes: bool,
+    encoded: bytes | Any,  # noqa: ANN401
+    with_bytes: Callable[[bytes], object],
+    with_json: Callable[[Any], object],
+) -> None:
+    """Shared dispatch for `_apply_data`/`_add_response` — the two objects each ends up mutating
+    (pyreqwest's `Mock`/`ResponseBuilder`) name their bytes/JSON-body setters differently
+    (`with_body_bytes`/`with_body_json` vs `body_bytes`/`body_json`), so the dispatch itself is
+    shared via these two bound-method callbacks rather than a common Protocol — both objects
+    mutate themselves in place and return `self` (confirmed live for `ResponseBuilder`), so
+    discarding the return value here is safe for both."""
+    if is_bytes:
+        with_bytes(encoded)
+    else:
+        with_json(encoded)
+
+
 def _apply_data(
     data: Data, *, with_bytes: Callable[[bytes], object], with_json: Callable[[Any], object]
 ) -> None:
-    """Shared `isinstance(data, bytes)` dispatch for `_encode_response_data`/`_apply_mock_response`
-    — the two objects they each mutate (pyreqwest's `Mock`/`ResponseBuilder`) name their
-    bytes/JSON-body setters differently (`with_body_bytes`/`with_body_json` vs `body_bytes`/
-    `body_json`), so the dispatch itself is shared via these two bound-method callbacks rather
-    than a common Protocol — both objects mutate themselves in place and return `self` (confirmed
-    live for `ResponseBuilder`), so discarding the return value here is safe for both."""
-    if isinstance(data, bytes):
-        with_bytes(data)
-    else:
-        with_json(_encode_json_payload(data))
+    """Encode-then-apply in one step, for a caller that doesn't need to split the two — see
+    `_encode_for_dispatch`/`_apply_encoded` for the two steps this combines."""
+    is_bytes, encoded = _encode_for_dispatch(data)
+    _apply_encoded(is_bytes=is_bytes, encoded=encoded, with_bytes=with_bytes, with_json=with_json)
 
 
 def _encode_response_data(mock: _MockTyping, data: Data) -> None:
@@ -245,10 +307,11 @@ def _query_param_match_values(
     `ValueError` a real request would, confirmed live, instead of silently registering a mock that
     a real call could never actually produce. `_encode_params`'s value union never includes a list
     (`Params` is `Mapping[str, str | int | float | bool] | BaseModel | Struct`, one scalar per
-    key), so `query_dict_multi_value`'s per-key result is always the plain `str` case, never the
-    `list[str]` one it also allows for genuinely repeated query keys."""
+    key), so `query_dict_multi_value`'s per-key result is always the plain `str` case here in
+    practice — `_first_value_per_key` still handles the `list[str]` case generically, the same way
+    it does for `MockRequest.query`, rather than assuming it never occurs."""
     encoded = Url.parse_with_params("http://mock.invalid/", params).query_dict_multi_value
-    return {name: value if isinstance(value, str) else value[0] for name, value in encoded.items()}
+    return _first_value_per_key(encoded)
 
 
 def _apply_mock_response(builder: ResponseBuilder, mock_response: MockResponse) -> ResponseBuilder:
@@ -287,7 +350,7 @@ def _wrap_custom_matcher(matcher: CustomMatcher) -> _PyreqwestCustomMatcher:
     generic, parametrized helper would trade a small amount of duplication for real type-signature
     complexity, the same tradeoff this codebase already makes deliberately for the six near-
     identical `add_*_response` methods further down."""
-    if inspect.iscoroutinefunction(matcher):
+    if _is_async_callable(matcher):
         async_matcher = cast("Callable[[MockRequest], Awaitable[bool]]", matcher)
         return functools.partial(_call_async_matcher, matcher=async_matcher)
 
@@ -334,7 +397,7 @@ def _wrap_custom_handler(handler: CustomHandler) -> _PyreqwestCustomHandler:
     raises a raw, unhelpful `AssertionError` — that mismatch happens deep inside pyreqwest's own
     call chain, after this wrapper has already returned, so it can't be intercepted here. Keep a
     given `handler`'s async-ness matched to whichever client will actually exercise that mock."""
-    if inspect.iscoroutinefunction(handler):
+    if _is_async_callable(handler):
         async_handler = cast("Callable[[MockRequest], Awaitable[MockResponse | None]]", handler)
         return functools.partial(_call_async_handler, handler=async_handler)
 
@@ -357,7 +420,7 @@ class LOTHCMock:
     either side here goes through `_commit`, so the guard can't be bypassed by a future setter
     that forgets to check it — `_commit` raises lothc's own clear `ValueError` for both orderings
     instead of leaking pyreqwest's internal `AssertionError`."""
-    _last_encoded_headers: dict[str, str] | None = None
+    _last_encoded_headers: Mapping[str, str] | None = None
     """Set by `with_headers`, re-applied by `with_data` — see `with_data`'s own comment for why:
     this is what makes `.with_headers(...).with_data(...)` (the natural order to chain them in)
     produce the correct single Content-Type header on the wire, not just `add_*_response`'s own
@@ -474,7 +537,7 @@ class LOTHCMocker:
             _query_param_match_values(_encode_params(params)) if params is not None else None
         )
         encoded_headers = _encode_headers(headers) if headers is not None else None
-        encoded_data: bytes | Any = data if isinstance(data, bytes) else _encode_json_payload(data)
+        is_bytes, encoded_data = _encode_for_dispatch(data)
 
         mock = verb(path=path, url=url)
         if query_matches is not None:
@@ -482,10 +545,12 @@ class LOTHCMocker:
                 mock.match_query_param(name, value)
         mock.with_status(status)
         # `data` before `headers` — see `_apply_mock_response`'s comment for why.
-        if isinstance(data, bytes):
-            mock.with_body_bytes(encoded_data)
-        else:
-            mock.with_body_json(encoded_data)
+        _apply_encoded(
+            is_bytes=is_bytes,
+            encoded=encoded_data,
+            with_bytes=mock.with_body_bytes,
+            with_json=mock.with_body_json,
+        )
         if encoded_headers is not None:
             mock.with_headers(encoded_headers)
         return LOTHCMock(mock, _committed="response", _last_encoded_headers=encoded_headers)
@@ -662,6 +727,17 @@ def _strict_marker_value(request: pytest.FixtureRequest) -> bool:
             "@pytest.mark.lothc_mocker: pass strict= either positionally "
             "(@pytest.mark.lothc_mocker(False)) or as a keyword "
             "(@pytest.mark.lothc_mocker(strict=False)), not both."
+        )
+    if len(marker.args) > 1:
+        raise TypeError(
+            "@pytest.mark.lothc_mocker takes at most one positional argument (strict), got "
+            f"{len(marker.args)}: {marker.args!r}."
+        )
+    unknown_kwargs = marker.kwargs.keys() - {"strict"}
+    if unknown_kwargs:
+        raise TypeError(
+            f"@pytest.mark.lothc_mocker got unexpected keyword argument(s): "
+            f"{sorted(unknown_kwargs)}. The only recognized keyword is strict=."
         )
     # @pytest.mark.lothc_mocker(False) — positional, not just the documented strict= keyword.
     value = marker.args[0] if marker.args else marker.kwargs.get("strict", True)

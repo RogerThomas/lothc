@@ -165,7 +165,7 @@ async def test_match_header_narrows_a_mock(client: HTTPClient, lothc_mocker: LOT
 ```
 
 `mock.get_requests()`/`lothc_mocker.get_requests()` return `list[MockRequest]` — lothc's own
-snapshot type (`method`/`path`/`query_string`/`headers`/`body`), not pyreqwest's `Request`:
+snapshot type (`method`/`path`/`query_string`/`query`/`headers`/`body`), not pyreqwest's `Request`:
 
 ```python
 @pytest.mark.asyncio
@@ -269,5 +269,5 @@ def test_sync_custom_handler_computes_response_from_the_request(
     assert item == {"id": 42}
 ```
 
-`request` also exposes `.method`, `.query_string`, and `.body` (`bytes | None`) — anything a real
-handler would need to branch on.
+`request` also exposes `.method`, `.query_string`, `.query` (`Mapping[str, str]`), and `.body`
+(`bytes | None`) — anything a real handler would need to branch on.

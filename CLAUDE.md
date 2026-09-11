@@ -378,7 +378,12 @@ the skill covers *how* to write new code that matches it.
   `_wrap_custom_handler`/`_wrap_custom_matcher` and the six `add_*_response` methods are
   deliberately not collapsed further despite looking similar — different return types/
   post-processing for the former, and matching `_client.py`'s own explicit-per-verb convention for
-  the latter.
+  the latter. Async/sync dispatch for a custom matcher/handler checks `__call__` too
+  (`_is_async_callable`), not just `inspect.iscoroutinefunction` on the callable itself — the
+  latter alone misclassifies a callable object whose `__call__` is `async def` as sync (confirmed
+  live), silently running it through the wrong path. `MockRequest.query` (parsed,
+  single-value-per-key) sits alongside the existing raw `query_string`, mirroring `.headers`'s own
+  ergonomics.
 - **`RequestInfo` must be captured *before* `.send()`, not after** — a consumed request genuinely
   can't be read once sent (`RuntimeError`). `_send`/`_send_sync` build the request, capture
   `RequestInfo`, *then* send — never as a single tuple expression (`built.send(),
