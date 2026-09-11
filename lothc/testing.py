@@ -278,7 +278,15 @@ def _call_sync_matcher(request: Request, *, matcher: Callable[[MockRequest], boo
 
 def _wrap_custom_matcher(matcher: CustomMatcher) -> _PyreqwestCustomMatcher:
     """Same `functools.partial`-over-a-nested-closure and async/sync-dispatch reasoning as
-    `_wrap_custom_handler` below — see its docstring for both."""
+    `_wrap_custom_handler` below — see its docstring for both. Deliberately not unified with it
+    into one generic helper despite the identical dispatch *shape*: a matcher returns a plain
+    `bool` (used as-is), a handler returns `MockResponse | None` that still needs converting to a
+    real pyreqwest `Response`/`SyncResponse` via `_apply_mock_response` — genuinely different
+    return types and post-processing, unlike `_apply_data` above (which really was the same
+    dispatch with only the target object's method names differing). Forcing these two through one
+    generic, parametrized helper would trade a small amount of duplication for real type-signature
+    complexity, the same tradeoff this codebase already makes deliberately for the six near-
+    identical `add_*_response` methods further down."""
     if inspect.iscoroutinefunction(matcher):
         async_matcher = cast("Callable[[MockRequest], Awaitable[bool]]", matcher)
         return functools.partial(_call_async_matcher, matcher=async_matcher)
@@ -349,6 +357,11 @@ class LOTHCMock:
     either side here goes through `_commit`, so the guard can't be bypassed by a future setter
     that forgets to check it — `_commit` raises lothc's own clear `ValueError` for both orderings
     instead of leaking pyreqwest's internal `AssertionError`."""
+    _last_encoded_headers: dict[str, str] | None = None
+    """Set by `with_headers`, re-applied by `with_data` — see `with_data`'s own comment for why:
+    this is what makes `.with_headers(...).with_data(...)` (the natural order to chain them in)
+    produce the correct single Content-Type header on the wire, not just `add_*_response`'s own
+    internal (already data-then-headers) call order."""
 
     def _commit(self, kind: Literal["response", "handler"]) -> None:
         if self._committed is not None and self._committed != kind:
@@ -367,12 +380,21 @@ class LOTHCMock:
 
     def with_headers(self, headers: Headers) -> Self:
         self._commit("response")
-        self._mock.with_headers(_encode_headers(headers))
+        self._last_encoded_headers = _encode_headers(headers)
+        self._mock.with_headers(self._last_encoded_headers)
         return self
 
     def with_data(self, data: Data) -> Self:
         self._commit("response")
         _encode_response_data(self._mock, data)
+        if self._last_encoded_headers is not None:
+            # pyreqwest's own `.body_json()` sets its own Content-Type by *appending* a header
+            # value, never replacing — confirmed live — so if `with_headers` was already called
+            # (this method running second, the natural order to chain them in), its headers must
+            # be re-applied now: `.headers()` merges with same-key *replace* semantics (also
+            # confirmed live), so re-applying here correctly overwrites whatever Content-Type
+            # `_encode_response_data` just set, matching what a real request would send.
+            self._mock.with_headers(self._last_encoded_headers)
         return self
 
     def match_query(self, query: QueryMatcher) -> Self:
@@ -440,29 +462,33 @@ class LOTHCMocker:
         headers: Headers | None,
         status: int,
     ) -> LOTHCMock:
-        # Validate/encode everything that can raise BEFORE calling `verb(...)` — pyreqwest
-        # registers a `Mock` the instant that call returns, so raising after it would leave a
-        # bare, unconfigured `Mock` behind: its response builder defaults to status 200/empty
-        # body, so it would silently match ANY later request to this method/path (confirmed
-        # live) — not "no mock got registered", which is what a caller raised past would expect.
+        # Encode everything that can raise BEFORE calling `verb(...)` — pyreqwest registers a
+        # `Mock` the instant that call returns, so raising after it would leave a bare,
+        # unconfigured `Mock` behind: its response builder defaults to status 200/empty body, so
+        # it would silently match ANY later request to this method/path (confirmed live) — not
+        # "no mock got registered", which is what a caller raised past would expect. The encoded
+        # results are applied directly below (bypassing `LOTHCMock.with_data`/`with_headers`,
+        # which would otherwise re-derive them a second time) rather than discarded — avoids
+        # wasted work, and means the mock is provably built from the exact values validated here.
         query_matches = (
             _query_param_match_values(_encode_params(params)) if params is not None else None
         )
-        if headers is not None:
-            _encode_headers(headers)
-        if not isinstance(data, bytes):
-            _encode_json_payload(data)
+        encoded_headers = _encode_headers(headers) if headers is not None else None
+        encoded_data: bytes | Any = data if isinstance(data, bytes) else _encode_json_payload(data)
 
-        lothc_mock = LOTHCMock(verb(path=path, url=url))
+        mock = verb(path=path, url=url)
         if query_matches is not None:
             for name, value in query_matches.items():
-                lothc_mock.match_query_param(name, value)
-        lothc_mock.with_status(status)
+                mock.match_query_param(name, value)
+        mock.with_status(status)
         # `data` before `headers` — see `_apply_mock_response`'s comment for why.
-        lothc_mock.with_data(data)
-        if headers is not None:
-            lothc_mock.with_headers(headers)
-        return lothc_mock
+        if isinstance(data, bytes):
+            mock.with_body_bytes(encoded_data)
+        else:
+            mock.with_body_json(encoded_data)
+        if encoded_headers is not None:
+            mock.with_headers(encoded_headers)
+        return LOTHCMock(mock, _committed="response", _last_encoded_headers=encoded_headers)
 
     def mock(
         self,
@@ -631,10 +657,17 @@ def _strict_marker_value(request: pytest.FixtureRequest) -> bool:
     marker = node.get_closest_marker("lothc_mocker")
     if marker is None:
         return True
-    if marker.args:
-        # @pytest.mark.lothc_mocker(False) — positional, not just the documented strict= keyword.
-        return bool(marker.args[0])
-    return bool(marker.kwargs.get("strict", True))
+    if marker.args and "strict" in marker.kwargs:
+        raise TypeError(
+            "@pytest.mark.lothc_mocker: pass strict= either positionally "
+            "(@pytest.mark.lothc_mocker(False)) or as a keyword "
+            "(@pytest.mark.lothc_mocker(strict=False)), not both."
+        )
+    # @pytest.mark.lothc_mocker(False) — positional, not just the documented strict= keyword.
+    value = marker.args[0] if marker.args else marker.kwargs.get("strict", True)
+    if not isinstance(value, bool):
+        raise TypeError(f"@pytest.mark.lothc_mocker's strict value must be a bool, got {value!r}.")
+    return value
 
 
 @pytest.fixture(name="lothc_mocker")

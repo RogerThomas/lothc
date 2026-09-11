@@ -249,6 +249,20 @@ async def test_lothc_mocker_marker_disables_strict_positional(
     assert lothc_mocker.get_call_count() == 0
 
 
+@pytest.mark.lothc_mocker(True, strict=False)  # noqa: FBT003 -- testing conflicting args on purpose
+def test_lothc_mocker_marker_conflicting_positional_and_keyword_raises(
+    request: pytest.FixtureRequest,
+) -> None:
+    with pytest.raises(TypeError, match="not both"):
+        request.getfixturevalue("lothc_mocker")
+
+
+@pytest.mark.lothc_mocker("not-a-bool")
+def test_lothc_mocker_marker_non_bool_value_raises(request: pytest.FixtureRequest) -> None:
+    with pytest.raises(TypeError, match="must be a bool"):
+        request.getfixturevalue("lothc_mocker")
+
+
 def test_add_get_response_returns_raw_bytes_by_default_sync(
     sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
@@ -341,6 +355,25 @@ def test_with_status_raises_after_match_request_with_response(lothc_mocker: LOTH
 
     with pytest.raises(ValueError, match="mutually exclusive"):
         mock.with_status(200)
+
+
+async def test_with_headers_then_with_data_content_type_not_duplicated(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    """`.with_headers(...).with_data(...)` — the natural order to chain them in — used to leave
+    two `Content-Type` headers on the wire (pyreqwest's `.body_json()` *appends* its own,
+    `.headers()` only *replaces* a same-key value if called afterward). Not directly observable
+    through `Result.headers` here (it already collapses to the first wire value, which happened
+    to be the correct one even before the fix — same reason `_add_response`'s own version of this
+    bug in CLAUDE.md's dev notes has no automated duplicate-detection test either); this at least
+    exercises the code path and asserts the value a real caller would actually read is correct."""
+    lothc_mocker.mock("GET", path="/items").with_headers({"content-type": "text/plain"}).with_data({
+        "a": 1
+    })
+
+    result = await client.get_result("items")
+
+    assert result.headers["content-type"] == "text/plain"
 
 
 async def test_match_query_and_match_body_json_narrow_a_mock(
