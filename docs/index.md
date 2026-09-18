@@ -124,9 +124,10 @@ there's demand for an httpx/aiohttp/niquests backend, the author is happy to con
 lothc is built on top of the awesome [pyreqwest](https://github.com/mostafa-hussein/pyreqwest)
 package — a Rust-based HTTP client for Python. lothc then adds some nice abstractions on top of that
 (discussed in the other sections of these docs): typed decode targets, retries, SSE, streaming,
-and so on. Because of that, there's a bit of overhead compared to using pyreqwest directly —
-however, this is almost negligible, as can be seen below: the heavy lifting still happens in
-Rust, so lothc stays far closer to pyreqwest's throughput than to any pure-Python HTTP library's.
+and so on, adding a bit of Python-level overhead compared to calling pyreqwest directly. However, the
+actual HTTP work still happens in Rust, so lothc's throughput stays close to pyreqwest's own, and
+both are far faster than pure-Python HTTP libraries. With msgspec, whose decoder is native C, that
+overhead is almost nil, as the benchmarks below show.
 
 ![HTTP client throughput race — lothc and pyreqwest finish in well under a fifth of a second, other libraries take much longer](assets/perf-race.svg){: .perf-race-img }
 
