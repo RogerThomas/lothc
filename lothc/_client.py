@@ -24,7 +24,7 @@ from json import dumps as _json_dumps
 from json import loads as _json_loads
 from mimetypes import guess_type as _guess_mime_type
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Self, cast, overload
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, cast, overload
 
 from pyreqwest.client import BaseClientBuilder, Client, ClientBuilder, SyncClient, SyncClientBuilder
 from pyreqwest.client.types import TlsVersion
@@ -57,6 +57,13 @@ from ._compat import (
     TypeAdapterTyping,
     msgspec,
 )
+
+if TYPE_CHECKING:
+    # Stub-only (typeshed has no runtime module), and the exact shape `MutableMapping.update`
+    # accepts — carrying it here is what lets `update`'s override stay LSP-compatible instead of
+    # needing a `reportIncompatibleMethodOverride` suppression.
+    from _typeshed import SupportsKeysAndGetItem
+
 
 # `Data`/`TypedHeaders`/`JSONPayload`/`Params`/`Headers` below deliberately use `BaseModelTyping`/
 # `StructTyping` (checker-local Protocols), not the real `BaseModel`/`Struct` — see
@@ -177,6 +184,19 @@ def _translate_transport_error(
     # descends from either RequestTimeoutError or NetworkError, both handled above — this is a
     # forward-compatible fallback for a future pyreqwest exception type, not reachable today.
     return HTTPTransportError(str(error))  # pragma: no cover
+
+
+def _is_permanent_transport_error(error: HTTPTransportError) -> bool:
+    """Whether retrying `error` is pointless because the request could never even be built.
+
+    pyreqwest raises `BuilderError` from `.build()`/`.build_streamed()` — a rejected scheme under
+    `https_only`, a malformed URL — before anything reaches the network, so no amount of waiting
+    changes the outcome. `RedirectError` is deliberately *not* included: a redirect loop can be
+    transient, so it stays retryable. Read off `__cause__`, which every site translating one of
+    these sets via `raise _translate_transport_error(error) from error`, so the public exception
+    type is unchanged and callers catching `HTTPTransportError` are unaffected.
+    """
+    return isinstance(error.__cause__, PyreqwestBuilderError)
 
 
 def _request_info(request: Request) -> RequestInfo:
@@ -1123,6 +1143,43 @@ def _sync_stream_chunks(
             yield bytes(chunk)
 
 
+# What CaseInsensitiveDict's constructor and update() both accept — mirrors the shapes
+# MutableMapping.update itself takes, which is what keeps the override LSP-compatible.
+type HeaderSource = Mapping[str, str] | SupportsKeysAndGetItem[str, str] | Iterable[tuple[str, str]]
+
+
+def _header_pairs(data: HeaderSource) -> Iterator[tuple[str, str]]:
+    """Every `(key, value)` pair in `data`, repeating a key once per value it holds.
+
+    `hasattr(data, "keys")` rather than `isinstance(data, Mapping)` is what tells the two
+    non-`CaseInsensitiveDict` shapes apart, since `SupportsKeysAndGetItem` is a structural
+    protocol with no runtime `isinstance` support — it's also exactly how `dict.update` itself
+    decides. Each branch then needs a `cast`, because neither `hasattr` nor the `else` narrows
+    the union for a checker.
+    """
+    if isinstance(data, CaseInsensitiveDict):
+        # `Mapping.items()` is single-valued, so reading another CaseInsensitiveDict through the
+        # branch below would drop every repeated header's extra values — the one thing the class
+        # exists to keep. Goes through the public `get_all` rather than the other instance's
+        # `_store` so there's one definition of "all values for this key", not two.
+        for key in data:
+            for value in data.get_all(key):
+                yield (key, value)
+    elif isinstance(data, Mapping):
+        # `.items()`, never `keys()` + `[key]`: pyreqwest's `HeaderMap` is a Mapping whose
+        # `keys()` repeats a duplicated name while `[name]` always returns that name's *first*
+        # value, so the pair below would yield the same value once per duplicate (caught by
+        # `test_get_result_headers_keep_every_value_of_a_repeated_header`). `.items()` is a live
+        # view of the real pairs and gets it right.
+        yield from cast("Mapping[str, str]", data).items()
+    elif hasattr(data, "keys"):
+        source = cast("SupportsKeysAndGetItem[str, str]", data)
+        for key in source.keys():  # noqa: SIM118
+            yield (key, source[key])
+    else:
+        yield from cast("Iterable[tuple[str, str]]", data)
+
+
 class CaseInsensitiveDict(MutableMapping[str, str]):
     """A mapping whose keys compare case-insensitively, as HTTP field names do (RFC 9110 §5.1).
 
@@ -1139,22 +1196,14 @@ class CaseInsensitiveDict(MutableMapping[str, str]):
     # Not a @dataclass, unlike most classes here (style-guide.md §1): the one field is a
     # normalized `{lowercased key: (key as stored, every value)}` store rather than anything a
     # caller passes in, and a generated __init__ can't express that translation.
-    def __init__(self, data: Mapping[str, str] | Iterable[tuple[str, str]] | None = None) -> None:
+    def __init__(self, data: HeaderSource | None = None) -> None:
         self._store: dict[str, tuple[str, list[str]]] = {}
         if data is not None:
             # Appending rather than overwriting is what keeps every value of a repeated header
             # reachable via `get_all`. Iterating pairs is required for that — `dict(data)` would
             # throw the extras away — while appending in arrival order keeps `__getitem__` on the
             # *first* value, which is what a plain `dict(raw_response.headers)` always returned.
-            if isinstance(data, Mapping):
-                # The cast covers a checker artifact, not a real case: basedpyright narrows the
-                # `Iterable[tuple[str, str]]` member against `Mapping` too, synthesizing a
-                # `Mapping[tuple[str, str], Unknown]` alternative that the declared type can't
-                # actually produce.
-                pairs: Iterable[tuple[str, str]] = cast("Mapping[str, str]", data).items()
-            else:
-                pairs = data
-            for key, value in pairs:
+            for key, value in _header_pairs(data):
                 lowered = key.lower()
                 if lowered in self._store:
                     self._store[lowered][1].append(value)
@@ -1197,9 +1246,41 @@ class CaseInsensitiveDict(MutableMapping[str, str]):
         # round-trips) as soon as any name is repeated — a repr rendering three `set-cookie`
         # values as one dict entry would hide exactly what this class exists to keep.
         if any(len(values) > 1 for _, values in self._store.values()):
-            pairs = [(key, value) for key, values in self._store.values() for value in values]
-            return f"{type(self).__name__}({pairs!r})"
+            return f"{type(self).__name__}({list(_header_pairs(self))!r})"
         return f"{type(self).__name__}({dict(self.items())!r})"
+
+    def update(
+        self,
+        data: HeaderSource = (),
+        /,
+        **kwargs: str,
+    ) -> None:
+        """Merge `data` in, replacing every value of each name it carries and keeping the rest.
+
+        Overridden because `MutableMapping.update`'s own mixin assigns one value per key, so
+        merging another `CaseInsensitiveDict` through it would drop a repeated header's extra
+        values — the same trap `__init__` has to avoid.
+        """
+        replaced: set[str] = set()
+        for key, value in _header_pairs(data):
+            lowered = key.lower()
+            if lowered in replaced:
+                self._store[lowered][1].append(value)
+            else:
+                replaced.add(lowered)
+                self._store[lowered] = (key, [value])
+        for key, value in kwargs.items():
+            self._store[key.lower()] = (key, [value])
+
+    def copy(self) -> "CaseInsensitiveDict":
+        """An independent copy, repeated header values included.
+
+        Present because swapping a plain `dict` for a `MutableMapping` otherwise takes
+        `dict.copy` away, and it's the natural way to get a mutable snapshot — `requests`'s own
+        `CaseInsensitiveDict` carries it for the same reason. `dict`'s `|` merge operator has no
+        equivalent here (nor in requests); build a new one from `_header_pairs` if you need it.
+        """
+        return CaseInsensitiveDict(self)
 
     def get_all(self, key: str) -> list[str]:
         """Every value sent under `key`, in arrival order — `[]` if the header wasn't sent.
@@ -1279,6 +1360,7 @@ class HTTPClient:
         proxy: str | None = None,
         max_retries: int = 0,
         retry_methods: frozenset[str] | None = None,
+        backoff_base: float = 0.1,
         connect_timeout: float | None = None,
         read_timeout: float | None = None,
         root_certificates: Sequence[bytes] | None = None,
@@ -1297,7 +1379,10 @@ class HTTPClient:
         `bearer_token` is a static token; `bearer_auth` is an async callable resolved fresh on
         every request; `basic_auth` is a `(username, password)` pair — provide at most one of the
         three. `max_retries` enables a real retry middleware (backoff, `Retry-After`-aware); with
-        no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`) retry.
+        no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`) retry, and
+        `backoff_base` scales the wait between attempts (`backoff_base * 2 ** attempt`, so the
+        0.1 default waits 0.1s then 0.2s) — a `Retry-After` header on the response always wins
+        over the computed delay.
 
         `connect_timeout` bounds only the TCP connect phase (separate from `timeout`, which
         covers the whole request); `read_timeout` bounds the idle gap between two consecutive
@@ -1327,7 +1412,9 @@ class HTTPClient:
         if proxy is not None:
             pyreqwest_client_builder = pyreqwest_client_builder.proxy(ProxyBuilder.all(proxy))
         if max_retries > 0:
-            middleware = _RetryMiddleware(max_retries, retry_methods or cls._default_retry_methods)
+            middleware = _RetryMiddleware(
+                max_retries, retry_methods or cls._default_retry_methods, backoff_base
+            )
             pyreqwest_client_builder = pyreqwest_client_builder.with_middleware(middleware)
         pyreqwest_client_builder = _apply_tls_and_pool_config(
             pyreqwest_client_builder,
@@ -1691,8 +1778,13 @@ class HTTPClient:
                     async for event in events:
                         consecutive_reconnects = 0
                         yield event
-            except HTTPTransportError:
-                if _sse_reconnect_budget_exhausted(max_reconnects, consecutive_reconnects):
+            except HTTPTransportError as error:
+                # A permanent failure can't be reconnected away, so it propagates on the first
+                # attempt instead of burning the whole budget sleeping between retries that
+                # cannot possibly succeed.
+                if _is_permanent_transport_error(error) or _sse_reconnect_budget_exhausted(
+                    max_reconnects, consecutive_reconnects
+                ):
                     raise
             else:
                 # A clean close: a 204 is the spec's explicit "stop, don't reconnect"; any other
@@ -3338,6 +3430,7 @@ class SyncHTTPClient:
         proxy: str | None = None,
         max_retries: int = 0,
         retry_methods: frozenset[str] | None = None,
+        backoff_base: float = 0.1,
         connect_timeout: float | None = None,
         read_timeout: float | None = None,
         root_certificates: Sequence[bytes] | None = None,
@@ -3356,7 +3449,10 @@ class SyncHTTPClient:
         `bearer_token` is a static token; `bearer_auth` is a callable resolved fresh on every
         request; `basic_auth` is a `(username, password)` pair — provide at most one of the
         three. `max_retries` enables a real retry middleware (backoff, `Retry-After`-aware); with
-        no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`) retry.
+        no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`) retry, and
+        `backoff_base` scales the wait between attempts (`backoff_base * 2 ** attempt`, so the
+        0.1 default waits 0.1s then 0.2s) — a `Retry-After` header on the response always wins
+        over the computed delay.
 
         `connect_timeout` bounds only the TCP connect phase (separate from `timeout`, which
         covers the whole request); `read_timeout` bounds the idle gap between two consecutive
@@ -3387,7 +3483,7 @@ class SyncHTTPClient:
             sync_client_builder = sync_client_builder.proxy(ProxyBuilder.all(proxy))
         if max_retries > 0:
             retry_methods = retry_methods or cls._default_retry_methods
-            middleware = _SyncRetryMiddleware(max_retries, retry_methods)
+            middleware = _SyncRetryMiddleware(max_retries, retry_methods, backoff_base)
             sync_client_builder = sync_client_builder.with_middleware(middleware)
         sync_client_builder = _apply_tls_and_pool_config(
             sync_client_builder,
@@ -3749,8 +3845,13 @@ class SyncHTTPClient:
                     for event in events:
                         consecutive_reconnects = 0
                         yield event
-            except HTTPTransportError:
-                if _sse_reconnect_budget_exhausted(max_reconnects, consecutive_reconnects):
+            except HTTPTransportError as error:
+                # A permanent failure can't be reconnected away, so it propagates on the first
+                # attempt instead of burning the whole budget sleeping between retries that
+                # cannot possibly succeed.
+                if _is_permanent_transport_error(error) or _sse_reconnect_budget_exhausted(
+                    max_reconnects, consecutive_reconnects
+                ):
                     raise
             else:
                 # See the matching comment in `HTTPClient._sse_stream`.

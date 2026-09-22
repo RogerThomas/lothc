@@ -210,9 +210,12 @@ class _ClientMockerTyping(Protocol):
 
 def _first_value_per_key(values: Mapping[str, str | list[str]]) -> dict[str, str]:
     """Collapses one of pyreqwest's real `query_dict_multi_value` results (a plain `str`, or a
-    `list[str]` for a genuinely repeated key) down to one value per key, first value wins — the
-    same single-value-per-key convention `MockRequest.headers`/`Result.headers` already use for
-    headers (see `_client.py`), applied here to query params too."""
+    `list[str]` for a genuinely repeated key) down to one value per key, first value wins.
+
+    Note this is *not* what headers do any more: `MockRequest.headers`/`Result.headers` are a
+    `CaseInsensitiveDict` and keep every value of a repeated name (see `_client.py`). Query params
+    still collapse, so a repeated key's extra values are genuinely dropped here — `query_string`
+    stays alongside `query` for anyone who needs them."""
     return {name: value if isinstance(value, str) else value[0] for name, value in values.items()}
 
 

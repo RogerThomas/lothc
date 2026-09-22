@@ -411,6 +411,20 @@ the skill covers *how* to write new code that matches it.
   *instance* level**, not the class level. `JSONPayload` (not `Json`) was named that way
   deliberately to avoid a case-only collision with the former `JSON` response-decode class
   (removed).
+- **A `BuilderError` is permanent, so it's never reconnected.** pyreqwest raises it from
+  `.build()`/`.build_streamed()` before anything reaches the network (a rejected scheme under
+  `https_only`, a malformed URL), so retrying cannot change the outcome — yet `sse()` used to
+  spend its whole `max_reconnects=5` × `reconnect_delay=3.0` budget on one, making a deterministic
+  misconfiguration take 15s to surface. `_is_permanent_transport_error` reads it off `__cause__`
+  (every translation site sets it via `raise ... from error`), so the public exception type is
+  unchanged and `except HTTPTransportError` still catches it — chosen over a new public subclass
+  to keep the surface flat. `RedirectError` is deliberately excluded: a redirect loop can be
+  transient. The retry middleware needed no change — it only catches `PyreqwestTransportError`,
+  and `.build()` runs outside `next.run` anyway, so a `BuilderError` never reached it.
+- **`backoff_base` is a `build()` parameter, not just a `_RetryMiddleware` field default.** It was
+  private, so a user on a retry-heavy path had no way to tune backoff at all (and the retry tests
+  couldn't shrink their ~2s of real sleeping). Same default (0.1), same
+  `backoff_base * 2 ** attempt` formula, `Retry-After` still wins over the computed delay.
 - **`Result.headers`/`MockRequest.headers` are a `CaseInsensitiveDict`, not a `dict`.** They were
   `dict(raw_response.headers)`, so `result.headers["Content-Type"]` raised `KeyError` while
   `["content-type"]` worked — pyreqwest's `HeaderMap` is itself a case-insensitive multi-value

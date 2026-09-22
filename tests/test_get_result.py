@@ -1,7 +1,7 @@
 from msgspec import Struct
 from pydantic import BaseModel
 
-from lothc import HTTPClient, SyncHTTPClient
+from lothc import CaseInsensitiveDict, HTTPClient, SyncHTTPClient
 
 
 class ItemModel(BaseModel):
@@ -135,3 +135,46 @@ async def test_get_result_headers_get_all_returns_a_copy(client: HTTPClient) -> 
     result.headers.get_all("Set-Cookie").clear()
 
     assert len(result.headers.get_all("Set-Cookie")) == 3
+
+
+async def test_copying_headers_keeps_every_repeated_value(client: HTTPClient) -> None:
+    # Mapping.items() is single-valued, so a copy taken through it would silently drop the extra
+    # values — the one thing CaseInsensitiveDict exists to keep.
+    result = await client.get_result("multi-set-cookie", response_data_type=dict)
+
+    assert CaseInsensitiveDict(result.headers).get_all("set-cookie") == [
+        "session=abc; Path=/",
+        "csrf=xyz; Path=/",
+        "theme=dark; Path=/",
+    ]
+    assert result.headers.copy().get_all("set-cookie") == result.headers.get_all("set-cookie")
+
+
+async def test_updating_headers_keeps_every_repeated_value(client: HTTPClient) -> None:
+    result = await client.get_result("multi-set-cookie", response_data_type=dict)
+    target = CaseInsensitiveDict({"X-Keep": "kept", "Set-Cookie": "replaced"})
+
+    target.update(result.headers)
+
+    assert target.get_all("set-cookie") == result.headers.get_all("set-cookie")
+    assert target["x-keep"] == "kept"
+
+
+def test_headers_copy_is_independent_of_the_original() -> None:
+    original = CaseInsensitiveDict([("Set-Cookie", "a"), ("Set-Cookie", "b")])
+
+    copied = original.copy()
+    copied["Set-Cookie"] = "replaced"
+
+    assert original.get_all("set-cookie") == ["a", "b"]
+    assert copied.get_all("set-cookie") == ["replaced"]
+
+
+def test_headers_accept_any_keys_and_getitem_source() -> None:
+    # MutableMapping.update accepts anything with .keys()/[], not just a Mapping — the signature
+    # matches that, so this must not fall through to the iterate-pairs branch and raise.
+    target = CaseInsensitiveDict()
+
+    target.update({"Content-Type": "application/json"})
+
+    assert target["content-type"] == "application/json"

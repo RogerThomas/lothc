@@ -354,7 +354,11 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self._write_json(200, {"attempts": attempt})
 
     def _handle_slow(self) -> None:
-        sleep(3)
+        # Long enough to comfortably outlast the 0.1s timeouts the timeout tests configure
+        # (5x margin), short enough that the two "a longer per-call timeout overrides the
+        # client's" tests — which deliberately let this endpoint run to completion — don't each
+        # pay for a multi-second sleep.
+        sleep(0.5)
         self._write_json(200, {"finally": True})
 
     def _handle_echo_headers(self) -> None:
