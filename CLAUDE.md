@@ -136,26 +136,56 @@ side** — confirmed twice in practice that one exists more often than expected:
 
 ### Test suite speed
 
-The suite runs in ~8.5s, down from ~45s. Almost all of that was a handful of deliberate sleeps,
-not per-test overhead (359 tests collect in 0.08s; per-test client construction is ~10ms, and the
-session-scoped server in `tests/conftest.py` is already the right shape). Three things did it:
+The suite runs in ~3.0s (385 tests), down from ~45s. It got there in two passes, and the useful
+lesson is what the time actually was: **not** per-test overhead. Measured, the fixed floor
+(interpreter + plugins + `import lothc` + collection) is ~0.45s, and ~360 of the tests cost ~2ms
+each including a real HTTP round trip. Everything else was a handful of deliberate sleeps.
+
+Two measurements worth not re-deriving, both of which killed a plausible-sounding idea:
+
+- **Per-test client construction is ~2ms, not ~10ms** (an earlier estimate here was wrong), and
+  most of that is the round trip, not the construction. Sharing an `HTTPClient` across a module
+  buys nothing and costs isolation.
+- **Per-test event-loop setup is inside that same 2ms.** No uvloop, no broader-scoped loop.
+
+What actually did it:
 
 - **`serve_forever(poll_interval=0.01)`, not the 0.5s default** (`tests/conftest.py`,
   `tests/test_sse_interrupt.py`). `shutdown()` blocks until the loop next wakes, so the default
-  charged up to half a second of pure waiting per server teardown — invisible in any single
-  test's reported duration, since it lands in teardown.
+  charged up to half a second per server teardown — invisible in any test's own reported duration.
+- **Scale a timing *pair* down together, never a lone margin.** Where a test asserts a ratio (a
+  server sleep vs. a client timeout), both numbers shrink and the assertion is bit-for-bit
+  identical: the SSE total-timeout tests went from 0.6s stream vs 0.3s timeout to 0.15s vs 0.05s,
+  which is a *wider* 3x margin at a quarter the cost. A green run never waits on that timeout at
+  all, since `sse()` substitutes a one-year default.
+- **`backoff_base=0.001` on the ten retry tests that assert *that* a retry happened**, never how
+  long it waited. Deliberately non-zero, so the same real sleep path still runs.
+- **`/slow` takes a `seconds=` query param**, so a test that aborts early can ask for a long sleep
+  it never waits out, while the two tests that deliberately run it to completion ask for a short
+  one. One shared constant had to be sized for the strictest caller and overcharged the rest.
 - **A negative control's dwell time is not the same number as a timeout.** In
-  `test_sse_ctrl_c_interruptibility`, the `interruptible=True` deadline is an upper bound a green
-  run never reaches (so its size is free), while the `False` one is paid in full every run. They
-  were one shared 2s value; splitting them (2.0 / 0.5) cut the negative control 2.63s -> 0.60s
-  with ~20x headroom still over the slowest measured Ctrl-C exit (~25ms).
-- **`/slow` sleeps 0.5s, not 3s** (`tests/_server.py`) — its timeout tests use a 0.1s timeout, so
-  the old value was a 30x margin where 5x does the same job.
+  `test_sse_ctrl_c_interruptibility` the `interruptible=True` deadline is an upper bound a green
+  run never reaches (so its size is free) while the `False` one is paid in full every run. They
+  were one shared 2s value; splitting them (2.0 / 0.5) cut the negative control 2.63s -> 0.60s,
+  still ~20x over the slowest measured Ctrl-C exit (~25ms).
 
-Deliberately still slow: the two `sse_is_not_killed_by_the_client_level_total_timeout` tests
-(0.63s each — the 0.6s stream duration exceeding a 0.3s total timeout *is* the assertion) and the
-`backoff_base` tests (0.61s each, asserting real backoff actually scales). pytest-xdist was
-considered and rejected: ~4s floor against non-deterministic ordering and a new dev dependency.
+**Going below a default inverts what a floor proves.** The `backoff_base` scaling test used to
+set 0.2 (above the 0.1 default) and assert `elapsed >= 0.6`. Testing at 0.02
+makes a floor useless — an ignored parameter would wait *longer* and still pass — so it asserts a
+bracket, `0.06 <= elapsed < 0.2`. That is strictly more discriminating than the old floor, which
+could not detect "waited far too long". Confirmed by mutation: deleting the `backoff_base=` kwarg
+fails both tests at the ceiling.
+
+Deliberately still slow, because the wait *is* the assertion: `sse_ctrl_c_interruptibility[False]`
+(0.60s, ~20% of the suite), the two SSE total-timeout tests (0.18s each), and
+`test_import_lothc_succeeds_without_msgspec_or_pydantic` (0.12s, a real subprocess).
+
+Rejected with measurements, so don't re-litigate: **pytest-xdist** (actually installed and run —
+`-n 4` is 2.54s wall vs 3.43s serial, so ~0.8s for a new dev dependency, non-deterministic
+ordering and degraded `-x`; the payoff *shrinks* as the suite gets faster, since worker startup is
+~0.85s of floor); **bypassing `uv run`** (~30ms); **lowering `/events`' default interval**
+(load-bearing for `test_sse_events_arrive_incrementally_not_buffered_until_stream_end`, which
+asserts on the per-event deltas).
 
 ### Doctests
 

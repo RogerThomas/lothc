@@ -219,25 +219,27 @@ def test_sync_sse_events_arrive_incrementally_not_buffered_until_stream_end(
 
 
 async def test_sse_is_not_killed_by_the_client_level_total_timeout(base_url: str) -> None:
-    # 6 events at 0.1s spacing is a 0.6s stream — well past a 0.3s total `timeout`, which must
-    # not apply to an open-ended SSE stream at all.
-    async with HTTPClient.build(base_url=base_url, timeout=0.3) as client:
+    # 6 events at 0.025s spacing is a ~0.15s stream — 3x a 0.05s total `timeout`, which must not
+    # apply to an open-ended SSE stream at all. Only the ratio carries the assertion, and a green
+    # run never waits on the timeout at all (nothing applies it), so both numbers are scaled down
+    # together: the old 0.6s/0.3s pair asserted exactly this at 4x the cost.
+    async with HTTPClient.build(base_url=base_url, timeout=0.05) as client:
         events = [
-            event async for event in client.sse("events", params={"interval": 0.1, "count": 6})
+            event async for event in client.sse("events", params={"interval": 0.025, "count": 6})
         ]
 
     assert len(events) == 6
 
 
 def test_sync_sse_is_not_killed_by_the_client_level_total_timeout(base_url: str) -> None:
-    with SyncHTTPClient.build(base_url=base_url, timeout=0.3) as client:
-        events = list(client.sse("events", params={"interval": 0.1, "count": 6}))
+    with SyncHTTPClient.build(base_url=base_url, timeout=0.05) as client:
+        events = list(client.sse("events", params={"interval": 0.025, "count": 6}))
 
     assert len(events) == 6
 
 
 async def test_sse_read_timeout_bounds_the_idle_gap_between_events(base_url: str) -> None:
-    async with HTTPClient.build(base_url=base_url, read_timeout=0.1) as client:
+    async with HTTPClient.build(base_url=base_url, read_timeout=0.03) as client:
         stream = client.sse("events", params={"interval": 0.3, "count": 3}, max_reconnects=0)
         first = await anext(stream)
         with pytest.raises(HTTPTimeoutError):
@@ -247,7 +249,7 @@ async def test_sse_read_timeout_bounds_the_idle_gap_between_events(base_url: str
 
 
 def test_sync_sse_read_timeout_bounds_the_idle_gap_between_events(base_url: str) -> None:
-    with SyncHTTPClient.build(base_url=base_url, read_timeout=0.1) as client:
+    with SyncHTTPClient.build(base_url=base_url, read_timeout=0.03) as client:
         stream = client.sse("events", params={"interval": 0.3, "count": 3}, max_reconnects=0)
         first = next(stream)
         with pytest.raises(HTTPTimeoutError):

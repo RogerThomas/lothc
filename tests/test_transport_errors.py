@@ -26,9 +26,11 @@ async def test_connecting_to_a_closed_port_raises_connection_error() -> None:
 
 
 async def test_slow_endpoint_past_timeout_raises_timeout_error(base_url: str) -> None:
-    async with HTTPClient.build(base_url=base_url, timeout=0.1) as client:
+    # `seconds` is 5x the timeout, as before — but a run only ever pays the timeout, never the
+    # sleep, so both numbers shrink together with the margin between them untouched.
+    async with HTTPClient.build(base_url=base_url, timeout=0.03) as client:
         with pytest.raises(HTTPTimeoutError):
-            await client.get("slow")
+            await client.get("slow", params={"seconds": 0.15})
 
 
 def test_sync_connecting_to_a_closed_port_raises_connection_error() -> None:
@@ -41,16 +43,16 @@ def test_sync_connecting_to_a_closed_port_raises_connection_error() -> None:
 
 def test_sync_slow_endpoint_past_timeout_raises_timeout_error(base_url: str) -> None:
     with (
-        SyncHTTPClient.build(base_url=base_url, timeout=0.1) as client,
+        SyncHTTPClient.build(base_url=base_url, timeout=0.03) as client,
         pytest.raises(HTTPTimeoutError),
     ):
-        client.get("slow")
+        client.get("slow", params={"seconds": 0.15})
 
 
 async def test_per_call_timeout_shorter_than_client_raises_timeout_error(base_url: str) -> None:
     async with HTTPClient.build(base_url=base_url, timeout=30.0) as client:
         with pytest.raises(HTTPTimeoutError):
-            await client.get("slow", timeout=0.1)
+            await client.get("slow", params={"seconds": 0.15}, timeout=0.03)
 
 
 def test_sync_per_call_timeout_shorter_than_client_raises_timeout_error(base_url: str) -> None:
@@ -58,19 +60,24 @@ def test_sync_per_call_timeout_shorter_than_client_raises_timeout_error(base_url
         SyncHTTPClient.build(base_url=base_url, timeout=30.0) as client,
         pytest.raises(HTTPTimeoutError),
     ):
-        client.get("slow", timeout=0.1)
+        client.get("slow", params={"seconds": 0.15}, timeout=0.03)
 
 
 async def test_per_call_timeout_longer_than_client_overrides_it(base_url: str) -> None:
-    async with HTTPClient.build(base_url=base_url, timeout=0.1) as client:
-        result = await client.get("slow", timeout=10.0, response_data_type=dict)
+    # This one waits the sleep out in full, so the sleep is the entire cost of the test. The
+    # client timeout stays 5x shorter than it (0.02 vs 0.1), which is all the override has to
+    # beat — a client that ignored the per-call value would abort long before 0.1s.
+    async with HTTPClient.build(base_url=base_url, timeout=0.02) as client:
+        result = await client.get(
+            "slow", params={"seconds": 0.1}, timeout=10.0, response_data_type=dict
+        )
 
     assert result == {"finally": True}
 
 
 def test_sync_per_call_timeout_longer_than_client_overrides_it(base_url: str) -> None:
-    with SyncHTTPClient.build(base_url=base_url, timeout=0.1) as client:
-        result = client.get("slow", timeout=10.0, response_data_type=dict)
+    with SyncHTTPClient.build(base_url=base_url, timeout=0.02) as client:
+        result = client.get("slow", params={"seconds": 0.1}, timeout=10.0, response_data_type=dict)
 
     assert result == {"finally": True}
 

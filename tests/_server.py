@@ -353,12 +353,13 @@ class TestAppHandler(BaseHTTPRequestHandler):
             return
         self._write_json(200, {"attempts": attempt})
 
-    def _handle_slow(self) -> None:
-        # Long enough to comfortably outlast the 0.1s timeouts the timeout tests configure
-        # (5x margin), short enough that the two "a longer per-call timeout overrides the
-        # client's" tests — which deliberately let this endpoint run to completion — don't each
-        # pay for a multi-second sleep.
-        sleep(0.5)
+    def _handle_slow(self, query: str) -> None:
+        # `seconds` lets each caller buy exactly the delay its own assertion needs, rather than
+        # one shared number sized for the strictest case. A test that only needs the client to
+        # time out never waits this out at all, so it can ask for a comfortably long sleep; the
+        # two "a longer per-call timeout overrides the client's" tests deliberately run this to
+        # completion and pay every millisecond, so they ask for a short one.
+        sleep(float(parse_qs(query).get("seconds", ["0.5"])[0]))
         self._write_json(200, {"finally": True})
 
     def _handle_echo_headers(self) -> None:
@@ -458,12 +459,12 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/ndjson-blank-line": self._handle_ndjson_with_blank_line,
             "/oauth/token-requests": self._handle_oauth_token_requests,
             "/echo-query": self._handle_echo_query,
+            "/slow": self._handle_slow,
         }
         if parsed.path in query_routes:
             query_routes[parsed.path](parsed.query)
             return
         plain_routes = {
-            "/slow": self._handle_slow,
             "/echo-headers": self._handle_echo_headers,
             "/events-weird": self._write_sse_weird,
             "/events-truncated": self._write_sse_truncated,
