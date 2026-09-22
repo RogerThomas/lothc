@@ -72,6 +72,7 @@ from pyreqwest.request import Request
 from pyreqwest.response import Response, ResponseBuilder, SyncResponse
 
 from ._client import (
+    CaseInsensitiveDict,
     Data,
     Headers,
     Params,
@@ -99,25 +100,25 @@ class MockRequest:
     itself pyreqwest's type. `body` is already the fully-read bytes — pyreqwest's own mock
     middleware reads any streamed body into bytes before a mock rule ever sees the request.
 
-    Deliberately not `frozen=True`: `headers` holds a plain `dict`, which a frozen dataclass can't
-    make genuinely immutable or hashable anyway (confirmed live — `frozen=True` here still let
-    `.headers[...] = ...` mutate in place, and `hash(...)` still raised from deep inside dataclass
-    machinery); a plain mutable dataclass is the honest shape, matching `hash(MockRequest(...))`
-    raising a direct, expected `TypeError` instead. `headers` is single-value-per-key — matching
-    every other place lothc reads real headers (`Result.headers`, see `_client.py`) — so a
-    genuinely repeated header collapses to its first value, same as pyreqwest's own
-    `HeaderMap.__getitem__`/`dict(HeaderMap(...))` already do. `query` is `query_string` already
-    parsed into the same single-value-per-key shape, via `_first_value_per_key` — the same
-    collapsing helper `_query_param_match_values` uses on the encode side, so a genuinely repeated
-    query key collapses the same way a genuinely repeated header does. `query_string` stays
-    alongside it (not replaced) for anyone who wants the raw, unparsed string — e.g. to match it
-    with a regex."""
+    Deliberately not `frozen=True`: `headers` holds a mutable mapping, which a frozen dataclass
+    can't make genuinely immutable or hashable anyway (confirmed live — `frozen=True` here still
+    let `.headers[...] = ...` mutate in place, and `hash(...)` still raised from deep inside
+    dataclass machinery); a plain mutable dataclass is the honest shape, matching
+    `hash(MockRequest(...))` raising a direct, expected `TypeError` instead. `headers` is a
+    `CaseInsensitiveDict`, matching `Result.headers` (see `_client.py`), so
+    `headers["Content-Type"]` and `headers["content-type"]` are one lookup and a repeated header
+    keeps every value — indexing gives the first, `get_all` gives all of them. `query` is
+    `query_string` already parsed into a single-value-per-key shape, via `_first_value_per_key` —
+    the same collapsing helper `_query_param_match_values` uses on the encode side — so unlike
+    `headers`, a genuinely repeated query key really does lose everything but its first value.
+    `query_string` stays alongside it (not replaced) for anyone who wants the raw, unparsed
+    string — e.g. to match it with a regex."""
 
     method: str
     path: str
     query_string: str
     query: Mapping[str, str]
-    headers: Mapping[str, str]
+    headers: CaseInsensitiveDict
     body: bytes | None
 
 
@@ -209,9 +210,12 @@ class _ClientMockerTyping(Protocol):
 
 def _first_value_per_key(values: Mapping[str, str | list[str]]) -> dict[str, str]:
     """Collapses one of pyreqwest's real `query_dict_multi_value` results (a plain `str`, or a
-    `list[str]` for a genuinely repeated key) down to one value per key, first value wins — the
-    same single-value-per-key convention `MockRequest.headers`/`Result.headers` already use for
-    headers (see `_client.py`), applied here to query params too."""
+    `list[str]` for a genuinely repeated key) down to one value per key, first value wins.
+
+    Note this is *not* what headers do any more: `MockRequest.headers`/`Result.headers` are a
+    `CaseInsensitiveDict` and keep every value of a repeated name (see `_client.py`). Query params
+    still collapse, so a repeated key's extra values are genuinely dropped here — `query_string`
+    stays alongside `query` for anyone who needs them."""
     return {name: value if isinstance(value, str) else value[0] for name, value in values.items()}
 
 
@@ -240,7 +244,7 @@ def _mock_request_from(request: Request) -> MockRequest:
         path=url.path,
         query_string=url.query_string or "",
         query=_first_value_per_key(url.query_dict_multi_value),
-        headers=dict(request.headers),
+        headers=CaseInsensitiveDict(request.headers),
         body=body_bytes,
     )
 

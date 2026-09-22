@@ -32,3 +32,6 @@ run_*.py
 # Local OAuth smoke-test script + its token cache (holds a live token)
 tmp.py
 tmp.json
+
+# Agent git worktrees (each carries its own .venv) — scratch, never committed
+.claude/worktrees/

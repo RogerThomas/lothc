@@ -1,3 +1,4 @@
+import time
 from datetime import UTC, datetime
 from email.utils import format_datetime
 
@@ -131,3 +132,29 @@ def test_sync_retries_exhausted_via_transport_error_raises_transport_error(
         pytest.raises(HTTPConnectionError),
     ):
         client.get("connection-flaky", params={"key": "sync-conn-flaky-exhausted", "fail_times": 5})
+
+
+async def test_backoff_base_scales_the_wait_between_attempts(base_url: str) -> None:
+    # backoff_base * 2 ** attempt, so two retries at 0.2 wait 0.2s + 0.4s = 0.6s minimum. The
+    # default 0.1 would be 0.3s, so the floor below can only be met if the parameter is honoured.
+    async with HTTPClient.build(base_url=base_url, max_retries=2, backoff_base=0.2) as client:
+        started = time.monotonic()
+        result = await client.get(
+            "flaky", params={"key": "backoff-base", "fail_times": 2}, response_data_type=dict
+        )
+        elapsed = time.monotonic() - started
+
+    assert result == {"attempts": 3}
+    assert elapsed >= 0.6
+
+
+def test_sync_backoff_base_scales_the_wait_between_attempts(base_url: str) -> None:
+    with SyncHTTPClient.build(base_url=base_url, max_retries=2, backoff_base=0.2) as client:
+        started = time.monotonic()
+        result = client.get(
+            "flaky", params={"key": "sync-backoff-base", "fail_times": 2}, response_data_type=dict
+        )
+        elapsed = time.monotonic() - started
+
+    assert result == {"attempts": 3}
+    assert elapsed >= 0.6

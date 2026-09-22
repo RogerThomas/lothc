@@ -134,6 +134,29 @@ side** — confirmed twice in practice that one exists more often than expected:
   it's a tool bug" — check whether a small, unrelated-looking change (here, the class decorator,
   not the type annotation) removes the disagreement first.
 
+### Test suite speed
+
+The suite runs in ~8.5s, down from ~45s. Almost all of that was a handful of deliberate sleeps,
+not per-test overhead (359 tests collect in 0.08s; per-test client construction is ~10ms, and the
+session-scoped server in `tests/conftest.py` is already the right shape). Three things did it:
+
+- **`serve_forever(poll_interval=0.01)`, not the 0.5s default** (`tests/conftest.py`,
+  `tests/test_sse_interrupt.py`). `shutdown()` blocks until the loop next wakes, so the default
+  charged up to half a second of pure waiting per server teardown — invisible in any single
+  test's reported duration, since it lands in teardown.
+- **A negative control's dwell time is not the same number as a timeout.** In
+  `test_sse_ctrl_c_interruptibility`, the `interruptible=True` deadline is an upper bound a green
+  run never reaches (so its size is free), while the `False` one is paid in full every run. They
+  were one shared 2s value; splitting them (2.0 / 0.5) cut the negative control 2.63s -> 0.60s
+  with ~20x headroom still over the slowest measured Ctrl-C exit (~25ms).
+- **`/slow` sleeps 0.5s, not 3s** (`tests/_server.py`) — its timeout tests use a 0.1s timeout, so
+  the old value was a 30x margin where 5x does the same job.
+
+Deliberately still slow: the two `sse_is_not_killed_by_the_client_level_total_timeout` tests
+(0.63s each — the 0.6s stream duration exceeding a 0.3s total timeout *is* the assertion) and the
+`backoff_base` tests (0.61s each, asserting real backoff actually scales). pytest-xdist was
+considered and rejected: ~4s floor against non-deterministic ordering and a new dev dependency.
+
 ### Doctests
 
 Prefer doctests for small, self-contained algorithmic functions — they double as inline documentation.
@@ -411,6 +434,61 @@ the skill covers *how* to write new code that matches it.
   *instance* level**, not the class level. `JSONPayload` (not `Json`) was named that way
   deliberately to avoid a case-only collision with the former `JSON` response-decode class
   (removed).
+- **A `BuilderError` is permanent, so it's never reconnected.** pyreqwest raises it from
+  `.build()`/`.build_streamed()` before anything reaches the network (a rejected scheme under
+  `https_only`, a malformed URL), so retrying cannot change the outcome — yet `sse()` used to
+  spend its whole `max_reconnects=5` × `reconnect_delay=3.0` budget on one, making a deterministic
+  misconfiguration take 15s to surface. `_is_permanent_transport_error` reads it off `__cause__`
+  (every translation site sets it via `raise ... from error`), so the public exception type is
+  unchanged and `except HTTPTransportError` still catches it — chosen over a new public subclass
+  to keep the surface flat. `RedirectError` is deliberately excluded: a redirect loop can be
+  transient. The retry middleware needed no change — it only catches `PyreqwestTransportError`,
+  and `.build()` runs outside `next.run` anyway, so a `BuilderError` never reached it.
+- **`backoff_base` is a `build()` parameter, not just a `_RetryMiddleware` field default.** It was
+  private, so a user on a retry-heavy path had no way to tune backoff at all (and the retry tests
+  couldn't shrink their ~2s of real sleeping). Same default (0.1), same
+  `backoff_base * 2 ** attempt` formula, `Retry-After` still wins over the computed delay.
+- **`Result.headers`/`MockRequest.headers` are a `CaseInsensitiveDict`, not a `dict`.** They were
+  `dict(raw_response.headers)`, so `result.headers["Content-Type"]` raised `KeyError` while
+  `["content-type"]` worked — pyreqwest's `HeaderMap` is itself a case-insensitive multi-value
+  map, and flattening it to a plain `dict` threw both properties away. Checked against the field:
+  requests, niquests, httpx and httpx2 all expose a `MutableMapping`, and *none* subclasses
+  `dict` — a `dict` subclass can only override the Python-level lookups, so `{**headers}` and
+  `dict(headers)` would silently revert to exact-match keys. Iteration keeps the stored casing
+  (requests/niquests behaviour; httpx lowercases instead) — though reqwest lowercases before
+  lothc ever sees a header, so in practice that only shows for headers lothc sets itself. The
+  `__init__` iterates pairs and *appends* rather than building from `dict(data)`, which is what
+  keeps every value of a repeated header (`set-cookie`) reachable via `get_all`; appending in
+  arrival order is also what keeps `__getitem__` on the first value, matching what a plain
+  `dict(raw_response.headers)` always returned. `get_all` (not httpx's `get_list`) because
+  stdlib `email.message.Message.get_all` is the precedent for exactly this data — `http.client`
+  responses *are* a `Message` — and `list` names the return container that `-> list[str]` already
+  states, where `all` names the semantics; urllib3 offers both spellings, so neither camp is
+  surprised. `__eq__` compares every value against another `CaseInsensitiveDict` (two responses
+  differing only in a dropped `set-cookie` must not compare equal) but only the single-valued
+  view against any other mapping, which is all the other side holds. `__repr__` switches to the
+  pair-list form as soon as a name repeats, so it can't render three cookies as one entry. The
+  one `cast` in `__init__` covers a basedpyright artifact, not a real case: it narrows the
+  `Iterable[tuple[str, str]]` member against `Mapping` too, synthesizing a
+  `Mapping[tuple[str, str], Unknown]` the declared type can't produce.
+- **A `Form` repeat tuple must be homogeneous** — `tuple[_FormValue, ...]` also admitted
+  `(b"...", "image/png")`, which reads like a file plus its content-type but has no filename to be
+  one, and silently went out as a binary part *plus* a text part reading `"image/png"` (confirmed
+  on the wire). `_FormRepeat` is now a union of four homogeneous tuples (text / bytes / `File` /
+  JSON), which all four checkers reject that shape against while still accepting every legitimate
+  repeat, and `_check_form_repeat` raises the same rule at runtime for anyone past the checker.
+  Only `Path` carries its own filename, which is why `tuple[Path, str]` is a `File` shape and
+  `tuple[bytes, str]` can't be. `_form_value_kind` deliberately mirrors `_apply_form_value`'s
+  *branch order*, not `_FormRepeat`'s member order, so a value's reported kind is always the
+  branch it actually takes. An empty repeat tuple raises `ValueError` — no type can express
+  "non-empty" here, and it would otherwise contribute no parts at all (same call as `Params`'s
+  empty-sequence rejection in `lothc.testing`).
+- **`case list()` must precede the `File` patterns in `_apply_form_value`/`_apply_sync_form_value`**
+  — a `match` sequence pattern matches a `list` as happily as a `tuple`, so `["a.png", b"..."]`
+  was read as a `(filename, content)` file despite the documented rule that a list *always* means
+  "JSON-encode me as one part." It now takes the JSON branch and stdlib `json` raises on the bytes
+  natively, per the "encode errors propagate unwrapped" rule. Ordering is the whole fix: there's
+  no tuple-only sequence-pattern syntax to reach for instead.
 - **`Params`'s `list[...]`/`tuple[...]` value means "repeat this query key once per element"** (e.g.
   `{"tag": ["a", "b"]}` → `?tag=a&tag=b`) — both spellings are accepted (unlike `Form`, which uses
   `tuple` specifically to disambiguate from a bare `list` meaning something else there; `Params`

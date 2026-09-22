@@ -5,7 +5,7 @@ from msgspec import Struct
 from pydantic import BaseModel
 from pyreqwest.pytest_plugin.mock import ClientMocker
 
-from lothc import HTTPClient, HTTPResponseError, SyncHTTPClient
+from lothc import CaseInsensitiveDict, HTTPClient, HTTPResponseError, SyncHTTPClient
 from lothc.testing import LOTHCMocker, MockRequest, MockResponse
 
 # Every method `_MockTyping`/`_ClientMockerTyping` (lothc/testing.py) declare against pyreqwest's
@@ -242,8 +242,8 @@ async def test_add_get_response_raising_does_not_register_an_orphaned_mock(
 
 def test_mock_request_is_not_frozen_and_not_hashable() -> None:
     """`MockRequest` deliberately isn't `frozen=True` — see its docstring for why (a mutable
-    `dict` field can't be made genuinely immutable/hashable by `frozen=True` alone)."""
-    headers: dict[str, str] = {}
+    mapping field can't be made genuinely immutable/hashable by `frozen=True` alone)."""
+    headers = CaseInsensitiveDict()
     request = MockRequest(
         method="GET", path="/items/7", query_string="", query={}, headers=headers, body=None
     )
@@ -613,3 +613,16 @@ def test_pyreqwest_client_mocker_protocol_surface(client_mocker: ClientMocker) -
     mock = client_mocker.get(path="/items/7")  # pyright: ignore[reportUnknownMemberType]
     for name in _MOCK_METHODS:
         assert callable(getattr(mock, name))
+
+
+async def test_get_requests_headers_are_case_insensitive(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items/7", data={"ok": True})
+
+    await client.get("items/7", headers={"X-Flag": "1"})
+
+    [seen] = mock.get_requests()
+    assert seen.headers["x-flag"] == "1"
+    assert seen.headers["X-FLAG"] == "1"
+    assert "X-Flag" in seen.headers
