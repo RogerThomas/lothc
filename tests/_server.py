@@ -186,6 +186,19 @@ class TestAppHandler(BaseHTTPRequestHandler):
     def _handle_set_cookie(self) -> None:
         self._write_json(200, {"ok": True}, {"Set-Cookie": "session=abc123; Path=/"})
 
+    def _handle_multi_set_cookie(self) -> None:
+        # Sent header-by-header rather than through _write_json's `extra_headers` dict, which
+        # can't express the same field name twice — which is the whole point here.
+        body = json.dumps({"ok": True}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Set-Cookie", "session=abc; Path=/")
+        self.send_header("Set-Cookie", "csrf=xyz; Path=/")
+        self.send_header("Set-Cookie", "theme=dark; Path=/")
+        self.end_headers()
+        self.wfile.write(body)
+
     def _handle_read_cookie(self) -> None:
         self._write_json(200, {"cookie": self.headers.get("Cookie")})
 
@@ -455,6 +468,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/events-spec-edge-cases": self._write_sse_spec_edge_cases,
             "/boom": self._handle_boom,
             "/set-cookie": self._handle_set_cookie,
+            "/multi-set-cookie": self._handle_multi_set_cookie,
             "/read-cookie": self._handle_read_cookie,
             "/redirect": self._handle_redirect,
             "/redirect-loop": self._handle_redirect_loop,

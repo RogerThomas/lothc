@@ -513,3 +513,65 @@ def test_sync_post_with_more_than_one_body_kind_raises_value_error(
 ) -> None:
     with pytest.raises(ValueError, match="at most one"):
         sync_client.post("items", json={"id": 1}, content="also-content")
+
+
+async def test_post_with_form_mixed_kinds_in_repeated_tuple_raises_type_error(
+    client: HTTPClient,
+) -> None:
+    # (bytes, content_type) reads like a file but has no filename to be one, so it would
+    # otherwise repeat as a binary part plus a text part reading "text/plain" — bypasses static
+    # typing via cast(Any, ...), since _FormRepeat already rejects it at type-check time.
+    with pytest.raises(TypeError, match="Mixed form value kinds for 'avatar'"):
+        await client.post(
+            "upload",
+            form={"avatar": cast(Any, (b"png-bytes", "image/png"))},
+            response_data_type=dict,
+        )
+
+
+def test_sync_post_with_form_mixed_kinds_in_repeated_tuple_raises_type_error(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(TypeError, match="Mixed form value kinds for 'avatar'"):
+        sync_client.post(
+            "upload",
+            form={"avatar": cast(Any, (b"png-bytes", "image/png"))},
+            response_data_type=dict,
+        )
+
+
+async def test_post_with_form_list_value_is_json_encoded_never_a_file(
+    client: HTTPClient,
+) -> None:
+    # A list always means "JSON-encode me as one part" — ["name.txt", b"..."] must not be read as
+    # a (filename, content) file just because a match sequence pattern also matches a list. The
+    # stdlib encoder's own error is the expected one here, exactly as for any other bad JSON body.
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        await client.post(
+            "upload",
+            form={"doc": ["doc.txt", b"file-content"]},
+            response_data_type=dict,
+        )
+
+
+def test_sync_post_with_form_list_value_is_json_encoded_never_a_file(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(TypeError, match="not JSON serializable"):
+        sync_client.post(
+            "upload",
+            form={"doc": ["doc.txt", b"file-content"]},
+            response_data_type=dict,
+        )
+
+
+async def test_post_with_empty_form_repeat_tuple_raises_value_error(client: HTTPClient) -> None:
+    with pytest.raises(ValueError, match="Empty form value tuple for 'photos'"):
+        await client.post("upload", form={"photos": ()}, response_data_type=dict)
+
+
+def test_sync_post_with_empty_form_repeat_tuple_raises_value_error(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(ValueError, match="Empty form value tuple for 'photos'"):
+        sync_client.post("upload", form={"photos": ()}, response_data_type=dict)

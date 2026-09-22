@@ -87,6 +87,31 @@ result.request.host  # "api.example.com"
 call a `Result` came from when you're juggling several. It reflects the target you asked for, not
 necessarily the one a final response came from if redirects were followed.
 
+`result.headers` is a `CaseInsensitiveDict`, so header names compare case-insensitively the way
+HTTP itself defines them (RFC 9110 §5.1) — `result.headers["Content-Type"]`,
+`result.headers["content-type"]` and `"CONTENT-TYPE" in result.headers` are all the same lookup.
+It's a `MutableMapping`, not a `dict` subclass (the same choice requests, niquests and httpx all
+make), so `isinstance(result.headers, dict)` is `False`; iterating it yields keys with the casing
+they arrived in, and only lookups, `in` and `==` ignore case.
+
+A header sent more than once — `Set-Cookie`, most often — keeps every value. Indexing gives the
+first, as it always has; `get_all` gives all of them, in arrival order, and `[]` for a header that
+wasn't sent at all:
+
+```python
+result.headers["set-cookie"]
+# 'session=abc; Path=/'
+
+result.headers.get_all("Set-Cookie")
+# ['session=abc; Path=/', 'csrf=xyz; Path=/', 'theme=dark; Path=/']
+
+result.headers.get_all("never-sent")
+# []
+```
+
+Iteration, `.items()` and `dict(result.headers)` stay single-valued (one entry per header name,
+its first value), so `get_all` is the only way to see a repeated header's extra values.
+
 Pass `response_headers_type` (a `BaseModel`/`Struct`) to get the *response* headers validated and parsed
 too, via `result.typed_headers`. Header names are lowercased and `-` becomes `_` before matching
 against your type's field names, so a `Content-Type` response header maps onto a `content_type`
@@ -150,7 +175,14 @@ it's sent:
 - **A `tuple` of any of the above** repeats that field name once per element — multiple parts,
   all sharing the same name (a real `multipart/form-data` capability, not something most HTTP
   client libraries expose). Note this is a `tuple` specifically, not a `list` — a `list` value
-  always means "JSON-encode me as one part," never "repeat."
+  always means "JSON-encode me as one part," never "repeat" and never a file, whatever it holds.
+  Every element must be the same kind of value — all fields, all raw binary, all files, or all
+  JSON. A mixed tuple is a type error, and raises `TypeError` if you reach it at runtime anyway;
+  an empty tuple raises `ValueError` rather than quietly contributing no parts at all. In
+  particular `(b"...", "image/png")`
+  is **not** a file paired with its content-type: only a `Path` carries a filename of its own
+  (hence the `(Path, content_type)` shape above), so `bytes` always needs the explicit
+  `(filename, content, content_type)` spelling instead.
 
 By default, a file part's content-type is guessed from its filename's extension (via the stdlib
 `mimetypes` module) unless you gave one explicitly. Pass `infer_mime_type_from_file_extension=False`

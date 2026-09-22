@@ -72,6 +72,7 @@ from pyreqwest.request import Request
 from pyreqwest.response import Response, ResponseBuilder, SyncResponse
 
 from ._client import (
+    CaseInsensitiveDict,
     Data,
     Headers,
     Params,
@@ -99,25 +100,25 @@ class MockRequest:
     itself pyreqwest's type. `body` is already the fully-read bytes — pyreqwest's own mock
     middleware reads any streamed body into bytes before a mock rule ever sees the request.
 
-    Deliberately not `frozen=True`: `headers` holds a plain `dict`, which a frozen dataclass can't
-    make genuinely immutable or hashable anyway (confirmed live — `frozen=True` here still let
-    `.headers[...] = ...` mutate in place, and `hash(...)` still raised from deep inside dataclass
-    machinery); a plain mutable dataclass is the honest shape, matching `hash(MockRequest(...))`
-    raising a direct, expected `TypeError` instead. `headers` is single-value-per-key — matching
-    every other place lothc reads real headers (`Result.headers`, see `_client.py`) — so a
-    genuinely repeated header collapses to its first value, same as pyreqwest's own
-    `HeaderMap.__getitem__`/`dict(HeaderMap(...))` already do. `query` is `query_string` already
-    parsed into the same single-value-per-key shape, via `_first_value_per_key` — the same
-    collapsing helper `_query_param_match_values` uses on the encode side, so a genuinely repeated
-    query key collapses the same way a genuinely repeated header does. `query_string` stays
-    alongside it (not replaced) for anyone who wants the raw, unparsed string — e.g. to match it
-    with a regex."""
+    Deliberately not `frozen=True`: `headers` holds a mutable mapping, which a frozen dataclass
+    can't make genuinely immutable or hashable anyway (confirmed live — `frozen=True` here still
+    let `.headers[...] = ...` mutate in place, and `hash(...)` still raised from deep inside
+    dataclass machinery); a plain mutable dataclass is the honest shape, matching
+    `hash(MockRequest(...))` raising a direct, expected `TypeError` instead. `headers` is a
+    `CaseInsensitiveDict`, matching `Result.headers` (see `_client.py`), so
+    `headers["Content-Type"]` and `headers["content-type"]` are one lookup and a repeated header
+    keeps every value — indexing gives the first, `get_all` gives all of them. `query` is
+    `query_string` already parsed into a single-value-per-key shape, via `_first_value_per_key` —
+    the same collapsing helper `_query_param_match_values` uses on the encode side — so unlike
+    `headers`, a genuinely repeated query key really does lose everything but its first value.
+    `query_string` stays alongside it (not replaced) for anyone who wants the raw, unparsed
+    string — e.g. to match it with a regex."""
 
     method: str
     path: str
     query_string: str
     query: Mapping[str, str]
-    headers: Mapping[str, str]
+    headers: CaseInsensitiveDict
     body: bytes | None
 
 
@@ -240,7 +241,7 @@ def _mock_request_from(request: Request) -> MockRequest:
         path=url.path,
         query_string=url.query_string or "",
         query=_first_value_per_key(url.query_dict_multi_value),
-        headers=dict(request.headers),
+        headers=CaseInsensitiveDict(request.headers),
         body=body_bytes,
     )
 

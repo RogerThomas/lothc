@@ -1,5 +1,6 @@
 from ._client import (
     AuthProvider,
+    CaseInsensitiveDict,
     Data,
     File,
     Form,
@@ -29,6 +30,7 @@ from ._oauth import (
 
 __all__ = [
     "AuthProvider",
+    "CaseInsensitiveDict",
     "Data",
     "File",
     "Form",

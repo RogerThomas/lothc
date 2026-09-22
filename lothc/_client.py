@@ -9,8 +9,10 @@ from collections.abc import (
     Awaitable,
     Callable,
     Generator,
+    Iterable,
     Iterator,
     Mapping,
+    MutableMapping,
     Sequence,
 )
 from contextlib import aclosing, asynccontextmanager, closing, contextmanager
@@ -79,11 +81,23 @@ type File = (
     | Path
     | BufferedIOBase
 )
-# A tuple[_FormValue, ...] value in Form (below) means "repeat this part name once per element" —
-# never "JSON-encode this tuple," which is what list[Any] means instead. Keeping the repeat
-# marker as `tuple` and the JSON-array marker as `list` is what makes the two unambiguous.
+# A tuple value in Form (below) means "repeat this part name once per element" — never
+# "JSON-encode this tuple," which is what list[Any] means instead. Keeping the repeat marker as
+# `tuple` and the JSON-array marker as `list` is what makes the two unambiguous.
+# Every element must be the same *kind* of value, which is why this is a union of four homogeneous
+# tuples rather than one `tuple[_FormValue, ...]`: the latter also admits `(b"...", "text/plain")`,
+# which reads like a file paired with its content-type but has no filename to be one (only `Path`
+# carries its own, hence File's `tuple[Path, str]`) — so it would quietly go out as a binary part
+# plus a second text part reading "text/plain". Spelled this way it's a type error instead, and
+# `_check_form_repeat` enforces the same rule at runtime for callers who bypass the checker.
+type _FormRepeat = (
+    tuple[str | int, ...]
+    | tuple[bytes, ...]
+    | tuple[File, ...]
+    | tuple[list[Any] | JSONPayload, ...]
+)
 type _FormValue = str | int | bytes | list[Any] | JSONPayload | File
-type Form = dict[str, _FormValue | tuple[_FormValue, ...]]
+type Form = dict[str, _FormValue | _FormRepeat]
 # A list[...]/tuple[...] value in Params (unlike Form's list-vs-tuple split, above) means "repeat
 # this query key once per element, verbatim" — e.g. {"tag": ["a", "b"]} sends ?tag=a&tag=b. Both
 # spellings are accepted, unlike Form, because Params has no existing meaning for a bare list the
@@ -281,6 +295,53 @@ def _encode_json_form_part(value: list[Any] | JSONPayload) -> bytes:
     return _json_dumps(value).encode()
 
 
+# Mirrors _apply_form_value's own branch order (not _FormRepeat's member order) so a value's kind
+# here is always the branch it will actually take. Returns None for anything unclassifiable and
+# leaves the reporting to _apply_form_value's `case _`, which names the offending value.
+def _form_value_kind(value: object) -> str | None:
+    match value:
+        case str() | int():
+            return "text"
+        case bytes():
+            return "bytes"
+        case list():
+            return "json"
+        case (
+            (str(), bytes() | Path() | BufferedIOBase())
+            | (str(), bytes() | Path() | BufferedIOBase(), str())
+            | (Path(), str())
+            | Path()
+            | BufferedIOBase()
+        ):
+            return "file"
+        case dict() | BaseModel() | Struct():
+            return "json"
+        case _:
+            return None
+
+
+# The runtime half of _FormRepeat (see its comment above): a repeated part name carries one kind
+# of value, so a mixed tuple raises here instead of going out as parts the caller didn't ask for.
+# An empty tuple is rejected too — no type can express "non-empty" here, and silently contributing
+# no parts at all is never what a caller who wrote a repeat meant (same call as `Params`'s own
+# empty-sequence rejection in lothc.testing).
+def _check_form_repeat(name: str, items: tuple[object, ...]) -> None:
+    if not items:
+        raise ValueError(
+            f"Empty form value tuple for {name!r}: a tuple repeats one part name once per "
+            "element, so an empty one would send no parts at all."
+        )
+    kinds = {kind for item in items if (kind := _form_value_kind(item)) is not None}
+    if len(kinds) > 1:
+        found = ", ".join(sorted(kinds))
+        raise TypeError(
+            f"Mixed form value kinds for {name!r}: a tuple repeats one part name once per "
+            f"element, so every element must be the same kind of value, got {found}. A file "
+            'part needs an explicit filename — write ("name.txt", content) or '
+            '("name.txt", content, "text/plain").'
+        )
+
+
 # `explicit_mime` always wins over inference; `filename` is only applied when given, since the
 # Path-override shape (a bare Path's own auto-derived filename, kept as-is) has no filename to
 # pass here at all. Collapsing this into one helper is what keeps _apply_form_value's/
@@ -331,6 +392,12 @@ async def _apply_form_value(  # pylint: disable=too-many-return-statements
             return form_builder.text(name, str(value))
         case bytes():
             return form_builder.part(name, PartBuilder.from_bytes(value))
+        # Must come before the file patterns below: a sequence pattern matches a `list` just as
+        # happily as a `tuple`, so ["a.png", b"..."] would otherwise be read as a file when a list
+        # always means "JSON-encode me as one part" (docs/verbs.md) — never a file, never a repeat.
+        case list():
+            body = _encode_json_form_part(cast(list[Any], value))
+            return form_builder.part(name, PartBuilder.from_bytes(body).mime("application/json"))
         case (str() as filename, bytes() | Path() | BufferedIOBase() as content):
             part = _finish_file_part(
                 await _build_file_part(content),
@@ -371,14 +438,13 @@ async def _apply_form_value(  # pylint: disable=too-many-return-statements
                 infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             )
             return form_builder.part(name, part)
-        case list():
-            body = _encode_json_form_part(cast(list[Any], value))
-            return form_builder.part(name, PartBuilder.from_bytes(body).mime("application/json"))
         case dict() | BaseModel() | Struct():
             body = _encode_json_form_part(cast("JSONPayload", value))
             return form_builder.part(name, PartBuilder.from_bytes(body).mime("application/json"))
         case tuple():
-            for item in cast("tuple[object, ...]", value):
+            items = cast("tuple[object, ...]", value)
+            _check_form_repeat(name, items)
+            for item in items:
                 form_builder = await _apply_form_value(
                     form_builder,
                     name,
@@ -662,6 +728,10 @@ def _apply_sync_form_value(  # pylint: disable=too-many-return-statements
             return form_builder.text(name, str(value))
         case bytes():
             return form_builder.part(name, PartBuilder.from_bytes(value))
+        # See _apply_form_value's own note here — same reasoning, sync mirror.
+        case list():
+            body = _encode_json_form_part(cast(list[Any], value))
+            return form_builder.part(name, PartBuilder.from_bytes(body).mime("application/json"))
         case (str() as filename, bytes() | Path() | BufferedIOBase() as content):
             part = _finish_file_part(
                 _build_sync_file_part(content),
@@ -702,14 +772,13 @@ def _apply_sync_form_value(  # pylint: disable=too-many-return-statements
                 infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             )
             return form_builder.part(name, part)
-        case list():
-            body = _encode_json_form_part(cast(list[Any], value))
-            return form_builder.part(name, PartBuilder.from_bytes(body).mime("application/json"))
         case dict() | BaseModel() | Struct():
             body = _encode_json_form_part(cast("JSONPayload", value))
             return form_builder.part(name, PartBuilder.from_bytes(body).mime("application/json"))
         case tuple():
-            for item in cast("tuple[object, ...]", value):
+            items = cast("tuple[object, ...]", value)
+            _check_form_repeat(name, items)
+            for item in items:
                 form_builder = _apply_sync_form_value(
                     form_builder,
                     name,
@@ -1054,8 +1123,98 @@ def _sync_stream_chunks(
             yield bytes(chunk)
 
 
+class CaseInsensitiveDict(MutableMapping[str, str]):
+    """A mapping whose keys compare case-insensitively, as HTTP field names do (RFC 9110 §5.1).
+
+    `Result.headers` and `lothc.testing`'s `MockRequest.headers` are this, so
+    `headers["Content-Type"]` and `headers["content-type"]` are the same lookup. Iteration,
+    `.keys()` and `dict(...)` yield keys with the casing they were stored under; only lookups,
+    `in`, and `==` ignore case — the same split `requests`/`niquests` make.
+
+    Deliberately a `MutableMapping`, not a `dict` subclass: a `dict` subclass can only override
+    the Python-level lookups, so `{**headers}` and `dict(headers)` would silently fall back to
+    exact-match keys. None of requests, niquests, httpx or httpx2 subclass `dict` here either.
+    """
+
+    # Not a @dataclass, unlike most classes here (style-guide.md §1): the one field is a
+    # normalized `{lowercased key: (key as stored, every value)}` store rather than anything a
+    # caller passes in, and a generated __init__ can't express that translation.
+    def __init__(self, data: Mapping[str, str] | Iterable[tuple[str, str]] | None = None) -> None:
+        self._store: dict[str, tuple[str, list[str]]] = {}
+        if data is not None:
+            # Appending rather than overwriting is what keeps every value of a repeated header
+            # reachable via `get_all`. Iterating pairs is required for that — `dict(data)` would
+            # throw the extras away — while appending in arrival order keeps `__getitem__` on the
+            # *first* value, which is what a plain `dict(raw_response.headers)` always returned.
+            if isinstance(data, Mapping):
+                # The cast covers a checker artifact, not a real case: basedpyright narrows the
+                # `Iterable[tuple[str, str]]` member against `Mapping` too, synthesizing a
+                # `Mapping[tuple[str, str], Unknown]` alternative that the declared type can't
+                # actually produce.
+                pairs: Iterable[tuple[str, str]] = cast("Mapping[str, str]", data).items()
+            else:
+                pairs = data
+            for key, value in pairs:
+                lowered = key.lower()
+                if lowered in self._store:
+                    self._store[lowered][1].append(value)
+                else:
+                    self._store[lowered] = (key, [value])
+
+    def __getitem__(self, key: str) -> str:
+        return self._store[key.lower()][1][0]
+
+    def __setitem__(self, key: str, value: str) -> None:
+        # Replaces every value for that name, matching pyreqwest `HeaderMap.__setitem__`'s own
+        # documented behaviour rather than quietly appending to a name that already has values.
+        self._store[key.lower()] = (key, [value])
+
+    def __delitem__(self, key: str) -> None:
+        del self._store[key.lower()]
+
+    def __iter__(self) -> Iterator[str]:
+        return (key for key, _ in self._store.values())
+
+    def __len__(self) -> int:
+        return len(self._store)
+
+    def __eq__(self, other: object) -> bool:
+        # Against another CaseInsensitiveDict, every value counts — two responses whose only
+        # difference is a dropped `set-cookie` must not compare equal. Against any other mapping
+        # only the single-valued view can be compared, since that's all the other side holds.
+        if isinstance(other, CaseInsensitiveDict):
+            mine = {key: values for key, (_, values) in self._store.items()}
+            theirs = {key: values for key, (_, values) in other._store.items()}
+            return mine == theirs
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        other_items = cast("Mapping[str, str]", other).items()
+        lowered = {str(key).lower(): value for key, value in other_items}
+        return {key: values[0] for key, (_, values) in self._store.items()} == lowered
+
+    def __repr__(self) -> str:
+        # Falls back to the pair-list form (which the constructor also accepts, so either form
+        # round-trips) as soon as any name is repeated — a repr rendering three `set-cookie`
+        # values as one dict entry would hide exactly what this class exists to keep.
+        if any(len(values) > 1 for _, values in self._store.values()):
+            pairs = [(key, value) for key, values in self._store.values() for value in values]
+            return f"{type(self).__name__}({pairs!r})"
+        return f"{type(self).__name__}({dict(self.items())!r})"
+
+    def get_all(self, key: str) -> list[str]:
+        """Every value sent under `key`, in arrival order — `[]` if the header wasn't sent.
+
+        `headers[key]` gives only the first, which is the wrong answer for a genuinely repeatable
+        field like `set-cookie`. The returned list is a copy, so mutating it changes nothing here.
+        """
+        lowered = key.lower()
+        if lowered not in self._store:
+            return []
+        return list(self._store[lowered][1])
+
+
 def _parse_typed_headers(
-    headers: dict[str, str], response_headers_type: type[TypedHeaders]
+    headers: Mapping[str, str], response_headers_type: type[TypedHeaders]
 ) -> TypedHeaders:
     normalized = {name.lower().replace("-", "_"): value for name, value in headers.items()}
     if issubclass(response_headers_type, Struct):
@@ -1080,7 +1239,7 @@ class Result[TData, THeaders: TypedHeaders | None = None]:
 
     data: TData
     status: int
-    headers: dict[str, str]
+    headers: CaseInsensitiveDict
     typed_headers: THeaders
     request: RequestInfo
 
@@ -1432,7 +1591,7 @@ class HTTPClient:
         if error_for_status:
             await self._check_status(raw_response, error_type, request_info)
         data = await self._decode_body(raw_response, response_data_type)
-        headers = dict(raw_response.headers)
+        headers = CaseInsensitiveDict(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
@@ -2188,7 +2347,7 @@ class HTTPClient:
         if error_for_status:
             await self._check_status(raw_response, error_type, request_info)
         data = await self._decode_body(raw_response, response_data_type)
-        response_headers = dict(raw_response.headers)
+        response_headers = CaseInsensitiveDict(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
@@ -3135,7 +3294,7 @@ class HTTPClient:
         raw_response, request_info = await _send(request_builder)
         if error_for_status:
             await self._check_status(raw_response, error_type, request_info)
-        response_headers = dict(raw_response.headers)
+        response_headers = CaseInsensitiveDict(raw_response.headers)
         typed_headers = (
             None
             if response_headers_type is None
@@ -3492,7 +3651,7 @@ class SyncHTTPClient:
         if error_for_status:
             self._check_status(raw_response, error_type, request_info)
         data = self._decode_body(raw_response, response_data_type)
-        headers = dict(raw_response.headers)
+        headers = CaseInsensitiveDict(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
@@ -4300,7 +4459,7 @@ class SyncHTTPClient:
         if error_for_status:
             self._check_status(raw_response, error_type, request_info)
         data = self._decode_body(raw_response, response_data_type)
-        response_headers = dict(raw_response.headers)
+        response_headers = CaseInsensitiveDict(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
@@ -5247,7 +5406,7 @@ class SyncHTTPClient:
         raw_response, request_info = _send_sync(request_builder)
         if error_for_status:
             self._check_status(raw_response, error_type, request_info)
-        response_headers = dict(raw_response.headers)
+        response_headers = CaseInsensitiveDict(raw_response.headers)
         typed_headers = (
             None
             if response_headers_type is None

@@ -411,6 +411,47 @@ the skill covers *how* to write new code that matches it.
   *instance* level**, not the class level. `JSONPayload` (not `Json`) was named that way
   deliberately to avoid a case-only collision with the former `JSON` response-decode class
   (removed).
+- **`Result.headers`/`MockRequest.headers` are a `CaseInsensitiveDict`, not a `dict`.** They were
+  `dict(raw_response.headers)`, so `result.headers["Content-Type"]` raised `KeyError` while
+  `["content-type"]` worked — pyreqwest's `HeaderMap` is itself a case-insensitive multi-value
+  map, and flattening it to a plain `dict` threw both properties away. Checked against the field:
+  requests, niquests, httpx and httpx2 all expose a `MutableMapping`, and *none* subclasses
+  `dict` — a `dict` subclass can only override the Python-level lookups, so `{**headers}` and
+  `dict(headers)` would silently revert to exact-match keys. Iteration keeps the stored casing
+  (requests/niquests behaviour; httpx lowercases instead) — though reqwest lowercases before
+  lothc ever sees a header, so in practice that only shows for headers lothc sets itself. The
+  `__init__` iterates pairs and *appends* rather than building from `dict(data)`, which is what
+  keeps every value of a repeated header (`set-cookie`) reachable via `get_all`; appending in
+  arrival order is also what keeps `__getitem__` on the first value, matching what a plain
+  `dict(raw_response.headers)` always returned. `get_all` (not httpx's `get_list`) because
+  stdlib `email.message.Message.get_all` is the precedent for exactly this data — `http.client`
+  responses *are* a `Message` — and `list` names the return container that `-> list[str]` already
+  states, where `all` names the semantics; urllib3 offers both spellings, so neither camp is
+  surprised. `__eq__` compares every value against another `CaseInsensitiveDict` (two responses
+  differing only in a dropped `set-cookie` must not compare equal) but only the single-valued
+  view against any other mapping, which is all the other side holds. `__repr__` switches to the
+  pair-list form as soon as a name repeats, so it can't render three cookies as one entry. The
+  one `cast` in `__init__` covers a basedpyright artifact, not a real case: it narrows the
+  `Iterable[tuple[str, str]]` member against `Mapping` too, synthesizing a
+  `Mapping[tuple[str, str], Unknown]` the declared type can't produce.
+- **A `Form` repeat tuple must be homogeneous** — `tuple[_FormValue, ...]` also admitted
+  `(b"...", "image/png")`, which reads like a file plus its content-type but has no filename to be
+  one, and silently went out as a binary part *plus* a text part reading `"image/png"` (confirmed
+  on the wire). `_FormRepeat` is now a union of four homogeneous tuples (text / bytes / `File` /
+  JSON), which all four checkers reject that shape against while still accepting every legitimate
+  repeat, and `_check_form_repeat` raises the same rule at runtime for anyone past the checker.
+  Only `Path` carries its own filename, which is why `tuple[Path, str]` is a `File` shape and
+  `tuple[bytes, str]` can't be. `_form_value_kind` deliberately mirrors `_apply_form_value`'s
+  *branch order*, not `_FormRepeat`'s member order, so a value's reported kind is always the
+  branch it actually takes. An empty repeat tuple raises `ValueError` — no type can express
+  "non-empty" here, and it would otherwise contribute no parts at all (same call as `Params`'s
+  empty-sequence rejection in `lothc.testing`).
+- **`case list()` must precede the `File` patterns in `_apply_form_value`/`_apply_sync_form_value`**
+  — a `match` sequence pattern matches a `list` as happily as a `tuple`, so `["a.png", b"..."]`
+  was read as a `(filename, content)` file despite the documented rule that a list *always* means
+  "JSON-encode me as one part." It now takes the JSON branch and stdlib `json` raises on the bytes
+  natively, per the "encode errors propagate unwrapped" rule. Ordering is the whole fix: there's
+  no tuple-only sequence-pattern syntax to reach for instead.
 - **`Params`'s `list[...]`/`tuple[...]` value means "repeat this query key once per element"** (e.g.
   `{"tag": ["a", "b"]}` → `?tag=a&tag=b`) — both spellings are accepted (unlike `Form`, which uses
   `tuple` specifically to disambiguate from a bare `list` meaning something else there; `Params`
