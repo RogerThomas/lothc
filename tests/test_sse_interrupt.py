@@ -107,7 +107,10 @@ def test_sync_sse_ctrl_c_interruptibility(*, interruptible: bool) -> None:
     original bug — Ctrl-C is dead while blocked in `read_chunk()` — as the negative control.
     """
     with _make_stalling_server() as server, ThreadPoolExecutor(max_workers=1) as pool:
-        pool.submit(server.serve_forever)
+        # `poll_interval=0.01`, not the 0.5s default: `shutdown()` blocks until
+        # `serve_forever`'s loop next wakes up, so the default makes every teardown pay up
+        # to half a second of pure waiting (measured).
+        pool.submit(server.serve_forever, 0.01)
         try:
             base_url = f"http://127.0.0.1:{server.server_port}/"
             pid, master_fd = pty.fork()
@@ -133,10 +136,22 @@ def test_sync_sse_ctrl_c_interruptibility(*, interruptible: bool) -> None:
             try:
                 assert _read_until(master_fd, _GOT_EVENT_MARKER, time.monotonic() + 10)
                 os.write(master_fd, b"\x03")
-                exited = _wait_exited(pid, master_fd, time.monotonic() + 2)
+                # These two deadlines are not the same kind of number, which is why they differ.
+                # For `interruptible=True` it's a generous upper bound that a passing run never
+                # reaches (a working Ctrl-C exits in ~15-25ms, measured over repeated runs), so
+                # its size is free and only bounds how long a genuine regression takes to fail.
+                # For the negative control it's a dwell time paid in full on every green run, so
+                # every extra second is pure suite latency — 0.5s still leaves ~20x headroom over
+                # the slowest exit observed, which is ample for a loaded CI box.
+                deadline = 2.0 if interruptible else 0.5
+                exited = _wait_exited(pid, master_fd, time.monotonic() + deadline)
                 if interruptible:
                     assert exited
                 else:
+                    # Note what guards this: were the `\x03` write silently not reaching the
+                    # child at all, this assertion would still pass — for the wrong reason. The
+                    # `interruptible=True` twin is what rules that out, since it exercises the
+                    # identical PTY write and fails if delivery breaks.
                     assert not exited
             finally:
                 if not interruptible:

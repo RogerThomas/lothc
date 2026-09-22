@@ -134,6 +134,29 @@ side** — confirmed twice in practice that one exists more often than expected:
   it's a tool bug" — check whether a small, unrelated-looking change (here, the class decorator,
   not the type annotation) removes the disagreement first.
 
+### Test suite speed
+
+The suite runs in ~8.5s, down from ~45s. Almost all of that was a handful of deliberate sleeps,
+not per-test overhead (359 tests collect in 0.08s; per-test client construction is ~10ms, and the
+session-scoped server in `tests/conftest.py` is already the right shape). Three things did it:
+
+- **`serve_forever(poll_interval=0.01)`, not the 0.5s default** (`tests/conftest.py`,
+  `tests/test_sse_interrupt.py`). `shutdown()` blocks until the loop next wakes, so the default
+  charged up to half a second of pure waiting per server teardown — invisible in any single
+  test's reported duration, since it lands in teardown.
+- **A negative control's dwell time is not the same number as a timeout.** In
+  `test_sse_ctrl_c_interruptibility`, the `interruptible=True` deadline is an upper bound a green
+  run never reaches (so its size is free), while the `False` one is paid in full every run. They
+  were one shared 2s value; splitting them (2.0 / 0.5) cut the negative control 2.63s -> 0.60s
+  with ~20x headroom still over the slowest measured Ctrl-C exit (~25ms).
+- **`/slow` sleeps 0.5s, not 3s** (`tests/_server.py`) — its timeout tests use a 0.1s timeout, so
+  the old value was a 30x margin where 5x does the same job.
+
+Deliberately still slow: the two `sse_is_not_killed_by_the_client_level_total_timeout` tests
+(0.63s each — the 0.6s stream duration exceeding a 0.3s total timeout *is* the assertion) and the
+`backoff_base` tests (0.61s each, asserting real backoff actually scales). pytest-xdist was
+considered and rejected: ~4s floor against non-deterministic ordering and a new dev dependency.
+
 ### Doctests
 
 Prefer doctests for small, self-contained algorithmic functions — they double as inline documentation.
