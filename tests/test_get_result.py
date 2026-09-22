@@ -1,7 +1,25 @@
+from collections.abc import KeysView
+from dataclasses import dataclass
+
 from msgspec import Struct
 from pydantic import BaseModel
 
 from lothc import CaseInsensitiveDict, HTTPClient, SyncHTTPClient
+
+
+@dataclass
+class _KeysAndGetItem:
+    """A `SupportsKeysAndGetItem` that is deliberately *not* a `Mapping` — the shape
+    `MutableMapping.update` accepts beyond a real mapping, and the one branch a plain `dict`
+    argument never reaches."""
+
+    _data: dict[str, str]
+
+    def keys(self) -> KeysView[str]:
+        return self._data.keys()
+
+    def __getitem__(self, key: str) -> str:
+        return self._data[key]
 
 
 class ItemModel(BaseModel):
@@ -178,3 +196,53 @@ def test_headers_accept_any_keys_and_getitem_source() -> None:
     target.update({"Content-Type": "application/json"})
 
     assert target["content-type"] == "application/json"
+
+
+def test_headers_support_len_and_deletion() -> None:
+    headers = CaseInsensitiveDict([("Set-Cookie", "a"), ("Set-Cookie", "b"), ("X-Other", "c")])
+
+    assert len(headers) == 2  # distinct names, not total values
+
+    del headers["x-other"]
+
+    assert len(headers) == 1
+    assert "X-Other" not in headers
+
+
+def test_headers_equality_counts_every_value_against_another_case_insensitive_dict() -> None:
+    both = CaseInsensitiveDict([("Set-Cookie", "a"), ("Set-Cookie", "b")])
+    same_but_lowercased = CaseInsensitiveDict([("set-cookie", "a"), ("set-cookie", "b")])
+    only_first = CaseInsensitiveDict([("Set-Cookie", "a")])
+
+    assert both == same_but_lowercased
+    # Two header sets differing only by a dropped repeat must not compare equal...
+    assert both != only_first
+    # ...but a plain mapping can only hold the single-valued view, so that's what it compares to.
+    assert only_first == {"SET-COOKIE": "a"}
+    assert both != "not-a-mapping"
+
+
+def test_headers_repr_reveals_repeated_values() -> None:
+    single = CaseInsensitiveDict({"Content-Type": "application/json"})
+    repeated = CaseInsensitiveDict([("Set-Cookie", "a"), ("Set-Cookie", "b")])
+
+    assert repr(single) == "CaseInsensitiveDict({'Content-Type': 'application/json'})"
+    # The pair-list form, so three cookies can't render as one entry — and it round-trips.
+    assert repr(repeated) == "CaseInsensitiveDict([('Set-Cookie', 'a'), ('Set-Cookie', 'b')])"
+
+
+def test_headers_update_accepts_keyword_arguments() -> None:
+    headers = CaseInsensitiveDict({"Accept": "text/plain"})
+
+    headers.update(accept="application/json")
+
+    assert headers["Accept"] == "application/json"
+    assert len(headers) == 1
+
+
+def test_headers_update_accepts_a_non_mapping_keys_and_getitem_source() -> None:
+    headers = CaseInsensitiveDict()
+
+    headers.update(_KeysAndGetItem({"Content-Type": "application/json"}))
+
+    assert headers["content-type"] == "application/json"

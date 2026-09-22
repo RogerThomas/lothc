@@ -320,8 +320,10 @@ def test_sync_post_with_form_all_value_types(sync_client: SyncHTTPClient, tmp_pa
                 "note": "hello",
                 "avatar": b"raw-bytes",
                 "path_doc": path_file,
+                "typed_path_doc": (path_file, "text/plain"),
                 "opened_doc": opened_file,
                 "blob": BytesIO(b"blob-content"),
+                "meta": {"key": "value"},
             },
             response_data_type=dict,
         )
@@ -331,11 +333,19 @@ def test_sync_post_with_form_all_value_types(sync_client: SyncHTTPClient, tmp_pa
         "note": "hello",
         "avatar": "raw-bytes",
         "blob": "blob-content",
+        # A JSON part carries no filename, so the server counts it a field, not a file.
+        "meta": '{"key": "value"}',
     }
     files = {file["name"]: file for file in result["files"]}
     assert files["doc"] == {"name": "doc", "filename": "doc.txt", "size": 12}
     assert files["path_doc"] == {"name": "path_doc", "filename": "path-upload.txt", "size": 12}
     assert files["opened_doc"] == {"name": "opened_doc", "filename": "opened.txt", "size": 14}
+    parts = {part["name"]: part for part in cast(list[dict[str, Any]], result["parts"])}
+    # A (Path, content_type) pair keeps the path's own filename and overrides only the mime.
+    assert parts["typed_path_doc"]["filename"] == "path-upload.txt"
+    assert parts["typed_path_doc"]["content_type"] == "text/plain"
+    assert parts["meta"]["content_type"] == "application/json"
+    assert json.loads(cast(str, parts["meta"]["text"])) == {"key": "value"}
 
 
 async def test_put_replaces_item(client: HTTPClient) -> None:
@@ -575,3 +585,18 @@ def test_sync_post_with_empty_form_repeat_tuple_raises_value_error(
 ) -> None:
     with pytest.raises(ValueError, match="Empty form value tuple for 'photos'"):
         sync_client.post("upload", form={"photos": ()}, response_data_type=dict)
+
+
+async def test_post_with_form_repeated_json_values(client: HTTPClient) -> None:
+    result = await client.post(
+        "upload",
+        form={"objects": ({"a": 1}, {"b": 2}), "arrays": (["a"], ["b"])},
+        response_data_type=dict,
+    )
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    objects = [part for part in parts if part["name"] == "objects"]
+    arrays = [part for part in parts if part["name"] == "arrays"]
+    assert [json.loads(cast(str, part["text"])) for part in objects] == [{"a": 1}, {"b": 2}]
+    assert [json.loads(cast(str, part["text"])) for part in arrays] == [["a"], ["b"]]
+    assert {part["content_type"] for part in objects + arrays} == {"application/json"}

@@ -107,8 +107,18 @@ asyncio_mode = "auto"
 [tool.deptry]
 # examples/, perf.py, and asv_bench/ are dev-only utility/benchmark scripts, not part of the
 # installable package — they're expected to import dev-group dependencies directly. .asv/ holds
-# asv's own per-commit checkouts + venvs (a full copy of this repo, gitignored) — not our code.
-exclude = ["examples", "perf\\.py", "asv_bench", "\\.venv", "\\.asv", "tests"]
+# asv's own per-commit checkouts + venvs (a full copy of this repo, gitignored) — not our code,
+# and .claude/worktrees/ is the same category: agent git worktrees, each with its own .venv, so
+# without this deptry scans ~2800 files and reports on pytest's own internals.
+exclude = [
+    "examples",
+    "perf\\.py",
+    "asv_bench",
+    "\\.venv",
+    "\\.asv",
+    "tests",
+    "\\.claude/worktrees",
+]
 
 [tool.deptry.per_rule_ignores]
 # pydantic/msgspec are both real, used-conditionally-at-runtime imports in lothc/_compat.py —
