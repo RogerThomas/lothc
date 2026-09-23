@@ -114,8 +114,9 @@ tasks:
     # next tag and pushes it; publishing to PyPI and deploying docs both happen in CI
     # (.github/workflows/release.yml), triggered by the `gh release create` below.
     desc: >
-      Bump the version (defaults to patch) and cut a GitHub release; PyPI publish + docs
-      deploy follow in CI. Usage: task release [-- major|minor|patch].
+      Bump the version (defaults to patch) and cut a GitHub release whose notes are CHANGELOG.md's
+      section for that version; PyPI publish + docs deploy follow in CI.
+      Usage: task release [-- major|minor|patch].
     cmds:
       - |
         set -eu
@@ -150,9 +151,15 @@ tasks:
           patch) version="${major}.${minor}.$((patch + 1))" ;;
         esac
         echo "releasing $version (bump=$bump, previous=$baseline)"
+        # Notes come from CHANGELOG.md's `## [$version]` section, checked before anything is
+        # tagged or pushed: GitHub's --generate-notes only lists merged PRs, so direct pushes to
+        # main left every release with nothing but a compare link.
+        notes_file="$(mktemp)"
+        trap 'rm -f "$notes_file"' EXIT
+        uv run yeet ./scripts/release_notes.py "$version" "$baseline" > "$notes_file"
         git tag -a "$version" -m "$version"
         git push origin "$version"
-        gh release create "$version" --target main --title "$version" --generate-notes
+        gh release create "$version" --target main --title "$version" --notes-file "$notes_file"
 
   # ------------------------------------------------------------------------------------------------
   # - Examples -----------------------------------------------------------------------------------

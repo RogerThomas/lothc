@@ -7,6 +7,8 @@ predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/re
 
 ## [Unreleased]
 
+## [0.0.17] - 2026-09-23
+
 ### Added
 
 - `data=` on `post`/`put`/`patch`/`delete`/`stream_post`: a urlencoded
@@ -75,4 +77,5 @@ predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/re
 - Sync streams no longer buffer the whole body in memory behind a slow consumer, and stop their
   worker thread when abandoned while data is still flowing.
 
-[Unreleased]: https://github.com/RogerThomas/lothc/compare/0.0.16...HEAD
+[Unreleased]: https://github.com/RogerThomas/lothc/compare/0.0.17...HEAD
+[0.0.17]: https://github.com/RogerThomas/lothc/compare/0.0.16...0.0.17

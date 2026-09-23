@@ -43,8 +43,14 @@ outage blocks a release. CI's `test-no-extras` job (and `task test-no-extras`) r
 module that never mentions pydantic/msgspec with both uninstalled (`--no-install-package`, then
 `uv run --no-sync`, since a plain `uv run` re-syncs them back), because the main job always has
 both and would miss an unguarded import. Only pyreqwest 0.13.0 is supported (`>=0.13.0`), so
-there's no lower-bound job; for the record the suite also passed on 0.11.6-0.12.x. Rename
-`CHANGELOG.md`'s `[Unreleased]` section to the new version when cutting a release.
+there's no lower-bound job; for the record the suite also passed on 0.11.6-0.12.x.
+
+Release notes are hand-written in `CHANGELOG.md` (Keep a Changelog). Before `task release`, rename
+`## [Unreleased]` to `## [X.Y.Z] - <date>` (the version the bump will produce), add a fresh empty
+`## [Unreleased]` above it plus the compare links at the bottom, and commit. `task release` posts
+that section (via `scripts/release_notes.py`) as the GitHub release notes with a compare link,
+and refuses to tag anything if the section is missing or empty. It used `--generate-notes`, which
+only lists merged PRs, so releases pushed straight to `main` got nothing but a compare link.
 
 **Follow-up not yet done**: the `pypi` environment has no deployment protection rules (anyone who
 can create a GitHub Release can trigger a publish) — add a tag-pattern restriction under
