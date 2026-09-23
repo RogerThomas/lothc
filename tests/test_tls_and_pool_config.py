@@ -77,7 +77,7 @@ def _identity_pem() -> bytes:
 async def test_connect_timeout_and_pool_settings_still_allow_a_normal_request(
     base_url: str,
 ) -> None:
-    async with HTTPClient.build(
+    async with HTTPClient(
         base_url=base_url,
         connect_timeout=5.0,
         max_connections=10,
@@ -93,7 +93,7 @@ async def test_connect_timeout_and_pool_settings_still_allow_a_normal_request(
 def test_sync_connect_timeout_and_pool_settings_still_allow_a_normal_request(
     base_url: str,
 ) -> None:
-    with SyncHTTPClient.build(
+    with SyncHTTPClient(
         base_url=base_url,
         connect_timeout=5.0,
         max_connections=10,
@@ -109,7 +109,7 @@ def test_sync_connect_timeout_and_pool_settings_still_allow_a_normal_request(
 async def test_tls_config_builds_and_still_allows_a_normal_request(
     base_url: str, identity_pem: bytes
 ) -> None:
-    async with HTTPClient.build(
+    async with HTTPClient(
         base_url=base_url,
         root_certificates=[_TEST_CERT_PEM],
         identity_pem=identity_pem,
@@ -125,7 +125,7 @@ async def test_tls_config_builds_and_still_allows_a_normal_request(
 def test_sync_tls_config_builds_and_still_allows_a_normal_request(
     base_url: str, identity_pem: bytes
 ) -> None:
-    with SyncHTTPClient.build(
+    with SyncHTTPClient(
         base_url=base_url,
         root_certificates=[_TEST_CERT_PEM],
         identity_pem=identity_pem,

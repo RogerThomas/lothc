@@ -85,7 +85,7 @@ class DownloadSuite:
         self._exit_stack.callback(_stop_server, server)
         _wait_for_port(port)
         self._client = self._exit_stack.enter_context(
-            SyncHTTPClient.build(base_url=f"http://127.0.0.1:{port}")
+            SyncHTTPClient(base_url=f"http://127.0.0.1:{port}")
         )
         tmp_dir = self._exit_stack.enter_context(tempfile.TemporaryDirectory())
         self._download_dest = Path(tmp_dir) / "download.bin"

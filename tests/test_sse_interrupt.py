@@ -33,7 +33,7 @@ import sys
 from lothc import SyncHTTPClient
 
 base_url, interruptible = sys.argv[1], sys.argv[2] == "true"
-with SyncHTTPClient.build(base_url=base_url) as client:
+with SyncHTTPClient(base_url=base_url) as client:
     for event in client.sse("stall", interruptible=interruptible):
         print(f"GOT_EVENT:{event.data}", flush=True)
 """
@@ -135,6 +135,14 @@ def test_sync_sse_ctrl_c_interruptibility(*, interruptible: bool) -> None:
                     os._exit(127)
             try:
                 assert _read_until(master_fd, _GOT_EVENT_MARKER, time.monotonic() + 10)
+                # Let the child get from printing the event back into its blocking `read_chunk()`
+                # before Ctrl-C arrives. Without this, a loaded machine could deliver the byte
+                # while the child was still running Python bytecode, where a KeyboardInterrupt
+                # lands immediately either way: the negative control then failed (reproduced 1/25
+                # under a 12-way CPU burn), and the `True` case could pass without ever proving a
+                # *blocked* read was interrupted. A child that isn't blocked by then is a failure
+                # of this harness, not something either case is meant to measure.
+                time.sleep(0.2)
                 os.write(master_fd, b"\x03")
                 # These two deadlines are not the same kind of number, which is why they differ.
                 # For `interruptible=True` it's a generous upper bound that a passing run never
@@ -157,7 +165,10 @@ def test_sync_sse_ctrl_c_interruptibility(*, interruptible: bool) -> None:
                 if not interruptible:
                     with contextlib.suppress(ProcessLookupError):
                         os.kill(pid, signal.SIGKILL)
-                    os.waitpid(pid, 0)
+                    # Already reaped if `_wait_exited` saw it exit, which is exactly when the
+                    # negative control fails; raising here would bury that assertion.
+                    with contextlib.suppress(ChildProcessError):
+                        os.waitpid(pid, 0)
                 os.close(master_fd)
         finally:
             server.shutdown()

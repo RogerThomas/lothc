@@ -1,4 +1,4 @@
-"""OAuth 2 client-credentials token providers, for `HTTPClient.build(bearer_auth=...)`.
+"""OAuth 2 client-credentials token providers, for `HTTPClient(bearer_auth=...)`.
 
 A utility built ON the client, not a split of it: `OAuthProvider`/`SyncOAuthProvider` are just
 objects whose `__call__` returns a valid access token, which is exactly what the clients'
@@ -12,6 +12,7 @@ import os
 import tempfile
 import threading
 import time
+import warnings
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
 from dataclasses import dataclass, replace
@@ -108,6 +109,27 @@ class _CachedToken:
     # The lifetime the token was issued with, in seconds — kept so `refresh_leeway` can be
     # clamped against it (a 300s leeway on a 60s token would otherwise renew on every call).
     expires_in: float
+
+
+def _invalidated(token: _CachedToken | None, stale_access_token: str | None) -> _CachedToken | None:
+    """`token` marked expired, unless it has already moved on from `stale_access_token`.
+
+    Marked expired rather than dropped, so the next call renews through the refresh token when
+    there is one (falling back to a fresh mint on a 400, as any refresh does). Comparing against
+    the token the rejected request carried is what stops two requests that both got a 401 from
+    each discarding the *new* token the other just obtained.
+
+    >>> token = _CachedToken("token-1", "refresh", expires_at=9e9, expires_in=3600.0)
+    >>> _invalidated(token, None).expires_at, _invalidated(token, "token-1").expires_at
+    (0.0, 0.0)
+    >>> _invalidated(token, "token-0") is token  # already renewed since that request
+    True
+    """
+    if token is None or (
+        stale_access_token is not None and token.access_token != stale_access_token
+    ):
+        return token
+    return replace(token, expires_at=0.0)
 
 
 def _fresh_token(
@@ -394,6 +416,27 @@ def _write_token_cache(
         raise
 
 
+def _persist_token(
+    path: Path, token_url: str, client_id: str, scope: str | None, token: _CachedToken
+) -> None:
+    """Write the token cache, warning rather than raising if the write fails.
+
+    By this point the token has already been obtained, and the cache "adds persistence only, it
+    never changes *when* a token is renewed" (see `OAuthProvider`), so a full disk or a
+    read-only directory mustn't fail the caller's unrelated request. Nor is it an
+    `OAuthTokenError`: that means no token could be obtained, and this one was.
+    """
+    try:
+        _write_token_cache(path, token_url, client_id, scope, token)
+    except OSError as error:
+        warnings.warn(
+            f"Could not write the OAuth token cache at {path} ({error}); the new token is still"
+            " used, but won't persist to the next process.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+
 def _validate_provider_config(
     token_request: TokenRequestTyping | None,
     token_refresh_request: TokenRefreshRequestTyping | None,
@@ -417,7 +460,7 @@ class OAuthProvider:
     """An OAuth 2 client-credentials `bearer_auth` provider for `HTTPClient` — see
     `SyncOAuthProvider` for the sync mirror.
 
-    Pass an instance as `HTTPClient.build(bearer_auth=OAuthProvider(...))`. Every request then
+    Pass an instance as `HTTPClient(bearer_auth=OAuthProvider(...))`. Every request then
     calls it, and it hands back a cached access token, minting or refreshing one behind the
     scenes only when needed:
 
@@ -449,7 +492,7 @@ class OAuthProvider:
       file is ignored. The parent directory must exist at construction. The write is plain sync
       file IO inside the async `__call__` — a few hundred bytes, once per token lifetime.
     - Every token request goes through a short-lived client from `client_factory` (default
-      `HTTPClient.build`), called with no arguments — so `functools.partial(HTTPClient.build,
+      `HTTPClient`), called with no arguments — so `functools.partial(HTTPClient,
       timeout=5.0, proxy=...)` is how the token endpoint gets its own timeout/proxy/TLS config.
 
     Deliberately a plain class, not `@dataclass` (style-guide.md #1's usual preference), for the
@@ -474,7 +517,7 @@ class OAuthProvider:
         refresh_leeway: float = 300.0,
         default_expires_in: float | None = None,
         token_cache_path: Path | None = None,
-        client_factory: Callable[[], AbstractAsyncContextManager[HTTPClient]] = HTTPClient.build,
+        client_factory: Callable[[], AbstractAsyncContextManager[HTTPClient]] = HTTPClient,
     ) -> None:
         _validate_provider_config(
             token_request, token_refresh_request, token_response, refresh_leeway, token_cache_path
@@ -572,6 +615,15 @@ class OAuthProvider:
             return await self._mint()
         return _carry_refresh_token(refreshed, current)
 
+    def invalidate(self, stale_access_token: str | None = None) -> None:
+        """Discard the current access token, so the next request obtains a new one.
+
+        For a token revoked before it expires. `HTTPClient` calls this itself when a request gets
+        a 401 (and retries it once, for idempotent verbs), so you rarely need to. Pass the token
+        that was rejected to make it a no-op if a fresh one has already been obtained since.
+        """
+        self._token = _invalidated(self._token, stale_access_token)
+
     async def __call__(self) -> str:
         fresh = _fresh_token(self._token, self._refresh_leeway, time.time())
         if fresh is not None:
@@ -587,14 +639,14 @@ class OAuthProvider:
                 raise OAuthTokenError(self._token_url, error) from error
             self._token = token
             if self._token_cache_path is not None:
-                _write_token_cache(
+                _persist_token(
                     self._token_cache_path, self._token_url, self._client_id, self._scope, token
                 )
             return token.access_token
 
 
 class SyncOAuthProvider:
-    """Sync mirror of `OAuthProvider`, for `SyncHTTPClient.build(bearer_auth=...)` — same
+    """Sync mirror of `OAuthProvider`, for `SyncHTTPClient(bearer_auth=...)` — same
     constructor, same token lifecycle, a `threading.Lock` instead of an `asyncio.Lock`, and a
     plain `def __call__` matching `SyncAuthProvider`. See `OAuthProvider` for the details."""
 
@@ -612,7 +664,7 @@ class SyncOAuthProvider:
         refresh_leeway: float = 300.0,
         default_expires_in: float | None = None,
         token_cache_path: Path | None = None,
-        client_factory: Callable[[], AbstractContextManager[SyncHTTPClient]] = SyncHTTPClient.build,
+        client_factory: Callable[[], AbstractContextManager[SyncHTTPClient]] = SyncHTTPClient,
     ) -> None:
         _validate_provider_config(
             token_request, token_refresh_request, token_response, refresh_leeway, token_cache_path
@@ -696,6 +748,15 @@ class SyncOAuthProvider:
             return self._mint()
         return _carry_refresh_token(refreshed, current)
 
+    def invalidate(self, stale_access_token: str | None = None) -> None:
+        """Discard the current access token, so the next request obtains a new one.
+
+        For a token revoked before it expires. `HTTPClient` calls this itself when a request gets
+        a 401 (and retries it once, for idempotent verbs), so you rarely need to. Pass the token
+        that was rejected to make it a no-op if a fresh one has already been obtained since.
+        """
+        self._token = _invalidated(self._token, stale_access_token)
+
     def __call__(self) -> str:
         fresh = _fresh_token(self._token, self._refresh_leeway, time.time())
         if fresh is not None:
@@ -711,7 +772,7 @@ class SyncOAuthProvider:
                 raise OAuthTokenError(self._token_url, error) from error
             self._token = token
             if self._token_cache_path is not None:
-                _write_token_cache(
+                _persist_token(
                     self._token_cache_path, self._token_url, self._client_id, self._scope, token
                 )
             return token.access_token

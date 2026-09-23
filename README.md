@@ -34,7 +34,7 @@ class Pokemon(BaseModel):
     name: str
 
 
-async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
+async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
     pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
     print(pikachu)  # id=25 name='pikachu'
 ```
@@ -83,7 +83,7 @@ validate yourself. See [Benchmarks](docs/benchmarks.md) for what that costs (usu
 | | |
 |---|---|
 | **Two clients, one API** | `HTTPClient` (async) and `SyncHTTPClient` (sync) — identical surface, both backed by pyreqwest. |
-| **Every verb** | `get`/`get_result`, `post`, `put`, `patch`, `delete`, `head`, `download` — see [Verbs](docs/verbs.md). |
+| **Every verb** | `get`, `post`, `put`, `patch`, `delete` (plus `client.with_result.<verb>` for status and headers), `head`, `download` — see [Verbs](docs/verbs.md). |
 | **Typed params, headers & forms** | A `BaseModel`/`Struct` for query params or headers (with `None`-field omission), or a real multipart body via `form=`. |
 | **Precise static types** | Every verb is paired `@overload`s, not a cast-laden generic — your editor knows the exact return type. |
 | **SSE & streaming** | Spec-compliant SSE — automatic reconnect with `Last-Event-ID`, server `retry:` honored, typed decode (discriminated unions included) — plus raw or NDJSON-typed `stream_get`/`stream_post` — see [SSE](docs/sse.md) / [Streaming](docs/streaming.md). |

@@ -1,6 +1,7 @@
-"""pytest plugin for mocking `HTTPClient`/`SyncHTTPClient` requests — install the `testing` extra
-(`lothc[testing]`) to get the `lothc_mocker` fixture, auto-registered via this module's
-`pytest11` entry point (see `pyproject.toml`).
+"""pytest plugin for mocking `HTTPClient`/`SyncHTTPClient` requests — the `lothc_mocker` fixture,
+auto-registered via this module's `pytest11` entry point (see `pyproject.toml`). It loads in any
+environment that has pytest, whether or not the `lothc[testing]` extra is installed; the extra only
+pins the pytest version it's tested against.
 
 This is a thin, lothc-flavored adapter over pyreqwest's own `client_mocker` fixture
 (`pyreqwest.pytest_plugin`) rather than a separate interception mechanism — pyreqwest's plugin
@@ -34,8 +35,8 @@ a limitation to live with. Only the `str | Pattern[str]` baseline is carried ove
 matcher support is dropped from these signatures accordingly.
 
 `params=`/`data=`/`headers=`'s encoding are the places this module has real lothc-specific
-behaviour, all three reusing `_client.py`'s own encoding helpers so a mock always matches/responds
-exactly the way a real request would encode the same value: `params=` accepts lothc's `Params`
+behaviour, all three encoding a value exactly as a real request would, so a mock always
+matches/responds the same way: `params=` accepts lothc's `Params`
 union (via `_encode_params`, shared with `_apply_params` — including a `list[...]`/`tuple[...]`
 value meaning a genuinely repeated query key, see `Params`'s own doc comment in `_client.py`) and
 is applied via a single `match_query(dict)` call — narrowing which requests an `add_*_response`
@@ -43,14 +44,16 @@ rule matches, the same way a real call's `params=` would build the query string 
 value derived via `_query_param_match_values` from pyreqwest's own real encoder, not reimplemented
 by hand — e.g. `True` becomes `"true"`, not Python's `str(True)` == `"True"`, confirmed live; a
 repeated key's match value is a `list[str]`, matched against pyreqwest's own order-sensitive
-`query_dict_multi_value` for the real request); `data=`
-accepts lothc's `Data` union (`bytes | dict | BaseModel | Struct`, via `_encode_json_payload`,
-shared with `_attach_body`/`_attach_body_sync`); and `headers=` accepts lothc's `Headers` union
+`query_dict_multi_value` for the real request); `data=` accepts lothc's `Data` union
+(`bytes | dict | BaseModel | Struct`, via this module's own `_encode_json_payload`, whose output
+is byte-identical to the real request path's `_attach_json_body`); and `headers=` accepts lothc's
+`Headers` union
 (`Mapping[str, str] | BaseModel | Struct`, via `_encode_headers`, shared with `_apply_headers`).
 The same typed params/headers class used for a real request, or for a `response_headers_type=`
 decode on the read side, can be constructed once and passed straight into `add_*_response(...)`.
 The import below is the one deliberate `reportPrivateUsage` suppression in this module: these
-three encoding helpers and the `_QueryValue` type alias (`_query_param_match_values`'s own
+two encoding helpers, `_pydantic_by_alias` (so a mock encodes a model exactly as a real request
+would) and the `_QueryValue` type alias (`_query_param_match_values`'s own
 parameter type, kept as one import rather than an inline duplicate of `Params`'s value union so
 the two can't silently drift apart) keep this file's otherwise-universal
 `_`-prefix-for-module-private-functions convention rather than losing it to cross-module sharing,
@@ -75,12 +78,14 @@ from ._client import (
     CaseInsensitiveDict,
     Data,
     Headers,
+    JSONPayload,
     Params,
     _encode_headers,  # pyright: ignore[reportPrivateUsage]
-    _encode_json_payload,  # pyright: ignore[reportPrivateUsage]
     _encode_params,  # pyright: ignore[reportPrivateUsage]
+    _pydantic_by_alias,  # pyright: ignore[reportPrivateUsage]
     _QueryValue,  # pyright: ignore[reportPrivateUsage]
 )
+from ._compat import BaseModel, Struct, msgspec
 
 __all__ = ["LOTHCMock", "LOTHCMocker", "MockRequest", "MockResponse"]
 
@@ -261,6 +266,21 @@ def _is_async_callable(func: Callable[..., Any]) -> bool:
     # a coroutine function, which callable() can't tell us.
     bound_call = getattr(func, "__call__", None)  # noqa: B004
     return inspect.iscoroutinefunction(func) or inspect.iscoroutinefunction(bound_call)
+
+
+def _encode_json_payload(payload: JSONPayload) -> Any:  # noqa: ANN401
+    """Turns any `JSONPayload` (`dict`, pydantic `BaseModel`, or msgspec `Struct`) into a plain
+    JSON-able value, for a mock response's `.body_json()`.
+
+    Lives here, not in `_client.py`, because the real request path no longer uses it: `json=`
+    bodies are now encoded straight to bytes by each library's own encoder (`_attach_json_body`),
+    which produces byte-identical output, so a mock still responds exactly as a real server
+    receiving the same value would be sent it."""
+    if isinstance(payload, BaseModel):
+        return payload.model_dump(mode="json", by_alias=_pydantic_by_alias(payload))
+    if isinstance(payload, Struct):
+        return msgspec.to_builtins(payload)
+    return payload
 
 
 def _encode_for_dispatch(data: Data) -> tuple[bool, bytes | Any]:

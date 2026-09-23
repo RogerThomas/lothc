@@ -39,13 +39,13 @@ from lothc.testing import LOTHCMocker, MockRequest, MockResponse
 
 @pytest_asyncio.fixture(name="client")
 async def _client():
-    async with HTTPClient.build(base_url="http://testserver/") as client:
+    async with HTTPClient(base_url="http://testserver/") as client:
         yield client
 
 
 @pytest.fixture(name="sync_client")
 def _sync_client():
-    with SyncHTTPClient.build(base_url="http://testserver/") as client:
+    with SyncHTTPClient(base_url="http://testserver/") as client:
         yield client
 ```
 
@@ -99,7 +99,7 @@ async def test_reuses_typed_data_and_headers_classes(
         headers=ItemHeaders(x_total_count=1),
     )
 
-    result = await client.get_result(
+    result = await client.with_result.get(
         "items/7", response_data_type=Item, response_headers_type=ItemHeaders
     )
 

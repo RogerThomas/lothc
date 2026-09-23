@@ -41,7 +41,7 @@ top-right corner to copy a one-liner that runs it via `uv run`, no local install
 
 
     async def main() -> None:
-        async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
+        async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
             pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
             print(pikachu)  # Pokemon(id=25, name='pikachu')
 
@@ -63,7 +63,7 @@ top-right corner to copy a one-liner that runs it via `uv run`, no local install
 
 
     async def main() -> None:
-        async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
+        async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
             pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
             print(pikachu)  # id=25 name='pikachu'
 
@@ -79,7 +79,7 @@ top-right corner to copy a one-liner that runs it via `uv run`, no local install
 
 
     async def main() -> None:
-        async with HTTPClient.build(base_url="https://pokeapi.co/api/v2/") as client:
+        async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
             pikachu = await client.get("pokemon/pikachu", response_data_type=dict)
             print(pikachu)  # {'id': 25, 'name': 'pikachu', ...}
 
@@ -164,7 +164,7 @@ Decoding into a real msgspec `Struct` even edged out the unvalidated dict path i
 
 -   **Every verb**
 
-    `get`, `get_result`, `post`, `put`, `patch`, `delete`, `head`, `download` — plus `sse`,
+    `get`, `post`, `put`, `patch`, `delete` (each also via `client.with_result`), `head`, `download` — plus `sse`,
     `stream_get`, and `stream_post` for streaming responses. See [Verbs](verbs.md).
 
 -   **Typed *and* raw params/headers**
@@ -189,9 +189,10 @@ Decoding into a real msgspec `Struct` even edged out the unvalidated dict path i
 
 -   **Authentication**
 
-    A static `bearer_token`, or `bearer_auth` for a token resolved fresh on every request —
-    plus `default_headers` for anything else that needs to go out on every request. See
-    [Authentication](auth.md).
+    A static `bearer_token`, `bearer_auth` for a token resolved fresh on every request, or
+    `basic_auth`; `OAuthProvider` handles OAuth 2 client credentials (with refresh and an optional
+    on-disk cache). Plus `default_headers` for anything else that needs to go out on every request.
+    See [Authentication](auth.md).
 
 -   **Cookies, redirects, proxy**
 

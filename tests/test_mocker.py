@@ -2,7 +2,7 @@ from typing import Any, cast
 
 import pytest
 from msgspec import Struct
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pyreqwest.pytest_plugin.mock import ClientMocker
 
 from lothc import CaseInsensitiveDict, HTTPClient, HTTPResponseError, SyncHTTPClient
@@ -113,7 +113,7 @@ async def test_add_get_response_with_status_raises_http_response_error(
 async def test_add_get_response_with_headers(client: HTTPClient, lothc_mocker: LOTHCMocker) -> None:
     lothc_mocker.add_get_response(path="/items/7", headers={"x-custom": "header-value"})
 
-    result = await client.get_result("items/7")
+    result = await client.with_result.get("items/7")
 
     assert result.headers["x-custom"] == "header-value"
 
@@ -132,7 +132,7 @@ async def test_add_get_response_with_data_and_headers_together(
         path="/items/7", data={"id": 7}, headers={"content-type": "text/plain"}
     )
 
-    result = await client.get_result("items/7", response_data_type=dict)
+    result = await client.with_result.get("items/7", response_data_type=dict)
 
     assert result.data == {"id": 7}
     assert result.headers["content-type"] == "text/plain"
@@ -263,7 +263,7 @@ async def test_add_get_response_reuses_a_typed_headers_class(
     `response_headers_type=` (decoding the mocked response's headers back into an instance)."""
     lothc_mocker.add_get_response(path="/items", headers=ItemHeaders(x_total_count=1))
 
-    result = await client.get_result("items", response_headers_type=ItemHeaders)
+    result = await client.with_result.get("items", response_headers_type=ItemHeaders)
 
     assert result.typed_headers == ItemHeaders(x_total_count=1)
 
@@ -472,7 +472,7 @@ async def test_with_headers_then_with_data_content_type_not_duplicated(
         "a": 1
     })
 
-    result = await client.get_result("items")
+    result = await client.with_result.get("items")
 
     assert result.headers["content-type"] == "text/plain"
 
@@ -490,7 +490,7 @@ async def test_with_headers_snapshots_the_dict_instead_of_aliasing_it(
     headers["x-custom"] = "mutated-after-the-fact"
     mock.with_data({"a": 1})
 
-    result = await client.get_result("items")
+    result = await client.with_result.get("items")
 
     assert result.headers["x-custom"] == "initial"
 
@@ -626,3 +626,17 @@ async def test_get_requests_headers_are_case_insensitive(
     assert seen.headers["x-flag"] == "1"
     assert seen.headers["X-FLAG"] == "1"
     assert "X-Flag" in seen.headers
+
+
+class _AliasedMockBody(BaseModel):
+    user_id: int = Field(alias="userId")
+
+
+async def test_mock_response_data_encodes_aliases_like_a_real_request(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/items/7", data=_AliasedMockBody(userId=7))
+
+    result = await client.get("items/7", response_data_type=dict)
+
+    assert result == {"userId": 7}

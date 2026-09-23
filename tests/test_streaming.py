@@ -197,3 +197,41 @@ def test_sync_stream_get_interruptible_early_break_does_not_hang(
 ) -> None:
     with ThreadPoolExecutor(max_workers=1) as pool:
         pool.submit(_consume_one_chunk_then_break, sync_client).result(timeout=5)
+
+
+async def test_stream_get_skips_blank_lines_in_a_crlf_ndjson_stream(client: HTTPClient) -> None:
+    # A CRLF stream's blank line arrives as a bare `\r`, which is truthy, so a plain `if line:`
+    # handed it to the JSON decoder and raised.
+    lines = [
+        line
+        async for line in client.stream_get(
+            "ndjson-blank-line", params={"count": 3, "newline": "crlf"}, response_data_type=dict
+        )
+    ]
+
+    assert lines == [{"i": 0}, {"i": 1}, {"i": 2}]
+
+
+def test_sync_stream_get_skips_blank_lines_in_a_crlf_ndjson_stream(
+    sync_client: SyncHTTPClient,
+) -> None:
+    lines = list(
+        sync_client.stream_get(
+            "ndjson-blank-line", params={"count": 3, "newline": "crlf"}, response_data_type=dict
+        )
+    )
+
+    assert lines == [{"i": 0}, {"i": 1}, {"i": 2}]
+
+
+async def test_stream_get_decodes_many_ndjson_lines_arriving_in_one_chunk(
+    client: HTTPClient,
+) -> None:
+    lines = [
+        line
+        async for line in client.stream_get(
+            "ndjson-blank-line", params={"count": 5000}, response_data_type=dict
+        )
+    ]
+
+    assert lines == [{"i": i} for i in range(5000)]

@@ -3,9 +3,8 @@ name = "lothc"
 # SemVer (e.g. `1.0.0`, no "v" prefix), derived from the git tag via hatch-vcs (see
 # [tool.hatch.version] below) — SemVer, not CalVer, because this is a library other packages
 # depend on: the major/minor/patch split is the signal pip's resolver, Dependabot, etc. rely on to
-# know whether an upgrade is safe, which a date can't communicate. No tag has been pushed yet, so
-# this currently resolves to a `0.1.dev0+gHASH`-style fallback version — push the first real tag
-# before publishing.
+# know whether an upgrade is safe, which a date can't communicate. An untagged checkout resolves
+# to a `0.1.dev0+gHASH`-style fallback version; `task release` pushes the tag a release builds from.
 dynamic = ["version"]
 description = "Lord Of The Http Clients — a typed HTTP client built on pyreqwest, with first-class pydantic and msgspec support"
 readme = "README.md"
@@ -262,7 +261,7 @@ max-branches = 15 # `_apply_form_value`/`_apply_sync_form_value`'s dispatch `mat
 # than pick an arbitrary number just past the current count
 
 [tool.pylint.format]
-max-module-lines = 5700 # _client.py is one deliberately unsplit file (see CLAUDE.md: "split it
+max-module-lines = 7200 # _client.py is one deliberately unsplit file (see CLAUDE.md: "split it
 # once it earns a split") that's grown past its previous bump (3800) to 4038 lines after
 # threading a per-verb `skip_auth` override through every overload of every verb on both clients
 # (mirroring the earlier `timeout` override); bumped again rather than split, since no split has
@@ -270,4 +269,9 @@ max-module-lines = 5700 # _client.py is one deliberately unsplit file (see CLAUD
 # (`max_reconnects`/`reconnect_delay`/`reconnect_on_close` on all 26 overload sites, plus the
 # shared reconnect/parsing helpers), landing at ~5200. 5500 -> 5700 after `CaseInsensitiveDict`
 # (case-insensitive, multi-value response headers) plus `backoff_base` on both `build`s, landing
-# at ~5520 — still no split decided on
+# at ~5520 — still no split decided on. 5700 -> 6000 after the `with_result` accessor classes, the
+# transport-error and body-read translation, atomic downloads and the linear NDJSON/SSE splitting,
+# landing at ~5850. 6000 -> 6300 after replacing the `build()` classmethods with a real
+# constructor + context manager (settings record, per-entry rebuild), landing at ~6170. 6300 -> 7200
+# after `TypeAdapter`/`Decoder` overloads on every body verb (30 of them), the re-auth middleware and
+# the read-only `SSEEvent`, landing at ~6940 (see finding #24 on generating the sync half)

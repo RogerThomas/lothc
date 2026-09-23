@@ -75,3 +75,68 @@ def test_sync_download_transport_error_mid_stream_raises_connection_error(
 ) -> None:
     with pytest.raises(HTTPConnectionError):
         sync_client.download("truncated")
+
+
+async def test_failed_download_leaves_no_partial_file(client: HTTPClient, tmp_path: Path) -> None:
+    dest = tmp_path / "dest"
+
+    with pytest.raises(HTTPConnectionError):
+        await client.download("truncated-after-first-chunk", dest=dest)
+
+    # Neither a truncated `dest` nor the hidden temp file it was being written into.
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_failed_download_keeps_an_existing_file_intact(
+    client: HTTPClient, tmp_path: Path
+) -> None:
+    # The old direct `dest.open("wb")` truncated this before the first byte had even arrived.
+    dest = tmp_path / "dest"
+    dest.write_bytes(b"previous-content")
+
+    with pytest.raises(HTTPConnectionError):
+        await client.download("truncated-after-first-chunk", dest=dest)
+
+    assert dest.read_bytes() == b"previous-content"
+    assert list(tmp_path.iterdir()) == [dest]
+
+
+def test_sync_failed_download_keeps_an_existing_file_intact(
+    sync_client: SyncHTTPClient, tmp_path: Path
+) -> None:
+    dest = tmp_path / "dest"
+    dest.write_bytes(b"previous-content")
+
+    with pytest.raises(HTTPConnectionError):
+        sync_client.download("truncated-after-first-chunk", dest=dest)
+
+    assert dest.read_bytes() == b"previous-content"
+    assert list(tmp_path.iterdir()) == [dest]
+
+
+async def test_successful_download_replaces_an_existing_file(
+    client: HTTPClient, tmp_path: Path
+) -> None:
+    dest = tmp_path / "dest"
+    dest.write_bytes(b"previous-content")
+
+    await client.download("binary", dest=dest)
+
+    assert dest.read_bytes() == b"AAA\nBBB\x00\nCCC"
+    assert list(tmp_path.iterdir()) == [dest]
+
+
+async def test_download_accepts_a_str_dest(client: HTTPClient, tmp_path: Path) -> None:
+    dest = tmp_path / "dest"
+
+    await client.download("binary", dest=str(dest))
+
+    assert dest.read_bytes() == b"AAA\nBBB\x00\nCCC"
+
+
+def test_sync_download_accepts_a_str_dest(sync_client: SyncHTTPClient, tmp_path: Path) -> None:
+    dest = tmp_path / "dest"
+
+    sync_client.download("binary", dest=str(dest))
+
+    assert dest.read_bytes() == b"AAA\nBBB\x00\nCCC"

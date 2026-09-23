@@ -177,7 +177,9 @@ could not detect "waited far too long". Confirmed by mutation: deleting the `bac
 fails both tests at the ceiling.
 
 Deliberately still slow, because the wait *is* the assertion: `sse_ctrl_c_interruptibility[False]`
-(0.60s, ~20% of the suite), the two SSE total-timeout tests (0.18s each), and
+(~0.8s: a 0.2s settle before Ctrl-C, so the child is really blocked in `read_chunk()` rather than
+racing the byte while still running Python bytecode, which flaked the negative control ~1 in 25
+under load, plus the 0.5s dwell), the two SSE total-timeout tests (0.18s each), and
 `test_import_lothc_succeeds_without_msgspec_or_pydantic` (0.12s, a real subprocess).
 
 Rejected with measurements, so don't re-litigate: **pytest-xdist** (actually installed and run —
@@ -310,18 +312,21 @@ overload shapes, one built on pyreqwest's `Client`/`RequestBuilder`/`Response`, 
 `SyncClient`/`SyncRequestBuilder`/`SyncResponse`. When adding a feature, implement it on both and verify
 both — it's easy to update one and forget the other.
 
-Both are plain `@dataclass`es (see style guide) built via a `classmethod` + context manager:
+Both are constructed with their settings and opened as a context manager; the pyreqwest client
+they wrap only exists while open, so it never appears in their public API:
 
 ```python
-async with HTTPClient.build(base_url=..., bearer_token=..., timeout=30.0) as client:
+async with HTTPClient(base_url=..., bearer_token=..., timeout=30.0) as client:
     ...
 ```
 
 ### Verbs
 
-`get`, `get_result`, `post`, `put`, `patch`, `delete`, `head`, `sse`, `stream_get`, `stream_post`,
-`download` — each is a set of `@overload`s plus one real implementation. See style guide for *why*
-overloads are used instead of a single generic signature.
+`get`, `post`, `put`, `patch`, `delete`, `head`, `sse`, `stream_get`, `stream_post`, `download` —
+each is a set of `@overload`s plus one real implementation. See style guide for *why* overloads are
+used instead of a single generic signature. `get`/`post`/`put`/`patch`/`delete` also exist on
+`client.with_result` (`WithResult`/`SyncWithResult`), returning a `Result` instead of the bare
+body; `head()` always returns a `Result`.
 
 ### Code style
 
@@ -333,12 +338,27 @@ the skill covers *how* to write new code that matches it.
 
 ## Development notes
 
+- **`async with HTTPClient(...)`, not `HTTPClient.build(...)`: the pyreqwest client is invisible.**
+  The clients used to be `@dataclass`es opened through a `build()` classmethod, so their public
+  constructor was `HTTPClient(<pyreqwest Client>, ...)`, a pyreqwest type in lothc's own API. Now
+  `__init__` takes only lothc settings (validated there, so e.g. conflicting auth fails at
+  construction), and `__aenter__`/`__enter__` build and open the pyreqwest client, which exists
+  only while open behind a `_client` property that raises a clear error otherwise. Deliberately
+  not dataclasses (style-guide §1 deviation): constructor params are settings, not stored fields.
+  A pyreqwest builder can only be built once ("Client was already built"), so settings live in a
+  `_TransportSettings` record and each entry rebuilds, which also makes a client re-enterable, so
+  a module-level client works across separate `asyncio.run()` calls. `WithResult` is handed a
+  `_send_method_result` callable taking the method as a string, never the pyreqwest client, since
+  its generated constructor is public too. `TlsVersion` is lothc's own `Literal` alias, not
+  pyreqwest's. `tests/test_public_api.py` enforces all of this by walking every exported
+  signature, overload and type alias in `lothc` and `lothc.testing` for a pyreqwest type; run
+  against the old code, it flags exactly the four leaking constructors.
 - **`OAuthProvider`/`SyncOAuthProvider` (`lothc/_oauth.py`).** RFC path sends the token request as
   `content=urlencode({...})` with an explicit `content-type: application/x-www-form-urlencoded`
   header (lothc's `form=` is multipart-only, no urlencoded option). An aliased pydantic
-  `token_request=`/`token_response=` model needs `ConfigDict(validate_by_name=True,
-  serialize_by_alias=True)` — lothc's `json=` encoding doesn't use `by_alias`; msgspec
-  `field(name=...)` needs nothing. Both provider classes are plain classes with an explicit
+  `token_request=`/`token_response=` model needs `ConfigDict(validate_by_name=True)` so lothc can
+  construct it by field name (it used to need `serialize_by_alias=True` too, before lothc encoded
+  pydantic models by alias; see below); msgspec `field(name=...)` needs nothing. Both provider classes are plain classes with an explicit
   keyword-only `__init__`, not `@dataclass` — zuban alone rejects a dataclass instance as
   `bearer_auth=` (confirmed a real zuban-only quirk, not a type error). `TokenRequestTyping`/
   `TokenRefreshRequestTyping` are `Callable[..., JSONPayload]` aliases, not exact-signature
@@ -360,12 +380,31 @@ the skill covers *how* to write new code that matches it.
   neither present is a `ValueError`. Refresh→mint fallback is 400-only; anything else propagates.
   `OAuthTokenError` (`.token_url`, original as `__cause__`) wraps everything `_renew` raises — the
   `bearer_auth` call happens *inside* the caller's own verb call, so an unwrapped error there would
-  misattribute to the wrong call. `client_factory` (default `HTTPClient.build`, called with no
-  args) replaced a `timeout` param — `functools.partial(HTTPClient.build, ...)` covers
+  misattribute to the wrong call. `client_factory` (default `HTTPClient`, called with no
+  args) replaced a `timeout` param — `functools.partial(HTTPClient, ...)` covers
   timeout/proxy/TLS for the token endpoint. `TokenResponseTyping` is a Protocol union needing only
   `.access_token`/`.expires_in`; `.refresh_token` is read via `getattr(..., "refresh_token", None)`
   so a model that omits it entirely is still valid (RFC 6749 §5.1 makes it optional). A
   `token_cache_path` whose parent doesn't exist fails at construction, not on first write.
+- **For `stream_get`/`stream_post`/`download`, the client's `timeout` is a gap limit, not a total
+  cap.** A total cap (pyreqwest's only per-request timeout) killed every healthy long stream or
+  large download at 30s. So these verbs swap it for `_streaming_default_timeout` (a year, as `sse`
+  does) and lothc enforces `_stream_idle_timeout` itself: the client `timeout`, unless
+  `read_timeout` was set (pyreqwest then enforces the gap at the socket). An explicit per-call
+  `timeout=` keeps meaning a total cap. `sse` gets no gap limit, since quiet periods are
+  legitimate there. pyreqwest has no per-request read timeout and `read_chunk()` takes no timeout,
+  so: async wraps opening the stream plus the status check, and each chunk read, in
+  `asyncio.timeout` (`_within_idle_limit`/`_read_chunk_within`), never across a `yield`, so a
+  slow consumer is never mistaken for a stalled server. Sync can only stop waiting by reading on a
+  worker thread (`_interruptible_chunk_iter`, now also the default path whenever a limit
+  applies): measured no throughput cost, but on a genuine stall the blocked read's thread and
+  socket stay parked until the peer closes (accepted; a blocked sync read can't be cancelled).
+  That queue is bounded (64 chunks) with an abandonment event, because an unbounded one made a
+  slow consumer buffer the whole body in RAM, and a plain blocking `put` would have left an early
+  `break`'s worker parked forever. The sync clock restarts when the caller asks for the next chunk
+  (the worker reads ahead), and polls at `idle/4`: at one poll per window, a clock left running
+  across a consumer's pause couldn't be told apart from a correct one, which mutation testing
+  caught.
 - **`sse()` never lets the client's total `timeout` touch the stream, and reconnects per the
   WHATWG EventSource model.** pyreqwest's `timeout` runs connect-to-body-finish, and an SSE body
   never finishes — `_sse_stream` passes a one-year default whenever the caller gives no `timeout=`;
@@ -412,10 +451,10 @@ the skill covers *how* to write new code that matches it.
   couldn't deliver real immutability/hashability anyway) is what a handler/predicate receives and
   `get_requests()` returns, built from the real `Request` by `_mock_request_from` — the only place
   this module still touches it. `url=` matching is `str | re.Pattern[str]` only (pyreqwest's `Url`
-  object is dropped — a string already matches the exact URL). A repeated header collapses to its
-  first value in `MockRequest.headers`, matching `Result.headers`'s own convention elsewhere.
+  object is dropped — a string already matches the exact URL). `MockRequest.headers` is a
+  `CaseInsensitiveDict` like `Result.headers`, so a repeated header keeps every value (`get_all`).
   `add_*_response`'s `params=`/`data=`/`headers=` share encoding with the real request path
-  (`_encode_params`/`_encode_json_payload`/`_encode_headers` in `_client.py`); `params=`'s match
+  (`_encode_params`/`_encode_headers` in `_client.py`; `data=` uses `testing.py`'s own `_encode_json_payload`, byte-identical to the real `_attach_json_body`); `params=`'s match
   string is derived from pyreqwest's own real query encoder rather than reimplemented (so an
   invalid value like `None` raises the same error a real request would) and is a **subset** match,
   not exact. `LOTHCMocker._add_response` validates/encodes everything before calling the pyreqwest
@@ -446,8 +485,14 @@ the skill covers *how* to write new code that matches it.
 - **`error_type` decodes from already-fetched bytes, never the live response object** — by the
   time `_check_status` raises, the body's already been read once for `body_start`, and a pyreqwest
   body can't be read twice. `_decode_error_body` mirrors `_decode_body`'s branch order on plain
-  bytes instead of reusing it. A decode failure against `error_type` propagates unwrapped, same
-  rule as `response_data_type`.
+  bytes instead of reusing it. Decoding is **best-effort** (`_try_decode_error_body`): a body
+  that doesn't match `error_type` gives `parsed_body=None` plus `.parse_error` (the library's own
+  `ValueError`, which every decode failure here is) and still raises `HTTPResponseError`. It used
+  to propagate unwrapped like `response_data_type`, so a proxy's 502 HTML page against
+  `error_type=ErrorModel` raised pydantic's `ValidationError` instead, losing the status and
+  skipping `except HTTPResponseError`. An unusable `error_type` is a caller bug and its
+  `TypeError` still propagates; `.parse_error` isn't pickled (pydantic's `ValidationError` can't
+  be).
 - **Bare `dict` is a valid `response_data_type`; a subscripted `dict[str, Any]` is not.** A single
   generic `type[TData]` overload resolves bare `dict` to `dict[Unknown, Unknown]` under
   basedpyright strict (a generic overload copies the argument's own static type, it doesn't fill in
@@ -464,6 +509,20 @@ the skill covers *how* to write new code that matches it.
   *instance* level**, not the class level. `JSONPayload` (not `Json`) was named that way
   deliberately to avoid a case-only collision with the former `JSON` response-decode class
   (removed).
+- **`client.with_result.<verb>`, not `<verb>_result` methods or a bool flag.** The `*_result`
+  twins read wrong, and a flag (`post(..., as_result=True)`) would make the return type depend on a
+  runtime `bool`: that multiplies every verb's overloads by `Literal[True]`/`Literal[False]`/`bool`,
+  and a non-literal `bool` argument matches no overload at all (the same trap as `sse`'s
+  `allow_missing_id=`). It would also leave `response_headers_type` meaningful in only one mode.
+  A namespace keeps one return type per method and scopes `response_headers_type` to where it
+  applies, with the same surface as before, just moved (prior art: the OpenAI/Anthropic SDKs'
+  `client.with_raw_response`). Named `with_result`, not `with_response`, because it returns a
+  `Result` and "response" suggests a raw one. `WithResult` is handed the pyreqwest client and a
+  bound `_send_with_body_result` (typed by the `_SendWithBodyResult` Protocol) rather than the
+  `HTTPClient` itself: basedpyright's `reportPrivateUsage` flags a protected member accessed from
+  another class even within one module (confirmed with a probe), so this is how it avoids reaching
+  into the client's privates. `with_result.get` reuses `_send_with_body_result` with no body,
+  rather than keeping its own copy of the send/decode/headers sequence.
 - **A `BuilderError` is permanent, so it's never reconnected.** pyreqwest raises it from
   `.build()`/`.build_streamed()` before anything reaches the network (a rejected scheme under
   `https_only`, a malformed URL), so retrying cannot change the outcome — yet `sse()` used to
@@ -474,7 +533,7 @@ the skill covers *how* to write new code that matches it.
   to keep the surface flat. `RedirectError` is deliberately excluded: a redirect loop can be
   transient. The retry middleware needed no change — it only catches `PyreqwestTransportError`,
   and `.build()` runs outside `next.run` anyway, so a `BuilderError` never reached it.
-- **`backoff_base` is a `build()` parameter, not just a `_RetryMiddleware` field default.** It was
+- **`backoff_base` is a client constructor parameter, not just a `_RetryMiddleware` field default.** It was
   private, so a user on a retry-heavy path had no way to tune backoff at all (and the retry tests
   couldn't shrink their ~2s of real sleeping). Same default (0.1), same
   `backoff_base * 2 ** attempt` formula, `Retry-After` still wins over the computed delay.
@@ -496,7 +555,10 @@ the skill covers *how* to write new code that matches it.
   states, where `all` names the semantics; urllib3 offers both spellings, so neither camp is
   surprised. `__eq__` compares every value against another `CaseInsensitiveDict` (two responses
   differing only in a dropped `set-cookie` must not compare equal) but only the single-valued
-  view against any other mapping, which is all the other side holds. `__repr__` switches to the
+  view against any other mapping, which is all the other side holds. That makes equality
+  non-transitive with repeated headers; documented rather than changed, since the alternative (a
+  plain-dict comparison returning `False` whenever a header repeats) would make `h == dict(h)`
+  false for any response with two cookies. requests' `CaseInsensitiveDict` behaves the same way. `__repr__` switches to the
   pair-list form as soon as a name repeats, so it can't render three cookies as one entry. The
   one `cast` in `__init__` covers a basedpyright artifact, not a real case: it narrows the
   `Iterable[tuple[str, str]]` member against `Mapping` too, synthesizing a
@@ -541,8 +603,18 @@ the skill covers *how* to write new code that matches it.
   whichever of the three is configured.
 - **`response_data_type` defaults to `bytes` everywhere** except `sse()`, whose bare default stays
   `SSEEvent[str]` — a stream of named records has no single "raw bytes" analogue.
-- **`SSEEvent[TData, TId = str]`** — the class's own `TId` default must track `sse()`'s actual
-  default (these disagreeing was a real bug once). `.event` is always `str` (spec default
+- **`SSEEvent[TData, TId = str | None]`, and `sse()` allows a missing `id` by default** — the
+  class's own `TId` default must track `sse()`'s actual default (these disagreeing was a real bug
+  once). The default used to *require* `id`, which failed on the first event from most real
+  servers (OpenAI/Anthropic-style streams never send one); `allow_missing_id=False` is now the
+  opt-in, giving `str`-typed ids. The overloads are `allow_missing_id: Literal[False]` (required)
+  → `SSEEvent[..., TId]` and `allow_missing_id: bool = True` → `SSEEvent[..., TId | None]`,
+  which only type-check without `reportOverlappingOverload` if `SSEEvent` is *covariant*. That's
+  why it's a plain class with read-only properties, not a dataclass: even a frozen dataclass (or
+  a `NamedTuple`) is invariant, because the synthesized `__replace__`/`_replace` takes the field
+  types as parameters, and an explicitly covariant `TypeVar` is rejected by mypy for the same
+  reason (all four checkers probed). `__eq__`/`__hash__` go through a private `_key()` with a
+  concrete return type, since `isinstance` narrows `other` to `SSEEvent[Unknown, Unknown]`. `.event` is always `str` (spec default
   `"message"`); `.id` is genuinely `str | None` per spec. `id_type`/`allow_missing_id` are two
   independent knobs (type coercion vs. requiredness) — a union-accepting `id_type` design was
   tried and rejected: it breaks `mypy`/`ty`/`zuban`'s handling of a real `UnionType` value where
@@ -555,8 +627,11 @@ the skill covers *how* to write new code that matches it.
   of a large body at peak** (pyreqwest's own internal buffering, plus lothc's own
   `bytes(await raw_response.bytes())` copy). `download()` streams via `build_streamed()` into a
   `bytearray` (`+=`, not `.extend()` — accepts pyreqwest's buffer-protocol chunks directly with no
-  per-chunk copy), roughly a third of the peak memory; `dest: Path` streams straight to a file
-  instead, O(chunk size) regardless of body size. Deliberately did not change `get()`'s own default
+  per-chunk copy), about two-thirds of `get()`'s peak (measured 105MB vs 154MB on a 50MB body;
+  an earlier "a third" claim here was wrong, since the final `bytes(buffer)` is a second full
+  copy); `dest` streams straight to a file instead, O(chunk size) regardless of body size, via
+  `_atomic_download_file` (hidden sibling + rename, so a failed download never leaves a truncated
+  file and never clobbers an existing one). Deliberately did not change `get()`'s own default
   path — the small JSON bodies this library is designed around make the extra copies free in
   practice, and `download()` is additive for the large-body case specifically.
 - **`.to_bytes()`, never `bytes(the_thing.bytes())`**, to turn a `pyreqwest.bytes.Bytes` into a
@@ -575,13 +650,45 @@ the skill covers *how* to write new code that matches it.
   connection closes. Fixed by setting it to `1` at all 4 real-time streaming call sites
   (`sse`/`stream_get`/`stream_post`, both clients) — confirmed this does *not* mean byte-at-a-time
   reads (chunk size/count are governed by the OS socket regardless), so there's no throughput cost.
-  Deliberately left `download()`'s two call sites untouched — bulk transfer benefits from the
-  larger default and has no low-latency requirement.
+  `download()` was once left on the default on the (unmeasured) belief that bulk transfer benefits
+  from the larger buffer. It now uses `1` too, because the stream idle limit needs chunks as they
+  arrive: a slow but healthy download (1KB/s) would otherwise look silent for over a minute. Measured
+  no cost (100MB over loopback in 79ms vs 80ms, similar chunk counts).
 - **Status errors are separate from transport errors.** `HTTPResponseError` (4xx/5xx with a
   body_start snippet) is a different failure class from `HTTPTransportError` (never got a response
   at all) — don't unify them.
-- **Validation errors from the chosen decode library are NOT wrapped.** A `pydantic.ValidationError`
-  or `msgspec.ValidationError` propagates natively — the user opted into that library by choosing
-  it as a `response_data_type`, so its own exception is the expected one to see.
+- **Validation errors from the chosen decode library are NOT wrapped** — for `response_data_type`.
+  A `pydantic.ValidationError` or `msgspec.ValidationError` propagates natively: the user opted
+  into that library by choosing it, so its own exception is the expected one to see. `error_type`
+  is the deliberate exception (best-effort, see its note above), because an error body is where a
+  server is least likely to honour its own contract.
+- **`TypeAdapter`/`Decoder` are valid `response_data_type`s on every verb**, as they already were
+  on `sse()`/`stream_*`: the way to decode a top-level JSON array (`TypeAdapter(list[Item])`).
+  Each verb gained one overload returning the adapted type, and the ten plain-verb
+  implementations return `object` rather than `Data`, since an overload returning an unbounded
+  `TAdapted` is otherwise "not consistent" with its implementation. `_decode_body` handles the
+  adapters before the "must be a class" validation (an adapter is an instance). `dict` on a
+  non-object body raises a clear `ValueError` (`_require_json_object`) instead of `dict()`'s own
+  `TypeError`, which also keeps "every decode failure is a `ValueError`" true for `error_type`.
+- **pydantic models encode by alias, like msgspec's `rename=`.** pydantic validates by alias but
+  serializes by field name by default, so a camelCase model decoded from an API went back to it
+  as snake_case. `_pydantic_by_alias` reads the model's own `serialize_by_alias` (default `True`),
+  so an explicit `False` is still honoured and lothc never contradicts a model's `model_dump()`.
+  Applied at every encode site: `json=`, `params=`, `headers=`, JSON form parts, and
+  `lothc.testing` mock responses.
+- **`max_retry_after` caps `Retry-After` (default 60s).** A longer wait ends retrying and the
+  429/503 is raised, so the caller can schedule its own retry from `e.headers["Retry-After"]`
+  (`Retry-After: 3600` used to sleep an hour inside `get()`). Stopping rather than clamping,
+  because retrying early against a server that asked for a long wait is usually rejected again.
+- **A 401 re-authenticates once when `bearer_auth` can `invalidate()`.** `_ReauthMiddleware`
+  invalidates the rejected token on *any* 401 (so the next call gets a fresh one) but retries
+  only idempotent verbs, never replaying a POST, and only once (a second 401 is raised). The
+  client knows nothing about OAuth: it checks for the `_InvalidatableAuth` protocol, which any
+  custom provider can implement. `invalidate(stale_access_token)` is a no-op if the provider has
+  already moved on, so concurrent 401s can't discard each other's fresh token; it marks the token
+  expired rather than dropping it, so renewal goes through the refresh token when there is one.
+  Mutation-testing this turned up a harness pitfall: restoring a same-size mutation within the
+  same second left Python running the mutated `.pyc` (its check is size plus 1-second mtime), so
+  mutation runs use `python -B`.
 - **basedpyright strict mode is the contract.** Every change must pass `task typecheck` with zero
   errors and, ideally, zero new `cast(...)` calls.

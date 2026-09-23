@@ -23,7 +23,7 @@ class HeadersResponse(Struct):
 
 
 async def main() -> None:
-    async with HTTPClient.build(base_url="https://httpbin.org/") as client:
+    async with HTTPClient(base_url="https://httpbin.org/") as client:
         get_result = await client.get("get", params={"foo": "bar"}, response_data_type=GetResponse)
         print("GET  /get        ->", get_result.args, get_result.url)
 

@@ -17,7 +17,10 @@ from ._client import (
     SSEEvent,
     SyncAuthProvider,
     SyncHTTPClient,
+    SyncWithResult,
+    TlsVersion,
     TypedHeaders,
+    WithResult,
 )
 from ._oauth import (
     OAuthProvider,
@@ -50,8 +53,11 @@ __all__ = [
     "SyncAuthProvider",
     "SyncHTTPClient",
     "SyncOAuthProvider",
+    "SyncWithResult",
+    "TlsVersion",
     "TokenRefreshRequestTyping",
     "TokenRequestTyping",
     "TokenResponseTyping",
     "TypedHeaders",
+    "WithResult",
 ]

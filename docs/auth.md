@@ -7,7 +7,7 @@ icon: lucide/key-round
 Two ways to send a `Bearer` `Authorization` header — provide at most one:
 
 ```python
-async with HTTPClient.build(
+async with HTTPClient(
     base_url="https://api.example.com/", bearer_token="my-static-token"
 ) as client:
     await client.get("items/7")
@@ -15,16 +15,14 @@ async with HTTPClient.build(
 
 `bearer_token` is a static string, sent as-is on every request. For a token that expires or
 rotates, pass `bearer_auth` instead — an async callable (sync callable on `SyncHTTPClient`)
-resolved fresh on *every* request, not just once at `build()` time:
+resolved fresh on *every* request, not just once when the client is created:
 
 ```python
 async def get_current_token() -> str:
     return await token_store.get_access_token()  # e.g. refreshed from a cache or auth server
 
 
-async with HTTPClient.build(
-    base_url="https://api.example.com/", bearer_auth=get_current_token
-) as client:
+async with HTTPClient(base_url="https://api.example.com/", bearer_auth=get_current_token) as client:
     await client.get("items/7")  # calls get_current_token() for this request
     await client.get("items/8")  # calls it again — always the latest token
 ```
@@ -38,7 +36,7 @@ Basic-auth `username`/`password` pair instead, pass `basic_auth` — provide at 
 three:
 
 ```python
-async with HTTPClient.build(
+async with HTTPClient(
     base_url="https://api.example.com/", basic_auth=("my-username", "my-password")
 ) as client:
     await client.get("items/7")
@@ -53,7 +51,7 @@ differently-authenticated target through the same instance, e.g. a presigned S3 
 never see your API's own token:
 
 ```python
-async with HTTPClient.build(
+async with HTTPClient(
     base_url="https://api.example.com/", bearer_token="my-static-token"
 ) as client:
     await client.get("items/7")  # gets the Authorization header
@@ -73,7 +71,7 @@ the scenes only when needed:
 ```python
 from lothc import HTTPClient, OAuthProvider
 
-async with HTTPClient.build(
+async with HTTPClient(
     base_url="https://api.example.com/",
     bearer_auth=OAuthProvider(
         token_url="https://auth.example.com/oauth/token",
@@ -124,7 +122,7 @@ token cached forever.
   rest wait for it and reuse its result rather than each hitting the token endpoint.
 
 Each token request goes through its own short-lived client, built by calling `client_factory`
-with no arguments (default `HTTPClient.build`). Anything the token endpoint needs that the API
+with no arguments (default `HTTPClient`). Anything the token endpoint needs that the API
 client doesn't — a shorter timeout, a proxy, a private CA, an mTLS identity — goes through a
 `functools.partial` of `build`:
 
@@ -135,7 +133,7 @@ OAuthProvider(
     token_url="https://auth.example.com/oauth/token",
     client_id="my-client-id",
     client_secret="my-client-secret",
-    client_factory=partial(HTTPClient.build, timeout=5.0, proxy="http://proxy.internal:3128"),
+    client_factory=partial(HTTPClient, timeout=5.0, proxy="http://proxy.internal:3128"),
 )
 ```
 
@@ -233,16 +231,11 @@ OAuthProvider(
 )
 ```
 
-The `model_config` line on the request model is load-bearing, not boilerplate. lothc constructs
-it by attribute name (`validate_by_name=True` is what lets an aliased pydantic model accept
-`client_id=` at all), and lothc's `json=` encoding calls `model_dump(mode="json")` with no
-`by_alias=True` — so without `serialize_by_alias=True` the body goes over the wire with the
-Python names. Confirmed against a real endpoint: with that config the token request succeeds,
-without it the same model is rejected with `400 "clientID must not be blank"`. This applies to
-any aliased pydantic model passed as `json=` anywhere in lothc, not just here. (For a
-request-only model, `Field(serialization_alias="clientID")` with just
-`ConfigDict(serialize_by_alias=True)` is an equivalent spelling that needs no
-`validate_by_name`, since the model is never validated from the wire.)
+The `model_config` line on the request model is load-bearing, not boilerplate: lothc constructs
+the model by attribute name, and `validate_by_name=True` is what lets an aliased pydantic model
+accept `client_id=` at all. `serialize_by_alias=True` is no longer needed, since lothc encodes
+every pydantic model by its aliases unless the model explicitly sets `serialize_by_alias=False`
+(the same way msgspec's `rename=`/`name=` works in both directions); it's harmless to keep.
 
 The msgspec spelling of the same thing needs no config — `name=` covers both directions:
 
@@ -288,16 +281,30 @@ OAuthProvider(
 )
 ```
 
+### Revoked tokens
+
+A token the server rejects with a `401` before it expires (revoked, rotated) is discarded
+automatically. The client calls `provider.invalidate()` and, for an idempotent verb
+(`GET`/`PUT`/`DELETE`/`HEAD`), retries the request once with a freshly obtained token. A `POST`
+or `PATCH` is never replayed, since it may not be safe to repeat: it raises the `401`, and the
+next call gets a fresh token. A second `401` on the retry is raised as-is, so a request that
+genuinely lacks access fails after one extra token fetch rather than looping.
+
+`invalidate()` is public too, and takes the rejected token optionally, becoming a no-op if a new
+one has been obtained since (so two concurrent 401s don't each discard the other's fresh token).
+The client knows nothing about OAuth here: any `bearer_auth` callable with an
+`invalidate(stale_access_token=None)` method gets the same behaviour.
+
 ### Sync
 
 `SyncOAuthProvider` is the mirror for `SyncHTTPClient` — same constructor, same lifecycle, a
-plain `def __call__`, and a `client_factory` defaulting to `SyncHTTPClient.build` (so
-`partial(SyncHTTPClient.build, timeout=5.0)` is the sync spelling of the example above):
+plain `def __call__`, and a `client_factory` defaulting to `SyncHTTPClient` (so
+`partial(SyncHTTPClient, timeout=5.0)` is the sync spelling of the example above):
 
 ```python
 from lothc import SyncHTTPClient, SyncOAuthProvider
 
-with SyncHTTPClient.build(
+with SyncHTTPClient(
     base_url="https://api.example.com/",
     bearer_auth=SyncOAuthProvider(
         token_url="https://auth.example.com/oauth/token",
@@ -311,11 +318,11 @@ with SyncHTTPClient.build(
 ## Default headers
 
 For anything that isn't a `Bearer` token — an API key header, a custom user-agent, whatever your
-API needs on every request — pass `default_headers` at `build()` time. Unlike `bearer_auth`,
+API needs on every request — pass `default_headers` when creating the client. Unlike `bearer_auth`,
 these are fixed for the client's whole lifetime, resolved once, not per-request:
 
 ```python
-async with HTTPClient.build(
+async with HTTPClient(
     base_url="https://api.example.com/",
     default_headers={"x-api-key": "my-api-key"},
 ) as client:
@@ -331,7 +338,7 @@ Combine freely with `bearer_token`/`bearer_auth`/`basic_auth` — they set diffe
 through it:
 
 ```python
-async with HTTPClient.build(base_url="https://api.example.com/", timeout=5.0) as client:
+async with HTTPClient(base_url="https://api.example.com/", timeout=5.0) as client:
     await client.get("items/7")  # raises HTTPTimeoutError if this takes longer than 5s
 ```
 
@@ -341,7 +348,7 @@ Pass `timeout=None` to disable it and fall back to pyreqwest's own default. See
 Every verb also takes its own `timeout`, overriding the client's for that one call only:
 
 ```python
-async with HTTPClient.build(base_url="https://api.example.com/", timeout=5.0) as client:
+async with HTTPClient(base_url="https://api.example.com/", timeout=5.0) as client:
     await client.get("items/7")  # uses the client default, 5s
     await client.get("exports/large-file.csv", timeout=60.0)  # this call gets 60s instead
 ```

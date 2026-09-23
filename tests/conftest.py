@@ -22,11 +22,11 @@ def _base_url() -> Generator[str]:
 
 @pytest.fixture(name="client")
 async def _client(base_url: str) -> AsyncGenerator[HTTPClient]:
-    async with HTTPClient.build(base_url=base_url) as client:
+    async with HTTPClient(base_url=base_url) as client:
         yield client
 
 
 @pytest.fixture(name="sync_client")
 def _sync_client(base_url: str) -> Generator[SyncHTTPClient]:
-    with SyncHTTPClient.build(base_url=base_url) as client:
+    with SyncHTTPClient(base_url=base_url) as client:
         yield client

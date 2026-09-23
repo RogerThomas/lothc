@@ -10,6 +10,8 @@ cookie/redirect/retry/streaming scenarios used by their own tests.
 import contextlib
 import email.policy
 import json
+import socket
+import sys
 import time
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -65,6 +67,9 @@ class TestAppHandler(BaseHTTPRequestHandler):
             {
                 "body": raw_body.decode(),
                 "content_type": self.headers.get("Content-Type"),
+                # Every value, not just the first: a duplicated Content-Type is exactly the kind
+                # of bug `.get` would hide.
+                "content_types": self.headers.get_all("Content-Type") or [],
             },
         )
 
@@ -322,13 +327,40 @@ class TestAppHandler(BaseHTTPRequestHandler):
     def _handle_ndjson_with_blank_line(self, query: str) -> None:
         params = parse_qs(query)
         count = int(params.get("count", ["3"])[0])
+        # `newline=crlf` sends CRLF line endings, whose blank lines arrive as a bare `\r`.
+        newline = "\r\n" if params.get("newline", ["lf"])[0] == "crlf" else "\n"
         lines = [json.dumps({"i": i}) for i in range(count)]
-        body = ("\n\n".join(lines) + "\n").encode()
+        body = ((newline * 2).join(lines) + newline).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _write_sse_byte_by_byte(self) -> None:
+        # Each record boundary is split *inside* itself, across separate reads: `\n` | `\n`,
+        # `\r` | `\r`, and `\r\n\r` | `\n`. The pause is what makes those real chunk boundaries;
+        # written back to back, TCP coalesces them into one read and the split never happens.
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        for piece in (b"data: a\n", b"\n", b"data: b\r", b"\r", b"data: c\r\n\r", b"\n"):
+            self.wfile.write(piece)
+            self.wfile.flush()
+            time.sleep(0.01)
+
+    def _write_sse_lenient_cases(self) -> None:
+        # An empty `event:` field (dispatched as "message" per spec, not "") and invalid UTF-8
+        # (decoded with replacement per spec, not raised).
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(b"event:\ndata: first\n\ndata: bad-\xff-byte\n\n")
+        self.wfile.flush()
 
     def _handle_truncated(self) -> None:
         # No terminating zero-length chunk is ever sent — a genuinely truncated
@@ -342,6 +374,91 @@ class TestAppHandler(BaseHTTPRequestHandler):
         body = b"partial-data"
         self.wfile.write(f"{len(body):x}\r\n".encode() + body + b"\r\n")
         self.wfile.flush()
+
+    def _handle_truncated_content_length(self) -> None:
+        # Promises 100 bytes, sends 8, then closes. Unlike `_handle_truncated` (chunked), this is
+        # what a server or pod dying mid-response usually looks like, and pyreqwest reports it
+        # through a different exception (`DecodeError`), so it needs its own route to be tested.
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "100")
+        self.end_headers()
+        self.wfile.write(b'{"id": 1')
+        self.wfile.flush()
+
+    def _handle_truncated_after_first_chunk(self) -> None:
+        # Like `_handle_truncated_content_length`, but a real first chunk arrives on its own
+        # before the connection dies, so a client is genuinely mid-body when it fails. The
+        # 8-byte version fails before any body chunk is handed over, which never exercises what
+        # a half-written download leaves behind.
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(1024 * 1024))
+        self.end_headers()
+        self.wfile.write(b"x" * 64 * 1024)
+        self.wfile.flush()
+        time.sleep(0.02)
+
+    def _handle_stall_after_first_chunk(self, query: str) -> None:
+        # One chunk, then silence for `seconds` (the connection stays open), then close. A client
+        # whose idle limit is shorter must give up during the silence rather than wait it out.
+        seconds = float(parse_qs(query).get("seconds", ["1"])[0])
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        self.wfile.write(b"5\r\nfirst\r\n")
+        self.wfile.flush()
+        time.sleep(seconds)
+
+    def _handle_rejects_first_token(self) -> None:
+        # Stands in for an API whose first-issued token was revoked before it expired: the token
+        # endpoint issues `token-1`, `token-2`, ..., and this rejects `token-1` with a 401.
+        # Drain any request body first, so a kept-alive connection's next request isn't misread.
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        authorization = self.headers.get("Authorization")
+        if authorization == "Bearer token-1":
+            self._write_json(401, {"error": "invalid_token"})
+        else:
+            self._write_json(200, {"authorization": authorization})
+
+    def _handle_always_unauthorized(self, query: str) -> None:
+        # Rejects every token, and says how many times it's been asked (per `key`), so a test can
+        # assert a request was retried exactly once rather than looping.
+        hits = self._bump_counter(parse_qs(query)["key"][0])
+        self._write_json(401, {"hits": hits})
+
+    def _handle_invalid_json_error(self) -> None:
+        # What a proxy in front of a JSON API sends when the API is down: an HTML 502.
+        body = b"<html><body>502 Bad Gateway</body></html>"
+        self.send_response(502)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_json_literal(self, query: str) -> None:
+        # A top-level JSON value that isn't an object, sent verbatim (`value=` is raw JSON).
+        body = parse_qs(query)["value"][0].encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_json_array(self) -> None:
+        self._write_json(200, [{"id": 1, "name": "one"}, {"id": 2, "name": "two"}])
+
+    def _handle_invalid_json(self) -> None:
+        body = b"{not json"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_connection_flaky(self, query: str) -> None:
         params = parse_qs(query)
@@ -373,6 +490,10 @@ class TestAppHandler(BaseHTTPRequestHandler):
 
     def _handle_boom(self) -> None:
         self._write_json(500, _server_error_body)
+
+    def _handle_boom_large(self) -> None:
+        # Longer than `HTTPResponseError.body_start`'s 100 bytes, with a header worth quoting.
+        self._write_json(500, {"detail": "x" * 300}, {"X-Request-Id": "request-id"})
 
     def _record_token_request(self, key: str, body: object) -> None:
         self._token_requests.setdefault(key, []).append({
@@ -460,6 +581,9 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/oauth/token-requests": self._handle_oauth_token_requests,
             "/echo-query": self._handle_echo_query,
             "/slow": self._handle_slow,
+            "/always-unauthorized": self._handle_always_unauthorized,
+            "/json-literal": self._handle_json_literal,
+            "/stall-after-first-chunk": self._handle_stall_after_first_chunk,
         }
         if parsed.path in query_routes:
             query_routes[parsed.path](parsed.query)
@@ -467,11 +591,14 @@ class TestAppHandler(BaseHTTPRequestHandler):
         plain_routes = {
             "/echo-headers": self._handle_echo_headers,
             "/events-weird": self._write_sse_weird,
+            "/events-byte-by-byte": self._write_sse_byte_by_byte,
+            "/events-lenient": self._write_sse_lenient_cases,
             "/events-truncated": self._write_sse_truncated,
             "/events-no-content": self._write_sse_no_content,
             "/events-wrong-content-type": self._write_sse_wrong_content_type,
             "/events-spec-edge-cases": self._write_sse_spec_edge_cases,
             "/boom": self._handle_boom,
+            "/boom-large": self._handle_boom_large,
             "/set-cookie": self._handle_set_cookie,
             "/multi-set-cookie": self._handle_multi_set_cookie,
             "/read-cookie": self._handle_read_cookie,
@@ -479,6 +606,12 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/redirect-loop": self._handle_redirect_loop,
             "/binary": self._handle_binary,
             "/truncated": self._handle_truncated,
+            "/truncated-content-length": self._handle_truncated_content_length,
+            "/truncated-after-first-chunk": self._handle_truncated_after_first_chunk,
+            "/invalid-json": self._handle_invalid_json,
+            "/invalid-json-error": self._handle_invalid_json_error,
+            "/rejects-first-token": self._handle_rejects_first_token,
+            "/json-array": self._handle_json_array,
         }
         route = plain_routes.get(parsed.path)
         if route is None:
@@ -510,6 +643,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self._handle_upload()
         elif parsed.path == "/echo-body":
             self._handle_echo_body()
+        elif parsed.path == "/rejects-first-token":
+            self._handle_rejects_first_token()
         elif parsed.path == "/oauth/token":
             self._handle_oauth_token(parsed.query)
         elif parsed.path == "/oauth/token-custom":
@@ -546,5 +681,23 @@ class TestAppHandler(BaseHTTPRequestHandler):
         pass  # silence default per-request stderr logging
 
 
+class _QuietOnDisconnectServer(ThreadingHTTPServer):
+    """Doesn't print a traceback when a client goes away before the server has finished answering.
+
+    Several tests deliberately stop reading early or give up on a stalled response, and the
+    stdlib server otherwise prints "Exception occurred during processing of request" plus a
+    `BrokenPipeError` traceback to stderr, sometimes after pytest's own summary. Only a client
+    disconnect (`ConnectionError`) is silenced; any other handler error still prints, so a real
+    bug in a test route stays visible.
+    """
+
+    def handle_error(
+        self, request: socket.socket | tuple[bytes, socket.socket], client_address: object
+    ) -> None:
+        if isinstance(sys.exc_info()[1], ConnectionError):
+            return
+        super().handle_error(request, client_address)
+
+
 def make_server() -> ThreadingHTTPServer:
-    return ThreadingHTTPServer(("127.0.0.1", 0), TestAppHandler)
+    return _QuietOnDisconnectServer(("127.0.0.1", 0), TestAppHandler)

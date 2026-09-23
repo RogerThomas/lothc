@@ -20,6 +20,13 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run basedpyright .
+      # tests/ exercises lothc's public API the way a consumer would, so it must type-check under
+      # every major checker, not only basedpyright (see CLAUDE.md, "Type-checking tests/ across
+      # all 4 major type checkers"). Until these ran here, that rule was only kept by habit.
+      - run: uv run mypy tests
+      - run: uv run ty check tests
+      - run: uv run zuban check tests
+      - run: uv run pytest --doctest-modules lothc
       # `coverage run` (process-level), not `pytest --cov` — the latter starts tracing after
       # pytest's own plugins (incl. lothc.testing, an auto-loaded pytest11 plugin) already
       # imported, so their module-level code always showed as uncovered. Real coverage was 97%,

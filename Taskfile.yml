@@ -74,11 +74,15 @@ tasks:
       exit ${rc}
 
   check:
-    desc: Lint, format-check, and typecheck (what CI runs)
+    desc: Lint, format-check, typecheck (all four checkers on tests/) and doctests — what CI runs
     cmds:
       - uv run ruff check .
       - uv run ruff format --check .
       - uv run basedpyright .
+      - uv run mypy tests
+      - uv run ty check tests
+      - uv run zuban check tests
+      - uv run pytest --doctest-modules lothc -q --no-header -p no:cacheprovider
 
   precommit-install:
     desc: Install the git pre-commit hook

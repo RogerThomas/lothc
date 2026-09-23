@@ -8,49 +8,52 @@ mirror methods 1:1 (drop `await`, `async with` → `with`, async iterators → s
 lothc's public API (including `lothc.testing`) must never require a caller to import from
 `pyreqwest` directly, or hand them a pyreqwest type to construct or receive. pyreqwest is an
 implementation detail; every user-facing type is lothc's own (`Data`, `Params`, `Headers`,
-`MockResponse`, `MockRequest`, ...). This is now a hard, fully-enforced rule in `lothc.testing`,
-not just an aspiration — two rounds of fixes:
-(1) `match_request_with_response`'s custom-handler escape hatch used to require building a
-response via pyreqwest's own `ResponseBuilder().status(...).body_json(...).build()`/
-`.build_sync()` — fixed by adding `MockResponse` (a plain dataclass, no builder pattern — this
-project doesn't use that pattern anywhere else) that the handler returns instead; lothc builds the
-real pyreqwest response internally.
-(2) `Request` (the handler/matcher's parameter type, and `get_requests()`'s return type) and
-`Url` (the `url=` matcher's type) were still pyreqwest's own types, re-exported rather than
-wrapped — rejected as insufficient (a re-export still means the *class itself* is pyreqwest's,
-even if the import path isn't). Fixed properly: `MockRequest` (`lothc/testing.py`) is a plain,
-slotted dataclass (`method`/`path`/`query_string`/`query`/`headers`/`body` — see the "Testing" section
-below for why it's deliberately not `frozen=True`) built by
-`_mock_request_from` from pyreqwest's real `Request` at the one point a mock actually receives
-one — `match_request`/`match_request_with_response` handlers get a `MockRequest`, `get_requests()`
-returns `list[MockRequest]`, and `url=` matching is narrowed to `str | re.Pattern[str]` only
-(pyreqwest's `Url`-object alternative is dropped entirely — a `str` already matches the exact URL,
-so nothing real is lost, and there's no `URL` type to wrap or re-export at all). No pyreqwest type
-appears anywhere in `lothc.testing`'s public API now, not even as a re-export.
+`CaseInsensitiveDict`, `TlsVersion`, `MockResponse`, `MockRequest`, ...). Enforced by
+`tests/test_public_api.py`, which walks every exported signature, overload and type alias in
+`lothc` and `lothc.testing` and fails on any pyreqwest type. History: the clients used to be opened
+via a `build()` classmethod, which left their public constructor taking a pyreqwest `Client`; in
+`lothc.testing`, `MockResponse`/`MockRequest` replaced pyreqwest's `ResponseBuilder`/`Request`
+(a re-export was rejected as insufficient: the class itself would still be pyreqwest's).
 
-## Build
+## Construct and open
 
 ```python
-async with HTTPClient.build(
+async with HTTPClient(
     base_url=None,
-    bearer_token=None,
+    bearer_token=None,  # at most one of bearer_token / bearer_auth / basic_auth
     bearer_auth=None,
-    default_headers=None,
-    timeout=30.0,
+    basic_auth=None,  # (username, password | None)
+    default_headers=None,  # Headers: a Mapping or BaseModel/Struct, encoded like headers=
+    timeout=30.0,  # total cap, except a gap limit for stream_get/stream_post/download (below)
     cookie_store=False,
     follow_redirects=True,
     max_redirects=None,
     proxy=None,
     max_retries=0,
-    retry_methods=None,
+    retry_methods=None,  # set/frozenset/list/tuple of str, case-insensitive; empty = retry nothing
+    backoff_base=0.1,
+    max_retry_after=60.0,
+    connect_timeout=None,
+    read_timeout=None,
+    root_certificates=None,
+    identity_pem=None,
+    min_tls_version=None,  # TlsVersion: "TLSv1.0" | "TLSv1.1" | "TLSv1.2" | "TLSv1.3"
+    max_tls_version=None,
+    danger_accept_invalid_certs=False,
+    https_only=False,
+    max_connections=None,
+    pool_idle_timeout=None,
+    pool_max_idle_per_host=None,
+    pool_timeout=None,
 ) as client:
     ...
 ```
 
-`bearer_token: str` (static) xor `bearer_auth: Callable[[], Awaitable[str]]` (sync client:
-`Callable[[], str]`) — resolved fresh per request, at most one of the two (see OAuth below for a
-ready-made `bearer_auth`). `default_headers`
-sent on every request. `cookie_store=True` = in-memory jar. `proxy: str | None`.
+The constructor only validates and stores settings (conflicting auth raises `ValueError` here);
+entering builds and opens the pyreqwest client. A client can be entered again after it exits (a
+module-level client works across separate `asyncio.run()` calls); entering an already-open one, or
+using one that isn't open, raises `RuntimeError`. `bearer_auth` is `Callable[[], Awaitable[str]]`
+(sync client: `Callable[[], str]`), resolved fresh per request.
 
 ## OAuth 2 client credentials (`lothc/_oauth.py`)
 
@@ -70,9 +73,9 @@ OAuthProvider(
     refresh_leeway=300.0,  # renew once fewer than this many seconds remain (clamped to expires_in / 2)
     default_expires_in=None,  # lifetime to assume when the response has no expires_in; else error
     token_cache_path=None,  # Path: JSON, atomic replace, 0600, keyed on token_url + client_id + scope;
-    # parent dir must exist at construction (FileNotFoundError)
-    client_factory=HTTPClient.build,  # called with NO args per token request; partial(...) for
-    # timeout/proxy/TLS. Sync: SyncHTTPClient.build
+    # parent dir must exist at construction (FileNotFoundError); a failed write warns, never raises
+    client_factory=HTTPClient,  # called with NO args per token request; partial(...) for
+    # timeout/proxy/TLS. Sync: SyncHTTPClient
 )
 ```
 
@@ -81,67 +84,84 @@ Basic header built by lothc with each half `quote(..., safe="")`-encoded (RFC 67
 Model path: request instance sent as `json=`, `client_auth` ignored, `token_request` +
 `token_response` both or neither; `token_response` needs `.access_token: str`,
 `.expires_in: int | None` — `.refresh_token` is read via `getattr(..., "refresh_token", None)`
-if the model declares it, but an API that never issues one needs no field for it at all.
-Aliased pydantic request models need
-`ConfigDict(validate_by_name=True, serialize_by_alias=True)` (lothc's `json=` dumps without
-`by_alias`); msgspec `field(name=...)` needs nothing. Renewal: refresh if a `refresh_token` is
-held and refreshing is possible (a refresh response without one keeps the old one), 400 on
-refresh → mint; anything else (401/403/429, 5xx, transport, decode, malformed payload) →
-`OAuthTokenError` (`.token_url`, original as `__cause__`) from the user's API call. One renewal
-under concurrency (lock; the async lock is per-event-loop, so a provider survives repeated
-`asyncio.run()`).
+if the model declares it. Aliased pydantic request models need `ConfigDict(validate_by_name=True)`
+so lothc can construct them by field name; they encode by alias automatically (below). Renewal:
+refresh if a `refresh_token` is held (a refresh response without one keeps the old one), 400 on
+refresh → mint; anything else → `OAuthTokenError` (`.token_url`, original as `__cause__`) from the
+user's API call. One renewal under concurrency (lock; the async lock is per-event-loop).
+
+Revoked tokens: on a 401, the client calls `provider.invalidate(rejected_token)` and, for an
+idempotent verb (GET/PUT/DELETE/HEAD), retries once with a fresh token; a POST/PATCH is never
+replayed but the next call gets a fresh token; a second 401 is raised. `invalidate()` is public
+and a no-op if the provider has already renewed. Any `bearer_auth` with an
+`invalidate(stale_access_token=None)` method gets this; the client knows nothing about OAuth.
 
 ## Decode targets (`response_data_type`, default `bytes`)
 
 - `bytes` — raw, default
-- `dict` — plain `dict[str, Any]`, zero validation
+- `dict` — plain `dict[str, Any]` for a JSON *object*; any other JSON value raises `ValueError`
 - pydantic `BaseModel` subclass
 - msgspec `Struct` subclass
+- pydantic `TypeAdapter` / msgspec `Decoder` — any other shape, e.g. a top-level array:
+  `TypeAdapter(list[Item])` → `list[Item]`
 - `dict[str, Any]` (subscripted) — NOT allowed, raises `TypeError` (not a real class)
 
 ## Verbs
 
-- `get(path, *, params=None, headers=None, response_data_type=bytes, error_for_status=True) -> Data`
-- `get_result(path, *, params=None, headers=None, response_data_type=bytes, response_headers_type=None, error_for_status=True) -> Result` —
-  `.data .status .headers .typed_headers`
-- `post/put/patch(path, *, params=None, headers=None, json=None, form=None, content=None, response_data_type=bytes, error_for_status=True) -> Data` —
+- `get(path, *, params=None, headers=None, response_data_type=bytes, error_for_status=True, error_type=None) -> Data`
+- `post/put/patch(path, *, params=None, headers=None, json=None, form=None, content=None, response_data_type=bytes, error_for_status=True, error_type=None) -> Data` —
   at most one of `json`/`form`/`content`, else `ValueError`
-- `delete(path, *, params=None, headers=None, response_data_type=bytes, error_for_status=True) -> Data`
+- `delete(path, *, params=None, headers=None, response_data_type=bytes, ...) -> Data`
+- `client.with_result.get/post/put/patch/delete(...)` — same arguments plus
+  `response_headers_type=None`, returning `Result` (`.data .status .headers .typed_headers .request`)
+  instead of the bare body. A namespace, not a flag, so each method has one return type.
 - `head(path, *, params=None, headers=None, response_headers_type=None, error_for_status=True) -> Result[None]`
-- `sse(path, *, params=None, headers=None, response_data_type=None, id_type=str, allow_missing_id=False, error_for_status=True) -> Iterator[SSEEvent[TData, TId]]` —
-  always yields `SSEEvent(id=, event=, data=)` (kw-only, `SSEEvent[TData, TId=str]`).
-  `response_data_type` controls `.data`'s type only (default `str`); class | pydantic
-  `TypeAdapter` | msgspec `Decoder`. `.event` is always `str`, never `None` (spec defaults it to
-  `"message"` when absent from the wire). `.id` is genuinely `str | None` per spec — two
-  independent knobs control it: `id_type` (a bare type, default `str`, coerced via
-  `id_type(raw)`) and `allow_missing_id` (default `False` — missing `id:` raises; `True` — `.id`
-  becomes `None` instead, coercion type still applies when present)
+- `sse(path, *, params=None, headers=None, response_data_type=None, id_type=str, allow_missing_id=True, error_for_status=True) -> Iterator[SSEEvent[TData, TId]]` —
+  yields `SSEEvent(id=, event=, data=)` (kw-only, read-only, `SSEEvent[TData, TId = str | None]`).
+  `response_data_type` controls `.data` only (default `str`); class | `TypeAdapter` | `Decoder`.
+  `.event` is always `str` (spec default `"message"`). `.id` is `None` when the server sends none
+  (the default, since most servers never do); `allow_missing_id=False` makes it required and
+  `str`-typed. `id_type` (a bare type, default `str`) coerces it via `id_type(raw)`.
 - `stream_get(path, *, params=None, headers=None, response_data_type=None, error_for_status=True) -> Iterator[bytes | TLine]` —
-  raw unbuffered bytes by default (safe for binary); `response_data_type` switches to
-  newline-buffered per-line decode
-- `stream_post(path, *, params=None, headers=None, json=None, form=None, content=None, response_data_type=None, error_for_status=True) -> Iterator[bytes | TLine]`
+  raw unbuffered bytes by default; `response_data_type` switches to newline-buffered per-line decode
+- `stream_post(path, *, ..., json=None, form=None, content=None, response_data_type=None, ...) -> Iterator[bytes | TLine]`
 - `download(path, dest=None, *, params=None, headers=None, error_for_status=True) -> bytes | None` —
-  memory-efficient GET for large bodies; no `dest` streams into one buffer and returns `bytes`
-  (~1/3 the peak memory of `get()`), `dest: Path` streams straight to a file instead (`None`
-  return, O(chunk size) memory regardless of body size)
+  large bodies: no `dest` returns `bytes` (~2/3 the peak memory of `get()`), `dest` (`str` or
+  path-like) streams to a file (O(chunk size) memory), written to a hidden sibling and renamed on
+  success, so a failed download never leaves a truncated file or clobbers an existing one
+
+For `stream_get`/`stream_post`/`download` the client `timeout` is the longest gap allowed between
+chunks (and before headers), not a total cap; a per-call `timeout=` is a total cap; `read_timeout`
+replaces the gap limit. `sse()` has no gap limit unless `read_timeout` is set.
 
 `params`/`headers`: `dict`/`Mapping[str, str]`, or `BaseModel`/`Struct` (`None` fields omitted).
 `params`'s value may also be a `list[...]`/`tuple[...]` of `str | int | float | bool` — sends that
-key once per element, verbatim (e.g. `{"tag": ["a", "b"]}` → `?tag=a&tag=b`); lothc has no opinion
-on what an element means. `json`: `dict` | `BaseModel` | `Struct`. `form`: `dict[str, int | bytes | str |
-File]`, `File = tuple[str, bytes] | Path | BufferedIOBase`. `content`: raw `str | bytes` body.
+key once per element (`{"tag": ["a", "b"]}` → `?tag=a&tag=b`). `json`: `dict` | `list` | `BaseModel`
+| `Struct`; pydantic models encode by alias (like msgspec's `rename=`) unless they set
+`serialize_by_alias=False`. `form`: `dict[str, str | int | float | bool | bytes | list | dict |
+model | File | tuple[...]]` — a `tuple` repeats the field and must be homogeneous; a `list` is always
+one JSON part; `bool` sends `"true"`/`"false"`. `content`: raw `str | bytes`, no `Content-Type` set.
+`Result.headers` / `HTTPResponseError.headers` are a `CaseInsensitiveDict`: case-insensitive
+lookups, `get_all(name)` for a repeated header's every value.
 
 ## Errors
 
-- `HTTPResponseError(status, body_start)` — 4xx/5xx, raised when `error_for_status=True` (default)
-- `HTTPTransportError` base; `HTTPTimeoutError`, `HTTPConnectionError` subclasses — no response received
-- pydantic/msgspec validation errors propagate unwrapped (not translated)
+- `HTTPResponseError` — 4xx/5xx when `error_for_status=True` (default). `.status`, `.headers`,
+  `.body` (whole), `.body_start` (first 100 bytes), `.request`, `.parsed_body` (with `error_type`),
+  `.parse_error`; pickles. `error_type` decoding is best-effort: a body that doesn't match gives
+  `parsed_body=None` and `.parse_error`, never replaces the error.
+- `HTTPTransportError` base; `HTTPTimeoutError`, `HTTPConnectionError` subclasses — no usable
+  response (none at all, or the connection failed partway through one)
+- Using a closed client → `RuntimeError`
+- `response_data_type` validation errors (pydantic/msgspec/`json`) propagate unwrapped
 
 ## Retries
 
 `max_retries` (default `0` = off), `retry_methods` (default `{GET,PUT,DELETE,HEAD}` — `POST`/
-`PATCH` need explicit opt-in). Exponential backoff; retries on transport error or status in
-`{429,500,502,503,504}`; honors `Retry-After`.
+`PATCH` need explicit opt-in). Backoff `backoff_base * 2 ** attempt`; retries on transport error or
+status in `{429,500,502,503,504}`; honours `Retry-After` up to `max_retry_after` (default 60s),
+beyond which retrying stops and the 429/503 is raised. Never retried: a request that can't be built
+(e.g. `https_only` against `http://`), a redirect loop, a body cut short mid-read.
 
 ## Testing (`lothc[testing]`, `lothc/testing.py`)
 
@@ -153,36 +173,27 @@ of this fixture's public surface, not even re-exported.
 - `add_get_response`/`add_post_response`/`add_put_response`/`add_patch_response`/
   `add_delete_response`/`add_head_response(*, path=None, url=None, params=None, data=b"",
   headers=None, status=200) -> LOTHCMock` — `params`/`data`/`headers` are lothc's own
-  `Params`/`Data`/`Headers` types (`dict` or `BaseModel`/`Struct`, same class you'd reuse for
-  `response_data_type=`/`response_headers_type=` on the real call), encoded exactly the way a real
-  request would be — `params=`'s match values are derived from pyreqwest's own real encoder
-  (`_query_param_match_values`, via `Url.parse_with_params(...).query_dict_multi_value`), not
-  hand-reimplemented, so a `bool` becomes lowercase `true`/`false` (not Python's `str(True)`) and
-  an invalid value (e.g. `None`) raises the same `ValueError` a real request would rather than
-  silently registering an unreachable mock. `params=` narrows by exact query-param match — a
-  `list[...]`/`tuple[...]` value (a genuinely repeated query key, same convention as the real
-  `params=`) narrows on the full, order-sensitive list of values for that key; no `data=` on
-  `add_head_response`. `url=` is `str | re.Pattern[str]` only.
+  `Params`/`Data`/`Headers` types, encoded exactly the way a real request would be (a model in
+  `data=` encodes by alias, as a real `json=` does). `params=`'s match values come from
+  pyreqwest's own real encoder, so a `bool` becomes lowercase `true`/`false` and an invalid value
+  (e.g. `None`) raises the same `ValueError` a real request would. `params=` narrows by exact
+  query-param match — a `list[...]`/`tuple[...]` value narrows on the full, order-sensitive list of
+  values for that key; no `data=` on `add_head_response`. `url=` is `str | re.Pattern[str]` only.
 - `LOTHCMock`: `.match_query`/`.match_query_param`/`.match_header`/`.match_body_json`/
   `.match_request(predicate)` narrow further (chainable); `.assert_called(count=/min_count=/
   max_count=)`, `.get_requests() -> list[MockRequest]`, `.get_call_count()`, `.reset_requests()`.
 - `LOTHCMocker.mock(method=None, *, path=None, url=None) -> LOTHCMock` — bare rule, no canned
   response yet; the only way to reach `.match_request_with_response(handler)` (a canned response
-  and a custom handler are mutually exclusive on one rule — raises `ValueError` either order, via
-  `LOTHCMock._commit`). `handler`: `async def` (for `HTTPClient`) or plain `def` (for
-  `SyncHTTPClient`) — dispatch is via `inspect.iscoroutinefunction`, not overloads — taking
+  and a custom handler are mutually exclusive on one rule — raises `ValueError` either order).
+  `handler`: `async def` (for `HTTPClient`) or plain `def` (for `SyncHTTPClient`), taking
   `MockRequest`, returning `MockResponse | None` (`None` = decline, fall through to the next
   mock). `match_request`'s predicate takes `MockRequest` too, same async/plain split.
-- `MockRequest` (slotted, **not** frozen — a mutable `headers` dict field means `frozen=True`
-  couldn't deliver real immutability/hashability anyway): `.method`/`.path`/`.query_string`/`.query`/
-  `.headers` (`Mapping[str, str]`, first-value-only for a repeated header, matching
-  `Result.headers`'s own convention elsewhere)/`.body` (`bytes | None`) — lothc's own snapshot of
-  the request a handler/predicate/`get_requests()` sees, built by `_mock_request_from`. Never
-  pyreqwest's `Request`.
+- `MockRequest` (slotted, **not** frozen — its mutable `headers` field means `frozen=True`
+  couldn't deliver real immutability anyway): `.method`/`.path`/`.query_string`/`.query`/
+  `.headers` (a `CaseInsensitiveDict`, like `Result.headers`: case-insensitive, `get_all` for a
+  repeated header)/`.body` (`bytes | None`). Never pyreqwest's `Request`.
 - `LOTHCMocker.strict(enabled=True)` raises `AssertionError` on an unmatched request — this is the
-  fixture's *default* (pyreqwest's own `client_mocker` defaults to silent passthrough instead; the
-  `lothc_mocker` fixture explicitly overrides that). Opt out per-test with
-  `@pytest.mark.lothc_mocker(strict=False)` (registered via this module's own `pytest_configure`
-  hook — a positional `@pytest.mark.lothc_mocker(False)` also works) or call
-  `.strict(enabled=False)` mid-test. `.clear()`, `.get_requests() -> list[MockRequest]`,
-  `.get_call_count()`, `.reset_requests()`.
+  fixture's *default* (pyreqwest's own `client_mocker` defaults to silent passthrough). Opt out
+  per-test with `@pytest.mark.lothc_mocker(strict=False)` or call `.strict(enabled=False)`
+  mid-test. `.clear()`, `.get_requests() -> list[MockRequest]`, `.get_call_count()`,
+  `.reset_requests()`.

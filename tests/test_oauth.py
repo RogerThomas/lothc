@@ -22,8 +22,9 @@ from lothc import (
 )
 
 
-# `validate_by_name` lets lothc construct these by field name; `serialize_by_alias` makes lothc's
-# `json=` encoding (`model_dump(mode="json")`, no `by_alias=True`) emit the wire names.
+# `validate_by_name` lets lothc construct these by field name. `serialize_by_alias` is no longer
+# needed (lothc encodes pydantic models by alias unless a model opts out), but kept here to show
+# an explicit `True` is honoured too.
 class _TokenRequest(BaseModel):
     model_config = ConfigDict(validate_by_name=True, serialize_by_alias=True)
 
@@ -118,7 +119,7 @@ async def test_rfc_mint_sends_bearer_token_and_basic_credentials(
         scope="scope",
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -139,7 +140,7 @@ def test_sync_rfc_mint_sends_bearer_token_and_basic_credentials(
         scope="scope",
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -160,7 +161,7 @@ async def test_rfc_client_auth_body_puts_credentials_in_form(
         client_auth="body",
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -184,7 +185,7 @@ def test_sync_rfc_client_auth_body_puts_credentials_in_form(
         client_auth="body",
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -205,7 +206,7 @@ async def test_valid_token_is_reused_across_requests(base_url: str, client: HTTP
         client_secret="client-secret",
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = await _bearer(api)
         second = await _bearer(api)
 
@@ -223,7 +224,7 @@ def test_sync_valid_token_is_reused_across_requests(
         client_secret="client-secret",
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = _sync_bearer(api)
         second = _sync_bearer(api)
 
@@ -241,7 +242,7 @@ async def test_token_inside_leeway_window_is_minted_again_without_refresh_token(
         client_secret="client-secret",
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = await _bearer(api)
         second = await _bearer(api)
 
@@ -260,7 +261,7 @@ def test_sync_token_inside_leeway_window_is_minted_again_without_refresh_token(
         client_secret="client-secret",
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = _sync_bearer(api)
         second = _sync_bearer(api)
 
@@ -279,7 +280,7 @@ async def test_token_inside_leeway_window_is_refreshed_with_refresh_token(
         client_secret="client-secret",
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = await _bearer(api)
         second = await _bearer(api)
 
@@ -299,7 +300,7 @@ def test_sync_token_inside_leeway_window_is_refreshed_with_refresh_token(
         client_secret="client-secret",
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = _sync_bearer(api)
         second = _sync_bearer(api)
 
@@ -317,7 +318,7 @@ async def test_rejected_refresh_falls_back_to_minting(base_url: str, client: HTT
         client_secret="client-secret",
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = await _bearer(api)
         second = await _bearer(api)
 
@@ -336,7 +337,7 @@ def test_sync_rejected_refresh_falls_back_to_minting(
         client_secret="client-secret",
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = _sync_bearer(api)
         second = _sync_bearer(api)
 
@@ -357,7 +358,7 @@ async def test_custom_pydantic_models_send_json_token_request(
         token_response=_TokenResponse,
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -383,7 +384,7 @@ def test_sync_custom_pydantic_models_send_json_token_request(
         token_response=_TokenResponse,
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -409,7 +410,7 @@ async def test_custom_msgspec_models_send_json_token_request(
         token_response=_MsgspecTokenResponse,
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -433,7 +434,7 @@ async def test_custom_pydantic_model_with_no_refresh_token_field_works(base_url:
         token_response=_NoRefreshFieldTokenResponse,
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -449,7 +450,7 @@ def test_sync_custom_pydantic_model_with_no_refresh_token_field_works(base_url: 
         token_response=_NoRefreshFieldTokenResponse,
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -468,7 +469,7 @@ async def test_custom_models_refresh_with_token_refresh_request(
         token_response=_TokenResponse,
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = await _bearer(api)
         second = await _bearer(api)
 
@@ -490,7 +491,7 @@ def test_sync_custom_models_refresh_with_token_refresh_request(
         token_response=_MsgspecTokenResponse,
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = _sync_bearer(api)
         second = _sync_bearer(api)
 
@@ -511,7 +512,7 @@ async def test_custom_models_without_token_refresh_request_mint_again(
         token_response=_TokenResponse,
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = await _bearer(api)
         second = await _bearer(api)
 
@@ -533,7 +534,7 @@ def test_sync_custom_models_without_token_refresh_request_mint_again(
         token_response=_TokenResponse,
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = _sync_bearer(api)
         second = _sync_bearer(api)
 
@@ -554,7 +555,7 @@ async def test_token_cache_path_writes_token_file_with_owner_only_permissions(
         token_cache_path=cache_path,
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         await _bearer(api)
 
     assert cache_path.stat().st_mode & 0o777 == 0o600
@@ -574,7 +575,7 @@ def test_sync_token_cache_path_writes_token_file_with_owner_only_permissions(
         token_cache_path=cache_path,
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         _sync_bearer(api)
 
     assert cache_path.stat().st_mode & 0o777 == 0o600
@@ -594,7 +595,7 @@ async def test_cached_token_is_reused_by_a_new_provider(
         client_secret="client-secret",
         token_cache_path=tmp_path / "cache.json",
     )
-    async with HTTPClient.build(base_url=base_url, bearer_auth=first_provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         await _bearer(api)
 
     second_provider = OAuthProvider(
@@ -603,7 +604,7 @@ async def test_cached_token_is_reused_by_a_new_provider(
         client_secret="client-secret",
         token_cache_path=tmp_path / "cache.json",
     )
-    async with HTTPClient.build(base_url=base_url, bearer_auth=second_provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -621,7 +622,7 @@ def test_sync_cached_token_is_reused_by_a_new_provider(
         client_secret="client-secret",
         token_cache_path=tmp_path / "cache.json",
     )
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=first_provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         _sync_bearer(api)
 
     second_provider = SyncOAuthProvider(
@@ -630,7 +631,7 @@ def test_sync_cached_token_is_reused_by_a_new_provider(
         client_secret="client-secret",
         token_cache_path=tmp_path / "cache.json",
     )
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=second_provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -647,7 +648,7 @@ async def test_cached_token_for_a_different_client_id_is_ignored(
         client_secret="client-secret",
         token_cache_path=tmp_path / "cache.json",
     )
-    async with HTTPClient.build(base_url=base_url, bearer_auth=first_provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         await _bearer(api)
 
     second_provider = OAuthProvider(
@@ -656,7 +657,7 @@ async def test_cached_token_for_a_different_client_id_is_ignored(
         client_secret="client-secret",
         token_cache_path=tmp_path / "cache.json",
     )
-    async with HTTPClient.build(base_url=base_url, bearer_auth=second_provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-2"
@@ -672,7 +673,7 @@ def test_sync_cached_token_for_a_different_client_id_is_ignored(
         client_secret="client-secret",
         token_cache_path=tmp_path / "cache.json",
     )
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=first_provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         _sync_bearer(api)
 
     second_provider = SyncOAuthProvider(
@@ -681,7 +682,7 @@ def test_sync_cached_token_for_a_different_client_id_is_ignored(
         client_secret="client-secret",
         token_cache_path=tmp_path / "cache.json",
     )
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=second_provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-2"
@@ -697,7 +698,7 @@ async def test_corrupt_cache_file_is_ignored_and_overwritten(base_url: str, tmp_
         token_cache_path=cache_path,
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -714,7 +715,7 @@ def test_sync_corrupt_cache_file_is_ignored_and_overwritten(base_url: str, tmp_p
         token_cache_path=cache_path,
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -732,7 +733,7 @@ async def test_cached_refresh_token_is_used_by_a_new_provider_inside_leeway_wind
         client_secret="client-secret",
         token_cache_path=tmp_path / "cache.json",
     )
-    async with HTTPClient.build(base_url=base_url, bearer_auth=first_provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         await _bearer(api)
 
     second_provider = OAuthProvider(
@@ -741,7 +742,7 @@ async def test_cached_refresh_token_is_used_by_a_new_provider_inside_leeway_wind
         client_secret="client-secret",
         token_cache_path=tmp_path / "cache.json",
     )
-    async with HTTPClient.build(base_url=base_url, bearer_auth=second_provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-2"
@@ -760,7 +761,7 @@ def test_sync_cached_refresh_token_is_used_by_a_new_provider_inside_leeway_windo
         client_secret="client-secret",
         token_cache_path=tmp_path / "cache.json",
     )
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=first_provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         _sync_bearer(api)
 
     second_provider = SyncOAuthProvider(
@@ -769,7 +770,7 @@ def test_sync_cached_refresh_token_is_used_by_a_new_provider_inside_leeway_windo
         client_secret="client-secret",
         token_cache_path=tmp_path / "cache.json",
     )
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=second_provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-2"
@@ -785,7 +786,7 @@ async def test_concurrent_requests_share_one_mint(base_url: str, client: HTTPCli
         client_secret="client-secret",
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearers = await asyncio.gather(*(_bearer(api) for _ in range(10)))
 
     assert bearers == ["Bearer token-1"] * 10
@@ -803,7 +804,7 @@ def test_sync_concurrent_requests_share_one_mint(
     )
 
     with (
-        SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api,
+        SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api,
         ThreadPoolExecutor(max_workers=10) as pool,
     ):
         bearers = list(pool.map(_sync_bearer, [api] * 10))
@@ -818,7 +819,7 @@ async def test_token_endpoint_server_error_is_an_oauth_token_error(base_url: str
         token_url=token_url, client_id="client-id", client_secret="client-secret"
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         with pytest.raises(OAuthTokenError) as error_info:
             await _bearer(api)
 
@@ -834,7 +835,7 @@ def test_sync_token_endpoint_server_error_is_an_oauth_token_error(base_url: str)
     )
 
     with (
-        SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api,
+        SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api,
         pytest.raises(OAuthTokenError) as error_info,
     ):
         _sync_bearer(api)
@@ -936,7 +937,7 @@ async def test_refresh_leeway_is_clamped_to_half_the_token_lifetime(
         client_secret="client-secret",
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = await _bearer(api)
         second = await _bearer(api)
         concurrent = await asyncio.gather(*(_bearer(api) for _ in range(5)))
@@ -957,7 +958,7 @@ def test_sync_refresh_leeway_is_clamped_to_half_the_token_lifetime(
     )
 
     with (
-        SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api,
+        SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api,
         ThreadPoolExecutor(max_workers=5) as pool,
     ):
         first = _sync_bearer(api)
@@ -981,7 +982,7 @@ async def test_refresh_response_without_refresh_token_keeps_the_previous_one(
         client_secret="client-secret",
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearers = [await _bearer(api) for _ in range(3)]
 
     assert bearers == ["Bearer token-1", "Bearer token-2", "Bearer token-3"]
@@ -1006,7 +1007,7 @@ def test_sync_refresh_response_without_refresh_token_keeps_the_previous_one(
         client_secret="client-secret",
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearers = [_sync_bearer(api) for _ in range(3)]
 
     assert bearers == ["Bearer token-1", "Bearer token-2", "Bearer token-3"]
@@ -1028,7 +1029,7 @@ async def test_cached_token_for_a_different_scope_is_ignored(base_url: str, tmp_
         scope="read",
         token_cache_path=tmp_path / "cache.json",
     )
-    async with HTTPClient.build(base_url=base_url, bearer_auth=first_provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         await _bearer(api)
 
     second_provider = OAuthProvider(
@@ -1038,7 +1039,7 @@ async def test_cached_token_for_a_different_scope_is_ignored(base_url: str, tmp_
         scope="read write",
         token_cache_path=tmp_path / "cache.json",
     )
-    async with HTTPClient.build(base_url=base_url, bearer_auth=second_provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-2"
@@ -1054,7 +1055,7 @@ def test_sync_cached_token_for_a_different_scope_is_ignored(base_url: str, tmp_p
         scope="read",
         token_cache_path=tmp_path / "cache.json",
     )
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=first_provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         _sync_bearer(api)
 
     second_provider = SyncOAuthProvider(
@@ -1064,7 +1065,7 @@ def test_sync_cached_token_for_a_different_scope_is_ignored(base_url: str, tmp_p
         scope="read write",
         token_cache_path=tmp_path / "cache.json",
     )
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=second_provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-2"
@@ -1072,7 +1073,7 @@ def test_sync_cached_token_for_a_different_scope_is_ignored(base_url: str, tmp_p
 
 
 async def _gather_bearers(base_url: str, provider: OAuthProvider) -> list[str]:
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         return await asyncio.gather(*(_bearer(api) for _ in range(3)))
 
 
@@ -1102,7 +1103,7 @@ async def test_basic_credentials_are_percent_encoded(base_url: str, client: HTTP
         client_secret="s3cr3t+/%= :",
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         await _bearer(api)
 
     (request,) = await _token_requests(client, key)
@@ -1120,7 +1121,7 @@ def test_sync_basic_credentials_are_percent_encoded(
         client_secret="s3cr3t+/%= :",
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         _sync_bearer(api)
 
     (request,) = _sync_token_requests(sync_client, key)
@@ -1138,7 +1139,7 @@ async def test_missing_expires_in_uses_default_expires_in(base_url: str, tmp_pat
         token_cache_path=cache_path,
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -1155,7 +1156,7 @@ def test_sync_missing_expires_in_uses_default_expires_in(base_url: str, tmp_path
         token_cache_path=cache_path,
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -1169,7 +1170,7 @@ async def test_missing_expires_in_without_default_is_an_oauth_token_error(base_u
         client_secret="client-secret",
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         with pytest.raises(OAuthTokenError, match="no 'expires_in'") as error_info:
             await _bearer(api)
 
@@ -1184,7 +1185,7 @@ def test_sync_missing_expires_in_without_default_is_an_oauth_token_error(base_ur
     )
 
     with (
-        SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api,
+        SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api,
         pytest.raises(OAuthTokenError, match="no 'expires_in'") as error_info,
     ):
         _sync_bearer(api)
@@ -1206,7 +1207,7 @@ async def test_custom_models_missing_expires_in_uses_default_expires_in(
         token_cache_path=cache_path,
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -1227,7 +1228,7 @@ def test_sync_custom_models_missing_expires_in_uses_default_expires_in(
         token_cache_path=cache_path,
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -1244,7 +1245,7 @@ async def test_refresh_rejected_with_a_non_400_is_not_retried_as_a_mint(
         client_secret="client-secret",
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = await _bearer(api)
         with pytest.raises(OAuthTokenError) as error_info:
             await _bearer(api)
@@ -1266,7 +1267,7 @@ def test_sync_refresh_rejected_with_a_non_400_is_not_retried_as_a_mint(
         client_secret="client-secret",
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         first = _sync_bearer(api)
         with pytest.raises(OAuthTokenError) as error_info:
             _sync_bearer(api)
@@ -1286,10 +1287,10 @@ async def test_client_factory_builds_the_token_endpoint_client(
         token_url=f"{base_url}oauth/token?key={key}",
         client_id="client-id",
         client_secret="client-secret",
-        client_factory=partial(HTTPClient.build, default_headers={"x-factory": "yes"}),
+        client_factory=partial(HTTPClient, default_headers={"x-factory": "yes"}),
     )
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-1"
@@ -1305,12 +1306,37 @@ def test_sync_client_factory_builds_the_token_endpoint_client(
         token_url=f"{base_url}oauth/token?key={key}",
         client_id="client-id",
         client_secret="client-secret",
-        client_factory=partial(SyncHTTPClient.build, default_headers={"x-factory": "yes"}),
+        client_factory=partial(SyncHTTPClient, default_headers={"x-factory": "yes"}),
     )
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as api:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-1"
     (request,) = _sync_token_requests(sync_client, key)
     assert request["headers"]["x-factory"] == "yes"
+
+
+async def test_failing_to_write_the_token_cache_warns_but_still_uses_the_token(
+    base_url: str, tmp_path: Path
+) -> None:
+    # The token was obtained; only persisting it failed, and the cache "adds persistence only",
+    # so the caller's own request must still go through rather than fail on a full disk.
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    provider = OAuthProvider(
+        token_url=f"{base_url}oauth/token?key={uuid4()}",
+        client_id="client-id",
+        client_secret="client-secret",
+        token_cache_path=cache_dir / "cache.json",
+    )
+    cache_dir.chmod(0o500)  # no longer writable, but it still existed at construction
+    try:
+        async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+            with pytest.warns(RuntimeWarning, match="Could not write the OAuth token cache"):
+                authorization = await _bearer(api)
+    finally:
+        cache_dir.chmod(0o700)
+
+    assert authorization == "Bearer token-1"
+    assert list(cache_dir.iterdir()) == []

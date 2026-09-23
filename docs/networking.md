@@ -5,7 +5,7 @@ icon: lucide/network
 # Cookies, redirects, proxy & TLS
 
 ```python
-async with HTTPClient.build(
+async with HTTPClient(
     base_url="https://api.example.com/",
     cookie_store=True,  # in-memory cookie jar, sent automatically on subsequent requests
     follow_redirects=True,  # default
@@ -28,7 +28,7 @@ rather than looking for a per-verb kwarg.
 ## TLS & mTLS
 
 ```python
-async with HTTPClient.build(
+async with HTTPClient(
     base_url="https://internal-api.example.com/",
     root_certificates=[Path("internal-ca.pem").read_bytes()],  # trust a custom/internal CA
     identity_pem=Path("client-identity.pem").read_bytes(),  # mTLS: cert + private key, one PEM
@@ -48,13 +48,13 @@ There's also `danger_accept_invalid_certs: bool = False`, which disables certifi
 entirely — insecure, and only ever appropriate against a local/test endpoint you control, never
 in production.
 
-Like `timeout`, these are all client-level only — set once at `build()`, no per-call override,
+Like `timeout`, these are all client-level only — set once on the client, no per-call override,
 since a TLS/connection identity belongs to the underlying connection, not a single request.
 
 ## Connection pooling
 
 ```python
-async with HTTPClient.build(
+async with HTTPClient(
     base_url="https://api.example.com/",
     connect_timeout=5.0,  # bounds only the TCP connect phase, separate from `timeout`
     read_timeout=60.0,  # max idle gap between body chunks — the stall detector for `sse()`

@@ -3,7 +3,8 @@ from typing import Any, cast
 
 import pytest
 from msgspec import Struct
-from pydantic import BaseModel
+from msgspec.json import Decoder
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from lothc import HTTPClient, HTTPResponseError, SyncHTTPClient
 
@@ -140,9 +141,7 @@ async def test_get_with_msgspec_headers_omits_none_fields(client: HTTPClient) ->
 
 
 async def test_default_headers_sent_on_every_request(base_url: str) -> None:
-    async with HTTPClient.build(
-        base_url=base_url, default_headers={"x-api-key": "secret"}
-    ) as client:
+    async with HTTPClient(base_url=base_url, default_headers={"x-api-key": "secret"}) as client:
         result = await client.get("echo-headers", response_data_type=dict)
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
@@ -214,3 +213,46 @@ def test_sync_get_response_data_type_unsupported_class_raises_type_error(
 ) -> None:
     with pytest.raises(TypeError, match="Unsupported response_data_type"):
         sync_client.get("items/7", response_data_type=cast(Any, _Unsupported))
+
+
+async def test_get_decodes_a_top_level_array_with_a_pydantic_type_adapter(
+    client: HTTPClient,
+) -> None:
+    items = await client.get("json-array", response_data_type=TypeAdapter(list[ItemModel]))
+
+    assert items == [ItemModel(id=1, name="one"), ItemModel(id=2, name="two")]
+
+
+async def test_get_decodes_a_top_level_array_with_a_msgspec_decoder(client: HTTPClient) -> None:
+    items = await client.get("json-array", response_data_type=Decoder(list[ItemStruct]))
+
+    assert items == [ItemStruct(id=1, name="one"), ItemStruct(id=2, name="two")]
+
+
+async def test_with_result_decodes_a_top_level_array(client: HTTPClient) -> None:
+    result = await client.with_result.get(
+        "json-array", response_data_type=TypeAdapter(list[ItemModel])
+    )
+
+    assert result.status == 200
+    assert [item.id for item in result.data] == [1, 2]
+
+
+def test_sync_get_decodes_a_top_level_array(sync_client: SyncHTTPClient) -> None:
+    items = sync_client.get("json-array", response_data_type=Decoder(list[ItemStruct]))
+
+    assert [item.id for item in items] == [1, 2]
+
+
+async def test_a_type_adapter_decode_failure_propagates_natively(client: HTTPClient) -> None:
+    # Same rule as a model `response_data_type`: the chosen library's own error, unwrapped.
+    with pytest.raises(ValidationError):
+        await client.get("json-array", response_data_type=TypeAdapter(list[int]))
+
+
+def test_sync_get_decodes_a_top_level_array_with_a_type_adapter(
+    sync_client: SyncHTTPClient,
+) -> None:
+    items = sync_client.get("json-array", response_data_type=TypeAdapter(list[ItemModel]))
+
+    assert [item.id for item in items] == [1, 2]

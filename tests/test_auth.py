@@ -29,7 +29,7 @@ class _SyncCountingAuthProvider:
 
 
 async def test_bearer_token_sends_authorization_header(base_url: str) -> None:
-    async with HTTPClient.build(base_url=base_url, bearer_token="token-value") as client:
+    async with HTTPClient(base_url=base_url, bearer_token="token-value") as client:
         result = await client.get("echo-headers", response_data_type=dict)
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
@@ -39,7 +39,7 @@ async def test_bearer_token_sends_authorization_header(base_url: str) -> None:
 async def test_bearer_auth_callable_is_invoked_per_request(base_url: str) -> None:
     provider = _CountingAuthProvider()
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as client:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as client:
         first = await client.get("echo-headers", response_data_type=dict)
         second = await client.get("echo-headers", response_data_type=dict)
 
@@ -50,7 +50,7 @@ async def test_bearer_auth_callable_is_invoked_per_request(base_url: str) -> Non
 
 
 def test_sync_bearer_token_sends_authorization_header(base_url: str) -> None:
-    with SyncHTTPClient.build(base_url=base_url, bearer_token="token-value") as client:
+    with SyncHTTPClient(base_url=base_url, bearer_token="token-value") as client:
         result = client.get("echo-headers", response_data_type=dict)
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
@@ -60,7 +60,7 @@ def test_sync_bearer_token_sends_authorization_header(base_url: str) -> None:
 def test_sync_bearer_auth_callable_is_invoked_per_request(base_url: str) -> None:
     provider = _SyncCountingAuthProvider()
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as client:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as client:
         first = client.get("echo-headers", response_data_type=dict)
         second = client.get("echo-headers", response_data_type=dict)
 
@@ -71,7 +71,7 @@ def test_sync_bearer_auth_callable_is_invoked_per_request(base_url: str) -> None
 
 
 async def test_skip_auth_omits_authorization_header_with_bearer_token(base_url: str) -> None:
-    async with HTTPClient.build(base_url=base_url, bearer_token="token-value") as client:
+    async with HTTPClient(base_url=base_url, bearer_token="token-value") as client:
         result = await client.get("echo-headers", response_data_type=dict, skip_auth=True)
 
     headers = {h["name"].lower() for h in result["headers"]}
@@ -81,7 +81,7 @@ async def test_skip_auth_omits_authorization_header_with_bearer_token(base_url: 
 async def test_skip_auth_does_not_invoke_bearer_auth_callable(base_url: str) -> None:
     provider = _CountingAuthProvider()
 
-    async with HTTPClient.build(base_url=base_url, bearer_auth=provider) as client:
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as client:
         skipped = await client.get("echo-headers", response_data_type=dict, skip_auth=True)
         # If the skipped call above had invoked `provider`, this next (non-skipped) call would
         # observe "token-2" instead of "token-1" — proving invocation without touching `provider`'s
@@ -95,7 +95,7 @@ async def test_skip_auth_does_not_invoke_bearer_auth_callable(base_url: str) -> 
 
 
 def test_sync_skip_auth_omits_authorization_header_with_bearer_token(base_url: str) -> None:
-    with SyncHTTPClient.build(base_url=base_url, bearer_token="token-value") as client:
+    with SyncHTTPClient(base_url=base_url, bearer_token="token-value") as client:
         result = client.get("echo-headers", response_data_type=dict, skip_auth=True)
 
     headers = {h["name"].lower() for h in result["headers"]}
@@ -105,7 +105,7 @@ def test_sync_skip_auth_omits_authorization_header_with_bearer_token(base_url: s
 def test_sync_skip_auth_does_not_invoke_bearer_auth_callable(base_url: str) -> None:
     provider = _SyncCountingAuthProvider()
 
-    with SyncHTTPClient.build(base_url=base_url, bearer_auth=provider) as client:
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as client:
         skipped = client.get("echo-headers", response_data_type=dict, skip_auth=True)
         # Same reasoning as the async version above: a "token-1" on the next, non-skipped call
         # proves the skipped call never invoked `provider`, without touching its private state.
@@ -118,7 +118,7 @@ def test_sync_skip_auth_does_not_invoke_bearer_auth_callable(base_url: str) -> N
 
 
 async def test_basic_auth_sends_authorization_header(base_url: str) -> None:
-    async with HTTPClient.build(base_url=base_url, basic_auth=("username", "password")) as client:
+    async with HTTPClient(base_url=base_url, basic_auth=("username", "password")) as client:
         result = await client.get("echo-headers", response_data_type=dict)
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
@@ -127,7 +127,7 @@ async def test_basic_auth_sends_authorization_header(base_url: str) -> None:
 
 
 def test_sync_basic_auth_sends_authorization_header(base_url: str) -> None:
-    with SyncHTTPClient.build(base_url=base_url, basic_auth=("username", "password")) as client:
+    with SyncHTTPClient(base_url=base_url, basic_auth=("username", "password")) as client:
         result = client.get("echo-headers", response_data_type=dict)
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
@@ -137,7 +137,7 @@ def test_sync_basic_auth_sends_authorization_header(base_url: str) -> None:
 
 async def test_build_raises_when_more_than_one_auth_mechanism_provided(base_url: str) -> None:
     with pytest.raises(ValueError, match="Provide at most one of"):
-        async with HTTPClient.build(
+        async with HTTPClient(
             base_url=base_url, bearer_token="token-value", basic_auth=("username", "password")
         ):
             pass
@@ -146,7 +146,7 @@ async def test_build_raises_when_more_than_one_auth_mechanism_provided(base_url:
 def test_sync_build_raises_when_more_than_one_auth_mechanism_provided(base_url: str) -> None:
     with (
         pytest.raises(ValueError, match="Provide at most one of"),
-        SyncHTTPClient.build(
+        SyncHTTPClient(
             base_url=base_url, bearer_token="token-value", basic_auth=("username", "password")
         ),
     ):

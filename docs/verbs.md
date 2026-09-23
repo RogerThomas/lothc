@@ -7,7 +7,7 @@ icon: lucide/route
 Every verb below exists on both `HTTPClient` and `SyncHTTPClient`. All examples assume:
 
 ```python
-async with HTTPClient.build(base_url="https://api.example.com/") as client:
+async with HTTPClient(base_url="https://api.example.com/") as client:
     ...
 ```
 
@@ -67,13 +67,32 @@ await client.get("items", params={"tag": ["ready", "pending"], "limit": 10})
 # -> ?tag=ready&tag=pending&limit=10
 ```
 
-## GET, with status and headers — `get_result`
+### Top-level arrays and other shapes
 
-Same signature as `get`, but returns a `Result` carrying the decoded body alongside the status
-code and response headers:
+`response_data_type` also accepts a pydantic `TypeAdapter` or a msgspec `Decoder`, which is how a
+top-level JSON array (or any shape that isn't one model) gets a typed decode. Build them once and
+reuse them:
 
 ```python
-result = await client.get_result("items/7", response_data_type=ItemModel)
+from msgspec.json import Decoder
+from pydantic import TypeAdapter
+
+items_adapter = TypeAdapter(list[ItemModel])
+items = await client.get("items", response_data_type=items_adapter)  # list[ItemModel]
+items = await client.get("items", response_data_type=Decoder(list[ItemStruct]))  # list[ItemStruct]
+```
+
+`response_data_type=dict` is for a JSON *object*; decoding an array (or a string, number, `null`)
+into it raises a `ValueError` that says what the body actually was.
+
+## Status and headers too — `with_result`
+
+Every body verb returns just the decoded body. When you also need the status code, response
+headers or the request that was sent, call the same verb through `client.with_result` — same
+arguments, but it returns a `Result`:
+
+```python
+result = await client.with_result.get("items/7", response_data_type=ItemModel)
 result.data  # ItemModel(id=7, name="item-7")
 result.status  # 200
 result.headers  # {"content-type": "application/json", ...}
@@ -112,6 +131,12 @@ result.headers.get_all("never-sent")
 Iteration, `.items()` and `dict(result.headers)` stay single-valued (one entry per header name,
 its first value), so `get_all` is the only way to see a repeated header's extra values.
 
+Equality follows the same split. Two header maps compare every value, so two responses that differ
+only in a dropped `Set-Cookie` aren't equal. Against a plain `dict`, which can only hold one
+value per name, only the first value of each is compared. So with repeated headers, equality isn't
+transitive: two maps can each equal the same `dict` without equalling each other (requests'
+`CaseInsensitiveDict` behaves the same way).
+
 Pass `response_headers_type` (a `BaseModel`/`Struct`) to get the *response* headers validated and parsed
 too, via `result.typed_headers`. Header names are lowercased and `-` becomes `_` before matching
 against your type's field names, so a `Content-Type` response header maps onto a `content_type`
@@ -122,7 +147,7 @@ class ItemHeaders(BaseModel):
     content_type: str | None = None
 
 
-result = await client.get_result(
+result = await client.with_result.get(
     "items/7", response_data_type=ItemModel, response_headers_type=ItemHeaders
 )
 result.typed_headers.content_type  # "application/json"
@@ -141,15 +166,30 @@ await client.put("items/7", json=ItemModel(id=7, name="replaced"))
 await client.patch("items/7", json={"name": "renamed"})
 ```
 
-`json` also accepts a `BaseModel`/`Struct` directly (serialized for you). `content` sends a raw
-`str`/`bytes` body as-is.
-
-Each has a `_result` variant too — `post_result`/`put_result`/`patch_result` — same body options,
-but returning a `Result` alongside status and headers, exactly like `get_result` above (including
-the same `response_headers_type` option):
+`json` also accepts a `BaseModel`/`Struct` directly (serialized for you, by alias for both
+libraries: a pydantic model is encoded by its aliases unless it sets `serialize_by_alias=False`,
+matching msgspec's `rename=`), or a top-level list
+for a JSON array body; it always sends `Content-Type: application/json`, replacing any you set.
+`content` sends a raw `str`/`bytes` body as-is and sets **no** `Content-Type` at all (unlike
+httpx/requests, which default a `str` to `text/plain`), so pass your own in `headers` if the
+server needs one:
 
 ```python
-result = await client.post_result("items", json={"name": "new-item"}, response_data_type=ItemModel)
+await client.post(
+    "login",
+    content="user=ash&pass=pikachu",
+    headers={"content-type": "application/x-www-form-urlencoded"},
+)
+```
+
+Each works through `client.with_result` too, with the same body options, returning a `Result`
+alongside status and headers exactly like `with_result.get` above (including the same
+`response_headers_type` option):
+
+```python
+result = await client.with_result.post(
+    "items", json={"name": "new-item"}, response_data_type=ItemModel
+)
 result.data  # ItemModel(...)
 result.status  # 200
 ```
@@ -159,7 +199,8 @@ result.status  # 200
 `form` builds a real `multipart/form-data` body from a `dict`. Each value's type decides how
 it's sent:
 
-- `str`/`int` — a plain form field.
+- `str`/`int`/`float`/`bool` — a plain form field. A `bool` goes out as `"true"`/`"false"`,
+  the same way `params=` sends one.
 - `bytes` — a form field too (no filename), for raw binary data that isn't a "file" as such.
 - `list`/`dict` (or a `BaseModel`/`Struct` instance) — JSON-encoded as that one part's body, with
   `Content-Type: application/json` set automatically.
@@ -213,8 +254,8 @@ await client.delete("items/7")  # bytes by default
 item = await client.delete("items/7", response_data_type=ItemModel)
 ```
 
-`delete_result` mirrors `get_result` too — same `response_data_type`/`response_headers_type`
-options, returning a `Result` instead of the bare decoded body.
+`client.with_result.delete(...)` works the same way, returning a `Result` instead of the bare
+decoded body.
 
 ## HEAD
 
@@ -226,7 +267,8 @@ result.status  # 200
 result.headers
 ```
 
-Same `response_headers_type` option as `get_result`, via `result.typed_headers`.
+`head()` always returns a `Result`, since there's no body to return on its own. It takes the same
+`response_headers_type` option as `with_result.get`, via `result.typed_headers`.
 
 ## Downloading large bodies — `download`
 
@@ -235,14 +277,23 @@ around, but for something genuinely large (a presigned S3 GET URL, a big export)
 memory copies internally. `download()` is a `get`-shaped verb built to avoid that:
 
 ```python
-body = await client.download("exports/large-file.csv")  # bytes, ~1/3 the peak memory of get()
+body = await client.download("exports/large-file.csv")  # bytes, ~2/3 the peak memory of get()
 
-await client.download("exports/large-file.csv", dest=Path("large-file.csv"))  # None returned
+await client.download("exports/large-file.csv", dest="large-file.csv")  # None returned
 ```
 
 With no `dest`, the body still ends up fully in memory as `bytes`, just streamed into one buffer
-instead of copied several times along the way. Pass `dest: Path` to stream straight to disk
-instead — memory then stays O(chunk size) regardless of how large the body is, and the call
-returns `None` rather than the body. `download()` only ever does a `GET`; there's no
+instead of copied several times along the way: measured on a 50MB body, `download()` peaks at
+about 105MB against `get()`'s 154MB. Pass `dest` (a `str` or any path-like) to stream straight to
+disk instead — memory then stays O(chunk size) regardless of how large the body is, and the call
+returns `None` rather than the body. The client's `timeout` is the longest allowed gap between
+chunks here, not a cap on the whole download, so a long download of a big file isn't cut off at
+30s; see [Streaming → Timeouts](streaming.md#timeouts).
+
+The file only appears at `dest` once the whole body has arrived. It's written to a hidden sibling
+first and renamed into place on success, so a download that fails partway (a dropped connection,
+a cancelled task) never leaves a truncated file behind, and an existing file at `dest` is left
+exactly as it was. Writes happen on the calling thread even for the async client: each chunk
+write takes microseconds, and moving them to a thread measured 2.5-3.8x slower. `download()` only ever does a `GET`; there's no
 `json`/`form`/`content` body option and no `response_data_type` — the response is always raw
 bytes, on disk or in memory. Same `params`/`headers`/`error_for_status` as every other verb.

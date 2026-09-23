@@ -5,7 +5,7 @@ from typing import Any, cast
 
 import pytest
 from msgspec import Struct
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from lothc import HTTPClient, SyncHTTPClient
 
@@ -18,6 +18,23 @@ class ItemModel(BaseModel):
 class ItemStruct(Struct):
     id: int
     name: str
+
+
+class AliasedModel(BaseModel):
+    user_id: int = Field(alias="userId")
+
+
+class ExplicitFieldNamesModel(BaseModel):
+    model_config = ConfigDict(serialize_by_alias=False, validate_by_name=True)
+    user_id: int = Field(alias="userId")
+
+
+class AliasedStruct(Struct, rename="camel"):
+    user_id: int
+
+
+class AliasedHeaders(BaseModel):
+    trace_id: str = Field(alias="X-Trace-Id")
 
 
 class RenameBody(BaseModel):
@@ -364,8 +381,8 @@ async def test_patch_renames_item(client: HTTPClient) -> None:
     assert item == ItemModel(id=7, name="renamed")
 
 
-async def test_post_result_includes_status_and_data(client: HTTPClient) -> None:
-    result = await client.post_result(
+async def test_with_result_post_includes_status_and_data(client: HTTPClient) -> None:
+    result = await client.with_result.post(
         "items", json=ItemModel(id=1, name="ditto"), response_data_type=ItemModel
     )
 
@@ -373,8 +390,8 @@ async def test_post_result_includes_status_and_data(client: HTTPClient) -> None:
     assert result.data == ItemModel(id=1, name="ditto")
 
 
-async def test_post_result_with_typed_headers(client: HTTPClient) -> None:
-    result = await client.post_result(
+async def test_with_result_post_with_typed_headers(client: HTTPClient) -> None:
+    result = await client.with_result.post(
         "items",
         json=ItemModel(id=1, name="ditto"),
         response_data_type=ItemModel,
@@ -385,7 +402,7 @@ async def test_post_result_with_typed_headers(client: HTTPClient) -> None:
 
 
 def test_sync_post_result_includes_status_and_data(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.post_result(
+    result = sync_client.with_result.post(
         "items", json=ItemModel(id=1, name="ditto"), response_data_type=ItemModel
     )
 
@@ -393,14 +410,14 @@ def test_sync_post_result_includes_status_and_data(sync_client: SyncHTTPClient) 
     assert result.data == ItemModel(id=1, name="ditto")
 
 
-async def test_post_result_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
-    result = await client.post_result("missing", error_for_status=False)
+async def test_with_result_post_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
+    result = await client.with_result.post("missing", error_for_status=False)
 
     assert result.status == 404
 
 
-async def test_put_result_includes_status_and_data(client: HTTPClient) -> None:
-    result = await client.put_result(
+async def test_with_result_put_includes_status_and_data(client: HTTPClient) -> None:
+    result = await client.with_result.put(
         "items/7", json=ItemModel(id=0, name="replaced"), response_data_type=ItemModel
     )
 
@@ -408,8 +425,8 @@ async def test_put_result_includes_status_and_data(client: HTTPClient) -> None:
     assert result.data == ItemModel(id=7, name="replaced")
 
 
-async def test_put_result_with_typed_headers(client: HTTPClient) -> None:
-    result = await client.put_result(
+async def test_with_result_put_with_typed_headers(client: HTTPClient) -> None:
+    result = await client.with_result.put(
         "items/7",
         json=ItemModel(id=0, name="replaced"),
         response_data_type=ItemModel,
@@ -420,7 +437,7 @@ async def test_put_result_with_typed_headers(client: HTTPClient) -> None:
 
 
 def test_sync_put_result_includes_status_and_data(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.put_result(
+    result = sync_client.with_result.put(
         "items/7", json=ItemModel(id=0, name="replaced"), response_data_type=ItemModel
     )
 
@@ -428,8 +445,8 @@ def test_sync_put_result_includes_status_and_data(sync_client: SyncHTTPClient) -
     assert result.data == ItemModel(id=7, name="replaced")
 
 
-async def test_patch_result_includes_status_and_data(client: HTTPClient) -> None:
-    result = await client.patch_result(
+async def test_with_result_patch_includes_status_and_data(client: HTTPClient) -> None:
+    result = await client.with_result.patch(
         "items/7", json=RenameBody(name="renamed"), response_data_type=ItemModel
     )
 
@@ -437,8 +454,8 @@ async def test_patch_result_includes_status_and_data(client: HTTPClient) -> None
     assert result.data == ItemModel(id=7, name="renamed")
 
 
-async def test_patch_result_with_typed_headers(client: HTTPClient) -> None:
-    result = await client.patch_result(
+async def test_with_result_patch_with_typed_headers(client: HTTPClient) -> None:
+    result = await client.with_result.patch(
         "items/7",
         json=RenameBody(name="renamed"),
         response_data_type=ItemModel,
@@ -449,7 +466,7 @@ async def test_patch_result_with_typed_headers(client: HTTPClient) -> None:
 
 
 def test_sync_patch_result_includes_status_and_data(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.patch_result(
+    result = sync_client.with_result.patch(
         "items/7", json=RenameBody(name="renamed"), response_data_type=ItemModel
     )
 
@@ -600,3 +617,116 @@ async def test_post_with_form_repeated_json_values(client: HTTPClient) -> None:
     assert [json.loads(cast(str, part["text"])) for part in objects] == [{"a": 1}, {"b": 2}]
     assert [json.loads(cast(str, part["text"])) for part in arrays] == [["a"], ["b"]]
     assert {part["content_type"] for part in objects + arrays} == {"application/json"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [ItemModel(id=1, name="ditto"), ItemStruct(id=1, name="ditto")],
+    ids=["pydantic", "msgspec"],
+)
+async def test_json_model_body_is_encoded_compactly_with_one_content_type(
+    client: HTTPClient, body: ItemModel | ItemStruct
+) -> None:
+    result = await client.post("echo-body", json=body, response_data_type=dict)
+
+    assert result["body"] == '{"id":1,"name":"ditto"}'
+    assert result["content_types"] == ["application/json"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [ItemModel(id=1, name="ditto"), ItemStruct(id=1, name="ditto"), {"id": 1}],
+    ids=["pydantic", "msgspec", "dict"],
+)
+async def test_json_body_replaces_a_callers_own_content_type_rather_than_duplicating_it(
+    client: HTTPClient, body: ItemModel | ItemStruct | dict[str, int]
+) -> None:
+    # `.header()` would append a second Content-Type; the body setter must replace the caller's,
+    # as `.body_json()` always has.
+    result = await client.post(
+        "echo-body", json=body, headers={"content-type": "text/plain"}, response_data_type=dict
+    )
+
+    assert result["content_types"] == ["application/json"]
+
+
+def test_sync_json_model_body_has_one_content_type(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.post(
+        "echo-body",
+        json=ItemModel(id=1, name="ditto"),
+        headers={"content-type": "text/plain"},
+        response_data_type=dict,
+    )
+
+    assert result["content_types"] == ["application/json"]
+
+
+async def test_post_with_a_top_level_json_array_body(client: HTTPClient) -> None:
+    result = await client.post("echo-body", json=[{"id": 1}, {"id": 2}], response_data_type=dict)
+
+    assert json.loads(result["body"]) == [{"id": 1}, {"id": 2}]
+    assert result["content_types"] == ["application/json"]
+
+
+async def test_post_form_encodes_bools_like_params_and_accepts_floats(client: HTTPClient) -> None:
+    # A bool used to hit the `int` branch and go out as Python's "True"; `params=` sends "true".
+    result = await client.post(
+        "upload",
+        form={"enabled": True, "disabled": False, "ratio": 1.5, "flags": (True, 0)},
+        response_data_type=dict,
+    )
+
+    parts = cast(list[dict[str, Any]], result["parts"])
+    assert {part["name"]: part["text"] for part in parts if part["name"] != "flags"} == {
+        "enabled": "true",
+        "disabled": "false",
+        "ratio": "1.5",
+    }
+    assert [part["text"] for part in parts if part["name"] == "flags"] == ["true", "0"]
+
+
+def test_sync_post_form_encodes_bools_like_params(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.post("upload", form={"enabled": True}, response_data_type=dict)
+
+    assert result["fields"] == {"enabled": "true"}
+
+
+@pytest.mark.parametrize(
+    "body", [AliasedModel(userId=1), AliasedStruct(user_id=1)], ids=["pydantic", "msgspec"]
+)
+async def test_json_body_encodes_aliases_the_same_way_for_both_libraries(
+    client: HTTPClient, body: AliasedModel | AliasedStruct
+) -> None:
+    # pydantic's own default serializes by field name; lothc encodes by alias like msgspec does,
+    # so a camelCase model goes back to the API in camelCase.
+    result = await client.post("echo-body", json=body, response_data_type=dict)
+
+    assert json.loads(result["body"]) == {"userId": 1}
+
+
+async def test_an_explicit_serialize_by_alias_false_is_respected(client: HTTPClient) -> None:
+    result = await client.post(
+        "echo-body", json=ExplicitFieldNamesModel(userId=1), response_data_type=dict
+    )
+
+    assert json.loads(result["body"]) == {"user_id": 1}
+
+
+async def test_params_headers_and_form_parts_encode_aliases_too(client: HTTPClient) -> None:
+    query = await client.get("echo-query", params=AliasedModel(userId=1), response_data_type=dict)
+    echoed = await client.get(
+        "echo-headers", headers=AliasedHeaders(**{"X-Trace-Id": "trace"}), response_data_type=dict
+    )
+    upload = await client.post(
+        "upload", form={"meta": AliasedModel(userId=1)}, response_data_type=dict
+    )
+
+    assert query["query"] == {"userId": ["1"]}
+    assert {h["name"].lower(): h["value"] for h in echoed["headers"]}["x-trace-id"] == "trace"
+    assert json.loads(cast(str, upload["fields"]["meta"])) == {"userId": 1}
+
+
+def test_sync_json_body_encodes_aliases(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.post("echo-body", json=AliasedModel(userId=1), response_data_type=dict)
+
+    assert json.loads(result["body"]) == {"userId": 1}

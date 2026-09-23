@@ -1,7 +1,9 @@
+import json
 import socket
 import time
 
 import pytest
+from pydantic import BaseModel
 
 from lothc import (
     HTTPClient,
@@ -12,6 +14,10 @@ from lothc import (
 )
 
 
+class ItemModel(BaseModel):
+    id: int
+
+
 def _closed_port_url() -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -20,7 +26,7 @@ def _closed_port_url() -> str:
 
 
 async def test_connecting_to_a_closed_port_raises_connection_error() -> None:
-    async with HTTPClient.build(base_url=_closed_port_url()) as client:
+    async with HTTPClient(base_url=_closed_port_url()) as client:
         with pytest.raises(HTTPConnectionError):
             await client.get("anything")
 
@@ -28,14 +34,14 @@ async def test_connecting_to_a_closed_port_raises_connection_error() -> None:
 async def test_slow_endpoint_past_timeout_raises_timeout_error(base_url: str) -> None:
     # `seconds` is 5x the timeout, as before — but a run only ever pays the timeout, never the
     # sleep, so both numbers shrink together with the margin between them untouched.
-    async with HTTPClient.build(base_url=base_url, timeout=0.03) as client:
+    async with HTTPClient(base_url=base_url, timeout=0.03) as client:
         with pytest.raises(HTTPTimeoutError):
             await client.get("slow", params={"seconds": 0.15})
 
 
 def test_sync_connecting_to_a_closed_port_raises_connection_error() -> None:
     with (
-        SyncHTTPClient.build(base_url=_closed_port_url()) as client,
+        SyncHTTPClient(base_url=_closed_port_url()) as client,
         pytest.raises(HTTPConnectionError),
     ):
         client.get("anything")
@@ -43,21 +49,21 @@ def test_sync_connecting_to_a_closed_port_raises_connection_error() -> None:
 
 def test_sync_slow_endpoint_past_timeout_raises_timeout_error(base_url: str) -> None:
     with (
-        SyncHTTPClient.build(base_url=base_url, timeout=0.03) as client,
+        SyncHTTPClient(base_url=base_url, timeout=0.03) as client,
         pytest.raises(HTTPTimeoutError),
     ):
         client.get("slow", params={"seconds": 0.15})
 
 
 async def test_per_call_timeout_shorter_than_client_raises_timeout_error(base_url: str) -> None:
-    async with HTTPClient.build(base_url=base_url, timeout=30.0) as client:
+    async with HTTPClient(base_url=base_url, timeout=30.0) as client:
         with pytest.raises(HTTPTimeoutError):
             await client.get("slow", params={"seconds": 0.15}, timeout=0.03)
 
 
 def test_sync_per_call_timeout_shorter_than_client_raises_timeout_error(base_url: str) -> None:
     with (
-        SyncHTTPClient.build(base_url=base_url, timeout=30.0) as client,
+        SyncHTTPClient(base_url=base_url, timeout=30.0) as client,
         pytest.raises(HTTPTimeoutError),
     ):
         client.get("slow", params={"seconds": 0.15}, timeout=0.03)
@@ -67,7 +73,7 @@ async def test_per_call_timeout_longer_than_client_overrides_it(base_url: str) -
     # This one waits the sleep out in full, so the sleep is the entire cost of the test. The
     # client timeout stays 5x shorter than it (0.02 vs 0.1), which is all the override has to
     # beat — a client that ignored the per-call value would abort long before 0.1s.
-    async with HTTPClient.build(base_url=base_url, timeout=0.02) as client:
+    async with HTTPClient(base_url=base_url, timeout=0.02) as client:
         result = await client.get(
             "slow", params={"seconds": 0.1}, timeout=10.0, response_data_type=dict
         )
@@ -76,35 +82,35 @@ async def test_per_call_timeout_longer_than_client_overrides_it(base_url: str) -
 
 
 def test_sync_per_call_timeout_longer_than_client_overrides_it(base_url: str) -> None:
-    with SyncHTTPClient.build(base_url=base_url, timeout=0.02) as client:
+    with SyncHTTPClient(base_url=base_url, timeout=0.02) as client:
         result = client.get("slow", params={"seconds": 0.1}, timeout=10.0, response_data_type=dict)
 
     assert result == {"finally": True}
 
 
 async def test_exceeding_max_redirects_raises_transport_error(base_url: str) -> None:
-    async with HTTPClient.build(base_url=base_url, max_redirects=1) as client:
+    async with HTTPClient(base_url=base_url, max_redirects=1) as client:
         with pytest.raises(HTTPTransportError):
             await client.get("redirect-loop")
 
 
 def test_sync_exceeding_max_redirects_raises_transport_error(base_url: str) -> None:
     with (
-        SyncHTTPClient.build(base_url=base_url, max_redirects=1) as client,
+        SyncHTTPClient(base_url=base_url, max_redirects=1) as client,
         pytest.raises(HTTPTransportError),
     ):
         client.get("redirect-loop")
 
 
 async def test_https_only_against_plain_http_raises_transport_error(base_url: str) -> None:
-    async with HTTPClient.build(base_url=base_url, https_only=True) as client:
+    async with HTTPClient(base_url=base_url, https_only=True) as client:
         with pytest.raises(HTTPTransportError):
             await client.get("anything")
 
 
 def test_sync_https_only_against_plain_http_raises_transport_error(base_url: str) -> None:
     with (
-        SyncHTTPClient.build(base_url=base_url, https_only=True) as client,
+        SyncHTTPClient(base_url=base_url, https_only=True) as client,
         pytest.raises(HTTPTransportError),
     ):
         client.get("anything")
@@ -116,7 +122,7 @@ async def test_https_only_against_plain_http_raises_transport_error_for_sse(
     # No `reconnect_delay=0` needed: an `https_only` rejection is a BuilderError, which can never
     # succeed on a reconnect, so `sse()` raises on the first attempt rather than sleeping through
     # its whole 5 x 3.0s budget. The timing assertion below is what actually pins that down.
-    async with HTTPClient.build(base_url=base_url, https_only=True) as client:
+    async with HTTPClient(base_url=base_url, https_only=True) as client:
         with pytest.raises(HTTPTransportError):
             async for _ in client.sse("events"):
                 pass
@@ -127,7 +133,7 @@ def test_sync_https_only_against_plain_http_raises_transport_error_for_sse(
 ) -> None:
     # See the async twin above for why no `reconnect_delay` override is needed.
     with (
-        SyncHTTPClient.build(base_url=base_url, https_only=True) as client,
+        SyncHTTPClient(base_url=base_url, https_only=True) as client,
         pytest.raises(HTTPTransportError),
     ):
         for _ in client.sse("events"):
@@ -140,7 +146,7 @@ async def test_sse_does_not_reconnect_after_a_permanently_unbuildable_request(
     # The real assertion is the elapsed time: with the default max_reconnects=5 and
     # reconnect_delay=3.0, retrying this at all would take ~15s. A permanent BuilderError has to
     # propagate on the first attempt instead.
-    async with HTTPClient.build(base_url=base_url, https_only=True) as client:
+    async with HTTPClient(base_url=base_url, https_only=True) as client:
         started = time.monotonic()
         with pytest.raises(HTTPTransportError):
             async for _ in client.sse("events"):
@@ -153,7 +159,7 @@ async def test_sse_does_not_reconnect_after_a_permanently_unbuildable_request(
 def test_sync_sse_does_not_reconnect_after_a_permanently_unbuildable_request(
     base_url: str,
 ) -> None:
-    with SyncHTTPClient.build(base_url=base_url, https_only=True) as client:
+    with SyncHTTPClient(base_url=base_url, https_only=True) as client:
         started = time.monotonic()
         with pytest.raises(HTTPTransportError):
             for _ in client.sse("events"):
@@ -161,3 +167,58 @@ def test_sync_sse_does_not_reconnect_after_a_permanently_unbuildable_request(
         elapsed = time.monotonic() - started
 
     assert elapsed < 1.0
+
+
+@pytest.mark.parametrize("response_data_type", [bytes, dict, ItemModel])
+async def test_body_cut_short_raises_connection_error(
+    client: HTTPClient, response_data_type: type[bytes | dict[str, object] | ItemModel]
+) -> None:
+    # A Content-Length body whose connection dies early surfaces as pyreqwest's `DecodeError`,
+    # which the old catch lists missed entirely: it leaked past `except HTTPTransportError`.
+    with pytest.raises(HTTPConnectionError):
+        await client.get("truncated-content-length", response_data_type=response_data_type)
+
+
+def test_sync_body_cut_short_raises_connection_error(sync_client: SyncHTTPClient) -> None:
+    with pytest.raises(HTTPConnectionError):
+        sync_client.get("truncated-content-length", response_data_type=dict)
+
+
+async def test_streamed_body_cut_short_raises_connection_error(client: HTTPClient) -> None:
+    with pytest.raises(HTTPConnectionError):
+        [chunk async for chunk in client.stream_get("truncated-content-length")]
+
+
+def test_sync_streamed_body_cut_short_raises_connection_error(sync_client: SyncHTTPClient) -> None:
+    with pytest.raises(HTTPConnectionError):
+        list(sync_client.stream_get("truncated-content-length"))
+
+
+async def test_download_cut_short_raises_connection_error(client: HTTPClient) -> None:
+    with pytest.raises(HTTPConnectionError):
+        await client.download("truncated-content-length")
+
+
+async def test_invalid_json_body_raises_the_stdlib_json_error(client: HTTPClient) -> None:
+    # Malformed JSON is a decode failure, not a transport one, so it must not be reported as a
+    # dropped connection even though pyreqwest's own JSON error descends from its DecodeError.
+    with pytest.raises(json.JSONDecodeError) as exc_info:
+        await client.get("invalid-json", response_data_type=dict)
+
+    assert type(exc_info.value) is json.JSONDecodeError
+
+
+async def test_using_a_closed_client_raises_runtime_error(base_url: str) -> None:
+    async with HTTPClient(base_url=base_url) as client:
+        pass
+
+    with pytest.raises(RuntimeError, match="client is closed"):
+        await client.get("items/7")
+
+
+def test_sync_using_a_closed_client_raises_runtime_error(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url) as client:
+        pass
+
+    with pytest.raises(RuntimeError, match="client is closed"):
+        client.get("items/7")

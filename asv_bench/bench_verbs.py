@@ -68,7 +68,7 @@ class VerbSuite:
         pool.submit(server.serve_forever)
         self._exit_stack.callback(server.shutdown)
         self._client = self._exit_stack.enter_context(
-            SyncHTTPClient.build(base_url=f"http://127.0.0.1:{server.server_port}/")
+            SyncHTTPClient(base_url=f"http://127.0.0.1:{server.server_port}/")
         )
 
     def teardown(self) -> None:

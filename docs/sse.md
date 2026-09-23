@@ -38,27 +38,31 @@ async for event in client.sse("events"):
 `id:` is always literal text on the wire, but it's frequently used to encode an integer, a
 `uuid.UUID`, or anything else with a single-argument `str`-taking constructor. Two independent
 knobs control it: `id_type` picks what `.id` becomes, and `allow_missing_id` picks whether a
-missing `id:` raises or becomes `None`:
+missing `id:` becomes `None` (the default) or raises:
 
 ```python
 async for event in client.sse("events"):
-    print(event.id)  # str — required, guaranteed present (id_type defaults to str)
+    print(event.id)  # str | None — None when the server sends no id (most don't)
 
 async for event in client.sse("events", id_type=int):
-    print(event.id)  # int — required, coerced
+    print(event.id)  # int | None — coerced when present
 
-async for event in client.sse("events", id_type=int, allow_missing_id=True):
-    print(event.id)  # int | None — optional, coerced when present
+async for event in client.sse("events", allow_missing_id=False):
+    print(event.id)  # str — required: an event without one raises
 
-async for event in client.sse("events", allow_missing_id=True):
-    print(event.id)  # str | None — optional, never coerced
+async for event in client.sse("events", id_type=int, allow_missing_id=False):
+    print(event.id)  # int — required and coerced
 ```
 
-- **`id_type=str`** (the default) — `.id` stays plain `str`.
+- **`id_type=str`** (the default) — `.id` stays plain `str` when present.
 - **a bare type** (`id_type=int`, `id_type=uuid.UUID`) — `.id` coerced via `id_type(raw_id)`.
-- **`allow_missing_id=False`** (the default) — a missing `id:` raises.
-- **`allow_missing_id=True`** — a missing `id:` becomes `None` instead of raising; the coercion
-  type still applies when `id:` *is* present.
+- **`allow_missing_id=True`** (the default) — a missing `id:` becomes `None`. The spec makes `id`
+  optional and most real servers (OpenAI/Anthropic-style streams included) never send one.
+- **`allow_missing_id=False`** — a missing `id:` raises, and `.id` is typed without `None`; the
+  coercion type still applies.
+
+Events are immutable: `.id`, `.event` and `.data` are read-only, which is also what lets a
+`SSEEvent[str, str]` be used wherever a `SSEEvent[str, str | None]` is expected.
 
 "Missing" follows the spec's *last event ID buffer* semantics, not "this record had no `id:`
 line": once the server has sent an `id:`, every later event inherits it until the server sends a
@@ -165,7 +169,7 @@ through end of body — and an SSE body is open-ended, so applying it would kill
 stream on schedule (with the default `timeout=30.0`, at the 30 second mark, as `HTTPTimeoutError`).
 `sse()` overrides it per request instead. Two knobs remain:
 
-- **`read_timeout`** on `build()` — the maximum idle gap between two consecutive chunks. This is
+- **`read_timeout`** on the client — the maximum idle gap between two consecutive chunks. This is
   the right way to detect a stalled stream: a server that stops sending (without closing) trips it,
   a server that keeps sending never does, however long the stream lives. Client-level, like
   `connect_timeout` — see [Cookies, redirects, proxy & TLS](networking.md#connection-pooling).
