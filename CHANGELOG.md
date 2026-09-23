@@ -7,6 +7,8 @@ predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/re
 
 ## [Unreleased]
 
+## [0.0.18] - 2026-09-23
+
 ### Fixed
 
 - The logo, benchmark chart and doc links on the PyPI page (the README used repo-relative
@@ -82,5 +84,6 @@ predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/re
 - Sync streams no longer buffer the whole body in memory behind a slow consumer, and stop their
   worker thread when abandoned while data is still flowing.
 
-[Unreleased]: https://github.com/RogerThomas/lothc/compare/0.0.17...HEAD
+[Unreleased]: https://github.com/RogerThomas/lothc/compare/0.0.18...HEAD
+[0.0.18]: https://github.com/RogerThomas/lothc/compare/0.0.17...0.0.18
 [0.0.17]: https://github.com/RogerThomas/lothc/compare/0.0.16...0.0.17
