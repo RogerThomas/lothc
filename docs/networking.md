@@ -11,6 +11,7 @@ async with HTTPClient(
     follow_redirects=True,  # default
     max_redirects=10,  # None (default) leaves pyreqwest's own limit in place
     proxy="http://localhost:8080",
+    no_proxy=["localhost", "internal.example.com"],  # hosts that skip the proxy
 ) as client:
     ...
 ```
@@ -24,6 +25,26 @@ connection gets opened, the cookie jar is shared state, and the redirect policy 
 transport loop before a response ever reaches request-level code. If one call genuinely needs
 different redirect/proxy/cookie behavior than the rest, build a second client with that setting
 rather than looking for a per-verb kwarg.
+
+`no_proxy` entries use the same format as the `NO_PROXY` environment variable. It only
+narrows `proxy`, so passing it without `proxy` raises `ValueError`.
+
+## User-Agent and HTTP/2
+
+```python
+async with HTTPClient(
+    base_url="https://api.example.com/",
+    user_agent="my-app/1.2",  # sent on every request; a per-request `headers=` still overrides it
+    http2=True,  # negotiate HTTP/2 where the server supports it
+) as client:
+    ...
+```
+
+Without `user_agent`, requests identify as `python-lothc/<version>`.
+
+`http2=True` negotiates HTTP/2 during the TLS handshake (ALPN) and falls back to HTTP/1.1 when
+the server doesn't offer it, so it's safe to turn on for a mixed set of servers. A plain `http://`
+connection stays on HTTP/1.1.
 
 ## TLS & mTLS
 
@@ -50,6 +71,20 @@ in production.
 
 Like `timeout`, these are all client-level only — set once on the client, no per-call override,
 since a TLS/connection identity belongs to the underlying connection, not a single request.
+
+## DNS overrides, source address and keepalive
+
+```python
+async with HTTPClient(
+    resolve={"api.example.com": "10.0.0.5"},  # skip DNS for this host; the URL's port still applies
+    local_address="10.0.0.2",  # the source IP connections come from
+    tcp_keepalive=60.0,  # seconds before TCP keepalive probes start on an idle connection
+) as client:
+    ...
+```
+
+`resolve` is handy for pointing a real hostname at a staging box or a local server without
+editing `/etc/hosts`; TLS still validates the certificate against the hostname in the URL.
 
 ## Connection pooling
 

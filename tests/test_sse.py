@@ -39,73 +39,22 @@ def test_sync_sse_yields_raw_events(sync_client: SyncHTTPClient, *, interruptibl
     assert events[0].event == "tick"
 
 
-async def test_sse_allows_a_missing_id_by_default(client: HTTPClient) -> None:
-    # The spec makes `id:` optional and most real servers never send it, so the default call has
-    # to work against them rather than fail on the first event.
+async def test_sse_missing_id_is_an_empty_string(client: HTTPClient) -> None:
+    # The spec makes `id:` optional and most real servers never send it; like a browser's
+    # `lastEventId`, a missing one reads as "".
     events = [event async for event in client.sse("events", params={"omit": "id"})]
 
-    assert events[0].id is None
+    assert events[0].id == ""
 
 
-async def test_sse_allow_missing_id_false_requires_an_id(client: HTTPClient) -> None:
-    with pytest.raises(ValueError, match="missing required 'id'"):
-        [
-            event
-            async for event in client.sse("events", params={"omit": "id"}, allow_missing_id=False)
-        ]
-
-
-async def test_sse_allow_missing_id_allows_missing_id(client: HTTPClient) -> None:
-    events = [
-        event async for event in client.sse("events", params={"omit": "id"}, allow_missing_id=True)
-    ]
-
-    assert events[0].id is None
-
-
-def test_sync_sse_allows_a_missing_id_by_default(sync_client: SyncHTTPClient) -> None:
+def test_sync_sse_missing_id_is_an_empty_string(sync_client: SyncHTTPClient) -> None:
     events = list(sync_client.sse("events", params={"omit": "id"}))
 
-    assert events[0].id is None
-
-
-def test_sync_sse_allow_missing_id_false_requires_an_id(sync_client: SyncHTTPClient) -> None:
-    with pytest.raises(ValueError, match="missing required 'id'"):
-        list(sync_client.sse("events", params={"omit": "id"}, allow_missing_id=False))
-
-
-async def test_sse_id_type_coerces_id(client: HTTPClient) -> None:
-    events = [event async for event in client.sse("events", id_type=int)]
-
-    assert events[0].id == 0
-    assert events[-1].id == 9
-
-
-def test_sync_sse_id_type_coerces_id(sync_client: SyncHTTPClient) -> None:
-    events = list(sync_client.sse("events", id_type=int))
-
-    assert events[0].id == 0
-
-
-async def test_sse_id_type_with_allow_missing_id_coerces_when_present(client: HTTPClient) -> None:
-    events = [event async for event in client.sse("events", id_type=int, allow_missing_id=True)]
-
-    assert events[0].id == 0
-
-
-async def test_sse_id_type_with_allow_missing_id_allows_missing_id(client: HTTPClient) -> None:
-    events = [
-        event
-        async for event in client.sse(
-            "events", params={"omit": "id"}, id_type=int, allow_missing_id=True
-        )
-    ]
-
-    assert events[0].id is None
+    assert events[0].id == ""
 
 
 async def test_sse_skips_comment_only_and_unrecognized_field_records(client: HTTPClient) -> None:
-    events = [event async for event in client.sse("events-weird", allow_missing_id=True)]
+    events = [event async for event in client.sse("events-weird")]
 
     assert len(events) == 1
     assert events[0].data == "hello"
@@ -176,7 +125,7 @@ async def test_sse_events_arrive_incrementally_not_buffered_until_stream_end(
 def test_sync_sse_skips_comment_only_and_unrecognized_field_records(
     sync_client: SyncHTTPClient,
 ) -> None:
-    events = list(sync_client.sse("events-weird", allow_missing_id=True))
+    events = list(sync_client.sse("events-weird"))
 
     assert len(events) == 1
     assert events[0].data == "hello"
@@ -418,30 +367,25 @@ def test_sync_sse_rejects_a_non_event_stream_content_type(sync_client: SyncHTTPC
 
 
 async def test_sse_spec_edge_cases_bom_bare_cr_and_persisted_id(client: HTTPClient) -> None:
-    events = [event async for event in client.sse("events-spec-edge-cases", allow_missing_id=True)]
+    events = [event async for event in client.sse("events-spec-edge-cases")]
 
     # `id: 7` arrived on a data-less record and must persist onto the next two events; the
     # bare `id` line then resets the buffer, so the last event has no id.
-    assert [(event.id, event.data) for event in events] == [("7", "a"), ("7", "b"), (None, "c")]
+    assert [(event.id, event.data) for event in events] == [("7", "a"), ("7", "b"), ("", "c")]
 
 
 def test_sync_sse_spec_edge_cases_bom_bare_cr_and_persisted_id(
     sync_client: SyncHTTPClient,
 ) -> None:
-    events = list(sync_client.sse("events-spec-edge-cases", allow_missing_id=True))
+    events = list(sync_client.sse("events-spec-edge-cases"))
 
-    assert [(event.id, event.data) for event in events] == [("7", "a"), ("7", "b"), (None, "c")]
+    assert [(event.id, event.data) for event in events] == [("7", "a"), ("7", "b"), ("", "c")]
 
 
 async def test_sse_finds_record_boundaries_split_across_single_byte_chunks(
     client: HTTPClient,
 ) -> None:
-    events = [
-        event
-        async for event in client.sse(
-            "events-byte-by-byte", allow_missing_id=True, max_reconnects=0
-        )
-    ]
+    events = [event async for event in client.sse("events-byte-by-byte", max_reconnects=0)]
 
     assert [event.data for event in events] == ["a", "b", "c"]
 
@@ -449,67 +393,28 @@ async def test_sse_finds_record_boundaries_split_across_single_byte_chunks(
 def test_sync_sse_finds_record_boundaries_split_across_single_byte_chunks(
     sync_client: SyncHTTPClient,
 ) -> None:
-    events = list(sync_client.sse("events-byte-by-byte", allow_missing_id=True, max_reconnects=0))
+    events = list(sync_client.sse("events-byte-by-byte", max_reconnects=0))
 
     assert [event.data for event in events] == ["a", "b", "c"]
 
 
 async def test_sse_empty_event_field_dispatches_as_message(client: HTTPClient) -> None:
-    events = [
-        event
-        async for event in client.sse("events-lenient", allow_missing_id=True, max_reconnects=0)
-    ]
+    events = [event async for event in client.sse("events-lenient", max_reconnects=0)]
 
     assert events[0].event == "message"
 
 
 async def test_sse_invalid_utf8_is_replaced_not_raised(client: HTTPClient) -> None:
-    events = [
-        event
-        async for event in client.sse("events-lenient", allow_missing_id=True, max_reconnects=0)
-    ]
+    events = [event async for event in client.sse("events-lenient", max_reconnects=0)]
 
     assert events[1].data == "bad-�-byte"
 
 
-@pytest.mark.parametrize("allow_missing_id", [True, False])
-async def test_sse_accepts_allow_missing_id_as_a_plain_bool(
-    client: HTTPClient, *, allow_missing_id: bool
-) -> None:
-    # A non-literal `bool` (and an explicit `False`, the documented default) used to match no
-    # overload at all. This call type-checking under all four checkers is half the assertion.
-    events = [
-        event
-        async for event in client.sse(
-            "events", params={"count": 2}, allow_missing_id=allow_missing_id, max_reconnects=0
-        )
-    ]
-
-    assert [event.id for event in events] == ["0", "1"]
-
-
-def test_sync_sse_accepts_an_explicit_false_allow_missing_id(sync_client: SyncHTTPClient) -> None:
-    events = list(
-        sync_client.sse("events", params={"count": 2}, allow_missing_id=False, max_reconnects=0)
-    )
-
-    assert [event.id for event in events] == ["0", "1"]
-
-
-def test_sse_events_compare_hash_and_print_by_value() -> None:
+def test_sse_events_compare_and_print_by_value() -> None:
     event = SSEEvent(id="1", event="tick", data="payload")
     same = SSEEvent(id="1", event="tick", data="payload")
 
     assert event == same
     assert event != SSEEvent(id="2", event="tick", data="payload")
     assert event != "not-an-event"
-    assert {event, same} == {event}
     assert repr(event) == "SSEEvent(id='1', event='tick', data='payload')"
-
-
-def test_sse_events_are_immutable() -> None:
-    # Read-only on purpose: it's what makes the type parameters covariant (see SSEEvent).
-    event = SSEEvent(id="1", data="payload")
-
-    with pytest.raises(AttributeError):
-        setattr(event, "id", "2")  # noqa: B010 — deliberately past the read-only type, to test the runtime

@@ -730,3 +730,106 @@ def test_sync_json_body_encodes_aliases(sync_client: SyncHTTPClient) -> None:
     result = sync_client.post("echo-body", json=AliasedModel(userId=1), response_data_type=dict)
 
     assert json.loads(result["body"]) == {"userId": 1}
+
+
+async def test_post_with_data_sends_a_urlencoded_body(client: HTTPClient) -> None:
+    result = await client.post(
+        "echo-body", data={"name": "a b&c", "count": 2}, response_data_type=dict
+    )
+
+    assert result["body"] == "name=a+b%26c&count=2"
+    assert result["content_types"] == ["application/x-www-form-urlencoded"]
+
+
+def test_sync_post_with_data_sends_a_urlencoded_body(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.post(
+        "echo-body", data={"name": "a b&c", "count": 2}, response_data_type=dict
+    )
+
+    assert result["body"] == "name=a+b%26c&count=2"
+    assert result["content_types"] == ["application/x-www-form-urlencoded"]
+
+
+async def test_data_repeats_a_key_per_sequence_element_and_encodes_bools(
+    client: HTTPClient,
+) -> None:
+    result = await client.post(
+        "echo-body", data={"tag": ["a", "b"], "enabled": True}, response_data_type=dict
+    )
+
+    assert result["body"] == "tag=a&tag=b&enabled=true"
+
+
+async def test_data_accepts_a_pydantic_model_encoded_by_alias(client: HTTPClient) -> None:
+    result = await client.post("echo-body", data=AliasedModel(userId=1), response_data_type=dict)
+
+    assert result["body"] == "userId=1"
+
+
+async def test_data_accepts_a_msgspec_struct(client: HTTPClient) -> None:
+    result = await client.post(
+        "echo-body", data=ItemStruct(id=1, name="ditto"), response_data_type=dict
+    )
+
+    assert result["body"] == "id=1&name=ditto"
+
+
+async def test_with_result_post_accepts_data(client: HTTPClient) -> None:
+    result = await client.with_result.post(
+        "echo-body", data={"name": "ditto"}, response_data_type=dict
+    )
+
+    assert result.data["body"] == "name=ditto"
+
+
+async def test_stream_post_accepts_data(client: HTTPClient) -> None:
+    chunks = [chunk async for chunk in client.stream_post("echo-body", data={"name": "ditto"})]
+
+    assert json.loads(b"".join(chunks))["body"] == "name=ditto"
+
+
+def test_sync_stream_post_accepts_data(sync_client: SyncHTTPClient) -> None:
+    chunks = list(sync_client.stream_post("echo-body", data={"name": "ditto"}))
+
+    assert json.loads(b"".join(chunks))["body"] == "name=ditto"
+
+
+async def test_data_and_form_together_are_rejected(client: HTTPClient) -> None:
+    with pytest.raises(ValueError, match="at most one of 'json', 'data', 'form' or 'content'"):
+        await client.post("echo-body", data={"a": "1"}, form={"b": "2"})
+
+
+def test_sync_data_and_json_together_are_rejected(sync_client: SyncHTTPClient) -> None:
+    with pytest.raises(ValueError, match="at most one of 'json', 'data', 'form' or 'content'"):
+        sync_client.post("echo-body", data={"a": "1"}, json={"b": "2"})
+
+
+async def test_delete_can_send_a_json_body(client: HTTPClient) -> None:
+    result = await client.delete("echo-body", json={"ids": [1, 2]}, response_data_type=dict)
+
+    assert json.loads(result["body"]) == {"ids": [1, 2]}
+    assert result["content_type"] == "application/json"
+
+
+def test_sync_delete_can_send_a_json_body(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.delete("echo-body", json={"ids": [1, 2]}, response_data_type=dict)
+
+    assert json.loads(result["body"]) == {"ids": [1, 2]}
+
+
+async def test_with_result_delete_can_send_a_urlencoded_body(client: HTTPClient) -> None:
+    result = await client.with_result.delete("echo-body", data={"id": "1"}, response_data_type=dict)
+
+    assert result.data["body"] == "id=1"
+
+
+def test_sync_with_result_delete_can_send_a_raw_body(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.with_result.delete("echo-body", content="raw", response_data_type=dict)
+
+    assert result.data["body"] == "raw"
+
+
+async def test_delete_without_a_body_still_works(client: HTTPClient) -> None:
+    result = await client.delete("items/7", response_data_type=dict)
+
+    assert result == {"id": 7, "deleted": True}

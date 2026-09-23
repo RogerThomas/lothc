@@ -4,6 +4,9 @@ on:
     branches:
       - main
   pull_request:
+  # Lets release.yml run this whole workflow as a gate before it publishes to PyPI, so a release
+  # can't ship a commit whose tests never ran (or failed).
+  workflow_call:
 jobs:
   test:
     strategy:
@@ -42,3 +45,30 @@ jobs:
           fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # pydantic and msgspec are optional extras, but the `test` job above always has both installed,
+  # so a stray unguarded import of either would pass CI and then crash `import lothc` for anyone
+  # who installed plain `lothc`. tests/test_compat_fallbacks.py only simulates the missing
+  # packages; this job genuinely leaves them out.
+  test-no-extras:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: "3.13"
+      # The locked dev group minus the two extras, rather than a hand-picked `pytest ...` list,
+      # so a new test-only dependency (e.g. trustme) can't silently break this job.
+      - run: >-
+          uv sync --group dev
+          --no-install-package pydantic --no-install-package pydantic-core
+          --no-install-package msgspec
+      # `--no-sync` from here on: a plain `uv run` would re-sync and put the extras back.
+      # Asserting they're absent guards against another dependency pulling one in transitively.
+      - run: >-
+          uv run --no-sync python -c "import importlib.util as u;
+          present = [m for m in ('pydantic', 'msgspec') if u.find_spec(m)];
+          assert not present, present; import lothc, lothc.testing"
+      # Every test module that never mentions either library, picked at run time so a new
+      # module is covered without editing this list.
+      - run: uv run --no-sync pytest $(grep -LE 'pydantic|msgspec' tests/test_*.py)

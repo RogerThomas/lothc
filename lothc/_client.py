@@ -6,7 +6,6 @@ import threading
 import time
 from collections.abc import (
     AsyncGenerator,
-    AsyncIterator,
     Awaitable,
     Buffer,
     Callable,
@@ -28,6 +27,9 @@ from contextlib import (
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
+from functools import cache
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _distribution_version
 from io import BufferedIOBase, BufferedWriter
 from json import dumps as _json_dumps
 from json import loads as _json_loads
@@ -45,6 +47,7 @@ from typing import (
     overload,
     runtime_checkable,
 )
+from urllib.parse import urlsplit
 
 from pyreqwest.bytes import Bytes
 from pyreqwest.client import BaseClientBuilder, Client, ClientBuilder, SyncClient, SyncClientBuilder
@@ -419,6 +422,19 @@ def _parse_retry_after(value: str | None) -> float | None:
     return max(0.0, (parsed - datetime.now(UTC)).total_seconds())
 
 
+def _is_retryable_send_error(error: PyreqwestRequestError) -> bool:
+    """A failure a retry can fix: a transport error, or a body cut off partway through.
+
+    A body shorter than its `Content-Length` isn't a `TransportError` in pyreqwest but a
+    `DecodeError`, the same type as a corrupt gzip body, which no retry can fix. hyper's
+    connection-read cause is what tells the two apart.
+    """
+    if isinstance(error, PyreqwestTransportError):
+        return True
+    causes = error.details["causes"] if isinstance(error, PyreqwestDecodeError) else None
+    return any(cause["message"] == "error reading a body from connection" for cause in causes or ())
+
+
 def _backoff_delay(attempt: int, backoff_base: float, retry_after: float | None) -> float:
     if retry_after is not None:
         return retry_after
@@ -561,8 +577,8 @@ class _RetryMiddleware:
         for attempt in range(self.max_retries + 1):
             try:
                 response = await next.run(request.copy())
-            except PyreqwestTransportError:
-                if attempt == self.max_retries:
+            except PyreqwestRequestError as error:
+                if attempt == self.max_retries or not _is_retryable_send_error(error):
                     raise
                 await asyncio.sleep(_backoff_delay(attempt, self.backoff_base, retry_after=None))
                 continue
@@ -592,8 +608,8 @@ class _SyncRetryMiddleware:
         for attempt in range(self.max_retries + 1):
             try:
                 response = next.run(request.copy())
-            except PyreqwestTransportError:
-                if attempt == self.max_retries:
+            except PyreqwestRequestError as error:
+                if attempt == self.max_retries or not _is_retryable_send_error(error):
                     raise
                 time.sleep(_backoff_delay(attempt, self.backoff_base, retry_after=None))
                 continue
@@ -826,62 +842,18 @@ async def _build_form(form: Form, *, infer_mime_type_from_file_extension: bool) 
     return form_builder
 
 
-class SSEEvent[TData, TId = str | None]:
+@dataclass(slots=True, kw_only=True)
+class SSEEvent[TData]:
     """One Server-Sent Event, as yielded by `sse()`.
 
-    `.event` is always a plain `str` (defaults to `"message"` per the SSE spec when the wire
-    omits it). `.id` is `None` when the server never sent one, since the spec makes it optional,
-    unless `sse()` was called with `allow_missing_id=False` (then it's required, and typed
-    without `None`); `id_type` controls its type. `.data` is decoded per `sse()`'s
-    `response_data_type`, raw `str` by default. The `TId` default is `str | None` to match
-    `sse()`'s own default.
+    `.event` defaults to `"message"` and `.id` to `""` when the wire omits them, as the SSE spec
+    (and a browser's `EventSource`) does. `.data` is decoded per `sse()`'s `response_data_type`,
+    raw `str` by default.
     """
 
-    # Not a @dataclass, unlike most classes here (style-guide.md §1), and read-only on purpose:
-    # read-only properties are what make `TData`/`TId` covariant, so a `SSEEvent[str, str]`
-    # genuinely *is* a `SSEEvent[str, str | None]`. `sse()` needs that for its
-    # `allow_missing_id=False` overload (`str` ids) to sit alongside its `bool` one (`str | None`
-    # ids). A dataclass can't provide it: even frozen, its synthesized `__replace__` takes the
-    # field types as parameters, which makes them invariant (checked under all four checkers).
-    __slots__ = ("_data", "_event", "_id")
-
-    # `id` shadows the builtin deliberately: it's the SSE field's own name.
-    def __init__(  # pylint: disable=redefined-builtin
-        self,
-        *,
-        id: TId,  # noqa: A002
-        event: str = "message",
-        data: TData,
-    ) -> None:
-        self._id = id
-        self._event = event
-        self._data = data
-
-    def _key(self) -> tuple[object, str, object]:
-        return (self._id, self._event, self._data)
-
-    @property
-    def id(self) -> TId:
-        return self._id
-
-    @property
-    def event(self) -> str:
-        return self._event
-
-    @property
-    def data(self) -> TData:
-        return self._data
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, SSEEvent):
-            return NotImplemented
-        return self._key() == other._key()
-
-    def __hash__(self) -> int:
-        return hash(self._key())
-
-    def __repr__(self) -> str:
-        return f"SSEEvent(id={self._id!r}, event={self._event!r}, data={self._data!r})"
+    id: str = ""
+    event: str = "message"
+    data: TData
 
 
 @dataclass(slots=True)
@@ -913,7 +885,7 @@ class _SSEStreamState:
     """
 
     retry_delay: float
-    last_event_id: str | None = None
+    last_event_id: str = ""
     status: int | None = None
 
 
@@ -992,15 +964,6 @@ def _may_complete_sse_record(buffer: bytearray, new_from: int) -> bool:
     """
     window = bytes(buffer[max(0, new_from - 3) :])
     return b"\n\n" in window.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-
-
-def _coerce_sse_id(raw_id: str | None, id_type: type[Any] | None, *, allow_missing_id: bool) -> Any:  # noqa: ANN401 — pylint: disable=line-too-long
-    real_type = id_type if id_type is not None else str
-    if raw_id is None:
-        if allow_missing_id:
-            return None
-        raise ValueError(f"SSE event missing required 'id' field (id_type={real_type!r})")
-    return raw_id if real_type is str else real_type(raw_id)
 
 
 def _verify_sse_response(state: _SSEStreamState, status: int, content_type: str | None) -> None:
@@ -1144,10 +1107,7 @@ def _dispatch_sse_record(
     record: bytes,
     state: _SSEStreamState,
     response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
-    id_type: type[Any] | None,
-    *,
-    allow_missing_id: bool,
-) -> SSEEvent[Any, Any] | None:
+) -> SSEEvent[Any] | None:
     """Apply one record's `retry:`/`id:` fields to `state`, then build its event (if it has data).
 
     `.id` comes from the *persisted* last-event-id buffer, not this record alone — per spec an
@@ -1159,14 +1119,13 @@ def _dispatch_sse_record(
     if parsed_record.retry_ms is not None:
         state.retry_delay = parsed_record.retry_ms / 1000
     if parsed_record.id is not None:
-        state.last_event_id = parsed_record.id or None
+        state.last_event_id = parsed_record.id
     if parsed_record.data is None:
         return None
-    event_id = _coerce_sse_id(state.last_event_id, id_type, allow_missing_id=allow_missing_id)
     if response_data_type is None:
-        return SSEEvent(id=event_id, event=parsed_record.event, data=parsed_record.data)
+        return SSEEvent(id=state.last_event_id, event=parsed_record.event, data=parsed_record.data)
     decoded = _decode_json_line(parsed_record.data, response_data_type)
-    return SSEEvent(id=event_id, event=parsed_record.event, data=decoded)
+    return SSEEvent(id=state.last_event_id, event=parsed_record.event, data=decoded)
 
 
 def _sse_reconnect_budget_exhausted(
@@ -1389,6 +1348,19 @@ type TlsVersion = Literal["TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3"]
 pyreqwest's identical one, so no pyreqwest name appears anywhere in lothc's public signatures."""
 
 
+def _is_joinable_base_url(base_url: str) -> bool:
+    """Whether pyreqwest accepts `base_url`: no query or fragment, and a path that's empty or
+    ends in `/`.
+
+    >>> [_is_joinable_base_url(u) for u in ("http://h", "http://h/api/", "http://h/api")]
+    [True, True, False]
+    >>> _is_joinable_base_url("http://h/api/?x=1")
+    False
+    """
+    split = urlsplit(base_url)
+    return not split.query and not split.fragment and (not split.path or split.path.endswith("/"))
+
+
 @dataclass(slots=True, kw_only=True)
 class _TransportSettings:  # pylint: disable=too-many-instance-attributes
     """Everything a client needs to (re)build its pyreqwest client on entry. Held by both clients
@@ -1399,11 +1371,13 @@ class _TransportSettings:  # pylint: disable=too-many-instance-attributes
 
     base_url: str | None
     default_headers: Headers | None
+    user_agent: str | None
     timeout: float | None
     cookie_store: bool
     follow_redirects: bool
     max_redirects: int | None
     proxy: str | None
+    no_proxy: list[str] | tuple[str, ...] | None
     max_retries: int
     retry_methods: frozenset[str]
     backoff_base: float
@@ -1416,10 +1390,35 @@ class _TransportSettings:  # pylint: disable=too-many-instance-attributes
     max_tls_version: TlsVersion | None
     danger_accept_invalid_certs: bool
     https_only: bool
+    http2: bool
+    resolve: Mapping[str, str] | None
+    local_address: str | None
+    tcp_keepalive: float | None
     max_connections: int | None
     pool_idle_timeout: float | None
     pool_max_idle_per_host: int | None
     pool_timeout: float | None
+
+    def __post_init__(self) -> None:
+        # pyreqwest's own rule, checked here so a bad `base_url` fails at construction rather than
+        # on entry: without the trailing slash, a relative path would replace the last segment.
+        if self.base_url is not None and not _is_joinable_base_url(self.base_url):
+            raise ValueError("base_url must end with a trailing slash '/'")
+        # `no_proxy` is an exclusion list on `proxy`; with no proxy it would silently do nothing.
+        if self.no_proxy is not None and self.proxy is None:
+            raise ValueError("'no_proxy' needs a 'proxy' to exclude hosts from")
+
+
+@cache
+def _default_user_agent() -> str:
+    """lothc's own `User-Agent`, so requests don't go out under pyreqwest's name.
+
+    Read lazily and once: package metadata isn't free, and not every import opens a client.
+    """
+    try:
+        return f"python-lothc/{_distribution_version('lothc')}"
+    except PackageNotFoundError:  # pragma: no cover — a vendored copy with no installed metadata
+        return "python-lothc"
 
 
 def _configure_client_builder[TBuilder: BaseClientBuilder](
@@ -1429,6 +1428,18 @@ def _configure_client_builder[TBuilder: BaseClientBuilder](
     if settings.timeout is not None:
         builder = builder.timeout(timedelta(seconds=settings.timeout))
     builder = _apply_default_headers(builder, settings.default_headers)
+    builder = builder.user_agent(
+        settings.user_agent if settings.user_agent is not None else _default_user_agent()
+    )
+    if settings.http2:
+        builder = builder.http2(True)  # noqa: FBT003 — pyreqwest's own positional flag
+    for host, ip in (settings.resolve or {}).items():
+        # Port 0: pyreqwest ignores it, sending to the URL's own port (or the scheme's default).
+        builder = builder.resolve(host, ip, 0)
+    if settings.local_address is not None:
+        builder = builder.local_address(settings.local_address)
+    if settings.tcp_keepalive is not None:
+        builder = builder.tcp_keepalive(timedelta(seconds=settings.tcp_keepalive))
     if settings.base_url:
         builder = builder.base_url(settings.base_url)
     builder = builder.default_cookie_store(settings.cookie_store)
@@ -1436,7 +1447,10 @@ def _configure_client_builder[TBuilder: BaseClientBuilder](
     if settings.max_redirects is not None:
         builder = builder.max_redirects(settings.max_redirects)
     if settings.proxy is not None:
-        builder = builder.proxy(ProxyBuilder.all(settings.proxy))
+        proxy = ProxyBuilder.all(settings.proxy)
+        if settings.no_proxy is not None:
+            proxy = proxy.no_proxy(",".join(settings.no_proxy))
+        builder = builder.proxy(proxy)
     return _apply_tls_and_pool_config(
         builder,
         connect_timeout=settings.connect_timeout,
@@ -1531,16 +1545,19 @@ def _attach_json_body[TBuilder: BaseRequestBuilder](
 async def _attach_body[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many-return-statements
     request_builder: TBuilder,
     json: JSONPayload | None,
+    data: Params | None,
     form: Form | None,
     content: str | bytes | None,
     *,
     infer_mime_type_from_file_extension: bool,
 ) -> TBuilder:
-    provided_bodies = [body for body in (json, form, content) if body is not None]
+    provided_bodies = [body for body in (json, data, form, content) if body is not None]
     if len(provided_bodies) > 1:
-        raise ValueError("Provide at most one of 'json', 'form' or 'content'")
+        raise ValueError("Provide at most one of 'json', 'data', 'form' or 'content'")
     if json is not None:
         return _attach_json_body(request_builder, json)
+    if data is not None:
+        return request_builder.form(_query_pairs(_encode_params(data)))
     if form is not None:
         return request_builder.multipart(
             await _build_form(
@@ -1557,16 +1574,19 @@ async def _attach_body[TBuilder: BaseRequestBuilder](  # pylint: disable=too-man
 def _attach_body_sync[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many-return-statements
     request_builder: TBuilder,
     json: JSONPayload | None,
+    data: Params | None,
     form: Form | None,
     content: str | bytes | None,
     *,
     infer_mime_type_from_file_extension: bool,
 ) -> TBuilder:
-    provided_bodies = [body for body in (json, form, content) if body is not None]
+    provided_bodies = [body for body in (json, data, form, content) if body is not None]
     if len(provided_bodies) > 1:
-        raise ValueError("Provide at most one of 'json', 'form' or 'content'")
+        raise ValueError("Provide at most one of 'json', 'data', 'form' or 'content'")
     if json is not None:
         return _attach_json_body(request_builder, json)
+    if data is not None:
+        return request_builder.form(_query_pairs(_encode_params(data)))
     if form is not None:
         return request_builder.multipart(
             _build_sync_form(
@@ -1907,6 +1927,8 @@ class Result[TData, THeaders: TypedHeaders | None = None]:
     `.typed_headers` is `None` unless `response_headers_type` was passed to the call that
     produced this. `.request` is the request actually sent — the target you asked for, not
     necessarily the one a final response came from if redirects were followed.
+    `.http_version` is the protocol the response came over (e.g. `"HTTP/1.1"`), and `.elapsed`
+    the seconds from sending the request to having the whole response, including any retries.
     """
 
     data: TData
@@ -1914,6 +1936,8 @@ class Result[TData, THeaders: TypedHeaders | None = None]:
     headers: CaseInsensitiveDict
     typed_headers: THeaders
     request: RequestInfo
+    http_version: str
+    elapsed: float
 
 
 class _SendMethodResult(Protocol):
@@ -1931,6 +1955,7 @@ class _SendMethodResult(Protocol):
         headers: Headers | None,
         timeout: float | None,
         json: JSONPayload | None,
+        data: Params | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
@@ -2094,6 +2119,7 @@ class WithResult:
             None,
             None,
             None,
+            None,
             response_data_type,
             response_headers_type,
             skip_auth=skip_auth,
@@ -2112,6 +2138,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
@@ -2128,6 +2155,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -2145,6 +2173,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -2162,6 +2191,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -2179,6 +2209,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_headers_type: type[THeaders],
@@ -2196,6 +2227,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -2214,6 +2246,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -2232,6 +2265,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -2249,6 +2283,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
@@ -2273,6 +2308,7 @@ class WithResult:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -2293,6 +2329,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
@@ -2309,6 +2346,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -2326,6 +2364,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -2343,6 +2382,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -2360,6 +2400,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_headers_type: type[THeaders],
@@ -2377,6 +2418,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -2395,6 +2437,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -2413,6 +2456,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -2430,6 +2474,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
@@ -2454,6 +2499,7 @@ class WithResult:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -2474,6 +2520,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
@@ -2490,6 +2537,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -2507,6 +2555,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -2524,6 +2573,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -2541,6 +2591,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_headers_type: type[THeaders],
@@ -2558,6 +2609,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -2576,6 +2628,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -2594,6 +2647,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -2611,6 +2665,7 @@ class WithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
@@ -2635,6 +2690,7 @@ class WithResult:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -2654,6 +2710,11 @@ class WithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
     ) -> Result[bytes]: ...
@@ -2666,6 +2727,11 @@ class WithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -2679,6 +2745,11 @@ class WithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[TData],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -2692,6 +2763,11 @@ class WithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -2705,6 +2781,11 @@ class WithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -2718,6 +2799,11 @@ class WithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[dict[str, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -2732,6 +2818,11 @@ class WithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[TData],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -2746,6 +2837,11 @@ class WithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -2759,6 +2855,11 @@ class WithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
@@ -2779,13 +2880,14 @@ class WithResult:
             params,
             headers,
             timeout,
-            None,
-            None,
-            None,
+            json,
+            data,
+            form,
+            content,
             response_data_type,
             response_headers_type,
             skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=True,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
             error_type=error_type,
         )
@@ -2820,7 +2922,8 @@ class HTTPClient:
     # client's *settings*, while the pyreqwest client it wraps only exists between entering and
     # exiting, and is rebuilt from those settings on every entry, since a pyreqwest builder can
     # only be built once. That also means one client can be entered again after it exits.
-    def __init__(
+    # Every "local" pylint counts here is a keyword setting, not working state.
+    def __init__(  # pylint: disable=too-many-locals
         self,
         *,
         base_url: str | None = None,
@@ -2828,11 +2931,13 @@ class HTTPClient:
         bearer_auth: AuthProvider | None = None,
         basic_auth: tuple[str, str | None] | None = None,
         default_headers: Headers | None = None,
+        user_agent: str | None = None,
         timeout: float | None = 30.0,
         cookie_store: bool = False,
         follow_redirects: bool = True,
         max_redirects: int | None = None,
         proxy: str | None = None,
+        no_proxy: list[str] | tuple[str, ...] | None = None,
         max_retries: int = 0,
         retry_methods: set[str] | frozenset[str] | list[str] | tuple[str, ...] | None = None,
         backoff_base: float = 0.1,
@@ -2845,6 +2950,10 @@ class HTTPClient:
         max_tls_version: TlsVersion | None = None,
         danger_accept_invalid_certs: bool = False,
         https_only: bool = False,
+        http2: bool = False,
+        resolve: Mapping[str, str] | None = None,
+        local_address: str | None = None,
+        tcp_keepalive: float | None = None,
         max_connections: int | None = None,
         pool_idle_timeout: float | None = None,
         pool_max_idle_per_host: int | None = None,
@@ -2872,6 +2981,15 @@ class HTTPClient:
         disables certificate validation entirely — insecure, for local/test use only.
         `max_connections`/`pool_idle_timeout`/`pool_max_idle_per_host`/`pool_timeout` tune the
         underlying connection pool; leave them `None` to keep pyreqwest's own defaults.
+
+        `user_agent` sets the `User-Agent` header every request sends, `python-lothc/<version>`
+        by default (a per-request `headers=` still overrides it). `no_proxy` lists hosts that
+        bypass `proxy`, each written as one entry of the `NO_PROXY` environment variable would be
+        (e.g. `"localhost"`); it needs `proxy`.
+        `http2=True` negotiates HTTP/2 with servers that support it (over TLS, via ALPN),
+        falling back to HTTP/1.1 otherwise. `resolve` maps hostnames to IP addresses, skipping
+        DNS for them (the URL's port is still used); `local_address` is the source IP to connect
+        from; `tcp_keepalive` (seconds) turns on TCP keepalive probes for idle connections.
         """
         if sum(value is not None for value in (bearer_token, bearer_auth, basic_auth)) > 1:
             raise ValueError(
@@ -2884,11 +3002,13 @@ class HTTPClient:
         self._transport = _TransportSettings(
             base_url=base_url,
             default_headers=default_headers,
+            user_agent=user_agent,
             timeout=timeout,
             cookie_store=cookie_store,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
             proxy=proxy,
+            no_proxy=no_proxy,
             max_retries=max_retries,
             backoff_base=backoff_base,
             max_retry_after=max_retry_after,
@@ -2900,6 +3020,10 @@ class HTTPClient:
             max_tls_version=max_tls_version,
             danger_accept_invalid_certs=danger_accept_invalid_certs,
             https_only=https_only,
+            http2=http2,
+            resolve=resolve,
+            local_address=local_address,
+            tcp_keepalive=tcp_keepalive,
             max_connections=max_connections,
             pool_idle_timeout=pool_idle_timeout,
             pool_max_idle_per_host=pool_max_idle_per_host,
@@ -3132,12 +3256,10 @@ class HTTPClient:
         request_builder: RequestBuilder,
         state: _SSEStreamState,
         response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
-        id_type: type[Any] | None,
         *,
-        allow_missing_id: bool,
         error_for_status: bool,
         error_type: type[Data] | None,
-    ) -> AsyncGenerator[SSEEvent[Any, Any]]:
+    ) -> AsyncGenerator[SSEEvent[Any]]:
         """One connection's worth of an SSE stream: yields its events, returns on clean EOF."""
         try:
             # pyreqwest's default streamed_read_buffer_limit is 64KB — it withholds received
@@ -3174,8 +3296,6 @@ class HTTPClient:
                             record,
                             state,
                             response_data_type,
-                            id_type,
-                            allow_missing_id=allow_missing_id,
                         )
                         if event is not None:
                             yield event
@@ -3189,16 +3309,14 @@ class HTTPClient:
         headers: Headers | None,
         timeout: float | None,
         response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
-        id_type: type[Any] | None,
         *,
         skip_auth: bool,
-        allow_missing_id: bool,
         error_for_status: bool,
         error_type: type[Data] | None,
         max_reconnects: int | None,
         reconnect_delay: float,
         reconnect_on_close: bool,
-    ) -> AsyncIterator[SSEEvent[Any, Any]]:
+    ) -> AsyncGenerator[SSEEvent[Any]]:
         state = _SSEStreamState(retry_delay=reconnect_delay)
         consecutive_reconnects = 0
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
@@ -3207,14 +3325,12 @@ class HTTPClient:
             request_builder = await self._prepare_request(
                 request_builder, params, headers, effective_timeout, skip_auth=skip_auth
             )
-            if state.last_event_id is not None:
+            if state.last_event_id:
                 request_builder = request_builder.header("last-event-id", state.last_event_id)
             connection = self._sse_connection(
                 request_builder,
                 state,
                 response_data_type,
-                id_type,
-                allow_missing_id=allow_missing_id,
                 error_for_status=error_for_status,
                 error_type=error_type,
             )
@@ -3253,97 +3369,12 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        allow_missing_id: Literal[False],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
-    ) -> AsyncIterator[SSEEvent[str, str]]: ...
-    @overload
-    def sse(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        allow_missing_id: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-    ) -> AsyncIterator[SSEEvent[str, str | None]]: ...
-    @overload
-    def sse[TId](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        allow_missing_id: Literal[False],
-        id_type: type[TId],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-    ) -> AsyncIterator[SSEEvent[str, TId]]: ...
-    @overload
-    def sse[TId](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        id_type: type[TId],
-        allow_missing_id: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-    ) -> AsyncIterator[SSEEvent[str, TId | None]]: ...
-    @overload
-    def sse(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        allow_missing_id: Literal[False],
-        response_data_type: type[dict[str, Any]],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-    ) -> AsyncIterator[SSEEvent[dict[str, Any], str]]: ...
-    @overload
-    def sse[TData](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        allow_missing_id: Literal[False],
-        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-    ) -> AsyncIterator[SSEEvent[TData, str]]: ...
+    ) -> AsyncGenerator[SSEEvent[str]]: ...
     @overload
     def sse(
         self,
@@ -3354,13 +3385,12 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
-        allow_missing_id: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
-    ) -> AsyncIterator[SSEEvent[dict[str, Any], str | None]]: ...
+    ) -> AsyncGenerator[SSEEvent[dict[str, Any]]]: ...
     @overload
     def sse[TData](
         self,
@@ -3371,85 +3401,12 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
-        allow_missing_id: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
-    ) -> AsyncIterator[SSEEvent[TData, str | None]]: ...
-    @overload
-    def sse[TId](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        allow_missing_id: Literal[False],
-        response_data_type: type[dict[str, Any]],
-        id_type: type[TId],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-    ) -> AsyncIterator[SSEEvent[dict[str, Any], TId]]: ...
-    @overload
-    def sse[TId](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
-        id_type: type[TId],
-        allow_missing_id: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-    ) -> AsyncIterator[SSEEvent[dict[str, Any], TId | None]]: ...
-    @overload
-    def sse[TData, TId](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        allow_missing_id: Literal[False],
-        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
-        id_type: type[TId],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-    ) -> AsyncIterator[SSEEvent[TData, TId]]: ...
-    @overload
-    def sse[TData, TId](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
-        id_type: type[TId],
-        allow_missing_id: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-    ) -> AsyncIterator[SSEEvent[TData, TId | None]]: ...
+    ) -> AsyncGenerator[SSEEvent[TData]]: ...
     def sse(
         self,
         path: str,
@@ -3459,20 +3416,17 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
-        id_type: type[Any] | None = None,
-        allow_missing_id: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
-    ) -> AsyncIterator[SSEEvent[Any, Any]]:
+    ) -> AsyncGenerator[SSEEvent[Any]]:
         """Open `path` as a Server-Sent Events stream, yielding one `SSEEvent` per event.
 
         `response_data_type` decodes `.data` (a class, `TypeAdapter`, or msgspec `Decoder`);
-        `.event`/`.id` are always populated regardless. `id_type` controls what `.id` becomes
-        (defaults to `str`); `allow_missing_id` controls whether a missing `id` field raises
-        (the default) or becomes `None`.
+        `.event`/`.id` are always populated regardless (`"message"`/`""` when the server omits
+        them).
 
         The client's `timeout` never applies here — an SSE stream is open-ended, and a total
         request timeout would kill every healthy stream on schedule. `timeout` bounds one
@@ -3495,9 +3449,7 @@ class HTTPClient:
             headers,
             timeout,
             response_data_type,
-            id_type,
             skip_auth=skip_auth,
-            allow_missing_id=allow_missing_id,
             error_for_status=error_for_status,
             error_type=error_type,
             max_reconnects=max_reconnects,
@@ -3512,6 +3464,7 @@ class HTTPClient:
         headers: Headers | None,
         timeout: float | None,
         json: JSONPayload | None,
+        data: Params | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
@@ -3520,7 +3473,7 @@ class HTTPClient:
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
         error_type: type[Data] | None,
-    ) -> AsyncIterator[Any]:
+    ) -> AsyncGenerator[Any]:
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
         idle = self._stream_idle_timeout if timeout is None else None
         request_builder = await self._prepare_request(
@@ -3529,6 +3482,7 @@ class HTTPClient:
         request_builder = await _attach_body(
             request_builder,
             json,
+            data,
             form,
             content,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
@@ -3573,7 +3527,7 @@ class HTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> AsyncIterator[bytes]: ...
+    ) -> AsyncGenerator[bytes]: ...
     @overload
     def stream_get(
         self,
@@ -3586,7 +3540,7 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> AsyncIterator[dict[str, Any]]: ...
+    ) -> AsyncGenerator[dict[str, Any]]: ...
     @overload
     def stream_get[TLine](
         self,
@@ -3599,7 +3553,7 @@ class HTTPClient:
         response_data_type: type[TLine] | TypeAdapterTyping[TLine] | DecoderTyping[TLine],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> AsyncIterator[TLine]: ...
+    ) -> AsyncGenerator[TLine]: ...
     def stream_get(
         self,
         path: str,
@@ -3611,7 +3565,7 @@ class HTTPClient:
         response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> AsyncIterator[Any]:
+    ) -> AsyncGenerator[Any]:
         """Stream GET `path`'s response as raw `bytes` chunks (unbuffered, safe for binary).
 
         Pass `response_data_type` to switch to newline-buffered NDJSON-style decoding instead —
@@ -3627,6 +3581,7 @@ class HTTPClient:
             params,
             headers,
             timeout,
+            None,
             None,
             None,
             None,
@@ -3647,12 +3602,13 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> AsyncIterator[bytes]: ...
+    ) -> AsyncGenerator[bytes]: ...
     @overload
     def stream_post(
         self,
@@ -3663,13 +3619,14 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> AsyncIterator[dict[str, Any]]: ...
+    ) -> AsyncGenerator[dict[str, Any]]: ...
     @overload
     def stream_post[TLine](
         self,
@@ -3680,13 +3637,14 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TLine] | TypeAdapterTyping[TLine] | DecoderTyping[TLine],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> AsyncIterator[TLine]: ...
+    ) -> AsyncGenerator[TLine]: ...
     def stream_post(
         self,
         path: str,
@@ -3696,15 +3654,17 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> AsyncIterator[Any]:
-        """Like `stream_get`, but POST a body first — same `json`/`form`/`content` options as
-        `post` (at most one), same raw-bytes-by-default / NDJSON-via-`response_data_type` split.
+    ) -> AsyncGenerator[Any]:
+        """Like `stream_get`, but POST a body first — same `json`/`data`/`form`/`content`
+        options as `post` (at most one), same raw-bytes-by-default / NDJSON-via-
+        `response_data_type` split.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
@@ -3717,6 +3677,7 @@ class HTTPClient:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -3843,6 +3804,7 @@ class HTTPClient:
         headers: Headers | None,
         timeout: float | None,
         json: JSONPayload | None,
+        data: Params | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
@@ -3858,6 +3820,7 @@ class HTTPClient:
         request_builder = await _attach_body(
             request_builder,
             json,
+            data,
             form,
             content,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
@@ -3879,6 +3842,7 @@ class HTTPClient:
         headers: Headers | None,
         timeout: float | None,
         json: JSONPayload | None,
+        data: Params | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
@@ -3897,6 +3861,7 @@ class HTTPClient:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -3914,6 +3879,7 @@ class HTTPClient:
         headers: Headers | None,
         timeout: float | None,
         json: JSONPayload | None,
+        data: Params | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
@@ -3930,20 +3896,31 @@ class HTTPClient:
         request_builder = await _attach_body(
             request_builder,
             json,
+            data,
             form,
             content,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
         )
+        started = time.monotonic()
         raw_response, request_info = await _send(request_builder)
+        elapsed = time.monotonic() - started
         if error_for_status:
             await self._check_status(raw_response, error_type, request_info)
-        data = await self._decode_body(raw_response, response_data_type)
+        decoded = await self._decode_body(raw_response, response_data_type)
         response_headers = CaseInsensitiveDict(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
             typed_headers = _parse_typed_headers(response_headers, response_headers_type)
-        return Result(data, raw_response.status, response_headers, typed_headers, request_info)
+        return Result(
+            decoded,
+            raw_response.status,
+            response_headers,
+            typed_headers,
+            request_info,
+            raw_response.version,
+            elapsed,
+        )
 
     @overload
     async def post(
@@ -3955,6 +3932,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
@@ -3971,6 +3949,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -3988,6 +3967,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -4005,6 +3985,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -4021,6 +4002,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
@@ -4028,8 +4010,9 @@ class HTTPClient:
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
     ) -> object:
-        """POST to `path` with at most one of `json`/`form`/`content` (raises `ValueError` if
-        more than one is given) and decode the response as `response_data_type`.
+        """POST to `path` with at most one of `json`/`data`/`form`/`content` (raises
+        `ValueError` if more than one is given) and decode the response as `response_data_type`.
+        `data` is a urlencoded body (`a=1&b=2`), `form` a `multipart/form-data` one.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
@@ -4042,6 +4025,7 @@ class HTTPClient:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -4061,6 +4045,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
@@ -4077,6 +4062,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -4094,6 +4080,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -4111,6 +4098,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -4127,6 +4115,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
@@ -4147,6 +4136,7 @@ class HTTPClient:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -4166,6 +4156,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
@@ -4182,6 +4173,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -4199,6 +4191,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -4216,6 +4209,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -4232,6 +4226,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
@@ -4252,6 +4247,7 @@ class HTTPClient:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -4270,6 +4266,11 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
     ) -> bytes: ...
@@ -4282,6 +4283,11 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -4295,6 +4301,11 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[TData],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -4308,6 +4319,11 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -4320,11 +4336,17 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
     ) -> object:
-        """DELETE `path` and decode the response as `response_data_type`.
+        """DELETE `path` and decode the response as `response_data_type`. A body is rare on a
+        DELETE but allowed: the same `json`/`data`/`form`/`content` options as `post`, at most one.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
@@ -4336,12 +4358,13 @@ class HTTPClient:
             params,
             headers,
             timeout,
-            None,
-            None,
-            None,
+            json,
+            data,
+            form,
+            content,
             response_data_type,
             skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=True,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
             error_type=error_type,
         )
@@ -4394,7 +4417,9 @@ class HTTPClient:
         request_builder = await self._prepare_request(
             self._client.head(path), params, headers, timeout, skip_auth=skip_auth
         )
+        started = time.monotonic()
         raw_response, request_info = await _send(request_builder)
+        elapsed = time.monotonic() - started
         if error_for_status:
             await self._check_status(raw_response, error_type, request_info)
         response_headers = CaseInsensitiveDict(raw_response.headers)
@@ -4403,7 +4428,15 @@ class HTTPClient:
             if response_headers_type is None
             else _parse_typed_headers(response_headers, response_headers_type)
         )
-        return Result(None, raw_response.status, response_headers, typed_headers, request_info)
+        return Result(
+            None,
+            raw_response.status,
+            response_headers,
+            typed_headers,
+            request_info,
+            raw_response.version,
+            elapsed,
+        )
 
 
 class _SyncSendMethodResult(Protocol):
@@ -4421,6 +4454,7 @@ class _SyncSendMethodResult(Protocol):
         headers: Headers | None,
         timeout: float | None,
         json: JSONPayload | None,
+        data: Params | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
@@ -4584,6 +4618,7 @@ class SyncWithResult:
             None,
             None,
             None,
+            None,
             response_data_type,
             response_headers_type,
             skip_auth=skip_auth,
@@ -4602,6 +4637,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
@@ -4618,6 +4654,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -4635,6 +4672,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -4652,6 +4690,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -4669,6 +4708,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_headers_type: type[THeaders],
@@ -4686,6 +4726,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -4704,6 +4745,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -4722,6 +4764,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -4739,6 +4782,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
@@ -4763,6 +4807,7 @@ class SyncWithResult:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -4783,6 +4828,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
@@ -4799,6 +4845,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -4816,6 +4863,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -4833,6 +4881,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -4850,6 +4899,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_headers_type: type[THeaders],
@@ -4867,6 +4917,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -4885,6 +4936,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -4903,6 +4955,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -4920,6 +4973,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
@@ -4944,6 +4998,7 @@ class SyncWithResult:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -4964,6 +5019,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
@@ -4980,6 +5036,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -4997,6 +5054,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -5014,6 +5072,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -5031,6 +5090,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_headers_type: type[THeaders],
@@ -5048,6 +5108,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -5066,6 +5127,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -5084,6 +5146,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -5101,6 +5164,7 @@ class SyncWithResult:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
@@ -5125,6 +5189,7 @@ class SyncWithResult:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -5144,6 +5209,11 @@ class SyncWithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
     ) -> Result[bytes]: ...
@@ -5156,6 +5226,11 @@ class SyncWithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -5169,6 +5244,11 @@ class SyncWithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[TData],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -5182,6 +5262,11 @@ class SyncWithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -5195,6 +5280,11 @@ class SyncWithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -5208,6 +5298,11 @@ class SyncWithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[dict[str, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -5222,6 +5317,11 @@ class SyncWithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[TData],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -5236,6 +5336,11 @@ class SyncWithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
@@ -5249,6 +5354,11 @@ class SyncWithResult:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
@@ -5269,13 +5379,14 @@ class SyncWithResult:
             params,
             headers,
             timeout,
-            None,
-            None,
-            None,
+            json,
+            data,
+            form,
+            content,
             response_data_type,
             response_headers_type,
             skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=True,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
             error_type=error_type,
         )
@@ -5310,7 +5421,8 @@ class SyncHTTPClient:
     # client's *settings*, while the pyreqwest client it wraps only exists between entering and
     # exiting, and is rebuilt from those settings on every entry, since a pyreqwest builder can
     # only be built once. That also means one client can be entered again after it exits.
-    def __init__(
+    # Every "local" pylint counts here is a keyword setting, not working state.
+    def __init__(  # pylint: disable=too-many-locals
         self,
         *,
         base_url: str | None = None,
@@ -5318,11 +5430,13 @@ class SyncHTTPClient:
         bearer_auth: SyncAuthProvider | None = None,
         basic_auth: tuple[str, str | None] | None = None,
         default_headers: Headers | None = None,
+        user_agent: str | None = None,
         timeout: float | None = 30.0,
         cookie_store: bool = False,
         follow_redirects: bool = True,
         max_redirects: int | None = None,
         proxy: str | None = None,
+        no_proxy: list[str] | tuple[str, ...] | None = None,
         max_retries: int = 0,
         retry_methods: set[str] | frozenset[str] | list[str] | tuple[str, ...] | None = None,
         backoff_base: float = 0.1,
@@ -5335,6 +5449,10 @@ class SyncHTTPClient:
         max_tls_version: TlsVersion | None = None,
         danger_accept_invalid_certs: bool = False,
         https_only: bool = False,
+        http2: bool = False,
+        resolve: Mapping[str, str] | None = None,
+        local_address: str | None = None,
+        tcp_keepalive: float | None = None,
         max_connections: int | None = None,
         pool_idle_timeout: float | None = None,
         pool_max_idle_per_host: int | None = None,
@@ -5362,6 +5480,15 @@ class SyncHTTPClient:
         disables certificate validation entirely — insecure, for local/test use only.
         `max_connections`/`pool_idle_timeout`/`pool_max_idle_per_host`/`pool_timeout` tune the
         underlying connection pool; leave them `None` to keep pyreqwest's own defaults.
+
+        `user_agent` sets the `User-Agent` header every request sends, `python-lothc/<version>`
+        by default (a per-request `headers=` still overrides it). `no_proxy` lists hosts that
+        bypass `proxy`, each written as one entry of the `NO_PROXY` environment variable would be
+        (e.g. `"localhost"`); it needs `proxy`.
+        `http2=True` negotiates HTTP/2 with servers that support it (over TLS, via ALPN),
+        falling back to HTTP/1.1 otherwise. `resolve` maps hostnames to IP addresses, skipping
+        DNS for them (the URL's port is still used); `local_address` is the source IP to connect
+        from; `tcp_keepalive` (seconds) turns on TCP keepalive probes for idle connections.
         """
         if sum(value is not None for value in (bearer_token, bearer_auth, basic_auth)) > 1:
             raise ValueError(
@@ -5374,11 +5501,13 @@ class SyncHTTPClient:
         self._transport = _TransportSettings(
             base_url=base_url,
             default_headers=default_headers,
+            user_agent=user_agent,
             timeout=timeout,
             cookie_store=cookie_store,
             follow_redirects=follow_redirects,
             max_redirects=max_redirects,
             proxy=proxy,
+            no_proxy=no_proxy,
             max_retries=max_retries,
             backoff_base=backoff_base,
             max_retry_after=max_retry_after,
@@ -5390,6 +5519,10 @@ class SyncHTTPClient:
             max_tls_version=max_tls_version,
             danger_accept_invalid_certs=danger_accept_invalid_certs,
             https_only=https_only,
+            http2=http2,
+            resolve=resolve,
+            local_address=local_address,
+            tcp_keepalive=tcp_keepalive,
             max_connections=max_connections,
             pool_idle_timeout=pool_idle_timeout,
             pool_max_idle_per_host=pool_max_idle_per_host,
@@ -5620,13 +5753,11 @@ class SyncHTTPClient:
         request_builder: SyncRequestBuilder,
         state: _SSEStreamState,
         response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
-        id_type: type[Any] | None,
         *,
-        allow_missing_id: bool,
         error_for_status: bool,
         error_type: type[Data] | None,
         interruptible: bool,
-    ) -> Generator[SSEEvent[Any, Any]]:
+    ) -> Generator[SSEEvent[Any]]:
         """One connection's worth of an SSE stream: yields its events, returns on clean EOF."""
         try:
             # See the matching comment in `HTTPClient._sse_connection` — pyreqwest's default
@@ -5658,8 +5789,6 @@ class SyncHTTPClient:
                         record,
                         state,
                         response_data_type,
-                        id_type,
-                        allow_missing_id=allow_missing_id,
                     )
                     if event is not None:
                         yield event
@@ -5673,17 +5802,15 @@ class SyncHTTPClient:
         headers: Headers | None,
         timeout: float | None,
         response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
-        id_type: type[Any] | None,
         *,
         skip_auth: bool,
-        allow_missing_id: bool,
         error_for_status: bool,
         error_type: type[Data] | None,
         max_reconnects: int | None,
         reconnect_delay: float,
         reconnect_on_close: bool,
         interruptible: bool,
-    ) -> Iterator[SSEEvent[Any, Any]]:
+    ) -> Generator[SSEEvent[Any]]:
         state = _SSEStreamState(retry_delay=reconnect_delay)
         consecutive_reconnects = 0
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
@@ -5692,14 +5819,12 @@ class SyncHTTPClient:
             request_builder = self._prepare_request(
                 request_builder, params, headers, effective_timeout, skip_auth=skip_auth
             )
-            if state.last_event_id is not None:
+            if state.last_event_id:
                 request_builder = request_builder.header("last-event-id", state.last_event_id)
             connection = self._sse_connection(
                 request_builder,
                 state,
                 response_data_type,
-                id_type,
-                allow_missing_id=allow_missing_id,
                 error_for_status=error_for_status,
                 error_type=error_type,
                 interruptible=interruptible,
@@ -5737,103 +5862,13 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        allow_missing_id: Literal[False],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
         interruptible: bool = False,
-    ) -> Iterator[SSEEvent[str, str]]: ...
-    @overload
-    def sse(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        allow_missing_id: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-        interruptible: bool = False,
-    ) -> Iterator[SSEEvent[str, str | None]]: ...
-    @overload
-    def sse[TId](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        allow_missing_id: Literal[False],
-        id_type: type[TId],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-        interruptible: bool = False,
-    ) -> Iterator[SSEEvent[str, TId]]: ...
-    @overload
-    def sse[TId](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        id_type: type[TId],
-        allow_missing_id: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-        interruptible: bool = False,
-    ) -> Iterator[SSEEvent[str, TId | None]]: ...
-    @overload
-    def sse(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        allow_missing_id: Literal[False],
-        response_data_type: type[dict[str, Any]],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-        interruptible: bool = False,
-    ) -> Iterator[SSEEvent[dict[str, Any], str]]: ...
-    @overload
-    def sse[TData](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        allow_missing_id: Literal[False],
-        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-        interruptible: bool = False,
-    ) -> Iterator[SSEEvent[TData, str]]: ...
+    ) -> Generator[SSEEvent[str]]: ...
     @overload
     def sse(
         self,
@@ -5844,14 +5879,13 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         response_data_type: type[dict[str, Any]],
-        allow_missing_id: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
         interruptible: bool = False,
-    ) -> Iterator[SSEEvent[dict[str, Any], str | None]]: ...
+    ) -> Generator[SSEEvent[dict[str, Any]]]: ...
     @overload
     def sse[TData](
         self,
@@ -5862,90 +5896,13 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
-        allow_missing_id: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
         interruptible: bool = False,
-    ) -> Iterator[SSEEvent[TData, str | None]]: ...
-    @overload
-    def sse[TId](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        allow_missing_id: Literal[False],
-        response_data_type: type[dict[str, Any]],
-        id_type: type[TId],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-        interruptible: bool = False,
-    ) -> Iterator[SSEEvent[dict[str, Any], TId]]: ...
-    @overload
-    def sse[TId](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
-        id_type: type[TId],
-        allow_missing_id: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-        interruptible: bool = False,
-    ) -> Iterator[SSEEvent[dict[str, Any], TId | None]]: ...
-    @overload
-    def sse[TData, TId](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        allow_missing_id: Literal[False],
-        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
-        id_type: type[TId],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-        interruptible: bool = False,
-    ) -> Iterator[SSEEvent[TData, TId]]: ...
-    @overload
-    def sse[TData, TId](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
-        id_type: type[TId],
-        allow_missing_id: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-        max_reconnects: int | None = 5,
-        reconnect_delay: float = 3.0,
-        reconnect_on_close: bool = False,
-        interruptible: bool = False,
-    ) -> Iterator[SSEEvent[TData, TId | None]]: ...
+    ) -> Generator[SSEEvent[TData]]: ...
     def sse(
         self,
         path: str,
@@ -5955,21 +5912,18 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
-        id_type: type[Any] | None = None,
-        allow_missing_id: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
         interruptible: bool = False,
-    ) -> Iterator[SSEEvent[Any, Any]]:
+    ) -> Generator[SSEEvent[Any]]:
         """Open `path` as a Server-Sent Events stream, yielding one `SSEEvent` per event.
 
         `response_data_type` decodes `.data` (a class, `TypeAdapter`, or msgspec `Decoder`);
-        `.event`/`.id` are always populated regardless. `id_type` controls what `.id` becomes
-        (defaults to `str`); `allow_missing_id` controls whether a missing `id` field raises
-        (the default) or becomes `None`.
+        `.event`/`.id` are always populated regardless (`"message"`/`""` when the server omits
+        them).
 
         The client's `timeout` never applies here — an SSE stream is open-ended, and a total
         request timeout would kill every healthy stream on schedule. `timeout` bounds one
@@ -6004,9 +5958,7 @@ class SyncHTTPClient:
             headers,
             timeout,
             response_data_type,
-            id_type,
             skip_auth=skip_auth,
-            allow_missing_id=allow_missing_id,
             error_for_status=error_for_status,
             error_type=error_type,
             max_reconnects=max_reconnects,
@@ -6022,6 +5974,7 @@ class SyncHTTPClient:
         headers: Headers | None,
         timeout: float | None,
         json: JSONPayload | None,
+        data: Params | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
@@ -6031,7 +5984,7 @@ class SyncHTTPClient:
         error_for_status: bool,
         error_type: type[Data] | None,
         interruptible: bool,
-    ) -> Iterator[Any]:
+    ) -> Generator[Any]:
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
         idle = self._stream_idle_timeout if timeout is None else None
         request_builder = self._prepare_request(
@@ -6040,6 +5993,7 @@ class SyncHTTPClient:
         request_builder = _attach_body_sync(
             request_builder,
             json,
+            data,
             form,
             content,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
@@ -6083,7 +6037,7 @@ class SyncHTTPClient:
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         interruptible: bool = False,
-    ) -> Iterator[bytes]: ...
+    ) -> Generator[bytes]: ...
     @overload
     def stream_get(
         self,
@@ -6097,7 +6051,7 @@ class SyncHTTPClient:
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         interruptible: bool = False,
-    ) -> Iterator[dict[str, Any]]: ...
+    ) -> Generator[dict[str, Any]]: ...
     @overload
     def stream_get[TLine](
         self,
@@ -6111,7 +6065,7 @@ class SyncHTTPClient:
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         interruptible: bool = False,
-    ) -> Iterator[TLine]: ...
+    ) -> Generator[TLine]: ...
     def stream_get(
         self,
         path: str,
@@ -6124,7 +6078,7 @@ class SyncHTTPClient:
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         interruptible: bool = False,
-    ) -> Iterator[Any]:
+    ) -> Generator[Any]:
         """Stream GET `path`'s response as raw `bytes` chunks (unbuffered, safe for binary).
 
         Pass `response_data_type` to switch to newline-buffered NDJSON-style decoding instead —
@@ -6155,6 +6109,7 @@ class SyncHTTPClient:
             None,
             None,
             None,
+            None,
             response_data_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
@@ -6173,13 +6128,14 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         interruptible: bool = False,
-    ) -> Iterator[bytes]: ...
+    ) -> Generator[bytes]: ...
     @overload
     def stream_post(
         self,
@@ -6190,6 +6146,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -6197,7 +6154,7 @@ class SyncHTTPClient:
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         interruptible: bool = False,
-    ) -> Iterator[dict[str, Any]]: ...
+    ) -> Generator[dict[str, Any]]: ...
     @overload
     def stream_post[TLine](
         self,
@@ -6208,6 +6165,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TLine] | TypeAdapterTyping[TLine] | DecoderTyping[TLine],
@@ -6215,7 +6173,7 @@ class SyncHTTPClient:
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         interruptible: bool = False,
-    ) -> Iterator[TLine]: ...
+    ) -> Generator[TLine]: ...
     def stream_post(
         self,
         path: str,
@@ -6225,6 +6183,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
@@ -6232,9 +6191,10 @@ class SyncHTTPClient:
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
         interruptible: bool = False,
-    ) -> Iterator[Any]:
-        """Like `stream_get`, but POST a body first — same `json`/`form`/`content` options as
-        `post` (at most one), same raw-bytes-by-default / NDJSON-via-`response_data_type` split.
+    ) -> Generator[Any]:
+        """Like `stream_get`, but POST a body first — same `json`/`data`/`form`/`content`
+        options as `post` (at most one), same raw-bytes-by-default / NDJSON-via-
+        `response_data_type` split.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
@@ -6259,6 +6219,7 @@ class SyncHTTPClient:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -6382,6 +6343,7 @@ class SyncHTTPClient:
         headers: Headers | None,
         timeout: float | None,
         json: JSONPayload | None,
+        data: Params | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
@@ -6397,6 +6359,7 @@ class SyncHTTPClient:
         request_builder = _attach_body_sync(
             request_builder,
             json,
+            data,
             form,
             content,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
@@ -6418,6 +6381,7 @@ class SyncHTTPClient:
         headers: Headers | None,
         timeout: float | None,
         json: JSONPayload | None,
+        data: Params | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
@@ -6436,6 +6400,7 @@ class SyncHTTPClient:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -6453,6 +6418,7 @@ class SyncHTTPClient:
         headers: Headers | None,
         timeout: float | None,
         json: JSONPayload | None,
+        data: Params | None,
         form: Form | None,
         content: str | bytes | None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
@@ -6469,20 +6435,31 @@ class SyncHTTPClient:
         request_builder = _attach_body_sync(
             request_builder,
             json,
+            data,
             form,
             content,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
         )
+        started = time.monotonic()
         raw_response, request_info = _send_sync(request_builder)
+        elapsed = time.monotonic() - started
         if error_for_status:
             self._check_status(raw_response, error_type, request_info)
-        data = self._decode_body(raw_response, response_data_type)
+        decoded = self._decode_body(raw_response, response_data_type)
         response_headers = CaseInsensitiveDict(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
             typed_headers = _parse_typed_headers(response_headers, response_headers_type)
-        return Result(data, raw_response.status, response_headers, typed_headers, request_info)
+        return Result(
+            decoded,
+            raw_response.status,
+            response_headers,
+            typed_headers,
+            request_info,
+            raw_response.version,
+            elapsed,
+        )
 
     @overload
     def post(
@@ -6494,6 +6471,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
@@ -6510,6 +6488,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -6527,6 +6506,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -6544,6 +6524,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -6560,6 +6541,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
@@ -6567,8 +6549,9 @@ class SyncHTTPClient:
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
     ) -> object:
-        """POST to `path` with at most one of `json`/`form`/`content` (raises `ValueError` if
-        more than one is given) and decode the response as `response_data_type`.
+        """POST to `path` with at most one of `json`/`data`/`form`/`content` (raises
+        `ValueError` if more than one is given) and decode the response as `response_data_type`.
+        `data` is a urlencoded body (`a=1&b=2`), `form` a `multipart/form-data` one.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
@@ -6581,6 +6564,7 @@ class SyncHTTPClient:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -6600,6 +6584,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
@@ -6616,6 +6601,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -6633,6 +6619,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -6650,6 +6637,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -6666,6 +6654,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
@@ -6686,6 +6675,7 @@ class SyncHTTPClient:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -6705,6 +6695,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
@@ -6721,6 +6712,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[dict[str, Any]],
@@ -6738,6 +6730,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[TData],
@@ -6755,6 +6748,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
@@ -6771,6 +6765,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         json: JSONPayload | None = None,
+        data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
@@ -6791,6 +6786,7 @@ class SyncHTTPClient:
             headers,
             timeout,
             json,
+            data,
             form,
             content,
             response_data_type,
@@ -6809,6 +6805,11 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
     ) -> bytes: ...
@@ -6821,6 +6822,11 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -6834,6 +6840,11 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[TData],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -6847,6 +6858,11 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
@@ -6859,11 +6875,17 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
     ) -> object:
-        """DELETE `path` and decode the response as `response_data_type`.
+        """DELETE `path` and decode the response as `response_data_type`. A body is rare on a
+        DELETE but allowed: the same `json`/`data`/`form`/`content` options as `post`, at most one.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
@@ -6875,12 +6897,13 @@ class SyncHTTPClient:
             params,
             headers,
             timeout,
-            None,
-            None,
-            None,
+            json,
+            data,
+            form,
+            content,
             response_data_type,
             skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=True,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
             error_type=error_type,
         )
@@ -6933,7 +6956,9 @@ class SyncHTTPClient:
         request_builder = self._prepare_request(
             self._client.head(path), params, headers, timeout, skip_auth=skip_auth
         )
+        started = time.monotonic()
         raw_response, request_info = _send_sync(request_builder)
+        elapsed = time.monotonic() - started
         if error_for_status:
             self._check_status(raw_response, error_type, request_info)
         response_headers = CaseInsensitiveDict(raw_response.headers)
@@ -6942,4 +6967,12 @@ class SyncHTTPClient:
             if response_headers_type is None
             else _parse_typed_headers(response_headers, response_headers_type)
         )
-        return Result(None, raw_response.status, response_headers, typed_headers, request_info)
+        return Result(
+            None,
+            raw_response.status,
+            response_headers,
+            typed_headers,
+            request_info,
+            raw_response.version,
+            elapsed,
+        )

@@ -5,22 +5,22 @@ icon: lucide/radio
 # Server-Sent Events (SSE)
 
 `sse()` opens a `GET` request with `Accept: text/event-stream` and always yields an `SSEEvent`,
-as the server sends them. It's an `AsyncIterator` on `HTTPClient` and a plain `Iterator` on
-`SyncHTTPClient` — breaking out of the loop closes the underlying connection.
+as the server sends them. It's an async generator on `HTTPClient` and a plain generator on
+`SyncHTTPClient`; to release the connection as soon as you stop reading, close it (`aclosing`/
+`closing`, or `.aclose()`/`.close()`), as [streaming](streaming.md) shows.
 
 ```python
-@dataclass(kw_only=True)
-class SSEEvent[TData, TId = str]:
-    id: TId
+@dataclass(slots=True, kw_only=True)
+class SSEEvent[TData]:
+    id: str = ""
     event: str = "message"
     data: TData
 ```
 
 `SSEEvent` is generic in `TData` — `response_data_type` controls what `.data` becomes (raw
-`str`, or decoded into a typed object). `.event` is always a plain `str`, never `None` — per the
-SSE spec, an event with no `event:` field on the wire is treated as type `"message"`, so there's
-always a value. `.id` is genuinely optional per spec (a server can choose never to send `id:`),
-which is what `id_type` (below) is about.
+`str`, or decoded into a typed object). `.event` and `.id` are always plain `str`, never `None`,
+with the same defaults a browser's `EventSource` uses: an event with no `event:` field is type
+`"message"`, and a stream that has sent no `id:` gives `""`.
 
 ## Raw events (default)
 
@@ -30,48 +30,19 @@ parsing, no model construction, just a plain `str`:
 
 ```python
 async for event in client.sse("events"):
-    print(event.data, event.event, event.id)  # SSEEvent[str, str]
+    print(event.data, event.event, event.id)  # SSEEvent[str]
 ```
 
-## The `id` field — `id_type` and `allow_missing_id`
+## The `id` field
 
-`id:` is always literal text on the wire, but it's frequently used to encode an integer, a
-`uuid.UUID`, or anything else with a single-argument `str`-taking constructor. Two independent
-knobs control it: `id_type` picks what `.id` becomes, and `allow_missing_id` picks whether a
-missing `id:` becomes `None` (the default) or raises:
+`.id` is the text of the server's `id:` field, or `""` when there isn't one (the spec makes it
+optional, and most real servers, OpenAI/Anthropic-style streams included, never send it). To use
+it as a number or a UUID, convert it yourself: `int(event.id)`.
 
-```python
-async for event in client.sse("events"):
-    print(event.id)  # str | None — None when the server sends no id (most don't)
-
-async for event in client.sse("events", id_type=int):
-    print(event.id)  # int | None — coerced when present
-
-async for event in client.sse("events", allow_missing_id=False):
-    print(event.id)  # str — required: an event without one raises
-
-async for event in client.sse("events", id_type=int, allow_missing_id=False):
-    print(event.id)  # int — required and coerced
-```
-
-- **`id_type=str`** (the default) — `.id` stays plain `str` when present.
-- **a bare type** (`id_type=int`, `id_type=uuid.UUID`) — `.id` coerced via `id_type(raw_id)`.
-- **`allow_missing_id=True`** (the default) — a missing `id:` becomes `None`. The spec makes `id`
-  optional and most real servers (OpenAI/Anthropic-style streams included) never send one.
-- **`allow_missing_id=False`** — a missing `id:` raises, and `.id` is typed without `None`; the
-  coercion type still applies.
-
-Events are immutable: `.id`, `.event` and `.data` are read-only, which is also what lets a
-`SSEEvent[str, str]` be used wherever a `SSEEvent[str, str | None]` is expected.
-
-"Missing" follows the spec's *last event ID buffer* semantics, not "this record had no `id:`
-line": once the server has sent an `id:`, every later event inherits it until the server sends a
-new one, and only an explicit empty `id:` line clears it. So a server that sends `id:` on some
-events but not others never trips `allow_missing_id=False` — only a stream that has sent no `id:`
-at all yet does. The same buffer is what goes out as `Last-Event-ID` on a reconnect (below).
-
-A conversion failure (e.g. `int("not-a-number")`) propagates as whatever exception that type's
-constructor raises — it isn't wrapped, same as every other decode-library error in lothc.
+It follows the spec's *last event ID buffer* semantics, not "this record had an `id:` line":
+once the server has sent an `id:`, every later event inherits it until the server sends a new
+one, and an explicit empty `id:` line resets it to `""`. The same buffer is what goes out as
+`Last-Event-ID` on a reconnect (below), which is omitted while it's empty.
 
 ## Decoding events
 

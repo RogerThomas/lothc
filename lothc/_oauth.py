@@ -21,7 +21,7 @@ from json import dumps as _json_dumps
 from json import loads as _json_loads
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
-from urllib.parse import quote, urlencode
+from urllib.parse import quote
 
 from ._client import HTTPClient, HTTPResponseError, JSONPayload, SyncHTTPClient
 from ._compat import BaseModelTyping, StructTyping
@@ -266,30 +266,29 @@ def _basic_authorization_header(client_id: str, client_secret: str) -> str:
 def _rfc_headers(
     client_id: str, client_secret: str, client_auth: Literal["basic", "body"]
 ) -> dict[str, str]:
-    """Per-request headers for an RFC 6749 token request: the form content type, plus the Basic
-    `Authorization` header when the credentials travel there rather than in the body.
+    """Per-request headers for an RFC 6749 token request: the Basic `Authorization` header when
+    the credentials travel there rather than in the body (`form=` sets the content type itself).
 
     >>> _rfc_headers("client-id", "client-secret", "body")
-    {'content-type': 'application/x-www-form-urlencoded'}
-    >>> sorted(_rfc_headers("client-id", "client-secret", "basic"))
-    ['authorization', 'content-type']
+    {}
+    >>> list(_rfc_headers("client-id", "client-secret", "basic"))
+    ['authorization']
     """
-    headers = {"content-type": "application/x-www-form-urlencoded"}
     if client_auth == "basic":
-        headers["authorization"] = _basic_authorization_header(client_id, client_secret)
-    return headers
+        return {"authorization": _basic_authorization_header(client_id, client_secret)}
+    return {}
 
 
 def _rfc_mint_body(
     client_id: str, client_secret: str, scope: str | None, client_auth: Literal["basic", "body"]
-) -> str:
-    """Form body for the client-credentials grant (RFC 6749 §4.4.2); credentials go in the body
+) -> dict[str, str]:
+    """Form fields for the client-credentials grant (RFC 6749 §4.4.2); credentials go in the body
     only with `client_auth="body"` (§2.3.1), otherwise they travel as HTTP Basic.
 
     >>> _rfc_mint_body("client-id", "client-secret", None, "basic")
-    'grant_type=client_credentials'
-    >>> _rfc_mint_body("client-id", "client-secret", "read write", "body")
-    'grant_type=client_credentials&scope=read+write&client_id=client-id&client_secret=client-secret'
+    {'grant_type': 'client_credentials'}
+    >>> list(_rfc_mint_body("client-id", "client-secret", "read write", "body"))
+    ['grant_type', 'scope', 'client_id', 'client_secret']
     """
     fields = {"grant_type": "client_credentials"}
     if scope is not None:
@@ -297,24 +296,24 @@ def _rfc_mint_body(
     if client_auth == "body":
         fields["client_id"] = client_id
         fields["client_secret"] = client_secret
-    return urlencode(fields)
+    return fields
 
 
 def _rfc_refresh_body(
     refresh_token: str, client_id: str, client_secret: str, client_auth: Literal["basic", "body"]
-) -> str:
-    """Form body for the refresh-token grant (RFC 6749 §6).
+) -> dict[str, str]:
+    """Form fields for the refresh-token grant (RFC 6749 §6).
 
     >>> _rfc_refresh_body("refresh-token", "client-id", "client-secret", "basic")
-    'grant_type=refresh_token&refresh_token=refresh-token'
-    >>> _rfc_refresh_body("refresh-token", "id", "secret", "body")
-    'grant_type=refresh_token&refresh_token=refresh-token&client_id=id&client_secret=secret'
+    {'grant_type': 'refresh_token', 'refresh_token': 'refresh-token'}
+    >>> list(_rfc_refresh_body("refresh-token", "id", "secret", "body"))
+    ['grant_type', 'refresh_token', 'client_id', 'client_secret']
     """
     fields = {"grant_type": "refresh_token", "refresh_token": refresh_token}
     if client_auth == "body":
         fields["client_id"] = client_id
         fields["client_secret"] = client_secret
-    return urlencode(fields)
+    return fields
 
 
 def _format_expires_at(expires_at: float) -> str:
@@ -553,11 +552,11 @@ class OAuthProvider:
             self._lock_loop = loop
         return self._lock
 
-    async def _post_rfc(self, body: str) -> _CachedToken:
+    async def _post_rfc(self, body: dict[str, str]) -> _CachedToken:
         headers = _rfc_headers(self._client_id, self._client_secret, self._client_auth)
         async with self._client_factory() as client:
             payload = await client.post(
-                self._token_url, content=body, headers=headers, response_data_type=dict
+                self._token_url, data=body, headers=headers, response_data_type=dict
             )
         return _token_from_rfc_payload(payload, self._default_expires_in, time.time())
 
@@ -688,11 +687,11 @@ class SyncOAuthProvider:
         )
         self._lock = threading.Lock()
 
-    def _post_rfc(self, body: str) -> _CachedToken:
+    def _post_rfc(self, body: dict[str, str]) -> _CachedToken:
         headers = _rfc_headers(self._client_id, self._client_secret, self._client_auth)
         with self._client_factory() as client:
             payload = client.post(
-                self._token_url, content=body, headers=headers, response_data_type=dict
+                self._token_url, data=body, headers=headers, response_data_type=dict
             )
         return _token_from_rfc_payload(payload, self._default_expires_in, time.time())
 

@@ -6,8 +6,20 @@ icon: lucide/waves
 
 `stream_get`/`stream_post` stream the response instead of buffering the whole body in memory —
 useful for large downloads, or a feed that keeps producing data over one long-lived connection.
-Like `sse()`, they're `AsyncIterator`s on `HTTPClient` and plain `Iterator`s on
-`SyncHTTPClient`; breaking out of the loop closes the underlying connection.
+Like `sse()`, they're async generators on `HTTPClient` and plain generators on
+`SyncHTTPClient`. If you stop reading early, close the stream to release its connection straight
+away, rather than whenever the generator is garbage-collected:
+
+```python
+from contextlib import aclosing
+
+async with aclosing(client.stream_get("feed")) as chunks:
+    async for chunk in chunks:
+        if done(chunk):
+            break  # the connection closes here
+```
+
+On `SyncHTTPClient`, use `contextlib.closing` or call `chunks.close()`.
 
 ## Raw chunks (default)
 
@@ -54,7 +66,7 @@ once the connection closes.
 
 ## Streaming a request with a body — `stream_post`
 
-`stream_post` takes the same `json`/`form`/`content` body options as `post` (at most one of
+`stream_post` takes the same `json`/`data`/`form`/`content` body options as `post` (at most one of
 them), so you can stream the *response* to a request that itself has a body — e.g. streaming
 back the results of a search:
 

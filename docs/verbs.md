@@ -11,6 +11,20 @@ async with HTTPClient(base_url="https://api.example.com/") as client:
     ...
 ```
 
+!!! warning "Write paths without a leading `/`"
+
+    Paths join onto `base_url` by the standard URL rules, so a leading `/` replaces the base's
+    own path instead of adding to it:
+
+    ```python
+    async with HTTPClient(base_url="https://api.example.com/v2/") as client:
+        await client.get("users")  # https://api.example.com/v2/users
+        await client.get("/users")  # https://api.example.com/users — the /v2/ is gone
+    ```
+
+    `base_url` itself must end with `/` when it has a path (`.../v2/`, not `.../v2`); lothc
+    raises `ValueError` otherwise.
+
 ## GET
 
 ```python
@@ -100,7 +114,11 @@ result.request.method  # "GET"
 result.request.url  # "https://api.example.com/items/7"
 result.request.path  # "/items/7"
 result.request.host  # "api.example.com"
+result.http_version  # "HTTP/1.1"
+result.elapsed  # 0.042: seconds from sending to having the whole response
 ```
+
+`result.elapsed` includes any retries, since it spans the whole call.
 
 `result.request` is the request actually sent — useful for logging, or for telling apart which
 call a `Result` came from when you're juggling several. It reflects the target you asked for, not
@@ -157,8 +175,8 @@ result.typed_headers.content_type  # "application/json"
 
 ## POST, PUT, PATCH
 
-All three take the same body options — provide at most one of `json`, `form`, or `content`
-(passing more than one raises `ValueError`):
+All three take the same body options — provide at most one of `json`, `data`, `form` or
+`content` (passing more than one raises `ValueError`):
 
 ```python
 await client.post("items", json={"name": "new-item"})
@@ -170,16 +188,25 @@ await client.patch("items/7", json={"name": "renamed"})
 libraries: a pydantic model is encoded by its aliases unless it sets `serialize_by_alias=False`,
 matching msgspec's `rename=`), or a top-level list
 for a JSON array body; it always sends `Content-Type: application/json`, replacing any you set.
+
+`data` sends a urlencoded body (`application/x-www-form-urlencoded`, what a plain HTML form
+submits), as `data=` does in requests and httpx. It takes the same values as `params`: a `dict`
+(a `list`/`tuple` value repeats the key, a `bool` goes out as `true`/`false`) or a
+`BaseModel`/`Struct`, whose `None` fields are omitted:
+
+```python
+await client.post("login", data={"user": "ash", "pass": "pikachu"})  # user=ash&pass=pikachu
+```
+
+`form` sends a `multipart/form-data` body: fields, JSON parts, raw bytes and files (see
+below).
+
 `content` sends a raw `str`/`bytes` body as-is and sets **no** `Content-Type` at all (unlike
 httpx/requests, which default a `str` to `text/plain`), so pass your own in `headers` if the
 server needs one:
 
 ```python
-await client.post(
-    "login",
-    content="user=ash&pass=pikachu",
-    headers={"content-type": "application/x-www-form-urlencoded"},
-)
+await client.post("render", content="# Title", headers={"content-type": "text/markdown"})
 ```
 
 Each works through `client.with_result` too, with the same body options, returning a `Result`
@@ -194,10 +221,10 @@ result.data  # ItemModel(...)
 result.status  # 200
 ```
 
-### Multipart forms and file uploads
+### Multipart forms — `form`
 
-`form` builds a real `multipart/form-data` body from a `dict`. Each value's type decides how
-it's sent:
+`form` builds a real `multipart/form-data` body from a `dict`, one part per key. Each value's
+type decides how it's sent:
 
 - `str`/`int`/`float`/`bool` — a plain form field. A `bool` goes out as `"true"`/`"false"`,
   the same way `params=` sends one.
@@ -254,6 +281,13 @@ await client.delete("items/7")  # bytes by default
 item = await client.delete("items/7", response_data_type=ItemModel)
 ```
 
+A body is rare on a DELETE but allowed (some APIs, like bulk or delete-by-query endpoints, need
+one), with the same `json`/`data`/`form`/`content` options as `post`:
+
+```python
+await client.delete("items", json={"ids": [7, 8]})
+```
+
 `client.with_result.delete(...)` works the same way, returning a `Result` instead of the bare
 decoded body.
 
@@ -295,5 +329,5 @@ first and renamed into place on success, so a download that fails partway (a dro
 a cancelled task) never leaves a truncated file behind, and an existing file at `dest` is left
 exactly as it was. Writes happen on the calling thread even for the async client: each chunk
 write takes microseconds, and moving them to a thread measured 2.5-3.8x slower. `download()` only ever does a `GET`; there's no
-`json`/`form`/`content` body option and no `response_data_type` — the response is always raw
+`json`/`data`/`form`/`content` body option and no `response_data_type` — the response is always raw
 bytes, on disk or in memory. Same `params`/`headers`/`error_for_status` as every other verb.

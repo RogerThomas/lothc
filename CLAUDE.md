@@ -35,6 +35,17 @@ GitHub Release. `.github/workflows/release.yml` triggers on `release: published`
 `uv publish`s to PyPI via Trusted Publishing (OIDC, no stored token, `pypi` GitHub Environment),
 then deploys docs to GitHub Pages.
 
+Publishing needs the tests to pass first: `release.yml` runs the whole of `ci.yml` (via
+`workflow_call`, `secrets: inherit` for Codecov) against the tagged commit, and before
+`uv publish` installs the built wheel with no extras and imports it, catching a module missing
+from the wheel. Side effect: ci.yml's Codecov step has `fail_ci_if_error: true`, so a Codecov
+outage blocks a release. CI's `test-no-extras` job (and `task test-no-extras`) runs every test
+module that never mentions pydantic/msgspec with both uninstalled (`--no-install-package`, then
+`uv run --no-sync`, since a plain `uv run` re-syncs them back), because the main job always has
+both and would miss an unguarded import. Only pyreqwest 0.13.0 is supported (`>=0.13.0`), so
+there's no lower-bound job; for the record the suite also passed on 0.11.6-0.12.x. Rename
+`CHANGELOG.md`'s `[Unreleased]` section to the new version when cutting a release.
+
 **Follow-up not yet done**: the `pypi` environment has no deployment protection rules (anyone who
 can create a GitHub Release can trigger a publish) — add a tag-pattern restriction under
 Settings → Environments → pypi as defense in depth. Left for manual GitHub UI setup since
@@ -56,18 +67,25 @@ SSE (`TypeAdapter`/`Decoder` support, spec-compliant reconnect — see dev notes
 `response_data_type`), `download` (see dev notes), the `Data` decode-target system (`bytes`
 default, `dict`, pydantic `BaseModel`, msgspec `Struct`), auth (`bearer_token` /
 `bearer_auth` callable / `basic_auth` pair — at most one; per-verb `skip_auth=True`), cookies
-(`cookie_store=True`), redirects (`follow_redirects`/`max_redirects`), `proxy=`, retries
+(`cookie_store=True`), redirects (`follow_redirects`/`max_redirects`), `proxy=`/`no_proxy=`,
+`user_agent=` (default `python-lothc/<version>`), `http2=`, `resolve=`, `local_address=`,
+`tcp_keepalive=`, retries
 (`max_retries`/`retry_methods`, real pyreqwest `with_middleware` hook, idempotent verbs by
 default), typed error bodies (`error_type=`, mirrors `response_data_type`), TLS/mTLS/pool config
 (`connect_timeout`, `root_certificates`, `identity_pem`, `min_tls_version`/`max_tls_version`,
 `danger_accept_invalid_certs`, `https_only`, `max_connections`, `pool_idle_timeout`,
 `pool_max_idle_per_host`, `pool_timeout`, `read_timeout`), request metadata (`.request:
-RequestInfo` on both `Result` and `HTTPResponseError`, every verb), OAuth 2 client credentials
+RequestInfo` on both `Result` and `HTTPResponseError`, every verb; `Result.http_version`/
+`.elapsed`), bodies on `delete`, OAuth 2 client credentials
 (`OAuthProvider`/`SyncOAuthProvider`, see dev notes), and a pytest mocking plugin (`lothc[testing]`
 — see dev notes).
 
-Not done yet: nothing outstanding right now — see git history/this file's own dev-notes for what's
-landed and why.
+Not done yet: `sse_post` (SSE over POST, deferred by the user). Maybe later, only if someone asks
+(dropped by the user; they came from a code review, not a request): request/response hooks, a
+generic `request()`/OPTIONS, streaming uploads, status/headers on stream/download calls,
+cookie-jar access. Deliberately not exposed: per-algorithm compression
+toggles, `interface`, `tcp_nodelay`, `referer`, CRLs. No final URL on `Result`: pyreqwest's
+response doesn't expose one.
 
 ## Testing
 
@@ -136,7 +154,7 @@ side** — confirmed twice in practice that one exists more often than expected:
 
 ### Test suite speed
 
-The suite runs in ~3.0s (385 tests), down from ~45s. It got there in two passes, and the useful
+The suite ran in ~3.0s (385 tests), down from ~45s; it's ~7.6s at 650 tests now, the growth being the deliberate timing tests (stream idle limits, retries) rather than overhead. It got there in two passes, and the useful
 lesson is what the time actually was: **not** per-test overhead. Measured, the fixed floor
 (interpreter + plugins + `import lothc` + collection) is ~0.45s, and ~360 of the tests cost ~2ms
 each including a real HTTP round trip. Everything else was a handful of deliberate sleeps.
@@ -188,6 +206,28 @@ ordering and degraded `-x`; the payoff *shrinks* as the suite gets faster, since
 ~0.85s of floor); **bypassing `uv run`** (~30ms); **lowering `/events`' default interval**
 (load-bearing for `test_sse_events_arrive_incrementally_not_buffered_until_stream_end`, which
 asserts on the per-event deltas).
+
+### Real TLS and sync/async parity tests
+
+- **TLS settings run against a real HTTPS server** (`tests/_tls_server.py`, certs minted by
+  `trustme`, a dev dependency). `conftest.py` provides `tls_ca_pem`, `tls_client_identity_pem`,
+  `https_base_url` and `mtls_base_url` (client cert required). The handshake runs on the handler
+  thread, so a failed one never blocks `serve_forever`. Every negative control in
+  `tests/test_tls.py` pins the rustls failure in `match=` (`UnknownIssuer`,
+  `CertificateRequired`, `UnknownCA`, `ProtocolVersion`) so it can't pass for an unrelated
+  reason. Certs load via stdlib `load_cert_chain` from a trustme tempfile, not trustme's
+  `configure_cert`, whose pyOpenSSL-typed signature is partially unknown to basedpyright.
+  `max_connections`/`pool_timeout` have a real test (one slot, two concurrent `/slow`);
+  `connect_timeout` can't be tested locally, since macOS completes the TCP connect even with a
+  full backlog.
+- **`tests/test_sync_async_parity.py` enforces the async/sync mirror.** Public API: same methods
+  and constructors, every overload's signature equal once async names map onto sync ones
+  (`_desync`). Implementation: every paired method body and module-level `foo`/`foo_sync` pair is
+  compared from source via `ast`, after stripping `async`/`await` and the `Sync` markers.
+  Intentional differences live in reasoned allowlists (sync-only `interruptible=`, the
+  `_sync_stream_chunks` readers, OAuth's lock), and an entry that stops differing fails. So a
+  feature added to one client only fails it. Mutation-checked: missing parameter, changed default,
+  missing method and body drift each fail.
 
 ### Doctests
 
@@ -353,10 +393,15 @@ the skill covers *how* to write new code that matches it.
   pyreqwest's. `tests/test_public_api.py` enforces all of this by walking every exported
   signature, overload and type alias in `lothc` and `lothc.testing` for a pyreqwest type; run
   against the old code, it flags exactly the four leaking constructors.
-- **`OAuthProvider`/`SyncOAuthProvider` (`lothc/_oauth.py`).** RFC path sends the token request as
-  `content=urlencode({...})` with an explicit `content-type: application/x-www-form-urlencoded`
-  header (lothc's `form=` is multipart-only, no urlencoded option). An aliased pydantic
-  `token_request=`/`token_response=` model needs `ConfigDict(validate_by_name=True)` so lothc can
+- **A bad `base_url` fails at construction, mirroring pyreqwest's rule.** pyreqwest rejects a
+  `base_url` with a query, a fragment, or a path not ending in `/` (without the slash a relative
+  path would replace the last segment), but only when the client is built, i.e. on entry.
+  `_is_joinable_base_url` repeats that rule in `_TransportSettings.__post_init__` with the same
+  message. Joining itself is pyreqwest's (RFC 3986): a leading `/` in a path drops the base's own
+  path prefix (`base_url=".../api/v2/"` + `get("/users")` hits `/users`), and an absolute or
+  protocol-relative (`//host/...`) path overrides the base, taking auth headers with it.
+- **`OAuthProvider`/`SyncOAuthProvider` (`lothc/_oauth.py`).** RFC path sends the token request
+  with `data=` (urlencoded). An aliased pydantic `token_request=`/`token_response=` model needs `ConfigDict(validate_by_name=True)` so lothc can
   construct it by field name (it used to need `serialize_by_alias=True` too, before lothc encoded
   pydantic models by alias; see below); msgspec `field(name=...)` needs nothing. Both provider classes are plain classes with an explicit
   keyword-only `__init__`, not `@dataclass` — zuban alone rejects a dataclass instance as
@@ -512,8 +557,8 @@ the skill covers *how* to write new code that matches it.
 - **`client.with_result.<verb>`, not `<verb>_result` methods or a bool flag.** The `*_result`
   twins read wrong, and a flag (`post(..., as_result=True)`) would make the return type depend on a
   runtime `bool`: that multiplies every verb's overloads by `Literal[True]`/`Literal[False]`/`bool`,
-  and a non-literal `bool` argument matches no overload at all (the same trap as `sse`'s
-  `allow_missing_id=`). It would also leave `response_headers_type` meaningful in only one mode.
+  and a non-literal `bool` argument matches no overload at all (the same trap `sse`'s former
+  `allow_missing_id=` hit). It would also leave `response_headers_type` meaningful in only one mode.
   A namespace keeps one return type per method and scopes `response_headers_type` to where it
   applies, with the same surface as before, just moved (prior art: the OpenAI/Anthropic SDKs'
   `client.with_raw_response`). Named `with_result`, not `with_response`, because it returns a
@@ -533,6 +578,14 @@ the skill covers *how* to write new code that matches it.
   to keep the surface flat. `RedirectError` is deliberately excluded: a redirect loop can be
   transient. The retry middleware needed no change — it only catches `PyreqwestTransportError`,
   and `.build()` runs outside `next.run` anyway, so a `BuilderError` never reached it.
+- **A body cut off partway is retried, a corrupt one isn't.** pyreqwest reads a non-streamed
+  body inside `send()`, so a body error surfaces inside the retry middleware's `next.run` and can
+  be retried there. A truncated chunked body is already a `ReadError` (a `TransportError`); one
+  shorter than its `Content-Length` is a `BodyDecodeError`, the same type as a corrupt gzip body.
+  `_is_retryable_send_error` retries a decode error only when one of its causes is hyper's
+  "error reading a body from connection" (probed: truncation always has it, corrupt gzip/br/
+  deflate/zstd never do). Gotcha when testing: a "corrupt" gzip body shorter than gzip's 10-byte
+  header ends the decoder early and comes back as a `ReadError`, i.e. already retryable.
 - **`backoff_base` is a client constructor parameter, not just a `_RetryMiddleware` field default.** It was
   private, so a user on a retry-heavy path had no way to tune backoff at all (and the retry tests
   couldn't shrink their ~2s of real sleeping). Same default (0.1), same
@@ -563,6 +616,14 @@ the skill covers *how* to write new code that matches it.
   one `cast` in `__init__` covers a basedpyright artifact, not a real case: it narrows the
   `Iterable[tuple[str, str]]` member against `Mapping` too, synthesizing a
   `Mapping[tuple[str, str], Unknown]` the declared type can't produce.
+- **`data=` is urlencoded, `form=` is multipart.** There used to be no urlencoded option at all
+  (OAuth built `content=urlencode(...)` plus a header by hand). `data=` matches requests/httpx,
+  where `data=` is the urlencoded one, so a call brought over from them sends the same body.
+  Settled after trying `form=`/`parts=`; `multipart=`, `xform=`/`mform=` were also rejected.
+  "data" also names response bodies here (`Result.data`, `SSEEvent.data`, the mocker's `data=`),
+  accepted as the cost of matching requests/httpx. `data=` takes `Params` and reuses its encoding
+  (`_query_pairs(_encode_params(...))`) into pyreqwest's native `.form()`, which takes the same
+  pairs as `.query()` (probed: repeats keys, `true`/`false`).
 - **A `Form` repeat tuple must be homogeneous** — `tuple[_FormValue, ...]` also admitted
   `(b"...", "image/png")`, which reads like a file plus its content-type but has no filename to be
   one, and silently went out as a binary part *plus* a text part reading `"image/png"` (confirmed
@@ -603,23 +664,22 @@ the skill covers *how* to write new code that matches it.
   whichever of the three is configured.
 - **`response_data_type` defaults to `bytes` everywhere** except `sse()`, whose bare default stays
   `SSEEvent[str]` — a stream of named records has no single "raw bytes" analogue.
-- **`SSEEvent[TData, TId = str | None]`, and `sse()` allows a missing `id` by default** — the
-  class's own `TId` default must track `sse()`'s actual default (these disagreeing was a real bug
-  once). The default used to *require* `id`, which failed on the first event from most real
-  servers (OpenAI/Anthropic-style streams never send one); `allow_missing_id=False` is now the
-  opt-in, giving `str`-typed ids. The overloads are `allow_missing_id: Literal[False]` (required)
-  → `SSEEvent[..., TId]` and `allow_missing_id: bool = True` → `SSEEvent[..., TId | None]`,
-  which only type-check without `reportOverlappingOverload` if `SSEEvent` is *covariant*. That's
-  why it's a plain class with read-only properties, not a dataclass: even a frozen dataclass (or
-  a `NamedTuple`) is invariant, because the synthesized `__replace__`/`_replace` takes the field
-  types as parameters, and an explicitly covariant `TypeVar` is rejected by mypy for the same
-  reason (all four checkers probed). `__eq__`/`__hash__` go through a private `_key()` with a
-  concrete return type, since `isinstance` narrows `other` to `SSEEvent[Unknown, Unknown]`. `.event` is always `str` (spec default
-  `"message"`); `.id` is genuinely `str | None` per spec. `id_type`/`allow_missing_id` are two
-  independent knobs (type coercion vs. requiredness) — a union-accepting `id_type` design was
-  tried and rejected: it breaks `mypy`/`ty`/`zuban`'s handling of a real `UnionType` value where
-  `basedpyright` alone would decompose it. `response_data_type` scopes to `.data` only — `sse()`
-  must never yield the decoded value bare, always inside a full `SSEEvent`.
+- **`SSEEvent[TData]` with `id: str = ""`, no id options.** A missing id reads as `""`, which is
+  what the spec's last-event-id buffer and a browser's `lastEventId` both use, so `.id` is
+  always `str` with no flag. This replaced `id_type=` (coercion) plus `allow_missing_id=`
+  (`None` vs. raising): together they cost twelve overloads per client, a second type parameter,
+  and a hand-written covariant class, since `Literal[False]`/`bool` overloads only stop
+  overlapping if `SSEEvent` is covariant, which no dataclass is (its `__replace__` makes the
+  fields invariant). Converting is `int(event.id)` at the call site. Not `frozen=True`, since
+  `.data` can be a `dict` (style-guide §1). An empty buffer sends no `Last-Event-ID`.
+  `response_data_type` scopes to `.data` only — `sse()` must never yield the decoded value bare,
+  always inside a full `SSEEvent`.
+- **`sse`/`stream_get`/`stream_post` are typed `Generator`/`AsyncGenerator`, not `Iterator`.**
+  They always were generators at runtime, but `Iterator`/`AsyncIterator` has no `close()`/
+  `aclose()`, so a caller who stopped reading early couldn't release the connection without a
+  cast, and an async generator abandoned by `break` stays open until the loop's finalizer runs.
+  `tests/test_stream_close.py` checks both halves: the calls type-check (mypy rejects
+  them against the old types) and the server really sees the hang-up (it doesn't without the close).
 - **`response_data_type` means something different on `stream_get`/`stream_post` than everywhere
   else** — whole-body decode on `get`/`post`/etc., per-NDJSON-line decode on the streaming verbs.
   Deliberate name reuse for consistency, not an oversight — called out in `docs/streaming.md`.

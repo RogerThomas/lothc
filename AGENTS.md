@@ -24,11 +24,13 @@ async with HTTPClient(
     bearer_auth=None,
     basic_auth=None,  # (username, password | None)
     default_headers=None,  # Headers: a Mapping or BaseModel/Struct, encoded like headers=
+    user_agent=None,  # default "python-lothc/<version>"; a per-request headers= overrides it
     timeout=30.0,  # total cap, except a gap limit for stream_get/stream_post/download (below)
     cookie_store=False,
     follow_redirects=True,
     max_redirects=None,
     proxy=None,
+    no_proxy=None,  # list/tuple of hosts that skip proxy (NO_PROXY format); needs proxy
     max_retries=0,
     retry_methods=None,  # set/frozenset/list/tuple of str, case-insensitive; empty = retry nothing
     backoff_base=0.1,
@@ -41,6 +43,10 @@ async with HTTPClient(
     max_tls_version=None,
     danger_accept_invalid_certs=False,
     https_only=False,
+    http2=False,  # negotiate HTTP/2 via TLS ALPN, falling back to HTTP/1.1
+    resolve=None,  # {hostname: ip}: skip DNS for these hosts (the URL's port still applies)
+    local_address=None,  # source IP to connect from
+    tcp_keepalive=None,  # seconds; TCP keepalive probes on idle connections
     max_connections=None,
     pool_idle_timeout=None,
     pool_max_idle_per_host=None,
@@ -49,7 +55,7 @@ async with HTTPClient(
     ...
 ```
 
-The constructor only validates and stores settings (conflicting auth raises `ValueError` here);
+The constructor only validates and stores settings (conflicting auth, or `no_proxy` without `proxy`, raises `ValueError` here);
 entering builds and opens the pyreqwest client. A client can be entered again after it exits (a
 module-level client works across separate `asyncio.run()` calls); entering an already-open one, or
 using one that isn't open, raises `RuntimeError`. `bearer_auth` is `Callable[[], Awaitable[str]]`
@@ -109,22 +115,22 @@ and a no-op if the provider has already renewed. Any `bearer_auth` with an
 ## Verbs
 
 - `get(path, *, params=None, headers=None, response_data_type=bytes, error_for_status=True, error_type=None) -> Data`
-- `post/put/patch(path, *, params=None, headers=None, json=None, form=None, content=None, response_data_type=bytes, error_for_status=True, error_type=None) -> Data` —
-  at most one of `json`/`form`/`content`, else `ValueError`
-- `delete(path, *, params=None, headers=None, response_data_type=bytes, ...) -> Data`
+- `post/put/patch(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, response_data_type=bytes, error_for_status=True, error_type=None) -> Data` —
+  at most one of `json`/`data`/`form`/`content`, else `ValueError`
+- `delete(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, response_data_type=bytes, ...) -> Data` — a body is optional
 - `client.with_result.get/post/put/patch/delete(...)` — same arguments plus
   `response_headers_type=None`, returning `Result` (`.data .status .headers .typed_headers .request`)
   instead of the bare body. A namespace, not a flag, so each method has one return type.
+  `Result.http_version` (e.g. `"HTTP/1.1"`) and `Result.elapsed` (seconds, including retries).
 - `head(path, *, params=None, headers=None, response_headers_type=None, error_for_status=True) -> Result[None]`
-- `sse(path, *, params=None, headers=None, response_data_type=None, id_type=str, allow_missing_id=True, error_for_status=True) -> Iterator[SSEEvent[TData, TId]]` —
-  yields `SSEEvent(id=, event=, data=)` (kw-only, read-only, `SSEEvent[TData, TId = str | None]`).
+- `sse(path, *, params=None, headers=None, response_data_type=None, error_for_status=True) -> Generator[SSEEvent[TData]]` —
+  yields `SSEEvent(id=, event=, data=)` (kw-only dataclass, `SSEEvent[TData]`).
   `response_data_type` controls `.data` only (default `str`); class | `TypeAdapter` | `Decoder`.
-  `.event` is always `str` (spec default `"message"`). `.id` is `None` when the server sends none
-  (the default, since most servers never do); `allow_missing_id=False` makes it required and
-  `str`-typed. `id_type` (a bare type, default `str`) coerces it via `id_type(raw)`.
-- `stream_get(path, *, params=None, headers=None, response_data_type=None, error_for_status=True) -> Iterator[bytes | TLine]` —
+  `.event` and `.id` are always `str`, defaulting to `"message"` and `""` as the spec does.
+- `stream_get(path, *, params=None, headers=None, response_data_type=None, error_for_status=True) -> Generator[bytes | TLine]` —
   raw unbuffered bytes by default; `response_data_type` switches to newline-buffered per-line decode
-- `stream_post(path, *, ..., json=None, form=None, content=None, response_data_type=None, ...) -> Iterator[bytes | TLine]`
+- `stream_post(path, *, ..., json=None, data=None, form=None, content=None, response_data_type=None, ...) -> Generator[bytes | TLine]`
+  (async: `AsyncGenerator`). Generators so a caller can `close()`/`aclose()` one it stops reading early.
 - `download(path, dest=None, *, params=None, headers=None, error_for_status=True) -> bytes | None` —
   large bodies: no `dest` returns `bytes` (~2/3 the peak memory of `get()`), `dest` (`str` or
   path-like) streams to a file (O(chunk size) memory), written to a hidden sibling and renamed on
@@ -138,7 +144,8 @@ replaces the gap limit. `sse()` has no gap limit unless `read_timeout` is set.
 `params`'s value may also be a `list[...]`/`tuple[...]` of `str | int | float | bool` — sends that
 key once per element (`{"tag": ["a", "b"]}` → `?tag=a&tag=b`). `json`: `dict` | `list` | `BaseModel`
 | `Struct`; pydantic models encode by alias (like msgspec's `rename=`) unless they set
-`serialize_by_alias=False`. `form`: `dict[str, str | int | float | bool | bytes | list | dict |
+`serialize_by_alias=False`. `data`: urlencoded body, same types as `params`. `form`
+(`multipart/form-data`): `dict[str, str | int | float | bool | bytes | list | dict |
 model | File | tuple[...]]` — a `tuple` repeats the field and must be homogeneous; a `list` is always
 one JSON part; `bool` sends `"true"`/`"false"`. `content`: raw `str | bytes`, no `Content-Type` set.
 `Result.headers` / `HTTPResponseError.headers` are a `CaseInsensitiveDict`: case-insensitive

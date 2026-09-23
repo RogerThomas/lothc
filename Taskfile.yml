@@ -47,6 +47,19 @@ tasks:
     desc: Run a single test in isolation
     cmd: '{{.PYTEST_RUN}} {{.CLI_ARGS}}'
 
+  test-no-extras:
+    # Mirrors CI's `test-no-extras` job (.github/workflows/ci.yml): the locked dev group minus
+    # pydantic/msgspec, in a throwaway env so the project's own .venv keeps both extras.
+    desc: Run every test module that doesn't need pydantic/msgspec, with neither installed
+    cmd: |
+      set -eu
+      env_dir="$(mktemp -d)"
+      trap 'rm -rf "$env_dir"' EXIT
+      export UV_PROJECT_ENVIRONMENT="$env_dir"
+      uv sync -q --group dev --no-install-package pydantic --no-install-package pydantic-core --no-install-package msgspec
+      uv run --no-sync python -c "import importlib.util as u; present = [m for m in ('pydantic', 'msgspec') if u.find_spec(m)]; assert not present, present; import lothc, lothc.testing"
+      uv run --no-sync pytest {{.PYTEST_ARGS}} $(grep -LE 'pydantic|msgspec' tests/test_*.py) {{.CLI_ARGS}}
+
   # ------------------------------------------------------------------------------------------------
   # - Lint / format / typecheck ----------------------------------------------------------------------
   # ------------------------------------------------------------------------------------------------

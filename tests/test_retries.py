@@ -253,3 +253,128 @@ async def test_max_retry_after_none_honours_any_wait(base_url: str) -> None:
         )
 
     assert result == {"attempts": 2}
+
+
+async def test_a_body_cut_off_partway_is_retried(base_url: str) -> None:
+    # Shorter than its `Content-Length`: pyreqwest reports this as a decode error, not a transport
+    # error, so it used to fail the call even with retries left.
+    async with HTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
+        result = await client.get(
+            "body-flaky", params={"key": "body-flaky-1", "fail_times": 2}, response_data_type=dict
+        )
+
+    assert result == {"attempts": 3}
+
+
+def test_sync_a_body_cut_off_partway_is_retried(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
+        result = client.get(
+            "body-flaky",
+            params={"key": "sync-body-flaky-1", "fail_times": 2},
+            response_data_type=dict,
+        )
+
+    assert result == {"attempts": 3}
+
+
+async def test_a_body_cut_off_on_every_attempt_raises_a_connection_error(base_url: str) -> None:
+    async with HTTPClient(base_url=base_url, max_retries=1, backoff_base=0.001) as client:
+        with pytest.raises(HTTPConnectionError):
+            await client.get("body-flaky", params={"key": "body-flaky-exhausted", "fail_times": 5})
+
+
+async def test_a_body_that_cannot_be_decompressed_is_not_retried(base_url: str) -> None:
+    # Unlike a cut-off body, a corrupt one comes back the same on every attempt.
+    async with HTTPClient(base_url=base_url, max_retries=3, backoff_base=0.001) as client:
+        with pytest.raises(HTTPConnectionError):
+            await client.get("corrupt-gzip", params={"key": "corrupt-gzip-1"})
+        hits = await client.get("hits", params={"key": "corrupt-gzip-1"}, response_data_type=dict)
+
+    assert hits == {"hits": 1}
+
+
+def test_sync_a_body_that_cannot_be_decompressed_is_not_retried(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, max_retries=3, backoff_base=0.001) as client:
+        with pytest.raises(HTTPConnectionError):
+            client.get("corrupt-gzip", params={"key": "sync-corrupt-gzip-1"})
+        hits = client.get("hits", params={"key": "sync-corrupt-gzip-1"}, response_data_type=dict)
+
+    assert hits == {"hits": 1}
+
+
+async def test_a_cut_off_body_on_a_post_is_not_retried_by_default(base_url: str) -> None:
+    async with HTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
+        with pytest.raises(HTTPConnectionError):
+            await client.post("body-flaky", params={"key": "body-flaky-post", "fail_times": 1})
+
+
+def test_sync_retries_honors_retry_after_header(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, max_retries=1) as client:
+        result = client.get(
+            "retry-after", params={"key": "sync-retry-after-1"}, response_data_type=dict
+        )
+
+    assert result == {"attempts": 2}
+
+
+def test_sync_retries_honors_http_date_retry_after_header(base_url: str) -> None:
+    retry_after = format_datetime(datetime.now(UTC))
+    with SyncHTTPClient(base_url=base_url, max_retries=1) as client:
+        result = client.get(
+            "retry-after-custom",
+            params={"key": "sync-retry-after-http-date", "value": retry_after},
+            response_data_type=dict,
+        )
+
+    assert result == {"attempts": 2}
+
+
+def test_sync_retries_falls_back_to_backoff_on_malformed_retry_after_header(
+    base_url: str,
+) -> None:
+    with SyncHTTPClient(base_url=base_url, max_retries=1, backoff_base=0.001) as client:
+        result = client.get(
+            "retry-after-custom",
+            params={"key": "sync-retry-after-malformed", "value": "not-a-date"},
+            response_data_type=dict,
+        )
+
+    assert result == {"attempts": 2}
+
+
+def test_sync_a_retry_after_longer_than_max_retry_after_raises_with_the_header(
+    base_url: str,
+) -> None:
+    # Mirrors the async test with the same 120s wait, so the elapsed ceiling proves the sync client
+    # stopped rather than slept.
+    with SyncHTTPClient(base_url=base_url, max_retries=2, max_retry_after=60) as client:
+        started = time.monotonic()
+        with pytest.raises(HTTPResponseError) as exc_info:
+            client.get("retry-after-custom", params={"key": "sync-retry-after-120", "value": "120"})
+        elapsed = time.monotonic() - started
+
+    assert exc_info.value.status == 429
+    assert exc_info.value.headers["Retry-After"] == "120"
+    assert elapsed < 1.0
+
+
+def test_sync_a_retry_after_within_max_retry_after_is_still_honoured(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, max_retries=1, max_retry_after=60) as client:
+        result = client.get(
+            "retry-after-custom",
+            params={"key": "sync-retry-after-within", "value": "0"},
+            response_data_type=dict,
+        )
+
+    assert result == {"attempts": 2}
+
+
+def test_sync_max_retry_after_none_honours_any_wait(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, max_retries=1, max_retry_after=None) as client:
+        result = client.get(
+            "retry-after-custom",
+            params={"key": "sync-retry-after-no-limit", "value": "0"},
+            response_data_type=dict,
+        )
+
+    assert result == {"attempts": 2}

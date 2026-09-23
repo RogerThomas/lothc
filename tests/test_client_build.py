@@ -1,9 +1,11 @@
 import asyncio
+from importlib.metadata import version
+from urllib.parse import urlsplit
 
 import pytest
 from pydantic import BaseModel
 
-from lothc import HTTPClient, SyncHTTPClient
+from lothc import HTTPClient, HTTPConnectionError, SyncHTTPClient
 
 
 class _DefaultHeaders(BaseModel):
@@ -190,3 +192,155 @@ def test_sync_exiting_a_client_that_is_not_open_is_harmless(base_url: str) -> No
     with client:
         pass
     client.__exit__(None, None, None)
+
+
+async def test_user_agent_is_sent_on_every_request(base_url: str) -> None:
+    async with HTTPClient(base_url=base_url, user_agent="agent-name/1.0") as client:
+        result = await client.get("echo-headers", response_data_type=dict)
+
+    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    assert headers["user-agent"] == "agent-name/1.0"
+
+
+def test_sync_user_agent_is_sent_on_every_request(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, user_agent="agent-name/1.0") as client:
+        result = client.get("echo-headers", response_data_type=dict)
+
+    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    assert headers["user-agent"] == "agent-name/1.0"
+
+
+async def test_a_per_request_user_agent_header_overrides_user_agent(base_url: str) -> None:
+    async with HTTPClient(base_url=base_url, user_agent="agent-name/1.0") as client:
+        result = await client.get(
+            "echo-headers", headers={"user-agent": "override/2.0"}, response_data_type=dict
+        )
+
+    values = [h["value"] for h in result["headers"] if h["name"].lower() == "user-agent"]
+    assert values == ["override/2.0"]
+
+
+async def test_a_proxy_that_is_down_fails_requests(base_url: str) -> None:
+    # The control for the `no_proxy` tests below: without an exclusion, requests go through the
+    # (unreachable) proxy and fail.
+    async with HTTPClient(base_url=base_url, proxy="http://127.0.0.1:1") as client:
+        with pytest.raises(HTTPConnectionError):
+            await client.get("items/7")
+
+
+async def test_no_proxy_hosts_bypass_the_proxy(base_url: str) -> None:
+    async with HTTPClient(
+        base_url=base_url, proxy="http://127.0.0.1:1", no_proxy=["127.0.0.1"]
+    ) as client:
+        result = await client.get("items/7", response_data_type=dict)
+
+    assert result == {"id": 7, "name": "item-7"}
+
+
+def test_sync_no_proxy_hosts_bypass_the_proxy(base_url: str) -> None:
+    with SyncHTTPClient(
+        base_url=base_url, proxy="http://127.0.0.1:1", no_proxy=["localhost", "127.0.0.1"]
+    ) as client:
+        result = client.get("items/7", response_data_type=dict)
+
+    assert result == {"id": 7, "name": "item-7"}
+
+
+async def test_no_proxy_that_does_not_match_still_uses_the_proxy(base_url: str) -> None:
+    async with HTTPClient(
+        base_url=base_url, proxy="http://127.0.0.1:1", no_proxy=["other-host"]
+    ) as client:
+        with pytest.raises(HTTPConnectionError):
+            await client.get("items/7")
+
+
+def test_no_proxy_without_a_proxy_is_rejected() -> None:
+    with pytest.raises(ValueError, match="'no_proxy' needs a 'proxy'"):
+        HTTPClient(no_proxy=["localhost"])
+
+
+def test_sync_no_proxy_without_a_proxy_is_rejected() -> None:
+    with pytest.raises(ValueError, match="'no_proxy' needs a 'proxy'"):
+        SyncHTTPClient(no_proxy=["localhost"])
+
+
+async def test_http2_falls_back_to_http1_against_an_http1_only_server(base_url: str) -> None:
+    async with HTTPClient(base_url=base_url, http2=True) as client:
+        result = await client.get("items/7", response_data_type=dict)
+
+    assert result == {"id": 7, "name": "item-7"}
+
+
+def test_sync_http2_falls_back_to_http1_against_an_http1_only_server(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, http2=True) as client:
+        result = client.get("items/7", response_data_type=dict)
+
+    assert result == {"id": 7, "name": "item-7"}
+
+
+async def test_the_default_user_agent_names_lothc_and_its_version(base_url: str) -> None:
+    async with HTTPClient(base_url=base_url) as client:
+        result = await client.get("echo-headers", response_data_type=dict)
+
+    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    assert headers["user-agent"] == f"python-lothc/{version('lothc')}"
+
+
+def test_sync_the_default_user_agent_names_lothc_and_its_version(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url) as client:
+        result = client.get("echo-headers", response_data_type=dict)
+
+    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    assert headers["user-agent"] == f"python-lothc/{version('lothc')}"
+
+
+async def test_resolve_sends_a_hostname_to_the_given_address(base_url: str) -> None:
+    # `lothc.test` exists only through the override; the URL's own port is still used.
+    port = urlsplit(base_url).port
+    async with HTTPClient(resolve={"lothc.test": "127.0.0.1"}) as client:
+        result = await client.get(f"http://lothc.test:{port}/items/7", response_data_type=dict)
+
+    assert result == {"id": 7, "name": "item-7"}
+
+
+def test_sync_resolve_sends_a_hostname_to_the_given_address(base_url: str) -> None:
+    port = urlsplit(base_url).port
+    with SyncHTTPClient(resolve={"lothc.test": "127.0.0.1"}) as client:
+        result = client.get(f"http://lothc.test:{port}/items/7", response_data_type=dict)
+
+    assert result == {"id": 7, "name": "item-7"}
+
+
+async def test_local_address_is_the_address_connections_come_from(base_url: str) -> None:
+    async with HTTPClient(base_url=base_url, local_address="127.0.0.1") as client:
+        result = await client.get("items/7", response_data_type=dict)
+
+    assert result == {"id": 7, "name": "item-7"}
+
+
+async def test_a_local_address_this_machine_does_not_have_fails_to_connect(base_url: str) -> None:
+    # 192.0.2.1 is reserved for documentation (TEST-NET-1), so it can't be bound: proof that
+    # `local_address` really reaches the socket.
+    async with HTTPClient(base_url=base_url, local_address="192.0.2.1") as client:
+        with pytest.raises(HTTPConnectionError):
+            await client.get("items/7")
+
+
+async def test_tcp_keepalive_is_accepted(base_url: str) -> None:
+    # Keepalive probes aren't observable from here; this only checks the setting is wired in
+    # without breaking requests.
+    async with HTTPClient(base_url=base_url, tcp_keepalive=30.0) as client:
+        result = await client.get("items/7", response_data_type=dict)
+
+    assert result == {"id": 7, "name": "item-7"}
+
+
+@pytest.mark.parametrize("base_url", ["http://host/api", "http://host/api/?key=value"])
+def test_an_unjoinable_base_url_is_rejected_at_construction(base_url: str) -> None:
+    with pytest.raises(ValueError, match="trailing slash"):
+        HTTPClient(base_url=base_url)
+
+
+def test_sync_an_unjoinable_base_url_is_rejected_at_construction() -> None:
+    with pytest.raises(ValueError, match="trailing slash"):
+        SyncHTTPClient(base_url="http://host/api")

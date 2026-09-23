@@ -414,6 +414,28 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
         time.sleep(seconds)
 
+    def _handle_endless(self, query: str) -> None:
+        # Streams chunks until the client hangs up, then counts the hang-up (per `key`), so a
+        # test can assert that closing a stream early really releases its connection.
+        key = parse_qs(query)["key"][0]
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        try:
+            while True:
+                self.wfile.write(b"5\r\nchunk\r\n")
+                self.wfile.flush()
+                time.sleep(0.005)
+        except ConnectionError:
+            self._bump_counter(f"{key}-hangups")
+
+    def _handle_hits(self, query: str) -> None:
+        # Reads back any per-key counter, for routes whose own response can't carry it.
+        key = parse_qs(query)["key"][0]
+        self._write_json(200, {"hits": self._counters.get(key, 0)})
+
     def _handle_rejects_first_token(self) -> None:
         # Stands in for an API whose first-issued token was revoked before it expired: the token
         # endpoint issues `token-1`, `token-2`, ..., and this rejects `token-1` with a 401.
@@ -469,6 +491,34 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self.close_connection = True  # abruptly drop the connection, no response at all
             return
         self._write_json(200, {"attempts": attempt})
+
+    def _handle_body_flaky(self, query: str) -> None:
+        # Like `/connection-flaky`, but the first `fail_times` responses die partway through the
+        # body (fewer bytes than `Content-Length` promised) rather than before any response.
+        params = parse_qs(query)
+        attempt = self._bump_counter(params["key"][0])
+        if attempt > int(params["fail_times"][0]):
+            self._write_json(200, {"attempts": attempt})
+            return
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", "100")
+        self.end_headers()
+        self.wfile.write(b'{"attempts": ')
+        self.wfile.flush()
+
+    def _handle_corrupt_gzip(self, query: str) -> None:
+        # A complete response whose body can never be decompressed, however often it's fetched.
+        # At least gzip's 10-byte header: a shorter body ends the decoder early, which pyreqwest
+        # reports as a connection error rather than a decode one.
+        self._bump_counter(parse_qs(query)["key"][0])
+        body = b"this-is-not-gzip"
+        self.send_response(200)
+        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_slow(self, query: str) -> None:
         # `seconds` lets each caller buy exactly the delay its own assertion needs, rather than
@@ -581,6 +631,10 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/oauth/token-requests": self._handle_oauth_token_requests,
             "/echo-query": self._handle_echo_query,
             "/slow": self._handle_slow,
+            "/endless": self._handle_endless,
+            "/hits": self._handle_hits,
+            "/body-flaky": self._handle_body_flaky,
+            "/corrupt-gzip": self._handle_corrupt_gzip,
             "/always-unauthorized": self._handle_always_unauthorized,
             "/json-literal": self._handle_json_literal,
             "/stall-after-first-chunk": self._handle_stall_after_first_chunk,
@@ -637,6 +691,11 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self._write_json(200, self._read_json_body())
         elif parsed.path == "/flaky":
             self._handle_flaky(parsed.query)
+        elif parsed.path == "/body-flaky":
+            self._handle_body_flaky(parsed.query)
+        elif parsed.path == "/endless":
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self._handle_endless(parsed.query)
         elif parsed.path == "/ndjson-echo":
             self._handle_ndjson_echo()
         elif parsed.path == "/upload":
@@ -674,6 +733,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/items/"):
             item_id = int(self.path.removeprefix("/items/"))
             self._write_json(200, {"id": item_id, "deleted": True})
+        elif self.path == "/echo-body":
+            self._handle_echo_body()
         else:
             self._write_json(404, _not_found_body)
 

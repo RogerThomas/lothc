@@ -246,3 +246,33 @@ def test_headers_update_accepts_a_non_mapping_keys_and_getitem_source() -> None:
     headers.update(_KeysAndGetItem({"Content-Type": "application/json"}))
 
     assert headers["content-type"] == "application/json"
+
+
+async def test_result_reports_the_http_version(client: HTTPClient) -> None:
+    result = await client.with_result.get("items/7")
+
+    assert result.http_version == "HTTP/1.1"
+
+
+def test_sync_head_result_reports_the_http_version(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.head("items/7")
+
+    assert result.http_version == "HTTP/1.1"
+
+
+async def test_result_elapsed_covers_the_time_the_server_took(client: HTTPClient) -> None:
+    result = await client.with_result.get("slow", params={"seconds": 0.05})
+
+    assert 0.05 <= result.elapsed < 2.0
+
+
+def test_sync_result_elapsed_covers_the_time_the_server_took(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.with_result.get("slow", params={"seconds": 0.05})
+
+    assert 0.05 <= result.elapsed < 2.0
+
+
+async def test_head_result_has_an_elapsed_time(client: HTTPClient) -> None:
+    result = await client.head("items/7")
+
+    assert result.elapsed >= 0.0
