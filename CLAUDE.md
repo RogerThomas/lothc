@@ -58,6 +58,11 @@ Settings → Environments → pypi as defense in depth. Left for manual GitHub U
 `release: published`'s ref context is the tag, not a branch, and there's no easy local way to
 preview a policy change first.
 
+**README.md uses absolute URLs only.** It's also the PyPI project description, and PyPI can't
+resolve repo-relative paths: images point at `raw.githubusercontent.com/.../main/`, docs links at
+the docs site (`rogerthomas.github.io/lothc/<page>/`), other files at `github.com/.../blob/main/`.
+A PyPI description is frozen per release, so a README fix only shows after the next one.
+
 **`[tool.hatch.build.targets.sdist]` needs an explicit `include` allowlist — the wheel doesn't.**
 hatchling's sdist default is "everything under version control." The real `0.0.1` sdist shipped
 the entire repo (420KB: `benchmarks/`, `docs/`, `tests/`, etc.) before `include = ["/lothc",

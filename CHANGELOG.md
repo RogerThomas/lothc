@@ -7,6 +7,11 @@ predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/re
 
 ## [Unreleased]
 
+### Fixed
+
+- The logo, benchmark chart and doc links on the PyPI page (the README used repo-relative
+  paths, which only resolve on GitHub).
+
 ## [0.0.17] - 2026-09-23
 
 ### Added

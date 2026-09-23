@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.svg" alt="lothc logo" width="220">
+  <img src="https://raw.githubusercontent.com/RogerThomas/lothc/main/assets/logo.svg" alt="lothc logo" width="220">
 </p>
 
 # lothc
@@ -8,7 +8,7 @@
 [![CI](https://github.com/RogerThomas/lothc/actions/workflows/ci.yml/badge.svg)](https://github.com/RogerThomas/lothc/actions/workflows/ci.yml)
 [![codecov](https://img.shields.io/codecov/c/github/RogerThomas/lothc/main)](https://codecov.io/gh/RogerThomas/lothc)
 [![Python versions](https://img.shields.io/pypi/pyversions/lothc)](https://pypi.org/project/lothc/)
-[![License](https://img.shields.io/pypi/l/lothc)](LICENSE)
+[![License](https://img.shields.io/pypi/l/lothc)](https://github.com/RogerThomas/lothc/blob/main/LICENSE)
 
 **L**ord **O**f **T**he **H**ttp **C**lients — a typed HTTP client for Python, built on
 [pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (an awesome Rust-backed HTTP client), with
@@ -64,33 +64,33 @@ there's demand for an httpx/aiohttp/niquests backend, the author is happy to con
 
 ## Fast
 
-![HTTP client throughput race — lothc and pyreqwest finish in well under a fifth of a second, other libraries take much longer](assets/perf-race.svg)
+![HTTP client throughput race — lothc and pyreqwest finish in well under a fifth of a second, other libraries take much longer](https://raw.githubusercontent.com/RogerThomas/lothc/main/assets/perf-race.svg)
 
-Benchmarked with [`perf.py`](perf.py) against a tiny Rust-based static JSON server, 10,000 requests at
+Benchmarked with [`perf.py`](https://github.com/RogerThomas/lothc/blob/main/perf.py) against a tiny Rust-based static JSON server, 10,000 requests at
 concurrency 100 — including lothc's fully-typed decode targets (`response_data_type=` a msgspec
 `Struct` or a pydantic `BaseModel`), not just raw bytes or an untyped dict. The object handed back
 from those runs isn't just parsed JSON — it's a real, constructed, field-validated instance of
 your own type, and that validation cost is included in the numbers, not benchmarked around.
 Decoding into a real msgspec `Struct` even edged out the unvalidated dict path in this run. Full
-numbers: [docs/benchmarks.md](docs/benchmarks.md).
+numbers: [docs/benchmarks.md](https://rogerthomas.github.io/lothc/benchmarks/).
 
 ## Highlights
 
 Pass `response_data_type` to any lothc call and get back a real, constructed, field-validated
 pydantic `BaseModel` or msgspec `Struct`, instead of the plain `dict` `.json()` leaves you to
-validate yourself. See [Benchmarks](docs/benchmarks.md) for what that costs (usually nothing).
+validate yourself. See [Benchmarks](https://rogerthomas.github.io/lothc/benchmarks/) for what that costs (usually nothing).
 
 | | |
 |---|---|
 | **Two clients, one API** | `HTTPClient` (async) and `SyncHTTPClient` (sync) — identical surface, both backed by pyreqwest. |
-| **Every verb** | `get`, `post`, `put`, `patch`, `delete` (plus `client.with_result.<verb>` for status and headers), `head`, `download` — see [Verbs](docs/verbs.md). |
+| **Every verb** | `get`, `post`, `put`, `patch`, `delete` (plus `client.with_result.<verb>` for status and headers), `head`, `download` — see [Verbs](https://rogerthomas.github.io/lothc/verbs/). |
 | **Typed params, headers & forms** | A `BaseModel`/`Struct` for query params or headers (with `None`-field omission), or a body sent urlencoded (`data=`) or as a real multipart form (`form=`). |
 | **Precise static types** | Every verb is paired `@overload`s, not a cast-laden generic — your editor knows the exact return type. |
-| **SSE & streaming** | Spec-compliant SSE — automatic reconnect with `Last-Event-ID`, server `retry:` honored, typed decode (discriminated unions included) — plus raw or NDJSON-typed `stream_get`/`stream_post` — see [SSE](docs/sse.md) / [Streaming](docs/streaming.md). |
-| **Retries with real backoff** | `max_retries`/`retry_methods`, a genuine pyreqwest middleware hook, `Retry-After`-aware — see [Retries](docs/retries.md). |
-| **Authentication** | Static `bearer_token`, a per-request-refreshed `bearer_auth`, `basic_auth`, or `default_headers` for anything else — plus a ready-made OAuth 2 client-credentials provider (`OAuthProvider`: mint, leeway-based renewal, refresh-then-mint fallback, optional on-disk token cache) — see [Authentication](docs/auth.md). |
-| **Cookies, redirects, proxy** | `cookie_store`, `follow_redirects`/`max_redirects`, `proxy=` — see [Networking](docs/networking.md). |
-| **A real error hierarchy** | `HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError` for no response, `HTTPResponseError` for 4xx/5xx — see [Error handling](docs/errors.md). |
+| **SSE & streaming** | Spec-compliant SSE — automatic reconnect with `Last-Event-ID`, server `retry:` honored, typed decode (discriminated unions included) — plus raw or NDJSON-typed `stream_get`/`stream_post` — see [SSE](https://rogerthomas.github.io/lothc/sse/) / [Streaming](https://rogerthomas.github.io/lothc/streaming/). |
+| **Retries with real backoff** | `max_retries`/`retry_methods`, a genuine pyreqwest middleware hook, `Retry-After`-aware — see [Retries](https://rogerthomas.github.io/lothc/retries/). |
+| **Authentication** | Static `bearer_token`, a per-request-refreshed `bearer_auth`, `basic_auth`, or `default_headers` for anything else — plus a ready-made OAuth 2 client-credentials provider (`OAuthProvider`: mint, leeway-based renewal, refresh-then-mint fallback, optional on-disk token cache) — see [Authentication](https://rogerthomas.github.io/lothc/auth/). |
+| **Cookies, redirects, proxy** | `cookie_store`, `follow_redirects`/`max_redirects`, `proxy=` — see [Networking](https://rogerthomas.github.io/lothc/networking/). |
+| **A real error hierarchy** | `HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError` for no response, `HTTPResponseError` for 4xx/5xx — see [Error handling](https://rogerthomas.github.io/lothc/errors/). |
 | **Everything optional** | pydantic, msgspec — works with neither, either, or both installed. |
 
 ## Development
