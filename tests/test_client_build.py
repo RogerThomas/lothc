@@ -31,14 +31,14 @@ async def test_build_rejects_both_bearer_token_and_bearer_auth(base_url: str) ->
 
 async def test_build_with_no_base_url_accepts_absolute_urls(base_url: str) -> None:
     async with HTTPClient(timeout=None) as client:
-        result = await client.get(f"{base_url}items/7", response_data_type=dict)
+        result = (await client.get(f"{base_url}items/7", response_data_type=dict)).data
 
     assert result == {"id": 7, "name": "item-7"}
 
 
 async def test_build_with_max_redirects_still_follows_redirect(base_url: str) -> None:
     async with HTTPClient(base_url=base_url, max_redirects=5) as client:
-        result = await client.with_result.get("redirect")
+        result = await client.get("redirect")
 
     assert result.status == 200
 
@@ -60,14 +60,14 @@ def test_sync_build_rejects_both_bearer_token_and_bearer_auth(base_url: str) -> 
 
 def test_sync_build_with_no_base_url_accepts_absolute_urls(base_url: str) -> None:
     with SyncHTTPClient(timeout=None) as client:
-        result = client.get(f"{base_url}items/7", response_data_type=dict)
+        result = client.get(f"{base_url}items/7", response_data_type=dict).data
 
     assert result == {"id": 7, "name": "item-7"}
 
 
 def test_sync_build_with_default_headers_sent_on_every_request(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, default_headers={"x-api-key": "secret"}) as client:
-        result = client.get("echo-headers", response_data_type=dict)
+        result = client.get("echo-headers", response_data_type=dict).data
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["x-api-key"] == "secret"
@@ -75,7 +75,7 @@ def test_sync_build_with_default_headers_sent_on_every_request(base_url: str) ->
 
 def test_sync_build_with_max_redirects_still_follows_redirect(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, max_redirects=5) as client:
-        result = client.with_result.get("redirect")
+        result = client.get("redirect")
 
     assert result.status == 200
 
@@ -90,7 +90,7 @@ async def test_build_accepts_a_model_as_default_headers(base_url: str) -> None:
     async with HTTPClient(
         base_url=base_url, default_headers=_DefaultHeaders(x_api_key="secret")
     ) as client:
-        result = await client.get("echo-headers", response_data_type=dict)
+        result = (await client.get("echo-headers", response_data_type=dict)).data
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["x-api-key"] == "secret"
@@ -99,7 +99,7 @@ async def test_build_accepts_a_model_as_default_headers(base_url: str) -> None:
 
 async def _fetch_once(client: HTTPClient) -> dict[str, object]:
     async with client:
-        return await client.get("items/7", response_data_type=dict)
+        return (await client.get("items/7", response_data_type=dict)).data
 
 
 async def test_client_used_before_it_is_opened_raises_a_clear_error(base_url: str) -> None:
@@ -120,9 +120,9 @@ async def test_client_can_be_opened_again_after_it_closes(base_url: str) -> None
     # Each entry builds a fresh pyreqwest client from the stored settings.
     client = HTTPClient(base_url=base_url)
     async with client:
-        first = await client.get("items/7", response_data_type=dict)
+        first = (await client.get("items/7", response_data_type=dict)).data
     async with client:
-        second = await client.get("items/7", response_data_type=dict)
+        second = (await client.get("items/7", response_data_type=dict)).data
 
     assert first == second == {"id": 7, "name": "item-7"}
 
@@ -130,9 +130,9 @@ async def test_client_can_be_opened_again_after_it_closes(base_url: str) -> None
 def test_sync_client_can_be_opened_again_after_it_closes(base_url: str) -> None:
     client = SyncHTTPClient(base_url=base_url)
     with client:
-        first = client.get("items/7", response_data_type=dict)
+        first = client.get("items/7", response_data_type=dict).data
     with client:
-        second = client.get("items/7", response_data_type=dict)
+        second = client.get("items/7", response_data_type=dict).data
 
     assert first == second
 
@@ -196,7 +196,7 @@ def test_sync_exiting_a_client_that_is_not_open_is_harmless(base_url: str) -> No
 
 async def test_user_agent_is_sent_on_every_request(base_url: str) -> None:
     async with HTTPClient(base_url=base_url, user_agent="agent-name/1.0") as client:
-        result = await client.get("echo-headers", response_data_type=dict)
+        result = (await client.get("echo-headers", response_data_type=dict)).data
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["user-agent"] == "agent-name/1.0"
@@ -204,7 +204,7 @@ async def test_user_agent_is_sent_on_every_request(base_url: str) -> None:
 
 def test_sync_user_agent_is_sent_on_every_request(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, user_agent="agent-name/1.0") as client:
-        result = client.get("echo-headers", response_data_type=dict)
+        result = client.get("echo-headers", response_data_type=dict).data
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["user-agent"] == "agent-name/1.0"
@@ -212,9 +212,11 @@ def test_sync_user_agent_is_sent_on_every_request(base_url: str) -> None:
 
 async def test_a_per_request_user_agent_header_overrides_user_agent(base_url: str) -> None:
     async with HTTPClient(base_url=base_url, user_agent="agent-name/1.0") as client:
-        result = await client.get(
-            "echo-headers", headers={"user-agent": "override/2.0"}, response_data_type=dict
-        )
+        result = (
+            await client.get(
+                "echo-headers", headers={"user-agent": "override/2.0"}, response_data_type=dict
+            )
+        ).data
 
     values = [h["value"] for h in result["headers"] if h["name"].lower() == "user-agent"]
     assert values == ["override/2.0"]
@@ -232,7 +234,7 @@ async def test_no_proxy_hosts_bypass_the_proxy(base_url: str) -> None:
     async with HTTPClient(
         base_url=base_url, proxy="http://127.0.0.1:1", no_proxy=["127.0.0.1"]
     ) as client:
-        result = await client.get("items/7", response_data_type=dict)
+        result = (await client.get("items/7", response_data_type=dict)).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -241,7 +243,7 @@ def test_sync_no_proxy_hosts_bypass_the_proxy(base_url: str) -> None:
     with SyncHTTPClient(
         base_url=base_url, proxy="http://127.0.0.1:1", no_proxy=["localhost", "127.0.0.1"]
     ) as client:
-        result = client.get("items/7", response_data_type=dict)
+        result = client.get("items/7", response_data_type=dict).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -266,21 +268,21 @@ def test_sync_no_proxy_without_a_proxy_is_rejected() -> None:
 
 async def test_http2_falls_back_to_http1_against_an_http1_only_server(base_url: str) -> None:
     async with HTTPClient(base_url=base_url, http2=True) as client:
-        result = await client.get("items/7", response_data_type=dict)
+        result = (await client.get("items/7", response_data_type=dict)).data
 
     assert result == {"id": 7, "name": "item-7"}
 
 
 def test_sync_http2_falls_back_to_http1_against_an_http1_only_server(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, http2=True) as client:
-        result = client.get("items/7", response_data_type=dict)
+        result = client.get("items/7", response_data_type=dict).data
 
     assert result == {"id": 7, "name": "item-7"}
 
 
 async def test_the_default_user_agent_names_lothc_and_its_version(base_url: str) -> None:
     async with HTTPClient(base_url=base_url) as client:
-        result = await client.get("echo-headers", response_data_type=dict)
+        result = (await client.get("echo-headers", response_data_type=dict)).data
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["user-agent"] == f"python-lothc/{version('lothc')}"
@@ -288,7 +290,7 @@ async def test_the_default_user_agent_names_lothc_and_its_version(base_url: str)
 
 def test_sync_the_default_user_agent_names_lothc_and_its_version(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url) as client:
-        result = client.get("echo-headers", response_data_type=dict)
+        result = client.get("echo-headers", response_data_type=dict).data
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["user-agent"] == f"python-lothc/{version('lothc')}"
@@ -298,7 +300,9 @@ async def test_resolve_sends_a_hostname_to_the_given_address(base_url: str) -> N
     # `lothc.test` exists only through the override; the URL's own port is still used.
     port = urlsplit(base_url).port
     async with HTTPClient(resolve={"lothc.test": "127.0.0.1"}) as client:
-        result = await client.get(f"http://lothc.test:{port}/items/7", response_data_type=dict)
+        result = (
+            await client.get(f"http://lothc.test:{port}/items/7", response_data_type=dict)
+        ).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -306,14 +310,14 @@ async def test_resolve_sends_a_hostname_to_the_given_address(base_url: str) -> N
 def test_sync_resolve_sends_a_hostname_to_the_given_address(base_url: str) -> None:
     port = urlsplit(base_url).port
     with SyncHTTPClient(resolve={"lothc.test": "127.0.0.1"}) as client:
-        result = client.get(f"http://lothc.test:{port}/items/7", response_data_type=dict)
+        result = client.get(f"http://lothc.test:{port}/items/7", response_data_type=dict).data
 
     assert result == {"id": 7, "name": "item-7"}
 
 
 async def test_local_address_is_the_address_connections_come_from(base_url: str) -> None:
     async with HTTPClient(base_url=base_url, local_address="127.0.0.1") as client:
-        result = await client.get("items/7", response_data_type=dict)
+        result = (await client.get("items/7", response_data_type=dict)).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -330,7 +334,7 @@ async def test_tcp_keepalive_is_accepted(base_url: str) -> None:
     # Keepalive probes aren't observable from here; this only checks the setting is wired in
     # without breaking requests.
     async with HTTPClient(base_url=base_url, tcp_keepalive=30.0) as client:
-        result = await client.get("items/7", response_data_type=dict)
+        result = (await client.get("items/7", response_data_type=dict)).data
 
     assert result == {"id": 7, "name": "item-7"}
 

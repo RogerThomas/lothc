@@ -110,7 +110,7 @@ class MockRequest:
     let `.headers[...] = ...` mutate in place, and `hash(...)` still raised from deep inside
     dataclass machinery); a plain mutable dataclass is the honest shape, matching
     `hash(MockRequest(...))` raising a direct, expected `TypeError` instead. `headers` is a
-    `CaseInsensitiveDict`, matching `Result.headers` (see `_client.py`), so
+    `CaseInsensitiveDict`, matching `Response.headers` (see `_client.py`), so
     `headers["Content-Type"]` and `headers["content-type"]` are one lookup and a repeated header
     keeps every value — indexing gives the first, `get_all` gives all of them. `query` is
     `query_string` already parsed into a single-value-per-key shape, via `_first_value_per_key` —
@@ -217,7 +217,7 @@ def _first_value_per_key(values: Mapping[str, str | list[str]]) -> dict[str, str
     """Collapses one of pyreqwest's real `query_dict_multi_value` results (a plain `str`, or a
     `list[str]` for a genuinely repeated key) down to one value per key, first value wins.
 
-    Note this is *not* what headers do any more: `MockRequest.headers`/`Result.headers` are a
+    Note this is *not* what headers do any more: `MockRequest.headers`/`Response.headers` are a
     `CaseInsensitiveDict` and keep every value of a repeated name (see `_client.py`). Query params
     still collapse, so a repeated key's extra values are genuinely dropped here — `query_string`
     stays alongside `query` for anyone who needs them."""
@@ -727,7 +727,7 @@ class LOTHCMocker:
         headers: Headers | None = None,
         status: int = 200,
     ) -> LOTHCMock:
-        # No `data=` — lothc's `head()` never decodes a body (`Result[None]`, see `_client.py`).
+        # No `data=` — lothc's `head()` never decodes a body (`Response[None]`, see `_client.py`).
         return self._add_response(
             self._client_mocker.head,
             path=path,

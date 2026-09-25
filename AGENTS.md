@@ -78,8 +78,9 @@ OAuthProvider(
     token_response=None,  # class with .access_token / .expires_in; .refresh_token read if present, not required
     refresh_leeway=300.0,  # renew once fewer than this many seconds remain (clamped to expires_in / 2)
     default_expires_in=None,  # lifetime to assume when the response has no expires_in; else error
-    token_cache_path=None,  # Path: JSON, atomic replace, 0600, keyed on token_url + client_id + scope;
-    # parent dir must exist at construction (FileNotFoundError); a failed write warns, never raises
+    token_cache_dir=None,  # Path: one JSON file per token_url + client_id + scope, named
+    # "<host>-<client_id>-<hash>.json"; atomic replace, 0600; the dir must exist at construction
+    # (FileNotFoundError); a failed write warns, never raises
     client_factory=HTTPClient,  # called with NO args per token request; partial(...) for
     # timeout/proxy/TLS. Sync: SyncHTTPClient
 )
@@ -114,15 +115,15 @@ and a no-op if the provider has already renewed. Any `bearer_auth` with an
 
 ## Verbs
 
-- `get(path, *, params=None, headers=None, response_data_type=bytes, error_for_status=True, error_type=None) -> Data`
-- `post/put/patch(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, response_data_type=bytes, error_for_status=True, error_type=None) -> Data` —
+Every body verb returns a `Response[TData]`: `.data` (the body decoded as `response_data_type`),
+`.status`, `.headers`, `.typed_headers` (set with `response_headers_type=`), `.request`,
+`.http_version` (e.g. `"HTTP/1.1"`) and `.elapsed` (seconds, including retries).
+
+- `get(path, *, params=None, headers=None, response_data_type=bytes, response_headers_type=None, error_for_status=True, error_type=None) -> Response[Data]`
+- `post/put/patch(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, response_data_type=bytes, response_headers_type=None, error_for_status=True, error_type=None) -> Response[Data]` —
   at most one of `json`/`data`/`form`/`content`, else `ValueError`
-- `delete(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, response_data_type=bytes, ...) -> Data` — a body is optional
-- `client.with_result.get/post/put/patch/delete(...)` — same arguments plus
-  `response_headers_type=None`, returning `Result` (`.data .status .headers .typed_headers .request`)
-  instead of the bare body. A namespace, not a flag, so each method has one return type.
-  `Result.http_version` (e.g. `"HTTP/1.1"`) and `Result.elapsed` (seconds, including retries).
-- `head(path, *, params=None, headers=None, response_headers_type=None, error_for_status=True) -> Result[None]`
+- `delete(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, response_data_type=bytes, ...) -> Response[Data]` — a body is optional
+- `head(path, *, params=None, headers=None, response_headers_type=None, error_for_status=True) -> Response[None]`
 - `sse(path, *, params=None, headers=None, response_data_type=None, error_for_status=True) -> Generator[SSEEvent[TData]]` —
   yields `SSEEvent(id=, event=, data=)` (kw-only dataclass, `SSEEvent[TData]`).
   `response_data_type` controls `.data` only (default `str`); class | `TypeAdapter` | `Decoder`.
@@ -148,7 +149,7 @@ key once per element (`{"tag": ["a", "b"]}` → `?tag=a&tag=b`). `json`: `dict` 
 (`multipart/form-data`): `dict[str, str | int | float | bool | bytes | list | dict |
 model | File | tuple[...]]` — a `tuple` repeats the field and must be homogeneous; a `list` is always
 one JSON part; `bool` sends `"true"`/`"false"`. `content`: raw `str | bytes`, no `Content-Type` set.
-`Result.headers` / `HTTPResponseError.headers` are a `CaseInsensitiveDict`: case-insensitive
+`Response.headers` / `HTTPResponseError.headers` are a `CaseInsensitiveDict`: case-insensitive
 lookups, `get_all(name)` for a repeated header's every value.
 
 ## Errors
@@ -197,7 +198,7 @@ of this fixture's public surface, not even re-exported.
   mock). `match_request`'s predicate takes `MockRequest` too, same async/plain split.
 - `MockRequest` (slotted, **not** frozen — its mutable `headers` field means `frozen=True`
   couldn't deliver real immutability anyway): `.method`/`.path`/`.query_string`/`.query`/
-  `.headers` (a `CaseInsensitiveDict`, like `Result.headers`: case-insensitive, `get_all` for a
+  `.headers` (a `CaseInsensitiveDict`, like `Response.headers`: case-insensitive, `get_all` for a
   repeated header)/`.body` (`bytes | None`). Never pyreqwest's `Request`.
 - `LOTHCMocker.strict(enabled=True)` raises `AssertionError` on an unmatched request — this is the
   fixture's *default* (pyreqwest's own `client_mocker` defaults to silent passthrough). Opt out

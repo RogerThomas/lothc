@@ -87,21 +87,29 @@ def _headers(result: dict[str, Any]) -> dict[str, str]:
 
 
 async def _bearer(client: HTTPClient) -> str:
-    return _headers(await client.get("echo-headers", response_data_type=dict))["authorization"]
+    return _headers((await client.get("echo-headers", response_data_type=dict)).data)[
+        "authorization"
+    ]
 
 
 def _sync_bearer(client: SyncHTTPClient) -> str:
-    return _headers(client.get("echo-headers", response_data_type=dict))["authorization"]
+    return _headers(client.get("echo-headers", response_data_type=dict).data)["authorization"]
 
 
 async def _token_requests(client: HTTPClient, key: str) -> list[dict[str, Any]]:
-    result = await client.get(f"oauth/token-requests?key={key}", response_data_type=dict)
+    result = (await client.get(f"oauth/token-requests?key={key}", response_data_type=dict)).data
     return result["requests"]
 
 
 def _sync_token_requests(client: SyncHTTPClient, key: str) -> list[dict[str, Any]]:
-    result = client.get(f"oauth/token-requests?key={key}", response_data_type=dict)
+    result = client.get(f"oauth/token-requests?key={key}", response_data_type=dict).data
     return result["requests"]
+
+
+def _cache_file(cache_dir: Path) -> Path:
+    """The one token cache file a single provider writes into `cache_dir`."""
+    (cache_file,) = cache_dir.glob("*.json")
+    return cache_file
 
 
 def _basic(client_id: str, client_secret: str) -> str:
@@ -544,42 +552,40 @@ def test_sync_custom_models_without_token_refresh_request_mint_again(
     assert "refreshToken" not in renewal["body"]
 
 
-async def test_token_cache_path_writes_token_file_with_owner_only_permissions(
+async def test_token_cache_dir_writes_token_file_with_owner_only_permissions(
     base_url: str, tmp_path: Path
 ) -> None:
-    cache_path = tmp_path / "cache.json"
     provider = OAuthProvider(
         token_url=f"{base_url}oauth/token?key={uuid4()}",
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=cache_path,
+        token_cache_dir=tmp_path,
     )
 
     async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         await _bearer(api)
 
-    assert cache_path.stat().st_mode & 0o777 == 0o600
-    cached = json.loads(cache_path.read_text())
+    assert _cache_file(tmp_path).stat().st_mode & 0o777 == 0o600
+    cached = json.loads(_cache_file(tmp_path).read_text())
     assert cached["access_token"] == "token-1"
     assert cached["client_id"] == "client-id"
 
 
-def test_sync_token_cache_path_writes_token_file_with_owner_only_permissions(
+def test_sync_token_cache_dir_writes_token_file_with_owner_only_permissions(
     base_url: str, tmp_path: Path
 ) -> None:
-    cache_path = tmp_path / "cache.json"
     provider = SyncOAuthProvider(
         token_url=f"{base_url}oauth/token?key={uuid4()}",
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=cache_path,
+        token_cache_dir=tmp_path,
     )
 
     with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         _sync_bearer(api)
 
-    assert cache_path.stat().st_mode & 0o777 == 0o600
-    cached = json.loads(cache_path.read_text())
+    assert _cache_file(tmp_path).stat().st_mode & 0o777 == 0o600
+    cached = json.loads(_cache_file(tmp_path).read_text())
     assert cached["access_token"] == "token-1"
     assert cached["client_id"] == "client-id"
 
@@ -593,7 +599,7 @@ async def test_cached_token_is_reused_by_a_new_provider(
         token_url=token_url,
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     async with HTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         await _bearer(api)
@@ -602,7 +608,7 @@ async def test_cached_token_is_reused_by_a_new_provider(
         token_url=token_url,
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     async with HTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = await _bearer(api)
@@ -620,7 +626,7 @@ def test_sync_cached_token_is_reused_by_a_new_provider(
         token_url=token_url,
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     with SyncHTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         _sync_bearer(api)
@@ -629,7 +635,7 @@ def test_sync_cached_token_is_reused_by_a_new_provider(
         token_url=token_url,
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     with SyncHTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = _sync_bearer(api)
@@ -646,7 +652,7 @@ async def test_cached_token_for_a_different_client_id_is_ignored(
         token_url=token_url,
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     async with HTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         await _bearer(api)
@@ -655,7 +661,7 @@ async def test_cached_token_for_a_different_client_id_is_ignored(
         token_url=token_url,
         client_id="other-client-id",
         client_secret="client-secret",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     async with HTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = await _bearer(api)
@@ -671,7 +677,7 @@ def test_sync_cached_token_for_a_different_client_id_is_ignored(
         token_url=token_url,
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     with SyncHTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         _sync_bearer(api)
@@ -680,7 +686,7 @@ def test_sync_cached_token_for_a_different_client_id_is_ignored(
         token_url=token_url,
         client_id="other-client-id",
         client_secret="client-secret",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     with SyncHTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = _sync_bearer(api)
@@ -689,37 +695,53 @@ def test_sync_cached_token_for_a_different_client_id_is_ignored(
 
 
 async def test_corrupt_cache_file_is_ignored_and_overwritten(base_url: str, tmp_path: Path) -> None:
-    cache_path = tmp_path / "cache.json"
-    cache_path.write_bytes(b"not json")
-    provider = OAuthProvider(
-        token_url=f"{base_url}oauth/token?key={uuid4()}",
+    token_url = f"{base_url}oauth/token?key={uuid4()}&expires_in=3600"
+    first_provider = OAuthProvider(
+        token_url=token_url,
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=cache_path,
+        token_cache_dir=tmp_path,
     )
+    async with HTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
+        await _bearer(api)
+    _cache_file(tmp_path).write_bytes(b"not json")
 
-    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+    second_provider = OAuthProvider(
+        token_url=token_url,
+        client_id="client-id",
+        client_secret="client-secret",
+        token_cache_dir=tmp_path,
+    )
+    async with HTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = await _bearer(api)
 
-    assert bearer == "Bearer token-1"
-    assert json.loads(cache_path.read_text())["access_token"] == "token-1"
+    assert bearer == "Bearer token-2"
+    assert json.loads(_cache_file(tmp_path).read_text())["access_token"] == "token-2"
 
 
 def test_sync_corrupt_cache_file_is_ignored_and_overwritten(base_url: str, tmp_path: Path) -> None:
-    cache_path = tmp_path / "cache.json"
-    cache_path.write_bytes(b"not json")
-    provider = SyncOAuthProvider(
-        token_url=f"{base_url}oauth/token?key={uuid4()}",
+    token_url = f"{base_url}oauth/token?key={uuid4()}&expires_in=3600"
+    first_provider = SyncOAuthProvider(
+        token_url=token_url,
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=cache_path,
+        token_cache_dir=tmp_path,
     )
+    with SyncHTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
+        _sync_bearer(api)
+    _cache_file(tmp_path).write_bytes(b"not json")
 
-    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
+    second_provider = SyncOAuthProvider(
+        token_url=token_url,
+        client_id="client-id",
+        client_secret="client-secret",
+        token_cache_dir=tmp_path,
+    )
+    with SyncHTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = _sync_bearer(api)
 
-    assert bearer == "Bearer token-1"
-    assert json.loads(cache_path.read_text())["access_token"] == "token-1"
+    assert bearer == "Bearer token-2"
+    assert json.loads(_cache_file(tmp_path).read_text())["access_token"] == "token-2"
 
 
 async def test_cached_refresh_token_is_used_by_a_new_provider_inside_leeway_window(
@@ -731,7 +753,7 @@ async def test_cached_refresh_token_is_used_by_a_new_provider_inside_leeway_wind
         token_url=token_url,
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     async with HTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         await _bearer(api)
@@ -740,7 +762,7 @@ async def test_cached_refresh_token_is_used_by_a_new_provider_inside_leeway_wind
         token_url=token_url,
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     async with HTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = await _bearer(api)
@@ -759,7 +781,7 @@ def test_sync_cached_refresh_token_is_used_by_a_new_provider_inside_leeway_windo
         token_url=token_url,
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     with SyncHTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         _sync_bearer(api)
@@ -768,7 +790,7 @@ def test_sync_cached_refresh_token_is_used_by_a_new_provider_inside_leeway_windo
         token_url=token_url,
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     with SyncHTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = _sync_bearer(api)
@@ -905,23 +927,23 @@ def test_sync_negative_refresh_leeway_is_rejected() -> None:
         )
 
 
-def test_missing_cache_parent_directory_is_rejected(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError, match="parent directory does not exist"):
+def test_missing_cache_directory_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="token_cache_dir does not exist"):
         OAuthProvider(
             token_url="token-url",
             client_id="client-id",
             client_secret="client-secret",
-            token_cache_path=tmp_path / "missing" / "cache.json",
+            token_cache_dir=tmp_path / "missing",
         )
 
 
-def test_sync_missing_cache_parent_directory_is_rejected(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError, match="parent directory does not exist"):
+def test_sync_missing_cache_directory_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="token_cache_dir does not exist"):
         SyncOAuthProvider(
             token_url="token-url",
             client_id="client-id",
             client_secret="client-secret",
-            token_cache_path=tmp_path / "missing" / "cache.json",
+            token_cache_dir=tmp_path / "missing",
         )
 
 
@@ -1027,7 +1049,7 @@ async def test_cached_token_for_a_different_scope_is_ignored(base_url: str, tmp_
         client_id="client-id",
         client_secret="client-secret",
         scope="read",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     async with HTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         await _bearer(api)
@@ -1037,13 +1059,14 @@ async def test_cached_token_for_a_different_scope_is_ignored(base_url: str, tmp_
         client_id="client-id",
         client_secret="client-secret",
         scope="read write",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     async with HTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-2"
-    assert json.loads((tmp_path / "cache.json").read_text())["scope"] == "read write"
+    scopes = sorted(json.loads(path.read_text())["scope"] for path in tmp_path.glob("*.json"))
+    assert scopes == ["read", "read write"]
 
 
 def test_sync_cached_token_for_a_different_scope_is_ignored(base_url: str, tmp_path: Path) -> None:
@@ -1053,7 +1076,7 @@ def test_sync_cached_token_for_a_different_scope_is_ignored(base_url: str, tmp_p
         client_id="client-id",
         client_secret="client-secret",
         scope="read",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     with SyncHTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
         _sync_bearer(api)
@@ -1063,13 +1086,14 @@ def test_sync_cached_token_for_a_different_scope_is_ignored(base_url: str, tmp_p
         client_id="client-id",
         client_secret="client-secret",
         scope="read write",
-        token_cache_path=tmp_path / "cache.json",
+        token_cache_dir=tmp_path,
     )
     with SyncHTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-2"
-    assert json.loads((tmp_path / "cache.json").read_text())["scope"] == "read write"
+    scopes = sorted(json.loads(path.read_text())["scope"] for path in tmp_path.glob("*.json"))
+    assert scopes == ["read", "read write"]
 
 
 async def _gather_bearers(base_url: str, provider: OAuthProvider) -> list[str]:
@@ -1130,37 +1154,35 @@ def test_sync_basic_credentials_are_percent_encoded(
 
 
 async def test_missing_expires_in_uses_default_expires_in(base_url: str, tmp_path: Path) -> None:
-    cache_path = tmp_path / "cache.json"
     provider = OAuthProvider(
         token_url=f"{base_url}oauth/token?key={uuid4()}&omit_expires_in=1",
         client_id="client-id",
         client_secret="client-secret",
         default_expires_in=900.0,
-        token_cache_path=cache_path,
+        token_cache_dir=tmp_path,
     )
 
     async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-1"
-    assert json.loads(cache_path.read_text())["expires_in"] == 900
+    assert json.loads(_cache_file(tmp_path).read_text())["expires_in"] == 900
 
 
 def test_sync_missing_expires_in_uses_default_expires_in(base_url: str, tmp_path: Path) -> None:
-    cache_path = tmp_path / "cache.json"
     provider = SyncOAuthProvider(
         token_url=f"{base_url}oauth/token?key={uuid4()}&omit_expires_in=1",
         client_id="client-id",
         client_secret="client-secret",
         default_expires_in=900.0,
-        token_cache_path=cache_path,
+        token_cache_dir=tmp_path,
     )
 
     with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-1"
-    assert json.loads(cache_path.read_text())["expires_in"] == 900
+    assert json.loads(_cache_file(tmp_path).read_text())["expires_in"] == 900
 
 
 async def test_missing_expires_in_without_default_is_an_oauth_token_error(base_url: str) -> None:
@@ -1196,7 +1218,6 @@ def test_sync_missing_expires_in_without_default_is_an_oauth_token_error(base_ur
 async def test_custom_models_missing_expires_in_uses_default_expires_in(
     base_url: str, tmp_path: Path
 ) -> None:
-    cache_path = tmp_path / "cache.json"
     provider = OAuthProvider(
         token_url=f"{base_url}oauth/token-custom?key={uuid4()}&omit_expires_in=1",
         client_id="client-id",
@@ -1204,20 +1225,19 @@ async def test_custom_models_missing_expires_in_uses_default_expires_in(
         token_request=_TokenRequest,
         token_response=_OptionalExpiresTokenResponse,
         default_expires_in=900.0,
-        token_cache_path=cache_path,
+        token_cache_dir=tmp_path,
     )
 
     async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = await _bearer(api)
 
     assert bearer == "Bearer token-1"
-    assert json.loads(cache_path.read_text())["expires_in"] == 900
+    assert json.loads(_cache_file(tmp_path).read_text())["expires_in"] == 900
 
 
 def test_sync_custom_models_missing_expires_in_uses_default_expires_in(
     base_url: str, tmp_path: Path
 ) -> None:
-    cache_path = tmp_path / "cache.json"
     provider = SyncOAuthProvider(
         token_url=f"{base_url}oauth/token-custom?key={uuid4()}&omit_expires_in=1",
         client_id="client-id",
@@ -1225,14 +1245,14 @@ def test_sync_custom_models_missing_expires_in_uses_default_expires_in(
         token_request=_MsgspecTokenRequest,
         token_response=_MsgspecOptionalExpiresTokenResponse,
         default_expires_in=900.0,
-        token_cache_path=cache_path,
+        token_cache_dir=tmp_path,
     )
 
     with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
         bearer = _sync_bearer(api)
 
     assert bearer == "Bearer token-1"
-    assert json.loads(cache_path.read_text())["expires_in"] == 900
+    assert json.loads(_cache_file(tmp_path).read_text())["expires_in"] == 900
 
 
 async def test_refresh_rejected_with_a_non_400_is_not_retried_as_a_mint(
@@ -1328,7 +1348,7 @@ async def test_failing_to_write_the_token_cache_warns_but_still_uses_the_token(
         token_url=f"{base_url}oauth/token?key={uuid4()}",
         client_id="client-id",
         client_secret="client-secret",
-        token_cache_path=cache_dir / "cache.json",
+        token_cache_dir=cache_dir,
     )
     cache_dir.chmod(0o500)  # no longer writable, but it still existed at construction
     try:
@@ -1340,3 +1360,28 @@ async def test_failing_to_write_the_token_cache_warns_but_still_uses_the_token(
 
     assert authorization == "Bearer token-1"
     assert list(cache_dir.iterdir()) == []
+
+
+async def test_providers_sharing_a_cache_dir_get_their_own_readable_files(
+    base_url: str, tmp_path: Path
+) -> None:
+    token_url = f"{base_url}oauth/token?key={uuid4()}&expires_in=3600"
+    for client_id in ("first-client", "second/client"):
+        provider = OAuthProvider(
+            token_url=token_url,
+            client_id=client_id,
+            client_secret="client-secret",
+            token_cache_dir=tmp_path,
+        )
+        async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+            await _bearer(api)
+
+    names = sorted(path.name for path in tmp_path.glob("*.json"))
+    # Host and client ID first, so a person can tell the files apart; the client ID is made safe
+    # for a filename; a hash suffix keeps them unique.
+    assert [name.rsplit("-", 1)[0] for name in names] == [
+        "127.0.0.1-first-client",
+        "127.0.0.1-second_client",
+    ]
+    client_ids = sorted(json.loads((tmp_path / name).read_text())["client_id"] for name in names)
+    assert client_ids == ["first-client", "second/client"]

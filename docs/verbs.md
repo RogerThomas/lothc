@@ -28,14 +28,20 @@ async with HTTPClient(base_url="https://api.example.com/") as client:
 ## GET
 
 ```python
-body = await client.get("items/7")  # bytes by default
-item = await client.get(
+response = await client.get("items/7")
+response.data  # the body as bytes, by default
+
+response = await client.get(
     "items/7",
     params={"q": "pikachu", "page": 2},
     headers={"x-custom": "header-value"},
     response_data_type=ItemModel,
 )
+response.data  # ItemModel(id=7, name="item-7")
 ```
+
+Every verb returns a `Response`: the decoded body on `.data`, plus the status, headers and more
+(see [The `Response`](#the-response) below).
 
 ### Typed params and headers
 
@@ -59,10 +65,10 @@ class SearchStructParams(Struct):
     cursor: str | None = None  # same omission behavior, msgspec Struct instead of BaseModel
 
 
-result = await client.get(
+response = await client.get(
     "items", params=SearchParams(q="pikachu", page=1), response_data_type=SearchResult
 )
-result = await client.get(
+response = await client.get(
     "items", params=SearchStructParams(q="pikachu", page=1), response_data_type=SearchResult
 )
 ```
@@ -92,43 +98,43 @@ from msgspec.json import Decoder
 from pydantic import TypeAdapter
 
 items_adapter = TypeAdapter(list[ItemModel])
-items = await client.get("items", response_data_type=items_adapter)  # list[ItemModel]
-items = await client.get("items", response_data_type=Decoder(list[ItemStruct]))  # list[ItemStruct]
+response = await client.get("items", response_data_type=items_adapter)
+response.data  # list[ItemModel]
+response = await client.get("items", response_data_type=Decoder(list[ItemStruct]))
+response.data  # list[ItemStruct]
 ```
 
 `response_data_type=dict` is for a JSON *object*; decoding an array (or a string, number, `null`)
 into it raises a `ValueError` that says what the body actually was.
 
-## Status and headers too — `with_result`
+## The `Response`
 
-Every body verb returns just the decoded body. When you also need the status code, response
-headers or the request that was sent, call the same verb through `client.with_result` — same
-arguments, but it returns a `Result`:
+`get`, `post`, `put`, `patch`, `delete` and `head` all return a `Response`:
 
 ```python
-result = await client.with_result.get("items/7", response_data_type=ItemModel)
-result.data  # ItemModel(id=7, name="item-7")
-result.status  # 200
-result.headers  # {"content-type": "application/json", ...}
-result.request.method  # "GET"
-result.request.url  # "https://api.example.com/items/7"
-result.request.path  # "/items/7"
-result.request.host  # "api.example.com"
-result.http_version  # "HTTP/1.1"
-result.elapsed  # 0.042: seconds from sending to having the whole response
+response = await client.get("items/7", response_data_type=ItemModel)
+response.data  # ItemModel(id=7, name="item-7")
+response.status  # 200
+response.headers  # {"content-type": "application/json", ...}
+response.request.method  # "GET"
+response.request.url  # "https://api.example.com/items/7"
+response.request.path  # "/items/7"
+response.request.host  # "api.example.com"
+response.http_version  # "HTTP/1.1"
+response.elapsed  # 0.042: seconds from sending to having the whole response
 ```
 
-`result.elapsed` includes any retries, since it spans the whole call.
+`response.elapsed` includes any retries, since it spans the whole call.
 
-`result.request` is the request actually sent — useful for logging, or for telling apart which
-call a `Result` came from when you're juggling several. It reflects the target you asked for, not
+`response.request` is the request actually sent — useful for logging, or for telling apart which
+call a `Response` came from when you're juggling several. It reflects the target you asked for, not
 necessarily the one a final response came from if redirects were followed.
 
-`result.headers` is a `CaseInsensitiveDict`, so header names compare case-insensitively the way
-HTTP itself defines them (RFC 9110 §5.1) — `result.headers["Content-Type"]`,
-`result.headers["content-type"]` and `"CONTENT-TYPE" in result.headers` are all the same lookup.
+`response.headers` is a `CaseInsensitiveDict`, so header names compare case-insensitively the way
+HTTP itself defines them (RFC 9110 §5.1) — `response.headers["Content-Type"]`,
+`response.headers["content-type"]` and `"CONTENT-TYPE" in response.headers` are all the same lookup.
 It's a `MutableMapping`, not a `dict` subclass (the same choice requests, niquests and httpx all
-make), so `isinstance(result.headers, dict)` is `False`; iterating it yields keys with the casing
+make), so `isinstance(response.headers, dict)` is `False`; iterating it yields keys with the casing
 they arrived in, and only lookups, `in` and `==` ignore case.
 
 A header sent more than once — `Set-Cookie`, most often — keeps every value. Indexing gives the
@@ -136,17 +142,17 @@ first, as it always has; `get_all` gives all of them, in arrival order, and `[]`
 wasn't sent at all:
 
 ```python
-result.headers["set-cookie"]
+response.headers["set-cookie"]
 # 'session=abc; Path=/'
 
-result.headers.get_all("Set-Cookie")
+response.headers.get_all("Set-Cookie")
 # ['session=abc; Path=/', 'csrf=xyz; Path=/', 'theme=dark; Path=/']
 
-result.headers.get_all("never-sent")
+response.headers.get_all("never-sent")
 # []
 ```
 
-Iteration, `.items()` and `dict(result.headers)` stay single-valued (one entry per header name,
+Iteration, `.items()` and `dict(response.headers)` stay single-valued (one entry per header name,
 its first value), so `get_all` is the only way to see a repeated header's extra values.
 
 Equality follows the same split. Two header maps compare every value, so two responses that differ
@@ -156,7 +162,7 @@ transitive: two maps can each equal the same `dict` without equalling each other
 `CaseInsensitiveDict` behaves the same way).
 
 Pass `response_headers_type` (a `BaseModel`/`Struct`) to get the *response* headers validated and parsed
-too, via `result.typed_headers`. Header names are lowercased and `-` becomes `_` before matching
+too, via `response.typed_headers`. Header names are lowercased and `-` becomes `_` before matching
 against your type's field names, so a `Content-Type` response header maps onto a `content_type`
 field:
 
@@ -165,10 +171,10 @@ class ItemHeaders(BaseModel):
     content_type: str | None = None
 
 
-result = await client.with_result.get(
+response = await client.get(
     "items/7", response_data_type=ItemModel, response_headers_type=ItemHeaders
 )
-result.typed_headers.content_type  # "application/json"
+response.typed_headers.content_type  # "application/json"
 ```
 
 `response_headers_type` works the same way on `head()` — see below.
@@ -209,16 +215,12 @@ server needs one:
 await client.post("render", content="# Title", headers={"content-type": "text/markdown"})
 ```
 
-Each works through `client.with_result` too, with the same body options, returning a `Result`
-alongside status and headers exactly like `with_result.get` above (including the same
-`response_headers_type` option):
+Each returns a `Response` like `get`'s, including the same `response_headers_type` option:
 
 ```python
-result = await client.with_result.post(
-    "items", json={"name": "new-item"}, response_data_type=ItemModel
-)
-result.data  # ItemModel(...)
-result.status  # 200
+response = await client.post("items", json={"name": "new-item"}, response_data_type=ItemModel)
+response.data  # ItemModel(...)
+response.status  # 201
 ```
 
 ### Multipart forms — `form`
@@ -277,8 +279,8 @@ await client.post(
 ## DELETE
 
 ```python
-await client.delete("items/7")  # bytes by default
-item = await client.delete("items/7", response_data_type=ItemModel)
+response = await client.delete("items/7", response_data_type=ItemModel)
+response.data  # ItemModel(...)
 ```
 
 A body is rare on a DELETE but allowed (some APIs, like bulk or delete-by-query endpoints, need
@@ -288,21 +290,18 @@ one), with the same `json`/`data`/`form`/`content` options as `post`:
 await client.delete("items", json={"ids": [7, 8]})
 ```
 
-`client.with_result.delete(...)` works the same way, returning a `Result` instead of the bare
-decoded body.
-
 ## HEAD
 
 Headers-only — no body is ever decoded, so there's no `response_data_type`:
 
 ```python
-result = await client.head("items/7")
-result.status  # 200
-result.headers
+response = await client.head("items/7")
+response.status  # 200
+response.headers
+response.data  # always None
 ```
 
-`head()` always returns a `Result`, since there's no body to return on its own. It takes the same
-`response_headers_type` option as `with_result.get`, via `result.typed_headers`.
+It takes the same `response_headers_type` option as `get`, via `response.typed_headers`.
 
 ## Downloading large bodies — `download`
 

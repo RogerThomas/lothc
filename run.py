@@ -24,18 +24,24 @@ class HeadersResponse(Struct):
 
 async def main() -> None:
     async with HTTPClient(base_url="https://httpbin.org/") as client:
-        get_result = await client.get("get", params={"foo": "bar"}, response_data_type=GetResponse)
+        get_result = (
+            await client.get("get", params={"foo": "bar"}, response_data_type=GetResponse)
+        ).data
         print("GET  /get        ->", get_result.args, get_result.url)
 
-        post_result = await client.post("post", json={"a": 1}, response_data_type=PostResponse)
+        post_result = (
+            await client.post("post", json={"a": 1}, response_data_type=PostResponse)
+        ).data
         print("POST /post       ->", post_result.json)
 
-        headers_result = await client.get(
-            "headers", headers={"X-Lothc-Demo": "1"}, response_data_type=HeadersResponse
-        )
+        headers_result = (
+            await client.get(
+                "headers", headers={"X-Lothc-Demo": "1"}, response_data_type=HeadersResponse
+            )
+        ).data
         print("GET  /headers    ->", headers_result.headers.get("X-Lothc-Demo"))
 
-        redirected = await client.get("redirect/2", response_data_type=GetResponse)
+        redirected = (await client.get("redirect/2", response_data_type=GetResponse)).data
         print("GET  /redirect/2 -> followed to", redirected.url)
 
         try:

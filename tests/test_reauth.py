@@ -35,7 +35,7 @@ def _sync_provider(base_url: str, key: str) -> SyncOAuthProvider:
 
 async def _token_requests(base_url: str, key: str) -> list[dict[str, Any]]:
     async with HTTPClient(base_url=base_url) as plain:
-        result = await plain.get(f"oauth/token-requests?key={key}", response_data_type=dict)
+        result = (await plain.get(f"oauth/token-requests?key={key}", response_data_type=dict)).data
     return result["requests"]
 
 
@@ -46,7 +46,7 @@ async def _no_invalidate_bearer() -> str:
 async def test_a_revoked_token_is_replaced_and_the_request_retried(base_url: str) -> None:
     key = str(uuid4())
     async with HTTPClient(base_url=base_url, bearer_auth=_provider(base_url, key)) as client:
-        result = await client.get("rejects-first-token", response_data_type=dict)
+        result = (await client.get("rejects-first-token", response_data_type=dict)).data
 
     assert result == {"authorization": "Bearer token-2"}
     assert len(await _token_requests(base_url, key)) == 2
@@ -55,7 +55,7 @@ async def test_a_revoked_token_is_replaced_and_the_request_retried(base_url: str
 def test_sync_a_revoked_token_is_replaced_and_the_request_retried(base_url: str) -> None:
     key = str(uuid4())
     with SyncHTTPClient(base_url=base_url, bearer_auth=_sync_provider(base_url, key)) as client:
-        result = client.get("rejects-first-token", response_data_type=dict)
+        result = client.get("rejects-first-token", response_data_type=dict).data
 
     assert result == {"authorization": "Bearer token-2"}
 
@@ -67,7 +67,9 @@ async def test_a_rejected_post_is_not_replayed_but_the_next_call_gets_a_fresh_to
     async with HTTPClient(base_url=base_url, bearer_auth=_provider(base_url, key)) as client:
         with pytest.raises(HTTPResponseError) as exc_info:
             await client.post("rejects-first-token", json={"a": 1})
-        follow_up = await client.post("rejects-first-token", json={"a": 1}, response_data_type=dict)
+        follow_up = (
+            await client.post("rejects-first-token", json={"a": 1}, response_data_type=dict)
+        ).data
 
     assert exc_info.value.status == 401
     assert follow_up == {"authorization": "Bearer token-2"}
@@ -132,7 +134,7 @@ def test_sync_a_rejected_post_is_not_replayed_but_the_next_call_gets_a_fresh_tok
     with SyncHTTPClient(base_url=base_url, bearer_auth=_sync_provider(base_url, key)) as client:
         with pytest.raises(HTTPResponseError) as exc_info:
             client.post("rejects-first-token", json={"a": 1})
-        follow_up = client.post("rejects-first-token", json={"a": 1}, response_data_type=dict)
+        follow_up = client.post("rejects-first-token", json={"a": 1}, response_data_type=dict).data
 
     assert exc_info.value.status == 401
     assert follow_up == {"authorization": "Bearer token-2"}

@@ -8,7 +8,9 @@ through a fresh, short-lived `HTTPClient`/`SyncHTTPClient` per token request.
 
 import asyncio
 import base64
+import hashlib
 import os
+import re
 import tempfile
 import threading
 import time
@@ -21,7 +23,7 @@ from json import dumps as _json_dumps
 from json import loads as _json_loads
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from ._client import HTTPClient, HTTPResponseError, JSONPayload, SyncHTTPClient
 from ._compat import BaseModelTyping, StructTyping
@@ -357,6 +359,25 @@ def _token_from_cache_payload(payload: dict[str, Any]) -> _CachedToken:
     )
 
 
+def _token_cache_file(cache_dir: Path, token_url: str, client_id: str, scope: str | None) -> Path:
+    """The cache file for one `token_url` + `client_id` + `scope`: readable, and never shared.
+
+    The host and client ID make the name recognisable; the hash of all three keeps two caches
+    apart even when they share a client ID (another token URL, or other scopes), and makes any
+    client ID safe as a filename. No leading dot, so it doesn't hide in the directory.
+
+    >>> _token_cache_file(Path("cache"), "https://auth.example.com/token", "my-client", None).name
+    'auth.example.com-my-client-9b73c8cc1d16.json'
+    >>> _token_cache_file(Path("cache"), "https://auth.example.com/token", "a/b c", "read").name
+    'auth.example.com-a_b_c-84b667342f92.json'
+    """
+    host = urlsplit(token_url).hostname or "token"
+    readable_id = re.sub(r"[^A-Za-z0-9._-]", "_", client_id)[:64]
+    key = "\0".join((token_url, client_id, scope or ""))
+    digest = hashlib.sha256(key.encode()).hexdigest()[:12]
+    return cache_dir / f"{host}-{readable_id}-{digest}.json"
+
+
 def _read_token_cache(
     path: Path, token_url: str, client_id: str, scope: str | None
 ) -> _CachedToken | None:
@@ -393,8 +414,8 @@ def _write_token_cache(
 ) -> None:
     """Atomically replace `path` with the current token, `0600` since it holds live credentials.
     `mkstemp` creates the temp file `O_EXCL` with mode `0600` in the same directory, so the
-    `os.replace` onto `path` is atomic and the final file keeps that mode. The parent directory
-    is checked to exist at construction (`_validate_provider_config`)."""
+    `os.replace` onto `path` is atomic and the final file keeps that mode. The directory is
+    checked to exist at construction (`_validate_provider_config`)."""
     payload = {
         "token_url": token_url,
         "client_id": client_id,
@@ -441,7 +462,7 @@ def _validate_provider_config(
     token_refresh_request: TokenRefreshRequestTyping | None,
     token_response: type[TokenResponseTyping] | None,
     refresh_leeway: float,
-    token_cache_path: Path | None,
+    token_cache_dir: Path | None,
 ) -> None:
     if (token_request is None) != (token_response is None):
         raise ValueError("Provide both 'token_request' and 'token_response', or neither")
@@ -449,10 +470,8 @@ def _validate_provider_config(
         raise ValueError("'token_refresh_request' requires 'token_request' and 'token_response'")
     if refresh_leeway < 0:
         raise ValueError("'refresh_leeway' must be >= 0")
-    if token_cache_path is not None and not token_cache_path.parent.is_dir():
-        raise FileNotFoundError(
-            f"token_cache_path parent directory does not exist: {token_cache_path.parent}"
-        )
+    if token_cache_dir is not None and not token_cache_dir.is_dir():
+        raise FileNotFoundError(f"token_cache_dir does not exist: {token_cache_dir}")
 
 
 class OAuthProvider:
@@ -485,11 +504,14 @@ class OAuthProvider:
       error, a malformed payload — is raised as `OAuthTokenError` from the API call that
       triggered the renewal, with the original as `__cause__`. Concurrent callers inside the
       window share one renewal via a lock.
-    - `token_cache_path` adds persistence only, it never changes *when* a token is renewed:
-      the token is written there (JSON, atomic replace, `0600`) after every mint/refresh and read
-      back on construction, guarded by `token_url` + `client_id` + `scope`; a corrupt/unreadable
-      file is ignored. The parent directory must exist at construction. The write is plain sync
-      file IO inside the async `__call__` — a few hundred bytes, once per token lifetime.
+    - `token_cache_dir` adds persistence only, it never changes *when* a token is renewed:
+      the token is written to a file there (JSON, atomic replace, `0600`) after every
+      mint/refresh and read back on construction. The file is named for the token URL's host,
+      the client ID and a hash of `token_url` + `client_id` + `scope`
+      (`auth.example.com-my-client-9b73c8cc1d16.json`), so providers can share one directory;
+      a corrupt/unreadable file is ignored. The directory must exist at construction. The write
+      is plain sync file IO inside the async `__call__` — a few hundred bytes, once per token
+      lifetime.
     - Every token request goes through a short-lived client from `client_factory` (default
       `HTTPClient`), called with no arguments — so `functools.partial(HTTPClient,
       timeout=5.0, proxy=...)` is how the token endpoint gets its own timeout/proxy/TLS config.
@@ -515,11 +537,11 @@ class OAuthProvider:
         token_response: type[TokenResponseTyping] | None = None,
         refresh_leeway: float = 300.0,
         default_expires_in: float | None = None,
-        token_cache_path: Path | None = None,
+        token_cache_dir: Path | None = None,
         client_factory: Callable[[], AbstractAsyncContextManager[HTTPClient]] = HTTPClient,
     ) -> None:
         _validate_provider_config(
-            token_request, token_refresh_request, token_response, refresh_leeway, token_cache_path
+            token_request, token_refresh_request, token_response, refresh_leeway, token_cache_dir
         )
         self._token_url = token_url
         self._client_id = client_id
@@ -531,11 +553,15 @@ class OAuthProvider:
         self._token_response = token_response
         self._refresh_leeway = refresh_leeway
         self._default_expires_in = default_expires_in
-        self._token_cache_path = token_cache_path
+        self._token_cache_path = (
+            None
+            if token_cache_dir is None
+            else _token_cache_file(token_cache_dir, token_url, client_id, scope)
+        )
         self._client_factory = client_factory
         self._token = (
-            _read_token_cache(token_cache_path, token_url, client_id, scope)
-            if token_cache_path is not None
+            _read_token_cache(self._token_cache_path, token_url, client_id, scope)
+            if self._token_cache_path is not None
             else None
         )
         # Created lazily, per event loop: an `asyncio.Lock` binds to the loop it's first used
@@ -555,18 +581,20 @@ class OAuthProvider:
     async def _post_rfc(self, body: dict[str, str]) -> _CachedToken:
         headers = _rfc_headers(self._client_id, self._client_secret, self._client_auth)
         async with self._client_factory() as client:
-            payload = await client.post(
+            response = await client.post(
                 self._token_url, data=body, headers=headers, response_data_type=dict
             )
+        payload = response.data
         return _token_from_rfc_payload(payload, self._default_expires_in, time.time())
 
     async def _post_model(
         self, payload: JSONPayload, token_response: type[TokenResponseTyping]
     ) -> _CachedToken:
         async with self._client_factory() as client:
-            decoded = await client.post(
+            response = await client.post(
                 self._token_url, json=payload, response_data_type=token_response
             )
+        decoded = response.data
         return _token_from_model(decoded, self._default_expires_in, time.time())
 
     async def _mint(self) -> _CachedToken:
@@ -662,11 +690,11 @@ class SyncOAuthProvider:
         token_response: type[TokenResponseTyping] | None = None,
         refresh_leeway: float = 300.0,
         default_expires_in: float | None = None,
-        token_cache_path: Path | None = None,
+        token_cache_dir: Path | None = None,
         client_factory: Callable[[], AbstractContextManager[SyncHTTPClient]] = SyncHTTPClient,
     ) -> None:
         _validate_provider_config(
-            token_request, token_refresh_request, token_response, refresh_leeway, token_cache_path
+            token_request, token_refresh_request, token_response, refresh_leeway, token_cache_dir
         )
         self._token_url = token_url
         self._client_id = client_id
@@ -678,11 +706,15 @@ class SyncOAuthProvider:
         self._token_response = token_response
         self._refresh_leeway = refresh_leeway
         self._default_expires_in = default_expires_in
-        self._token_cache_path = token_cache_path
+        self._token_cache_path = (
+            None
+            if token_cache_dir is None
+            else _token_cache_file(token_cache_dir, token_url, client_id, scope)
+        )
         self._client_factory = client_factory
         self._token = (
-            _read_token_cache(token_cache_path, token_url, client_id, scope)
-            if token_cache_path is not None
+            _read_token_cache(self._token_cache_path, token_url, client_id, scope)
+            if self._token_cache_path is not None
             else None
         )
         self._lock = threading.Lock()
@@ -690,16 +722,18 @@ class SyncOAuthProvider:
     def _post_rfc(self, body: dict[str, str]) -> _CachedToken:
         headers = _rfc_headers(self._client_id, self._client_secret, self._client_auth)
         with self._client_factory() as client:
-            payload = client.post(
+            response = client.post(
                 self._token_url, data=body, headers=headers, response_data_type=dict
             )
+        payload = response.data
         return _token_from_rfc_payload(payload, self._default_expires_in, time.time())
 
     def _post_model(
         self, payload: JSONPayload, token_response: type[TokenResponseTyping]
     ) -> _CachedToken:
         with self._client_factory() as client:
-            decoded = client.post(self._token_url, json=payload, response_data_type=token_response)
+            response = client.post(self._token_url, json=payload, response_data_type=token_response)
+        decoded = response.data
         return _token_from_model(decoded, self._default_expires_in, time.time())
 
     def _mint(self) -> _CachedToken:

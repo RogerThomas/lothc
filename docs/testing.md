@@ -61,9 +61,9 @@ your `pyproject.toml`/`pytest.ini` configures `asyncio_mode`.
 async def test_get_item(client: HTTPClient, lothc_mocker: LOTHCMocker) -> None:
     lothc_mocker.add_get_response(path="/items/7", data={"id": 7, "name": "item-7"})
 
-    item = await client.get("items/7", response_data_type=dict)
+    response = await client.get("items/7", response_data_type=dict)
 
-    assert item == {"id": 7, "name": "item-7"}
+    assert response.data == {"id": 7, "name": "item-7"}
 ```
 
 `add_get_response`/`add_post_response`/`add_put_response`/`add_patch_response`/
@@ -99,12 +99,12 @@ async def test_reuses_typed_data_and_headers_classes(
         headers=ItemHeaders(x_total_count=1),
     )
 
-    result = await client.with_result.get(
+    response = await client.get(
         "items/7", response_data_type=Item, response_headers_type=ItemHeaders
     )
 
-    assert result.data == Item(id=7, name="item-7")
-    assert result.typed_headers == ItemHeaders(x_total_count=1)
+    assert response.data == Item(id=7, name="item-7")
+    assert response.typed_headers == ItemHeaders(x_total_count=1)
 ```
 
 Both are encoded exactly the way a real request would encode them (field names with `_` become
@@ -130,9 +130,9 @@ async def test_add_get_response_matches_on_params(
 ) -> None:
     lothc_mocker.add_get_response(path="/items", params={"page": "2"}, data={"page": 2})
 
-    item = await client.get("items", params={"page": "2"}, response_data_type=dict)
+    response = await client.get("items", params={"page": "2"}, response_data_type=dict)
 
-    assert item == {"page": 2}
+    assert response.data == {"page": 2}
 
 
 @pytest.mark.asyncio
@@ -141,9 +141,9 @@ async def test_add_get_response_matches_on_a_repeated_query_param(
 ) -> None:
     lothc_mocker.add_get_response(path="/items", params={"tag": ["a", "b"]}, data={"ok": True})
 
-    item = await client.get("items", params={"tag": ["a", "b"]}, response_data_type=dict)
+    response = await client.get("items", params={"tag": ["a", "b"]}, response_data_type=dict)
 
-    assert item == {"ok": True}
+    assert response.data == {"ok": True}
 ```
 
 `params=` — same `Params` type a real call's `params=` takes — narrows a rule to requests that
@@ -171,9 +171,9 @@ async def test_match_header_narrows_a_mock(client: HTTPClient, lothc_mocker: LOT
     mock = lothc_mocker.add_get_response(path="/items", data={"ok": True})
     mock.match_header("x-request-id", re.compile(r"^req-"))
 
-    item = await client.get("items", headers={"x-request-id": "req-1"}, response_data_type=dict)
+    response = await client.get("items", headers={"x-request-id": "req-1"}, response_data_type=dict)
 
-    assert item == {"ok": True}
+    assert response.data == {"ok": True}
     mock.assert_called(count=1)
 ```
 
@@ -263,9 +263,9 @@ async def test_custom_handler_computes_response_from_the_request(
 ) -> None:
     lothc_mocker.mock("GET").match_request_with_response(_handler)
 
-    item = await client.get("items/42", response_data_type=dict)
+    response = await client.get("items/42", response_data_type=dict)
 
-    assert item == {"id": 42}
+    assert response.data == {"id": 42}
 
 
 def _sync_handler(request: MockRequest) -> MockResponse:
@@ -277,9 +277,9 @@ def test_sync_custom_handler_computes_response_from_the_request(
 ) -> None:
     lothc_mocker.mock("GET").match_request_with_response(_sync_handler)
 
-    item = sync_client.get("items/42", response_data_type=dict)
+    response = sync_client.get("items/42", response_data_type=dict)
 
-    assert item == {"id": 42}
+    assert response.data == {"id": 42}
 ```
 
 `request` also exposes `.method`, `.query_string`, `.query` (`Mapping[str, str]`), and `.body`

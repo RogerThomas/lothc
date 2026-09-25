@@ -153,7 +153,7 @@ type SyncAuthProvider = Callable[[], str]
 
 @dataclass(slots=True)
 class RequestInfo:
-    """The request actually sent, attached to `Result.request`/`head`'s result and to
+    """The request actually sent, attached to `Response.request`/`head`'s result and to
     `HTTPResponseError.request` — the target you asked for, not necessarily the one a final
     response came from if redirects were followed.
     """
@@ -1793,7 +1793,7 @@ def _header_pairs(data: HeaderSource) -> Iterator[tuple[str, str]]:
 class CaseInsensitiveDict(MutableMapping[str, str]):
     """A mapping whose keys compare case-insensitively, as HTTP field names do (RFC 9110 §5.1).
 
-    `Result.headers` and `lothc.testing`'s `MockRequest.headers` are this, so
+    `Response.headers` and `lothc.testing`'s `MockRequest.headers` are this, so
     `headers["Content-Type"]` and `headers["content-type"]` are the same lookup. Iteration,
     `.keys()` and `dict(...)` yield keys with the casing they were stored under; only lookups,
     `in`, and `==` ignore case — the same split `requests`/`niquests` make.
@@ -1920,9 +1920,9 @@ def _parse_typed_headers(
 
 
 @dataclass
-class Result[TData, THeaders: TypedHeaders | None = None]:
-    """The decoded body alongside status/headers, as returned by `client.with_result.<verb>()`
-    and `head()`.
+class Response[TData, THeaders: TypedHeaders | None = None]:
+    """What `get`/`post`/`put`/`patch`/`delete`/`head` return: the decoded body (`.data`)
+    alongside the status and headers.
 
     `.typed_headers` is `None` unless `response_headers_type` was passed to the call that
     produced this. `.request` is the request actually sent — the target you asked for, not
@@ -1938,959 +1938,6 @@ class Result[TData, THeaders: TypedHeaders | None = None]:
     request: RequestInfo
     http_version: str
     elapsed: float
-
-
-class _SendMethodResult(Protocol):
-    """The shape of `HTTPClient._send_method_result`, bound: what `WithResult` is handed
-    instead of the client. It takes the HTTP method as a plain string, so `WithResult`
-    never touches a pyreqwest type (its constructor signature is public) and never reaches
-    into the client's privates.
-    """
-
-    def __call__(
-        self,
-        method: str,
-        path: str,
-        params: Params | None,
-        headers: Headers | None,
-        timeout: float | None,
-        json: JSONPayload | None,
-        data: Params | None,
-        form: Form | None,
-        content: str | bytes | None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-        response_headers_type: type[TypedHeaders] | None,
-        *,
-        skip_auth: bool,
-        infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
-        error_type: type[Data] | None,
-    ) -> Awaitable[Result[Any, Any]]: ...
-
-
-@dataclass
-class WithResult:
-    """`HTTPClient.with_result`: the same verbs, each returning a `Result` instead of the bare
-    body.
-
-    A `Result` carries the decoded body alongside the response status, headers (and, with
-    `response_headers_type`, those headers parsed into `.typed_headers`) and the `RequestInfo`
-    of what was sent. A separate namespace rather than a boolean flag on each verb, so every
-    method keeps exactly one return type — a flag would make the return type depend on a runtime
-    `bool`, which a non-literal argument can't satisfy any overload of.
-    """
-
-    _send: _SendMethodResult
-
-    @overload
-    async def get(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes]: ...
-    @overload
-    async def get(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any]]: ...
-    @overload
-    async def get[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[TData],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData]: ...
-    @overload
-    async def get[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted]: ...
-    @overload
-    async def get[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes, THeaders]: ...
-    @overload
-    async def get[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any], THeaders]: ...
-    @overload
-    async def get[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData, THeaders]: ...
-    @overload
-    async def get[TAdapted, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted, THeaders]: ...
-    async def get(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        response_headers_type: type[TypedHeaders] | None = None,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[Any, Any]:
-        """Like `HTTPClient.get`, but return a `Result` carrying the decoded body
-        alongside the response status and headers. Pass `response_headers_type` to also get the
-        headers parsed into `result.typed_headers`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return await self._send(
-            "GET",
-            path,
-            params,
-            headers,
-            timeout,
-            None,
-            None,
-            None,
-            None,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=True,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    async def post(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes]: ...
-    @overload
-    async def post(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any]]: ...
-    @overload
-    async def post[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData]: ...
-    @overload
-    async def post[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted]: ...
-    @overload
-    async def post[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes, THeaders]: ...
-    @overload
-    async def post[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any], THeaders]: ...
-    @overload
-    async def post[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData, THeaders]: ...
-    @overload
-    async def post[TAdapted, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted, THeaders]: ...
-    async def post(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        response_headers_type: type[TypedHeaders] | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[Any, Any]:
-        """Like `HTTPClient.post`, but return a `Result` carrying the decoded body
-        alongside the response status and headers. Pass `response_headers_type` to also get the
-        headers parsed into `result.typed_headers`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return await self._send(
-            "POST",
-            path,
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    async def put(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes]: ...
-    @overload
-    async def put(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any]]: ...
-    @overload
-    async def put[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData]: ...
-    @overload
-    async def put[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted]: ...
-    @overload
-    async def put[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes, THeaders]: ...
-    @overload
-    async def put[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any], THeaders]: ...
-    @overload
-    async def put[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData, THeaders]: ...
-    @overload
-    async def put[TAdapted, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted, THeaders]: ...
-    async def put(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        response_headers_type: type[TypedHeaders] | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[Any, Any]:
-        """Like `HTTPClient.put`, but return a `Result` carrying the decoded body
-        alongside the response status and headers. Pass `response_headers_type` to also get the
-        headers parsed into `result.typed_headers`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return await self._send(
-            "PUT",
-            path,
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    async def patch(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes]: ...
-    @overload
-    async def patch(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any]]: ...
-    @overload
-    async def patch[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData]: ...
-    @overload
-    async def patch[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted]: ...
-    @overload
-    async def patch[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes, THeaders]: ...
-    @overload
-    async def patch[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any], THeaders]: ...
-    @overload
-    async def patch[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData, THeaders]: ...
-    @overload
-    async def patch[TAdapted, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted, THeaders]: ...
-    async def patch(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        response_headers_type: type[TypedHeaders] | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[Any, Any]:
-        """Like `HTTPClient.patch`, but return a `Result` carrying the decoded body
-        alongside the response status and headers. Pass `response_headers_type` to also get the
-        headers parsed into `result.typed_headers`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return await self._send(
-            "PATCH",
-            path,
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    async def delete(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes]: ...
-    @overload
-    async def delete(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[dict[str, Any]],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any]]: ...
-    @overload
-    async def delete[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[TData],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData]: ...
-    @overload
-    async def delete[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted]: ...
-    @overload
-    async def delete[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes, THeaders]: ...
-    @overload
-    async def delete[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[dict[str, Any]],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any], THeaders]: ...
-    @overload
-    async def delete[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData, THeaders]: ...
-    @overload
-    async def delete[TAdapted, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted, THeaders]: ...
-    async def delete(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        response_headers_type: type[TypedHeaders] | None = None,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[Any, Any]:
-        """Like `HTTPClient.delete`, but return a `Result` carrying the decoded body
-        alongside the response status and headers. Pass `response_headers_type` to also get the
-        headers parsed into `result.typed_headers`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return await self._send(
-            "DELETE",
-            path,
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
 
 
 class HTTPClient:
@@ -3161,6 +2208,93 @@ class HTTPClient:
             await self._check_status(raw_response, error_type, request_info)
         return await self._decode_body(raw_response, response_data_type)
 
+    async def _send_method(
+        self,
+        method: str,
+        path: str,
+        params: Params | None,
+        headers: Headers | None,
+        timeout: float | None,
+        json: JSONPayload | None,
+        data: Params | None,
+        form: Form | None,
+        content: str | bytes | None,
+        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
+        response_headers_type: type[TypedHeaders] | None,
+        *,
+        skip_auth: bool,
+        infer_mime_type_from_file_extension: bool,
+        error_for_status: bool,
+        error_type: type[Data] | None,
+    ) -> Response[Any, Any]:
+        """Every body verb's shared path, taking the HTTP method as a string."""
+        return await self._send_with_body(
+            self._client.request(method, path),
+            params,
+            headers,
+            timeout,
+            json,
+            data,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            skip_auth=skip_auth,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+            error_type=error_type,
+        )
+
+    async def _send_with_body(
+        self,
+        request_builder: RequestBuilder,
+        params: Params | None,
+        headers: Headers | None,
+        timeout: float | None,
+        json: JSONPayload | None,
+        data: Params | None,
+        form: Form | None,
+        content: str | bytes | None,
+        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
+        response_headers_type: type[TypedHeaders] | None,
+        *,
+        skip_auth: bool,
+        infer_mime_type_from_file_extension: bool,
+        error_for_status: bool,
+        error_type: type[Data] | None,
+    ) -> Response[Any, Any]:
+        request_builder = await self._prepare_request(
+            request_builder, params, headers, timeout, skip_auth=skip_auth
+        )
+        request_builder = await _attach_body(
+            request_builder,
+            json,
+            data,
+            form,
+            content,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+        )
+        started = time.monotonic()
+        raw_response, request_info = await _send(request_builder)
+        elapsed = time.monotonic() - started
+        if error_for_status:
+            await self._check_status(raw_response, error_type, request_info)
+        decoded = await self._decode_body(raw_response, response_data_type)
+        response_headers = CaseInsensitiveDict(raw_response.headers)
+        if response_headers_type is None:
+            typed_headers = None
+        else:
+            typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+        return Response(
+            decoded,
+            raw_response.status,
+            response_headers,
+            typed_headers,
+            request_info,
+            raw_response.version,
+            elapsed,
+        )
+
     @overload
     async def get(
         self,
@@ -3172,7 +2306,7 @@ class HTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> bytes: ...
+    ) -> Response[bytes]: ...
     @overload
     async def get(
         self,
@@ -3185,7 +2319,7 @@ class HTTPClient:
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> Response[dict[str, Any]]: ...
     @overload
     async def get[TData: Data](
         self,
@@ -3198,7 +2332,7 @@ class HTTPClient:
         response_data_type: type[TData],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> TData: ...
+    ) -> Response[TData]: ...
     @overload
     async def get[TAdapted](
         self,
@@ -3211,7 +2345,62 @@ class HTTPClient:
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> TAdapted: ...
+    ) -> Response[TAdapted]: ...
+    @overload
+    async def get[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes, THeaders]: ...
+    @overload
+    async def get[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        response_data_type: type[dict[str, Any]],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any], THeaders]: ...
+    @overload
+    async def get[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData, THeaders]: ...
+    @overload
+    async def get[TAdapted, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted, THeaders]: ...
     async def get(
         self,
         path: str,
@@ -3221,10 +2410,14 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> object:
-        """GET `path` and decode the body as `response_data_type` (raw `bytes` by default).
+    ) -> Response[Any, Any]:
+        """GET `path`, returning a `Response` whose `.data` is the body decoded as
+        `response_data_type` (raw `bytes` by default), alongside `.status`, `.headers`,
+        `.request`, `.http_version` and `.elapsed`. Pass `response_headers_type` to also get the
+        headers parsed into `.typed_headers`.
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
 
@@ -3233,23 +2426,782 @@ class HTTPClient:
         decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
         `None`.
         """
-        request_builder = await self._prepare_request(
-            self._client.get(path), params, headers, timeout, skip_auth=skip_auth
-        )
-        raw_response, request_info = await _send(request_builder)
-        return await self._parse(
-            raw_response,
+        return await self._send_method(
+            "GET",
+            path,
+            params,
+            headers,
+            timeout,
+            None,
+            None,
+            None,
+            None,
             response_data_type,
-            request_info,
+            response_headers_type,
+            skip_auth=skip_auth,
+            infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
             error_type=error_type,
         )
 
-    @property
-    def with_result(self) -> WithResult:
-        """The same verbs, each returning a `Result` (body + status + headers + request) instead
-        of the bare decoded body — `await client.with_result.get(...)`."""
-        return WithResult(self._send_method_result)
+    @overload
+    async def post(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes]: ...
+    @overload
+    async def post(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[dict[str, Any]],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any]]: ...
+    @overload
+    async def post[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData]: ...
+    @overload
+    async def post[TAdapted](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted]: ...
+    @overload
+    async def post[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes, THeaders]: ...
+    @overload
+    async def post[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[dict[str, Any]],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any], THeaders]: ...
+    @overload
+    async def post[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData, THeaders]: ...
+    @overload
+    async def post[TAdapted, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted, THeaders]: ...
+    async def post(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[Any, Any]:
+        """POST to `path` with at most one of `json`/`data`/`form`/`content` (raises
+        `ValueError` if more than one is given), returning a `Response` like `get`'s.
+        `data` is a urlencoded body (`a=1&b=2`), `form` a `multipart/form-data` one.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
+        """
+        return await self._send_method(
+            "POST",
+            path,
+            params,
+            headers,
+            timeout,
+            json,
+            data,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            skip_auth=skip_auth,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+            error_type=error_type,
+        )
+
+    @overload
+    async def put(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes]: ...
+    @overload
+    async def put(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[dict[str, Any]],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any]]: ...
+    @overload
+    async def put[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData]: ...
+    @overload
+    async def put[TAdapted](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted]: ...
+    @overload
+    async def put[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes, THeaders]: ...
+    @overload
+    async def put[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[dict[str, Any]],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any], THeaders]: ...
+    @overload
+    async def put[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData, THeaders]: ...
+    @overload
+    async def put[TAdapted, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted, THeaders]: ...
+    async def put(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[Any, Any]:
+        """PUT to `path`. Same body/decode rules as `post`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
+        """
+        return await self._send_method(
+            "PUT",
+            path,
+            params,
+            headers,
+            timeout,
+            json,
+            data,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            skip_auth=skip_auth,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+            error_type=error_type,
+        )
+
+    @overload
+    async def patch(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes]: ...
+    @overload
+    async def patch(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[dict[str, Any]],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any]]: ...
+    @overload
+    async def patch[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData]: ...
+    @overload
+    async def patch[TAdapted](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted]: ...
+    @overload
+    async def patch[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes, THeaders]: ...
+    @overload
+    async def patch[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[dict[str, Any]],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any], THeaders]: ...
+    @overload
+    async def patch[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData, THeaders]: ...
+    @overload
+    async def patch[TAdapted, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted, THeaders]: ...
+    async def patch(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[Any, Any]:
+        """PATCH `path`. Same body/decode rules as `post`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
+        """
+        return await self._send_method(
+            "PATCH",
+            path,
+            params,
+            headers,
+            timeout,
+            json,
+            data,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            skip_auth=skip_auth,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+            error_type=error_type,
+        )
+
+    @overload
+    async def delete(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes]: ...
+    @overload
+    async def delete(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: type[dict[str, Any]],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any]]: ...
+    @overload
+    async def delete[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: type[TData],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData]: ...
+    @overload
+    async def delete[TAdapted](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted]: ...
+    @overload
+    async def delete[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes, THeaders]: ...
+    @overload
+    async def delete[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: type[dict[str, Any]],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any], THeaders]: ...
+    @overload
+    async def delete[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData, THeaders]: ...
+    @overload
+    async def delete[TAdapted, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted, THeaders]: ...
+    async def delete(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[Any, Any]:
+        """DELETE `path`, returning a `Response` like `get`'s. A body is rare on a DELETE but
+        allowed: the same `json`/`data`/`form`/`content` options as `post`, at most one.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
+        """
+        return await self._send_method(
+            "DELETE",
+            path,
+            params,
+            headers,
+            timeout,
+            json,
+            data,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            skip_auth=skip_auth,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+            error_type=error_type,
+        )
 
     async def _sse_connection(
         self,
@@ -3797,578 +3749,6 @@ class HTTPClient:
             error_type=error_type,
         )
 
-    async def _send_with_body(
-        self,
-        request_builder: RequestBuilder,
-        params: Params | None,
-        headers: Headers | None,
-        timeout: float | None,
-        json: JSONPayload | None,
-        data: Params | None,
-        form: Form | None,
-        content: str | bytes | None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-        *,
-        skip_auth: bool,
-        infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
-        error_type: type[Data] | None,
-    ) -> Data:
-        request_builder = await self._prepare_request(
-            request_builder, params, headers, timeout, skip_auth=skip_auth
-        )
-        request_builder = await _attach_body(
-            request_builder,
-            json,
-            data,
-            form,
-            content,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-        )
-        raw_response, request_info = await _send(request_builder)
-        return await self._parse(
-            raw_response,
-            response_data_type,
-            request_info,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    async def _send_method_result(
-        self,
-        method: str,
-        path: str,
-        params: Params | None,
-        headers: Headers | None,
-        timeout: float | None,
-        json: JSONPayload | None,
-        data: Params | None,
-        form: Form | None,
-        content: str | bytes | None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-        response_headers_type: type[TypedHeaders] | None,
-        *,
-        skip_auth: bool,
-        infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
-        error_type: type[Data] | None,
-    ) -> Result[Any, Any]:
-        """`with_result`'s entry point: the method as a string, so the accessor stays free of
-        pyreqwest types; the request is built here, where the pyreqwest client lives."""
-        return await self._send_with_body_result(
-            self._client.request(method, path),
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    async def _send_with_body_result(
-        self,
-        request_builder: RequestBuilder,
-        params: Params | None,
-        headers: Headers | None,
-        timeout: float | None,
-        json: JSONPayload | None,
-        data: Params | None,
-        form: Form | None,
-        content: str | bytes | None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-        response_headers_type: type[TypedHeaders] | None,
-        *,
-        skip_auth: bool,
-        infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
-        error_type: type[Data] | None,
-    ) -> Result[Any, Any]:
-        request_builder = await self._prepare_request(
-            request_builder, params, headers, timeout, skip_auth=skip_auth
-        )
-        request_builder = await _attach_body(
-            request_builder,
-            json,
-            data,
-            form,
-            content,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-        )
-        started = time.monotonic()
-        raw_response, request_info = await _send(request_builder)
-        elapsed = time.monotonic() - started
-        if error_for_status:
-            await self._check_status(raw_response, error_type, request_info)
-        decoded = await self._decode_body(raw_response, response_data_type)
-        response_headers = CaseInsensitiveDict(raw_response.headers)
-        if response_headers_type is None:
-            typed_headers = None
-        else:
-            typed_headers = _parse_typed_headers(response_headers, response_headers_type)
-        return Result(
-            decoded,
-            raw_response.status,
-            response_headers,
-            typed_headers,
-            request_info,
-            raw_response.version,
-            elapsed,
-        )
-
-    @overload
-    async def post(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> bytes: ...
-    @overload
-    async def post(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> dict[str, Any]: ...
-    @overload
-    async def post[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TData: ...
-    @overload
-    async def post[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TAdapted: ...
-    async def post(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> object:
-        """POST to `path` with at most one of `json`/`data`/`form`/`content` (raises
-        `ValueError` if more than one is given) and decode the response as `response_data_type`.
-        `data` is a urlencoded body (`a=1&b=2`), `form` a `multipart/form-data` one.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return await self._send_with_body(
-            self._client.post(path),
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    async def put(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> bytes: ...
-    @overload
-    async def put(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> dict[str, Any]: ...
-    @overload
-    async def put[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TData: ...
-    @overload
-    async def put[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TAdapted: ...
-    async def put(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> object:
-        """PUT to `path`. Same body/decode rules as `post`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return await self._send_with_body(
-            self._client.put(path),
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    async def patch(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> bytes: ...
-    @overload
-    async def patch(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> dict[str, Any]: ...
-    @overload
-    async def patch[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TData: ...
-    @overload
-    async def patch[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TAdapted: ...
-    async def patch(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> object:
-        """PATCH `path`. Same body/decode rules as `post`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return await self._send_with_body(
-            self._client.patch(path),
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    async def delete(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> bytes: ...
-    @overload
-    async def delete(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[dict[str, Any]],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> dict[str, Any]: ...
-    @overload
-    async def delete[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[TData],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TData: ...
-    @overload
-    async def delete[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TAdapted: ...
-    async def delete(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> object:
-        """DELETE `path` and decode the response as `response_data_type`. A body is rare on a
-        DELETE but allowed: the same `json`/`data`/`form`/`content` options as `post`, at most one.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return await self._send_with_body(
-            self._client.delete(path),
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
     @overload
     async def head(
         self,
@@ -4380,7 +3760,7 @@ class HTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> Result[None]: ...
+    ) -> Response[None]: ...
     @overload
     async def head[THeaders: TypedHeaders](
         self,
@@ -4393,7 +3773,7 @@ class HTTPClient:
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> Result[None, THeaders]: ...
+    ) -> Response[None, THeaders]: ...
     async def head(
         self,
         path: str,
@@ -4405,9 +3785,9 @@ class HTTPClient:
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> Result[None, Any]:
+    ) -> Response[None, Any]:
         """HEAD `path` — headers-only, no body is ever decoded. Pass
-        `response_headers_type` to get the response headers parsed into `result.typed_headers`.
+        `response_headers_type` to get the response headers parsed into `.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
@@ -4428,7 +3808,7 @@ class HTTPClient:
             if response_headers_type is None
             else _parse_typed_headers(response_headers, response_headers_type)
         )
-        return Result(
+        return Response(
             None,
             raw_response.status,
             response_headers,
@@ -4436,959 +3816,6 @@ class HTTPClient:
             request_info,
             raw_response.version,
             elapsed,
-        )
-
-
-class _SyncSendMethodResult(Protocol):
-    """The shape of `SyncHTTPClient._send_method_result`, bound: what `SyncWithResult` is handed
-    instead of the client. It takes the HTTP method as a plain string, so `SyncWithResult`
-    never touches a pyreqwest type (its constructor signature is public) and never reaches
-    into the client's privates.
-    """
-
-    def __call__(
-        self,
-        method: str,
-        path: str,
-        params: Params | None,
-        headers: Headers | None,
-        timeout: float | None,
-        json: JSONPayload | None,
-        data: Params | None,
-        form: Form | None,
-        content: str | bytes | None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-        response_headers_type: type[TypedHeaders] | None,
-        *,
-        skip_auth: bool,
-        infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
-        error_type: type[Data] | None,
-    ) -> Result[Any, Any]: ...
-
-
-@dataclass
-class SyncWithResult:
-    """`SyncHTTPClient.with_result`: the same verbs, each returning a `Result` instead of the
-    bare body.
-
-    A `Result` carries the decoded body alongside the response status, headers (and, with
-    `response_headers_type`, those headers parsed into `.typed_headers`) and the `RequestInfo`
-    of what was sent. A separate namespace rather than a boolean flag on each verb, so every
-    method keeps exactly one return type — a flag would make the return type depend on a runtime
-    `bool`, which a non-literal argument can't satisfy any overload of.
-    """
-
-    _send: _SyncSendMethodResult
-
-    @overload
-    def get(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes]: ...
-    @overload
-    def get(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any]]: ...
-    @overload
-    def get[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[TData],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData]: ...
-    @overload
-    def get[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted]: ...
-    @overload
-    def get[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes, THeaders]: ...
-    @overload
-    def get[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any], THeaders]: ...
-    @overload
-    def get[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData, THeaders]: ...
-    @overload
-    def get[TAdapted, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted, THeaders]: ...
-    def get(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        response_headers_type: type[TypedHeaders] | None = None,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[Any, Any]:
-        """Like `SyncHTTPClient.get`, but return a `Result` carrying the decoded body
-        alongside the response status and headers. Pass `response_headers_type` to also get the
-        headers parsed into `result.typed_headers`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return self._send(
-            "GET",
-            path,
-            params,
-            headers,
-            timeout,
-            None,
-            None,
-            None,
-            None,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=True,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    def post(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes]: ...
-    @overload
-    def post(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any]]: ...
-    @overload
-    def post[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData]: ...
-    @overload
-    def post[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted]: ...
-    @overload
-    def post[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes, THeaders]: ...
-    @overload
-    def post[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any], THeaders]: ...
-    @overload
-    def post[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData, THeaders]: ...
-    @overload
-    def post[TAdapted, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted, THeaders]: ...
-    def post(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        response_headers_type: type[TypedHeaders] | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[Any, Any]:
-        """Like `SyncHTTPClient.post`, but return a `Result` carrying the decoded body
-        alongside the response status and headers. Pass `response_headers_type` to also get the
-        headers parsed into `result.typed_headers`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return self._send(
-            "POST",
-            path,
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    def put(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes]: ...
-    @overload
-    def put(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any]]: ...
-    @overload
-    def put[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData]: ...
-    @overload
-    def put[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted]: ...
-    @overload
-    def put[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes, THeaders]: ...
-    @overload
-    def put[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any], THeaders]: ...
-    @overload
-    def put[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData, THeaders]: ...
-    @overload
-    def put[TAdapted, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted, THeaders]: ...
-    def put(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        response_headers_type: type[TypedHeaders] | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[Any, Any]:
-        """Like `SyncHTTPClient.put`, but return a `Result` carrying the decoded body
-        alongside the response status and headers. Pass `response_headers_type` to also get the
-        headers parsed into `result.typed_headers`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return self._send(
-            "PUT",
-            path,
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    def patch(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes]: ...
-    @overload
-    def patch(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any]]: ...
-    @overload
-    def patch[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData]: ...
-    @overload
-    def patch[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted]: ...
-    @overload
-    def patch[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes, THeaders]: ...
-    @overload
-    def patch[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any], THeaders]: ...
-    @overload
-    def patch[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData, THeaders]: ...
-    @overload
-    def patch[TAdapted, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted, THeaders]: ...
-    def patch(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        response_headers_type: type[TypedHeaders] | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[Any, Any]:
-        """Like `SyncHTTPClient.patch`, but return a `Result` carrying the decoded body
-        alongside the response status and headers. Pass `response_headers_type` to also get the
-        headers parsed into `result.typed_headers`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return self._send(
-            "PATCH",
-            path,
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    def delete(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes]: ...
-    @overload
-    def delete(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[dict[str, Any]],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any]]: ...
-    @overload
-    def delete[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[TData],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData]: ...
-    @overload
-    def delete[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted]: ...
-    @overload
-    def delete[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[bytes, THeaders]: ...
-    @overload
-    def delete[THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[dict[str, Any]],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[dict[str, Any], THeaders]: ...
-    @overload
-    def delete[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TData, THeaders]: ...
-    @overload
-    def delete[TAdapted, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[TAdapted, THeaders]: ...
-    def delete(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        response_headers_type: type[TypedHeaders] | None = None,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Result[Any, Any]:
-        """Like `SyncHTTPClient.delete`, but return a `Result` carrying the decoded body
-        alongside the response status and headers. Pass `response_headers_type` to also get the
-        headers parsed into `result.typed_headers`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return self._send(
-            "DELETE",
-            path,
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
         )
 
 
@@ -5658,6 +4085,93 @@ class SyncHTTPClient:
             self._check_status(raw_response, error_type, request_info)
         return self._decode_body(raw_response, response_data_type)
 
+    def _send_method(
+        self,
+        method: str,
+        path: str,
+        params: Params | None,
+        headers: Headers | None,
+        timeout: float | None,
+        json: JSONPayload | None,
+        data: Params | None,
+        form: Form | None,
+        content: str | bytes | None,
+        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
+        response_headers_type: type[TypedHeaders] | None,
+        *,
+        skip_auth: bool,
+        infer_mime_type_from_file_extension: bool,
+        error_for_status: bool,
+        error_type: type[Data] | None,
+    ) -> Response[Any, Any]:
+        """Every body verb's shared path, taking the HTTP method as a string."""
+        return self._send_with_body(
+            self._client.request(method, path),
+            params,
+            headers,
+            timeout,
+            json,
+            data,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            skip_auth=skip_auth,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+            error_type=error_type,
+        )
+
+    def _send_with_body(
+        self,
+        request_builder: SyncRequestBuilder,
+        params: Params | None,
+        headers: Headers | None,
+        timeout: float | None,
+        json: JSONPayload | None,
+        data: Params | None,
+        form: Form | None,
+        content: str | bytes | None,
+        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
+        response_headers_type: type[TypedHeaders] | None,
+        *,
+        skip_auth: bool,
+        infer_mime_type_from_file_extension: bool,
+        error_for_status: bool,
+        error_type: type[Data] | None,
+    ) -> Response[Any, Any]:
+        request_builder = self._prepare_request(
+            request_builder, params, headers, timeout, skip_auth=skip_auth
+        )
+        request_builder = _attach_body_sync(
+            request_builder,
+            json,
+            data,
+            form,
+            content,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+        )
+        started = time.monotonic()
+        raw_response, request_info = _send_sync(request_builder)
+        elapsed = time.monotonic() - started
+        if error_for_status:
+            self._check_status(raw_response, error_type, request_info)
+        decoded = self._decode_body(raw_response, response_data_type)
+        response_headers = CaseInsensitiveDict(raw_response.headers)
+        if response_headers_type is None:
+            typed_headers = None
+        else:
+            typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+        return Response(
+            decoded,
+            raw_response.status,
+            response_headers,
+            typed_headers,
+            request_info,
+            raw_response.version,
+            elapsed,
+        )
+
     @overload
     def get(
         self,
@@ -5669,7 +4183,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> bytes: ...
+    ) -> Response[bytes]: ...
     @overload
     def get(
         self,
@@ -5682,7 +4196,7 @@ class SyncHTTPClient:
         response_data_type: type[dict[str, Any]],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> Response[dict[str, Any]]: ...
     @overload
     def get[TData: Data](
         self,
@@ -5695,7 +4209,7 @@ class SyncHTTPClient:
         response_data_type: type[TData],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> TData: ...
+    ) -> Response[TData]: ...
     @overload
     def get[TAdapted](
         self,
@@ -5708,7 +4222,62 @@ class SyncHTTPClient:
         response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> TAdapted: ...
+    ) -> Response[TAdapted]: ...
+    @overload
+    def get[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes, THeaders]: ...
+    @overload
+    def get[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        response_data_type: type[dict[str, Any]],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any], THeaders]: ...
+    @overload
+    def get[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData, THeaders]: ...
+    @overload
+    def get[TAdapted, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted, THeaders]: ...
     def get(
         self,
         path: str,
@@ -5718,10 +4287,14 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> object:
-        """GET `path` and decode the body as `response_data_type` (raw `bytes` by default).
+    ) -> Response[Any, Any]:
+        """GET `path`, returning a `Response` whose `.data` is the body decoded as
+        `response_data_type` (raw `bytes` by default), alongside `.status`, `.headers`,
+        `.request`, `.http_version` and `.elapsed`. Pass `response_headers_type` to also get the
+        headers parsed into `.typed_headers`.
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
 
@@ -5730,23 +4303,782 @@ class SyncHTTPClient:
         decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
         `None`.
         """
-        request_builder = self._prepare_request(
-            self._client.get(path), params, headers, timeout, skip_auth=skip_auth
-        )
-        raw_response, request_info = _send_sync(request_builder)
-        return self._parse(
-            raw_response,
+        return self._send_method(
+            "GET",
+            path,
+            params,
+            headers,
+            timeout,
+            None,
+            None,
+            None,
+            None,
             response_data_type,
-            request_info,
+            response_headers_type,
+            skip_auth=skip_auth,
+            infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
             error_type=error_type,
         )
 
-    @property
-    def with_result(self) -> SyncWithResult:
-        """The same verbs, each returning a `Result` (body + status + headers + request) instead
-        of the bare decoded body — `await client.with_result.get(...)`."""
-        return SyncWithResult(self._send_method_result)
+    @overload
+    def post(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes]: ...
+    @overload
+    def post(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[dict[str, Any]],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any]]: ...
+    @overload
+    def post[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData]: ...
+    @overload
+    def post[TAdapted](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted]: ...
+    @overload
+    def post[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes, THeaders]: ...
+    @overload
+    def post[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[dict[str, Any]],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any], THeaders]: ...
+    @overload
+    def post[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData, THeaders]: ...
+    @overload
+    def post[TAdapted, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted, THeaders]: ...
+    def post(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[Any, Any]:
+        """POST to `path` with at most one of `json`/`data`/`form`/`content` (raises
+        `ValueError` if more than one is given), returning a `Response` like `get`'s.
+        `data` is a urlencoded body (`a=1&b=2`), `form` a `multipart/form-data` one.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
+        """
+        return self._send_method(
+            "POST",
+            path,
+            params,
+            headers,
+            timeout,
+            json,
+            data,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            skip_auth=skip_auth,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+            error_type=error_type,
+        )
+
+    @overload
+    def put(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes]: ...
+    @overload
+    def put(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[dict[str, Any]],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any]]: ...
+    @overload
+    def put[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData]: ...
+    @overload
+    def put[TAdapted](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted]: ...
+    @overload
+    def put[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes, THeaders]: ...
+    @overload
+    def put[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[dict[str, Any]],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any], THeaders]: ...
+    @overload
+    def put[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData, THeaders]: ...
+    @overload
+    def put[TAdapted, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted, THeaders]: ...
+    def put(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[Any, Any]:
+        """PUT to `path`. Same body/decode rules as `post`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
+        """
+        return self._send_method(
+            "PUT",
+            path,
+            params,
+            headers,
+            timeout,
+            json,
+            data,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            skip_auth=skip_auth,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+            error_type=error_type,
+        )
+
+    @overload
+    def patch(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes]: ...
+    @overload
+    def patch(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[dict[str, Any]],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any]]: ...
+    @overload
+    def patch[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData]: ...
+    @overload
+    def patch[TAdapted](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted]: ...
+    @overload
+    def patch[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes, THeaders]: ...
+    @overload
+    def patch[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[dict[str, Any]],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any], THeaders]: ...
+    @overload
+    def patch[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData, THeaders]: ...
+    @overload
+    def patch[TAdapted, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted, THeaders]: ...
+    def patch(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[Any, Any]:
+        """PATCH `path`. Same body/decode rules as `post`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
+        """
+        return self._send_method(
+            "PATCH",
+            path,
+            params,
+            headers,
+            timeout,
+            json,
+            data,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            skip_auth=skip_auth,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+            error_type=error_type,
+        )
+
+    @overload
+    def delete(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes]: ...
+    @overload
+    def delete(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: type[dict[str, Any]],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any]]: ...
+    @overload
+    def delete[TData: Data](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: type[TData],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData]: ...
+    @overload
+    def delete[TAdapted](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted]: ...
+    @overload
+    def delete[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[bytes, THeaders]: ...
+    @overload
+    def delete[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: type[dict[str, Any]],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[dict[str, Any], THeaders]: ...
+    @overload
+    def delete[TData: Data, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: type[TData],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TData, THeaders]: ...
+    @overload
+    def delete[TAdapted, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[TAdapted, THeaders]: ...
+    def delete(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        response_headers_type: type[TypedHeaders] | None = None,
+        error_for_status: bool = True,
+        error_type: type[Data] | None = None,
+    ) -> Response[Any, Any]:
+        """DELETE `path`, returning a `Response` like `get`'s. A body is rare on a DELETE but
+        allowed: the same `json`/`data`/`form`/`content` options as `post`, at most one.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
+        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
+        `None`.
+        """
+        return self._send_method(
+            "DELETE",
+            path,
+            params,
+            headers,
+            timeout,
+            json,
+            data,
+            form,
+            content,
+            response_data_type,
+            response_headers_type,
+            skip_auth=skip_auth,
+            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            error_for_status=error_for_status,
+            error_type=error_type,
+        )
 
     def _sse_connection(
         self,
@@ -6336,578 +5668,6 @@ class SyncHTTPClient:
             error_type=error_type,
         )
 
-    def _send_with_body(
-        self,
-        request_builder: SyncRequestBuilder,
-        params: Params | None,
-        headers: Headers | None,
-        timeout: float | None,
-        json: JSONPayload | None,
-        data: Params | None,
-        form: Form | None,
-        content: str | bytes | None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-        *,
-        skip_auth: bool,
-        infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
-        error_type: type[Data] | None,
-    ) -> Data:
-        request_builder = self._prepare_request(
-            request_builder, params, headers, timeout, skip_auth=skip_auth
-        )
-        request_builder = _attach_body_sync(
-            request_builder,
-            json,
-            data,
-            form,
-            content,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-        )
-        raw_response, request_info = _send_sync(request_builder)
-        return self._parse(
-            raw_response,
-            response_data_type,
-            request_info,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    def _send_method_result(
-        self,
-        method: str,
-        path: str,
-        params: Params | None,
-        headers: Headers | None,
-        timeout: float | None,
-        json: JSONPayload | None,
-        data: Params | None,
-        form: Form | None,
-        content: str | bytes | None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-        response_headers_type: type[TypedHeaders] | None,
-        *,
-        skip_auth: bool,
-        infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
-        error_type: type[Data] | None,
-    ) -> Result[Any, Any]:
-        """`with_result`'s entry point: the method as a string, so the accessor stays free of
-        pyreqwest types; the request is built here, where the pyreqwest client lives."""
-        return self._send_with_body_result(
-            self._client.request(method, path),
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    def _send_with_body_result(
-        self,
-        request_builder: SyncRequestBuilder,
-        params: Params | None,
-        headers: Headers | None,
-        timeout: float | None,
-        json: JSONPayload | None,
-        data: Params | None,
-        form: Form | None,
-        content: str | bytes | None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-        response_headers_type: type[TypedHeaders] | None,
-        *,
-        skip_auth: bool,
-        infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
-        error_type: type[Data] | None,
-    ) -> Result[Any, Any]:
-        request_builder = self._prepare_request(
-            request_builder, params, headers, timeout, skip_auth=skip_auth
-        )
-        request_builder = _attach_body_sync(
-            request_builder,
-            json,
-            data,
-            form,
-            content,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-        )
-        started = time.monotonic()
-        raw_response, request_info = _send_sync(request_builder)
-        elapsed = time.monotonic() - started
-        if error_for_status:
-            self._check_status(raw_response, error_type, request_info)
-        decoded = self._decode_body(raw_response, response_data_type)
-        response_headers = CaseInsensitiveDict(raw_response.headers)
-        if response_headers_type is None:
-            typed_headers = None
-        else:
-            typed_headers = _parse_typed_headers(response_headers, response_headers_type)
-        return Result(
-            decoded,
-            raw_response.status,
-            response_headers,
-            typed_headers,
-            request_info,
-            raw_response.version,
-            elapsed,
-        )
-
-    @overload
-    def post(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> bytes: ...
-    @overload
-    def post(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> dict[str, Any]: ...
-    @overload
-    def post[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TData: ...
-    @overload
-    def post[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TAdapted: ...
-    def post(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> object:
-        """POST to `path` with at most one of `json`/`data`/`form`/`content` (raises
-        `ValueError` if more than one is given) and decode the response as `response_data_type`.
-        `data` is a urlencoded body (`a=1&b=2`), `form` a `multipart/form-data` one.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return self._send_with_body(
-            self._client.post(path),
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    def put(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> bytes: ...
-    @overload
-    def put(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> dict[str, Any]: ...
-    @overload
-    def put[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TData: ...
-    @overload
-    def put[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TAdapted: ...
-    def put(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> object:
-        """PUT to `path`. Same body/decode rules as `post`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return self._send_with_body(
-            self._client.put(path),
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    def patch(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> bytes: ...
-    @overload
-    def patch(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> dict[str, Any]: ...
-    @overload
-    def patch[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TData: ...
-    @overload
-    def patch[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TAdapted: ...
-    def patch(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> object:
-        """PATCH `path`. Same body/decode rules as `post`.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return self._send_with_body(
-            self._client.patch(path),
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
-    @overload
-    def delete(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> bytes: ...
-    @overload
-    def delete(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[dict[str, Any]],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> dict[str, Any]: ...
-    @overload
-    def delete[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[TData],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TData: ...
-    @overload
-    def delete[TAdapted](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> TAdapted: ...
-    def delete(
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> object:
-        """DELETE `path` and decode the response as `response_data_type`. A body is rare on a
-        DELETE but allowed: the same `json`/`data`/`form`/`content` options as `post`, at most one.
-
-        `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
-        """
-        return self._send_with_body(
-            self._client.delete(path),
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
-
     @overload
     def head(
         self,
@@ -6919,7 +5679,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> Result[None]: ...
+    ) -> Response[None]: ...
     @overload
     def head[THeaders: TypedHeaders](
         self,
@@ -6932,7 +5692,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> Result[None, THeaders]: ...
+    ) -> Response[None, THeaders]: ...
     def head(
         self,
         path: str,
@@ -6944,9 +5704,9 @@ class SyncHTTPClient:
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> Result[None, Any]:
+    ) -> Response[None, Any]:
         """HEAD `path` — headers-only, no body is ever decoded. Pass
-        `response_headers_type` to get the response headers parsed into `result.typed_headers`.
+        `response_headers_type` to get the response headers parsed into `.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
@@ -6967,7 +5727,7 @@ class SyncHTTPClient:
             if response_headers_type is None
             else _parse_typed_headers(response_headers, response_headers_type)
         )
-        return Result(
+        return Response(
             None,
             raw_response.status,
             response_headers,

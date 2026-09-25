@@ -7,6 +7,23 @@ predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/re
 
 ## [Unreleased]
 
+### Changed
+
+- `get`/`post`/`put`/`patch`/`delete` now return a `Response` instead of the bare body: the
+  decoded body is on `.data`, alongside `.status`, `.headers`, `.typed_headers`, `.request`,
+  `.http_version` and `.elapsed`. `response_headers_type=` is accepted on every one of them.
+  Migrate `item = await client.get(...)` to `item = (await client.get(...)).data`.
+- `Result` is renamed to `Response`.
+- `OAuthProvider`/`SyncOAuthProvider` take `token_cache_dir=` instead of `token_cache_path=`. Each
+  provider writes its own file there, named for the token URL's host, the client ID and a short
+  hash (`auth.example.com-my-client-9b73c8cc1d16.json`), so several providers can share one
+  directory.
+
+### Removed
+
+- `client.with_result` (`WithResult`/`SyncWithResult`): the verbs themselves now return what it
+  did. Replace `client.with_result.get(...)` with `client.get(...)`.
+
 ## [0.0.18] - 2026-09-23
 
 ### Fixed

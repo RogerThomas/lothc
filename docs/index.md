@@ -42,8 +42,8 @@ top-right corner to copy a one-liner that runs it via `uv run`, no local install
 
     async def main() -> None:
         async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
-            pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
-            print(pikachu)  # Pokemon(id=25, name='pikachu')
+            response = await client.get("pokemon/pikachu", response_data_type=Pokemon)
+            print(response.status, response.data)  # 200 Pokemon(id=25, name='pikachu')
 
 
     asyncio.run(main())
@@ -64,8 +64,8 @@ top-right corner to copy a one-liner that runs it via `uv run`, no local install
 
     async def main() -> None:
         async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
-            pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
-            print(pikachu)  # id=25 name='pikachu'
+            response = await client.get("pokemon/pikachu", response_data_type=Pokemon)
+            print(response.status, response.data)  # 200 id=25 name='pikachu'
 
 
     asyncio.run(main())
@@ -80,8 +80,8 @@ top-right corner to copy a one-liner that runs it via `uv run`, no local install
 
     async def main() -> None:
         async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
-            pikachu = await client.get("pokemon/pikachu", response_data_type=dict)
-            print(pikachu)  # {'id': 25, 'name': 'pikachu', ...}
+            response = await client.get("pokemon/pikachu", response_data_type=dict)
+            print(response.status, response.data)  # 200 {'id': 25, 'name': 'pikachu', ...}
 
 
     asyncio.run(main())
@@ -164,7 +164,7 @@ Decoding into a real msgspec `Struct` even edged out the unvalidated dict path i
 
 -   **Every verb**
 
-    `get`, `post`, `put`, `patch`, `delete` (each also via `client.with_result`), `head`, `download` — plus `sse`,
+    `get`, `post`, `put`, `patch`, `delete`, `head` (each returning a `Response`: `.data`, `.status`, `.headers`), `download` — plus `sse`,
     `stream_get`, and `stream_post` for streaming responses. See [Verbs](verbs.md).
 
 -   **Typed *and* raw params/headers**

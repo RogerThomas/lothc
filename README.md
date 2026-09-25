@@ -35,8 +35,8 @@ class Pokemon(BaseModel):
 
 
 async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
-    pikachu = await client.get("pokemon/pikachu", response_data_type=Pokemon)
-    print(pikachu)  # id=25 name='pikachu'
+    response = await client.get("pokemon/pikachu", response_data_type=Pokemon)
+    print(response.status, response.data)  # 200 id=25 name='pikachu'
 ```
 
 ## Why?
@@ -83,7 +83,7 @@ validate yourself. See [Benchmarks](https://rogerthomas.github.io/lothc/benchmar
 | | |
 |---|---|
 | **Two clients, one API** | `HTTPClient` (async) and `SyncHTTPClient` (sync) — identical surface, both backed by pyreqwest. |
-| **Every verb** | `get`, `post`, `put`, `patch`, `delete` (plus `client.with_result.<verb>` for status and headers), `head`, `download` — see [Verbs](https://rogerthomas.github.io/lothc/verbs/). |
+| **Every verb** | `get`, `post`, `put`, `patch`, `delete`, `head` (each returning a `Response`: `.data`, `.status`, `.headers`), `download` — see [Verbs](https://rogerthomas.github.io/lothc/verbs/). |
 | **Typed params, headers & forms** | A `BaseModel`/`Struct` for query params or headers (with `None`-field omission), or a body sent urlencoded (`data=`) or as a real multipart form (`form=`). |
 | **Precise static types** | Every verb is paired `@overload`s, not a cast-laden generic — your editor knows the exact return type. |
 | **SSE & streaming** | Spec-compliant SSE — automatic reconnect with `Last-Event-ID`, server `retry:` honored, typed decode (discriminated unions included) — plus raw or NDJSON-typed `stream_get`/`stream_post` — see [SSE](https://rogerthomas.github.io/lothc/sse/) / [Streaming](https://rogerthomas.github.io/lothc/streaming/). |

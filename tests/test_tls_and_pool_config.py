@@ -26,7 +26,7 @@ async def test_connect_timeout_and_pool_settings_still_allow_a_normal_request(
         pool_max_idle_per_host=5,
         pool_timeout=2.0,
     ) as client:
-        result = await client.get("items/7", response_data_type=dict)
+        result = (await client.get("items/7", response_data_type=dict)).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -42,7 +42,7 @@ def test_sync_connect_timeout_and_pool_settings_still_allow_a_normal_request(
         pool_max_idle_per_host=5,
         pool_timeout=2.0,
     ) as client:
-        result = client.get("items/7", response_data_type=dict)
+        result = client.get("items/7", response_data_type=dict).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -58,7 +58,8 @@ async def test_request_past_pool_timeout_waiting_for_a_connection_slot_raises_ti
         )
 
     assert [isinstance(outcome, HTTPTimeoutError) for outcome in outcomes].count(True) == 1
-    assert b'{"finally": true}' in outcomes
+    bodies = [outcome.data for outcome in outcomes if not isinstance(outcome, BaseException)]
+    assert bodies == [b'{"finally": true}']
 
 
 def test_sync_request_past_pool_timeout_waiting_for_a_connection_slot_raises_timeout_error(
@@ -72,4 +73,5 @@ def test_sync_request_past_pool_timeout_waiting_for_a_connection_slot_raises_tim
         outcomes = [future.exception() or future.result() for future in futures]
 
     assert [isinstance(outcome, HTTPTimeoutError) for outcome in outcomes].count(True) == 1
-    assert b'{"finally": true}' in outcomes
+    bodies = [outcome.data for outcome in outcomes if not isinstance(outcome, BaseException)]
+    assert bodies == [b'{"finally": true}']

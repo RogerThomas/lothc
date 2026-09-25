@@ -86,7 +86,7 @@ default), typed error bodies (`error_type=`, mirrors `response_data_type`), TLS/
 (`connect_timeout`, `root_certificates`, `identity_pem`, `min_tls_version`/`max_tls_version`,
 `danger_accept_invalid_certs`, `https_only`, `max_connections`, `pool_idle_timeout`,
 `pool_max_idle_per_host`, `pool_timeout`, `read_timeout`), request metadata (`.request:
-RequestInfo` on both `Result` and `HTTPResponseError`, every verb; `Result.http_version`/
+RequestInfo` on both `Response` and `HTTPResponseError`, every verb; `Response.http_version`/
 `.elapsed`), bodies on `delete`, OAuth 2 client credentials
 (`OAuthProvider`/`SyncOAuthProvider`, see dev notes), and a pytest mocking plugin (`lothc[testing]`
 — see dev notes).
@@ -95,7 +95,7 @@ Not done yet: `sse_post` (SSE over POST, deferred by the user). Maybe later, onl
 (dropped by the user; they came from a code review, not a request): request/response hooks, a
 generic `request()`/OPTIONS, streaming uploads, status/headers on stream/download calls,
 cookie-jar access. Deliberately not exposed: per-algorithm compression
-toggles, `interface`, `tcp_nodelay`, `referer`, CRLs. No final URL on `Result`: pyreqwest's
+toggles, `interface`, `tcp_nodelay`, `referer`, CRLs. No final URL on `Response`: pyreqwest's
 response doesn't expose one.
 
 ## Testing
@@ -375,9 +375,8 @@ async with HTTPClient(base_url=..., bearer_token=..., timeout=30.0) as client:
 
 `get`, `post`, `put`, `patch`, `delete`, `head`, `sse`, `stream_get`, `stream_post`, `download` —
 each is a set of `@overload`s plus one real implementation. See style guide for *why* overloads are
-used instead of a single generic signature. `get`/`post`/`put`/`patch`/`delete` also exist on
-`client.with_result` (`WithResult`/`SyncWithResult`), returning a `Result` instead of the bare
-body; `head()` always returns a `Result`.
+used instead of a single generic signature. `get`/`post`/`put`/`patch`/`delete`/`head` return a
+`Response` (body on `.data`); the streaming verbs and `download` don't.
 
 ### Code style
 
@@ -398,9 +397,7 @@ the skill covers *how* to write new code that matches it.
   not dataclasses (style-guide §1 deviation): constructor params are settings, not stored fields.
   A pyreqwest builder can only be built once ("Client was already built"), so settings live in a
   `_TransportSettings` record and each entry rebuilds, which also makes a client re-enterable, so
-  a module-level client works across separate `asyncio.run()` calls. `WithResult` is handed a
-  `_send_method_result` callable taking the method as a string, never the pyreqwest client, since
-  its generated constructor is public too. `TlsVersion` is lothc's own `Literal` alias, not
+  a module-level client works across separate `asyncio.run()` calls. `TlsVersion` is lothc's own `Literal` alias, not
   pyreqwest's. `tests/test_public_api.py` enforces all of this by walking every exported
   signature, overload and type alias in `lothc` and `lothc.testing` for a pyreqwest type; run
   against the old code, it flags exactly the four leaking constructors.
@@ -441,7 +438,15 @@ the skill covers *how* to write new code that matches it.
   timeout/proxy/TLS for the token endpoint. `TokenResponseTyping` is a Protocol union needing only
   `.access_token`/`.expires_in`; `.refresh_token` is read via `getattr(..., "refresh_token", None)`
   so a model that omits it entirely is still valid (RFC 6749 §5.1 makes it optional). A
-  `token_cache_path` whose parent doesn't exist fails at construction, not on first write.
+  `token_cache_dir` that doesn't exist fails at construction, not on first write. It replaced a
+  single `token_cache_path` file so providers can share one directory: `_token_cache_file` names
+  each file `<host>-<sanitised client_id>-<sha256(token_url, client_id, scope)[:12]>.json`, not
+  just `{client_id}.json`, because one client ID can be used against several token URLs or scopes
+  (cached separately) and may contain characters unsafe in a filename. No leading dot, and the
+  in-file `token_url`/`client_id`/`scope` guard stays as a second check. Not encrypted (considered
+  and rejected): stdlib has no cipher, so it'd need `cryptography`, and a key derived from the
+  client secret protects little, since the secret can mint tokens itself; AWS CLI and gcloud also
+  rely on `0600` plaintext.
 - **For `stream_get`/`stream_post`/`download`, the client's `timeout` is a gap limit, not a total
   cap.** A total cap (pyreqwest's only per-request timeout) killed every healthy long stream or
   large download at 30s. So these verbs swap it for `_streaming_default_timeout` (a year, as `sse`
@@ -508,7 +513,7 @@ the skill covers *how* to write new code that matches it.
   `get_requests()` returns, built from the real `Request` by `_mock_request_from` — the only place
   this module still touches it. `url=` matching is `str | re.Pattern[str]` only (pyreqwest's `Url`
   object is dropped — a string already matches the exact URL). `MockRequest.headers` is a
-  `CaseInsensitiveDict` like `Result.headers`, so a repeated header keeps every value (`get_all`).
+  `CaseInsensitiveDict` like `Response.headers`, so a repeated header keeps every value (`get_all`).
   `add_*_response`'s `params=`/`data=`/`headers=` share encoding with the real request path
   (`_encode_params`/`_encode_headers` in `_client.py`; `data=` uses `testing.py`'s own `_encode_json_payload`, byte-identical to the real `_attach_json_body`); `params=`'s match
   string is derived from pyreqwest's own real query encoder rather than reimplemented (so an
@@ -565,20 +570,17 @@ the skill covers *how* to write new code that matches it.
   *instance* level**, not the class level. `JSONPayload` (not `Json`) was named that way
   deliberately to avoid a case-only collision with the former `JSON` response-decode class
   (removed).
-- **`client.with_result.<verb>`, not `<verb>_result` methods or a bool flag.** The `*_result`
-  twins read wrong, and a flag (`post(..., as_result=True)`) would make the return type depend on a
-  runtime `bool`: that multiplies every verb's overloads by `Literal[True]`/`Literal[False]`/`bool`,
-  and a non-literal `bool` argument matches no overload at all (the same trap `sse`'s former
-  `allow_missing_id=` hit). It would also leave `response_headers_type` meaningful in only one mode.
-  A namespace keeps one return type per method and scopes `response_headers_type` to where it
-  applies, with the same surface as before, just moved (prior art: the OpenAI/Anthropic SDKs'
-  `client.with_raw_response`). Named `with_result`, not `with_response`, because it returns a
-  `Result` and "response" suggests a raw one. `WithResult` is handed the pyreqwest client and a
-  bound `_send_with_body_result` (typed by the `_SendWithBodyResult` Protocol) rather than the
-  `HTTPClient` itself: basedpyright's `reportPrivateUsage` flags a protected member accessed from
-  another class even within one module (confirmed with a probe), so this is how it avoids reaching
-  into the client's privates. `with_result.get` reuses `_send_with_body_result` with no body,
-  rather than keeping its own copy of the send/decode/headers sequence.
+- **Every body verb returns a `Response`; there's no body-only mode.** It used to return the bare
+  decoded body, with `client.with_result.<verb>` (a `Result`) as the escape hatch, modelled on the
+  OpenAI/Anthropic SDKs' `with_raw_response`. Reversed because lothc is a general-purpose ("raw")
+  client, not an SDK for one known API: a research pass found typed SDKs return the body (their
+  authors know every endpoint's shape), while general clients (requests, httpx, aiohttp, axios)
+  return a response object, and the maintainer expects most callers to need status/headers. So
+  `Result` became `Response` (`.data`, `.status`, `.headers`, `.typed_headers`, `.request`,
+  `.http_version`, `.elapsed`), `response_headers_type=` moved onto the verbs, and `WithResult`/
+  `SyncWithResult`/`with_result` were deleted. A flag (`as_response=True`) was never an option:
+  a return type depending on a runtime `bool` multiplies overloads and a non-literal `bool` matches
+  none. The verbs share `_send_method` (the method as a string) → `_send_with_body`.
 - **A `BuilderError` is permanent, so it's never reconnected.** pyreqwest raises it from
   `.build()`/`.build_streamed()` before anything reaches the network (a rejected scheme under
   `https_only`, a malformed URL), so retrying cannot change the outcome — yet `sse()` used to
@@ -601,7 +603,7 @@ the skill covers *how* to write new code that matches it.
   private, so a user on a retry-heavy path had no way to tune backoff at all (and the retry tests
   couldn't shrink their ~2s of real sleeping). Same default (0.1), same
   `backoff_base * 2 ** attempt` formula, `Retry-After` still wins over the computed delay.
-- **`Result.headers`/`MockRequest.headers` are a `CaseInsensitiveDict`, not a `dict`.** They were
+- **`Response.headers`/`MockRequest.headers` are a `CaseInsensitiveDict`, not a `dict`.** They were
   `dict(raw_response.headers)`, so `result.headers["Content-Type"]` raised `KeyError` while
   `["content-type"]` worked — pyreqwest's `HeaderMap` is itself a case-insensitive multi-value
   map, and flattening it to a plain `dict` threw both properties away. Checked against the field:
@@ -631,7 +633,7 @@ the skill covers *how* to write new code that matches it.
   (OAuth built `content=urlencode(...)` plus a header by hand). `data=` matches requests/httpx,
   where `data=` is the urlencoded one, so a call brought over from them sends the same body.
   Settled after trying `form=`/`parts=`; `multipart=`, `xform=`/`mform=` were also rejected.
-  "data" also names response bodies here (`Result.data`, `SSEEvent.data`, the mocker's `data=`),
+  "data" also names response bodies here (`Response.data`, `SSEEvent.data`, the mocker's `data=`),
   accepted as the cost of matching requests/httpx. `data=` takes `Params` and reuses its encoding
   (`_query_pairs(_encode_params(...))`) into pyreqwest's native `.form()`, which takes the same
   pairs as `.query()` (probed: repeats keys, `true`/`false`).

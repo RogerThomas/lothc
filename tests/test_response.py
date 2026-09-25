@@ -35,57 +35,57 @@ class EchoedHeadersStruct(Struct):
     x_custom: str | None = None
 
 
-async def test_with_result_get_includes_status_and_data(client: HTTPClient) -> None:
-    result = await client.with_result.get("items/7", response_data_type=ItemModel)
+async def test_response_get_includes_status_and_data(client: HTTPClient) -> None:
+    result = await client.get("items/7", response_data_type=ItemModel)
 
     assert result.status == 200
     assert result.data == ItemModel(id=7, name="item-7")
 
 
-async def test_with_result_get_includes_raw_headers(client: HTTPClient) -> None:
-    result = await client.with_result.get("items/7", response_data_type=ItemModel)
+async def test_response_get_includes_raw_headers(client: HTTPClient) -> None:
+    result = await client.get("items/7", response_data_type=ItemModel)
 
     assert "content-type" in result.headers
 
 
-async def test_with_result_get_with_typed_headers(client: HTTPClient) -> None:
-    result = await client.with_result.get(
+async def test_response_get_with_typed_headers(client: HTTPClient) -> None:
+    result = await client.get(
         "items/7", response_data_type=ItemModel, response_headers_type=EchoedHeaders
     )
 
     assert result.typed_headers is not None
 
 
-async def test_with_result_get_with_msgspec_typed_headers(client: HTTPClient) -> None:
-    result = await client.with_result.get(
+async def test_response_get_with_msgspec_typed_headers(client: HTTPClient) -> None:
+    result = await client.get(
         "items/7", response_data_type=ItemModel, response_headers_type=EchoedHeadersStruct
     )
 
     assert result.typed_headers is not None
 
 
-async def test_with_result_get_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
-    result = await client.with_result.get("boom", error_for_status=False)
+async def test_response_get_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
+    result = await client.get("boom", error_for_status=False)
 
     assert result.status == 500
     assert b"internal-server-error" in result.data
 
 
 def test_sync_get_result_includes_status_and_data(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.with_result.get("items/7", response_data_type=ItemModel)
+    result = sync_client.get("items/7", response_data_type=ItemModel)
 
     assert result.status == 200
     assert result.data == ItemModel(id=7, name="item-7")
 
 
 def test_sync_get_result_includes_raw_headers(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.with_result.get("items/7", response_data_type=ItemModel)
+    result = sync_client.get("items/7", response_data_type=ItemModel)
 
     assert "content-type" in result.headers
 
 
 def test_sync_get_result_with_typed_headers(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.with_result.get(
+    result = sync_client.get(
         "items/7", response_data_type=ItemModel, response_headers_type=EchoedHeaders
     )
 
@@ -95,14 +95,14 @@ def test_sync_get_result_with_typed_headers(sync_client: SyncHTTPClient) -> None
 def test_sync_get_result_error_for_status_false_suppresses_raise(
     sync_client: SyncHTTPClient,
 ) -> None:
-    result = sync_client.with_result.get("boom", error_for_status=False)
+    result = sync_client.get("boom", error_for_status=False)
 
     assert result.status == 500
     assert b"internal-server-error" in result.data
 
 
-async def test_with_result_get_headers_are_case_insensitive(client: HTTPClient) -> None:
-    result = await client.with_result.get("items/7", response_data_type=ItemModel)
+async def test_response_get_headers_are_case_insensitive(client: HTTPClient) -> None:
+    result = await client.get("items/7", response_data_type=ItemModel)
 
     assert result.headers["Content-Type"] == result.headers["content-type"]
     assert result.headers["CONTENT-TYPE"] == result.headers["content-type"]
@@ -112,17 +112,17 @@ async def test_with_result_get_headers_are_case_insensitive(client: HTTPClient) 
 
 
 def test_sync_get_result_headers_are_case_insensitive(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.with_result.get("items/7", response_data_type=ItemModel)
+    result = sync_client.get("items/7", response_data_type=ItemModel)
 
     assert result.headers["Content-Type"] == result.headers["content-type"]
     assert "Content-Type" in result.headers
     assert result.headers.get("CoNtEnT-tYpE") is not None
 
 
-async def test_with_result_get_headers_keep_every_value_of_a_repeated_header(
+async def test_response_get_headers_keep_every_value_of_a_repeated_header(
     client: HTTPClient,
 ) -> None:
-    result = await client.with_result.get("multi-set-cookie", response_data_type=dict)
+    result = await client.get("multi-set-cookie", response_data_type=dict)
 
     assert result.headers.get_all("Set-Cookie") == [
         "session=abc; Path=/",
@@ -137,7 +137,7 @@ async def test_with_result_get_headers_keep_every_value_of_a_repeated_header(
 def test_sync_get_result_headers_keep_every_value_of_a_repeated_header(
     sync_client: SyncHTTPClient,
 ) -> None:
-    result = sync_client.with_result.get("multi-set-cookie", response_data_type=dict)
+    result = sync_client.get("multi-set-cookie", response_data_type=dict)
 
     assert result.headers.get_all("Set-Cookie") == [
         "session=abc; Path=/",
@@ -147,8 +147,8 @@ def test_sync_get_result_headers_keep_every_value_of_a_repeated_header(
     assert result.headers["set-cookie"] == "session=abc; Path=/"
 
 
-async def test_with_result_get_headers_get_all_returns_a_copy(client: HTTPClient) -> None:
-    result = await client.with_result.get("multi-set-cookie", response_data_type=dict)
+async def test_response_get_headers_get_all_returns_a_copy(client: HTTPClient) -> None:
+    result = await client.get("multi-set-cookie", response_data_type=dict)
 
     result.headers.get_all("Set-Cookie").clear()
 
@@ -158,7 +158,7 @@ async def test_with_result_get_headers_get_all_returns_a_copy(client: HTTPClient
 async def test_copying_headers_keeps_every_repeated_value(client: HTTPClient) -> None:
     # Mapping.items() is single-valued, so a copy taken through it would silently drop the extra
     # values — the one thing CaseInsensitiveDict exists to keep.
-    result = await client.with_result.get("multi-set-cookie", response_data_type=dict)
+    result = await client.get("multi-set-cookie", response_data_type=dict)
 
     assert CaseInsensitiveDict(result.headers).get_all("set-cookie") == [
         "session=abc; Path=/",
@@ -169,7 +169,7 @@ async def test_copying_headers_keeps_every_repeated_value(client: HTTPClient) ->
 
 
 async def test_updating_headers_keeps_every_repeated_value(client: HTTPClient) -> None:
-    result = await client.with_result.get("multi-set-cookie", response_data_type=dict)
+    result = await client.get("multi-set-cookie", response_data_type=dict)
     target = CaseInsensitiveDict({"X-Keep": "kept", "Set-Cookie": "replaced"})
 
     target.update(result.headers)
@@ -249,7 +249,7 @@ def test_headers_update_accepts_a_non_mapping_keys_and_getitem_source() -> None:
 
 
 async def test_result_reports_the_http_version(client: HTTPClient) -> None:
-    result = await client.with_result.get("items/7")
+    result = await client.get("items/7")
 
     assert result.http_version == "HTTP/1.1"
 
@@ -261,13 +261,13 @@ def test_sync_head_result_reports_the_http_version(sync_client: SyncHTTPClient) 
 
 
 async def test_result_elapsed_covers_the_time_the_server_took(client: HTTPClient) -> None:
-    result = await client.with_result.get("slow", params={"seconds": 0.05})
+    result = await client.get("slow", params={"seconds": 0.05})
 
     assert 0.05 <= result.elapsed < 2.0
 
 
 def test_sync_result_elapsed_covers_the_time_the_server_took(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.with_result.get("slow", params={"seconds": 0.05})
+    result = sync_client.get("slow", params={"seconds": 0.05})
 
     assert 0.05 <= result.elapsed < 2.0
 

@@ -76,9 +76,9 @@ async def test_get_error_has_request_info(client: HTTPClient) -> None:
     assert exc_info.value.request.host == "127.0.0.1"
 
 
-async def test_with_result_get_error_has_request_info(client: HTTPClient) -> None:
+async def test_response_get_error_has_request_info(client: HTTPClient) -> None:
     with pytest.raises(HTTPResponseError) as exc_info:
-        await client.with_result.get("boom")
+        await client.get("boom")
     assert exc_info.value.request.method == "GET"
     assert exc_info.value.request.path == "/boom"
 
@@ -143,7 +143,7 @@ def test_sync_get_error_has_request_info(sync_client: SyncHTTPClient) -> None:
 
 def test_sync_get_result_error_has_request_info(sync_client: SyncHTTPClient) -> None:
     with pytest.raises(HTTPResponseError) as exc_info:
-        sync_client.with_result.get("boom")
+        sync_client.get("boom")
     assert exc_info.value.request.method == "GET"
     assert exc_info.value.request.path == "/boom"
 

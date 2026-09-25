@@ -74,16 +74,18 @@ async def test_per_call_timeout_longer_than_client_overrides_it(base_url: str) -
     # client timeout stays 5x shorter than it (0.02 vs 0.1), which is all the override has to
     # beat — a client that ignored the per-call value would abort long before 0.1s.
     async with HTTPClient(base_url=base_url, timeout=0.02) as client:
-        result = await client.get(
-            "slow", params={"seconds": 0.1}, timeout=10.0, response_data_type=dict
-        )
+        result = (
+            await client.get("slow", params={"seconds": 0.1}, timeout=10.0, response_data_type=dict)
+        ).data
 
     assert result == {"finally": True}
 
 
 def test_sync_per_call_timeout_longer_than_client_overrides_it(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, timeout=0.02) as client:
-        result = client.get("slow", params={"seconds": 0.1}, timeout=10.0, response_data_type=dict)
+        result = client.get(
+            "slow", params={"seconds": 0.1}, timeout=10.0, response_data_type=dict
+        ).data
 
     assert result == {"finally": True}
 

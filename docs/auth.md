@@ -142,7 +142,7 @@ header itself, per request.
 
 ### Persisting the token across restarts
 
-`token_cache_path` adds persistence, and only persistence — it never changes *when* a token is
+`token_cache_dir` adds persistence, and only persistence — it never changes *when* a token is
 renewed:
 
 ```python
@@ -152,11 +152,18 @@ OAuthProvider(
     token_url="https://auth.example.com/oauth/token",
     client_id="my-client-id",
     client_secret="my-client-secret",
-    token_cache_path=Path("~/.cache/my-app/token.json").expanduser(),
+    token_cache_dir=Path("~/.cache/my-app").expanduser(),
 )
 ```
 
-After every mint/refresh the token triple is written there as JSON, atomically (a temp file in
+Each provider gets its own file in that directory, named for the token URL's host, the client ID
+and a short hash of the token URL, client ID and scope, e.g.
+`auth.example.com-my-client-id-825a9a6162ca.json`. So several providers (different clients, token
+URLs or scopes) can share one directory without overwriting each other, and you can still tell the
+files apart by eye. Characters that aren't safe in a filename are replaced with `_` in the
+readable part; the hash always uses the real values.
+
+After every mint/refresh the token triple is written to that file as JSON, atomically (a temp file in
 the same directory, then replaced into place) with `0600` permissions, since it holds live
 credentials. It's meant to be readable by a person checking why a token did or didn't renew, so
 the expiry is an ISO 8601 UTC timestamp at whole-second precision, not an epoch float:
@@ -179,9 +186,13 @@ the cached refresh token (`expires_in`, the lifetime the token was issued with, 
 leeway clamp above is computed from). The file also records `token_url`, `client_id` and `scope`;
 a mismatch on any of them reads as "no cache", so one client is never handed another client's
 token, or a token minted for a different set of scopes. A corrupt or unreadable file is never
-fatal — it's ignored and overwritten on the next mint. The parent directory is the one thing
-checked up front: if it doesn't exist, constructing the provider raises `FileNotFoundError`
-immediately rather than failing on the first write.
+fatal — it's ignored and overwritten on the next mint. The directory is the one thing checked
+up front: if it doesn't exist, constructing the provider raises `FileNotFoundError` immediately
+rather than failing on the first write.
+
+The file isn't encrypted: like the AWS CLI's `~/.aws/sso/cache` and gcloud's credentials, it
+relies on `0600` permissions. Encrypting it with the client secret would add little, since anyone
+who can read the secret can mint a fresh token anyway.
 
 ### Non-RFC token endpoints
 

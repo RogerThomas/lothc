@@ -15,7 +15,9 @@ async def _hangups(client: HTTPClient, key: str) -> int:
     deadline = time.monotonic() + 2.0
     while True:
         hangups = (
-            await client.get("hits", params={"key": f"{key}-hangups"}, response_data_type=dict)
+            (
+                await client.get("hits", params={"key": f"{key}-hangups"}, response_data_type=dict)
+            ).data
         )["hits"]
         if hangups or time.monotonic() > deadline:
             return hangups
@@ -27,7 +29,7 @@ def _sync_hangups(sync_client: SyncHTTPClient, key: str) -> int:
     while True:
         hangups = sync_client.get(
             "hits", params={"key": f"{key}-hangups"}, response_data_type=dict
-        )["hits"]
+        ).data["hits"]
         if hangups or time.monotonic() > deadline:
             return hangups
         time.sleep(0.01)

@@ -29,8 +29,6 @@ from lothc import (
     SyncAuthProvider,
     SyncHTTPClient,
     SyncOAuthProvider,
-    SyncWithResult,
-    WithResult,
 )
 
 
@@ -285,7 +283,6 @@ lothc_implementation_pairs, lothc_one_sided_methods = _collect_lothc_implementat
     ("async_cls", "sync_cls"),
     [
         (HTTPClient, SyncHTTPClient),
-        (WithResult, SyncWithResult),
         (OAuthProvider, SyncOAuthProvider),
     ],
     ids=lambda cls: cls.__name__,
@@ -311,7 +308,8 @@ def test_implementation_pairs_were_discovered() -> None:
     assert {
         "HTTPClient.get",
         "HTTPClient.__enter__",
-        "WithResult.post",
+        "HTTPClient.post",
+        "HTTPClient._send_with_body",
         "_RetryMiddleware.__call__",
         "_ReauthMiddleware.__call__",
         "OAuthProvider._renew",

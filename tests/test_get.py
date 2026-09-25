@@ -39,71 +39,83 @@ class SearchParamsStruct(Struct):
 
 
 async def test_get_returns_raw_bytes_by_default(client: HTTPClient) -> None:
-    body = await client.get("items/7")
+    body = (await client.get("items/7")).data
 
     assert isinstance(body, bytes)
     assert json.loads(body) == {"id": 7, "name": "item-7"}
 
 
 async def test_get_decodes_pydantic_model(client: HTTPClient) -> None:
-    item = await client.get("items/7", response_data_type=ItemModel)
+    item = (await client.get("items/7", response_data_type=ItemModel)).data
     assert item == ItemModel(id=7, name="item-7")
 
 
 async def test_get_decodes_msgspec_struct(client: HTTPClient) -> None:
-    item = await client.get("items/7", response_data_type=ItemStruct)
+    item = (await client.get("items/7", response_data_type=ItemStruct)).data
     assert item == ItemStruct(id=7, name="item-7")
 
 
 async def test_get_decodes_plain_dict(client: HTTPClient) -> None:
-    item = await client.get("items/7", response_data_type=dict)
+    item = (await client.get("items/7", response_data_type=dict)).data
     assert item == {"id": 7, "name": "item-7"}
 
 
 async def test_get_with_raw_dict_params(client: HTTPClient) -> None:
-    result = await client.get("items", params={"q": "pikachu", "page": 2}, response_data_type=dict)
+    result = (
+        await client.get("items", params={"q": "pikachu", "page": 2}, response_data_type=dict)
+    ).data
     assert result == {"q": "pikachu", "page": 2, "items": [{"id": 2, "name": "pikachu-match"}]}
 
 
 async def test_get_with_repeated_query_param(client: HTTPClient) -> None:
     """A `list[...]` `params` value sends that key once per element, verbatim — see `Params`'s
     own doc comment in `lothc/_client.py`."""
-    result = await client.get(
-        "echo-query", params={"tag": ["a", "b"], "limit": 10}, response_data_type=dict
-    )
+    result = (
+        await client.get(
+            "echo-query", params={"tag": ["a", "b"], "limit": 10}, response_data_type=dict
+        )
+    ).data
     assert result == {"query": {"tag": ["a", "b"], "limit": ["10"]}}
 
 
 async def test_get_with_repeated_query_param_as_tuple(client: HTTPClient) -> None:
     """A `tuple[...]` value works exactly like `list[...]` — both spell "repeat this key"."""
-    result = await client.get("echo-query", params={"tag": ("a", "b")}, response_data_type=dict)
+    result = (
+        await client.get("echo-query", params={"tag": ("a", "b")}, response_data_type=dict)
+    ).data
     assert result == {"query": {"tag": ["a", "b"]}}
 
 
 async def test_get_with_scalar_query_params_still_works(client: HTTPClient) -> None:
-    result = await client.get("echo-query", params={"page": "2"}, response_data_type=dict)
+    result = (await client.get("echo-query", params={"page": "2"}, response_data_type=dict)).data
     assert result == {"query": {"page": ["2"]}}
 
 
 async def test_get_with_pydantic_params_omits_none_fields(client: HTTPClient) -> None:
-    result = await client.get(
-        "items", params=SearchParamsModel(q="pikachu", page=1), response_data_type=dict
-    )
+    result = (
+        await client.get(
+            "items", params=SearchParamsModel(q="pikachu", page=1), response_data_type=dict
+        )
+    ).data
     assert result["q"] == "pikachu"
     assert result["page"] == 1
 
 
 async def test_get_with_msgspec_params(client: HTTPClient) -> None:
-    result = await client.get(
-        "items", params=SearchParamsStruct(q="pikachu", page=1), response_data_type=dict
-    )
+    result = (
+        await client.get(
+            "items", params=SearchParamsStruct(q="pikachu", page=1), response_data_type=dict
+        )
+    ).data
     assert result["q"] == "pikachu"
 
 
 async def test_get_with_raw_headers(client: HTTPClient) -> None:
-    result = await client.get(
-        "echo-headers", headers={"x-custom": "header-value"}, response_data_type=dict
-    )
+    result = (
+        await client.get(
+            "echo-headers", headers={"x-custom": "header-value"}, response_data_type=dict
+        )
+    ).data
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["x-custom"] == "header-value"
 
@@ -119,22 +131,26 @@ class TypedHeadersStruct(Struct):
 
 
 async def test_get_with_pydantic_headers_omits_none_fields(client: HTTPClient) -> None:
-    result = await client.get(
-        "echo-headers",
-        headers=TypedHeadersModel(x_custom="header-value"),
-        response_data_type=dict,
-    )
+    result = (
+        await client.get(
+            "echo-headers",
+            headers=TypedHeadersModel(x_custom="header-value"),
+            response_data_type=dict,
+        )
+    ).data
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["x-custom"] == "header-value"
     assert "x-omitted" not in headers
 
 
 async def test_get_with_msgspec_headers_omits_none_fields(client: HTTPClient) -> None:
-    result = await client.get(
-        "echo-headers",
-        headers=TypedHeadersStruct(x_custom="header-value"),
-        response_data_type=dict,
-    )
+    result = (
+        await client.get(
+            "echo-headers",
+            headers=TypedHeadersStruct(x_custom="header-value"),
+            response_data_type=dict,
+        )
+    ).data
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["x-custom"] == "header-value"
     assert "x-omitted" not in headers
@@ -142,7 +158,7 @@ async def test_get_with_msgspec_headers_omits_none_fields(client: HTTPClient) ->
 
 async def test_default_headers_sent_on_every_request(base_url: str) -> None:
     async with HTTPClient(base_url=base_url, default_headers={"x-api-key": "secret"}) as client:
-        result = await client.get("echo-headers", response_data_type=dict)
+        result = (await client.get("echo-headers", response_data_type=dict)).data
 
     headers = {h["name"].lower(): h["value"] for h in result["headers"]}
     assert headers["x-api-key"] == "secret"
@@ -155,7 +171,7 @@ async def test_get_raises_response_error_for_status(client: HTTPClient) -> None:
 
 
 async def test_get_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
-    body = await client.get("boom", error_for_status=False)
+    body = (await client.get("boom", error_for_status=False)).data
     assert b"internal-server-error" in body
 
 
@@ -176,24 +192,24 @@ async def test_get_response_data_type_unsupported_class_raises_type_error(
 
 
 def test_sync_get_decodes_pydantic_model(sync_client: SyncHTTPClient) -> None:
-    item = sync_client.get("items/7", response_data_type=ItemModel)
+    item = sync_client.get("items/7", response_data_type=ItemModel).data
     assert item == ItemModel(id=7, name="item-7")
 
 
 def test_sync_get_decodes_msgspec_struct(sync_client: SyncHTTPClient) -> None:
-    item = sync_client.get("items/7", response_data_type=ItemStruct)
+    item = sync_client.get("items/7", response_data_type=ItemStruct).data
     assert item == ItemStruct(id=7, name="item-7")
 
 
 def test_sync_get_decodes_plain_dict(sync_client: SyncHTTPClient) -> None:
-    item = sync_client.get("items/7", response_data_type=dict)
+    item = sync_client.get("items/7", response_data_type=dict).data
     assert item == {"id": 7, "name": "item-7"}
 
 
 def test_sync_get_with_repeated_query_param(sync_client: SyncHTTPClient) -> None:
     result = sync_client.get(
         "echo-query", params={"tag": ["a", "b"], "limit": 10}, response_data_type=dict
-    )
+    ).data
     assert result == {"query": {"tag": ["a", "b"], "limit": ["10"]}}
 
 
@@ -204,7 +220,7 @@ def test_sync_get_raises_response_error_for_status(sync_client: SyncHTTPClient) 
 
 
 def test_sync_get_error_for_status_false_suppresses_raise(sync_client: SyncHTTPClient) -> None:
-    body = sync_client.get("boom", error_for_status=False)
+    body = sync_client.get("boom", error_for_status=False).data
     assert b"internal-server-error" in body
 
 
@@ -218,28 +234,26 @@ def test_sync_get_response_data_type_unsupported_class_raises_type_error(
 async def test_get_decodes_a_top_level_array_with_a_pydantic_type_adapter(
     client: HTTPClient,
 ) -> None:
-    items = await client.get("json-array", response_data_type=TypeAdapter(list[ItemModel]))
+    items = (await client.get("json-array", response_data_type=TypeAdapter(list[ItemModel]))).data
 
     assert items == [ItemModel(id=1, name="one"), ItemModel(id=2, name="two")]
 
 
 async def test_get_decodes_a_top_level_array_with_a_msgspec_decoder(client: HTTPClient) -> None:
-    items = await client.get("json-array", response_data_type=Decoder(list[ItemStruct]))
+    items = (await client.get("json-array", response_data_type=Decoder(list[ItemStruct]))).data
 
     assert items == [ItemStruct(id=1, name="one"), ItemStruct(id=2, name="two")]
 
 
-async def test_with_result_decodes_a_top_level_array(client: HTTPClient) -> None:
-    result = await client.with_result.get(
-        "json-array", response_data_type=TypeAdapter(list[ItemModel])
-    )
+async def test_response_decodes_a_top_level_array(client: HTTPClient) -> None:
+    result = await client.get("json-array", response_data_type=TypeAdapter(list[ItemModel]))
 
     assert result.status == 200
     assert [item.id for item in result.data] == [1, 2]
 
 
 def test_sync_get_decodes_a_top_level_array(sync_client: SyncHTTPClient) -> None:
-    items = sync_client.get("json-array", response_data_type=Decoder(list[ItemStruct]))
+    items = sync_client.get("json-array", response_data_type=Decoder(list[ItemStruct])).data
 
     assert [item.id for item in items] == [1, 2]
 
@@ -253,6 +267,6 @@ async def test_a_type_adapter_decode_failure_propagates_natively(client: HTTPCli
 def test_sync_get_decodes_a_top_level_array_with_a_type_adapter(
     sync_client: SyncHTTPClient,
 ) -> None:
-    items = sync_client.get("json-array", response_data_type=TypeAdapter(list[ItemModel]))
+    items = sync_client.get("json-array", response_data_type=TypeAdapter(list[ItemModel])).data
 
     assert [item.id for item in items] == [1, 2]

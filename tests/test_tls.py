@@ -35,14 +35,14 @@ def _tls13_only_base_url(tls_ca: trustme.CA) -> Generator[str]:
 
 async def test_root_certificates_trusts_a_custom_ca(https_base_url: str, tls_ca_pem: bytes) -> None:
     async with HTTPClient(base_url=https_base_url, root_certificates=[tls_ca_pem]) as client:
-        result = await client.get("items/7", response_data_type=dict)
+        result = (await client.get("items/7", response_data_type=dict)).data
 
     assert result == {"id": 7, "name": "item-7"}
 
 
 def test_sync_root_certificates_trusts_a_custom_ca(https_base_url: str, tls_ca_pem: bytes) -> None:
     with SyncHTTPClient(base_url=https_base_url, root_certificates=[tls_ca_pem]) as client:
-        result = client.get("items/7", response_data_type=dict)
+        result = client.get("items/7", response_data_type=dict).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -71,14 +71,14 @@ async def test_root_certificates_from_another_ca_is_still_untrusted(https_base_u
 
 async def test_danger_accept_invalid_certs_skips_verification(https_base_url: str) -> None:
     async with HTTPClient(base_url=https_base_url, danger_accept_invalid_certs=True) as client:
-        result = await client.get("items/7", response_data_type=dict)
+        result = (await client.get("items/7", response_data_type=dict)).data
 
     assert result == {"id": 7, "name": "item-7"}
 
 
 def test_sync_danger_accept_invalid_certs_skips_verification(https_base_url: str) -> None:
     with SyncHTTPClient(base_url=https_base_url, danger_accept_invalid_certs=True) as client:
-        result = client.get("items/7", response_data_type=dict)
+        result = client.get("items/7", response_data_type=dict).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -91,7 +91,7 @@ async def test_identity_pem_satisfies_a_server_requiring_a_client_cert(
         root_certificates=[tls_ca_pem],
         identity_pem=tls_client_identity_pem,
     ) as client:
-        result = await client.get("items/7", response_data_type=dict)
+        result = (await client.get("items/7", response_data_type=dict)).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -104,7 +104,7 @@ def test_sync_identity_pem_satisfies_a_server_requiring_a_client_cert(
         root_certificates=[tls_ca_pem],
         identity_pem=tls_client_identity_pem,
     ) as client:
-        result = client.get("items/7", response_data_type=dict)
+        result = client.get("items/7", response_data_type=dict).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -210,7 +210,7 @@ async def test_tls_version_range_overlapping_the_server_succeeds(
         min_tls_version=min_tls_version,
         max_tls_version=max_tls_version,
     ) as client:
-        result = await client.get("items/7", response_data_type=dict)
+        result = (await client.get("items/7", response_data_type=dict)).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -219,7 +219,7 @@ async def test_https_only_allows_an_https_request(https_base_url: str, tls_ca_pe
     async with HTTPClient(
         base_url=https_base_url, root_certificates=[tls_ca_pem], https_only=True
     ) as client:
-        result = await client.get("items/7", response_data_type=dict)
+        result = (await client.get("items/7", response_data_type=dict)).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -228,7 +228,7 @@ def test_sync_https_only_allows_an_https_request(https_base_url: str, tls_ca_pem
     with SyncHTTPClient(
         base_url=https_base_url, root_certificates=[tls_ca_pem], https_only=True
     ) as client:
-        result = client.get("items/7", response_data_type=dict)
+        result = client.get("items/7", response_data_type=dict).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -241,7 +241,7 @@ async def test_http2_over_tls_falls_back_to_http1_via_alpn(
     async with HTTPClient(
         base_url=https_base_url, root_certificates=[tls_ca_pem], http2=True
     ) as client:
-        result = await client.get("items/7", response_data_type=dict)
+        result = (await client.get("items/7", response_data_type=dict)).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -252,6 +252,6 @@ def test_sync_http2_over_tls_falls_back_to_http1_via_alpn(
     with SyncHTTPClient(
         base_url=https_base_url, root_certificates=[tls_ca_pem], http2=True
     ) as client:
-        result = client.get("items/7", response_data_type=dict)
+        result = client.get("items/7", response_data_type=dict).data
 
     assert result == {"id": 7, "name": "item-7"}

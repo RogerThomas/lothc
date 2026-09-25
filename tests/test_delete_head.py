@@ -8,26 +8,26 @@ class EchoedHeaders(BaseModel):
 
 
 async def test_delete_returns_raw_bytes_by_default(client: HTTPClient) -> None:
-    body = await client.delete("items/7")
+    body = (await client.delete("items/7")).data
 
     assert body == b'{"id": 7, "deleted": true}'
 
 
 async def test_delete_decodes_response_data_type(client: HTTPClient) -> None:
-    result = await client.delete("items/7", response_data_type=dict)
+    result = (await client.delete("items/7", response_data_type=dict)).data
 
     assert result == {"id": 7, "deleted": True}
 
 
-async def test_with_result_delete_includes_status_and_data(client: HTTPClient) -> None:
-    result = await client.with_result.delete("items/7", response_data_type=dict)
+async def test_response_delete_includes_status_and_data(client: HTTPClient) -> None:
+    result = await client.delete("items/7", response_data_type=dict)
 
     assert result.status == 200
     assert result.data == {"id": 7, "deleted": True}
 
 
-async def test_with_result_delete_with_typed_headers(client: HTTPClient) -> None:
-    result = await client.with_result.delete(
+async def test_response_delete_with_typed_headers(client: HTTPClient) -> None:
+    result = await client.delete(
         "items/7", response_data_type=dict, response_headers_type=EchoedHeaders
     )
 
@@ -35,16 +35,16 @@ async def test_with_result_delete_with_typed_headers(client: HTTPClient) -> None
 
 
 def test_sync_delete_result_includes_status_and_data(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.with_result.delete("items/7", response_data_type=dict)
+    result = sync_client.delete("items/7", response_data_type=dict)
 
     assert result.status == 200
     assert result.data == {"id": 7, "deleted": True}
 
 
-async def test_with_result_delete_error_for_status_false_suppresses_raise(
+async def test_response_delete_error_for_status_false_suppresses_raise(
     client: HTTPClient,
 ) -> None:
-    result = await client.with_result.delete("missing", error_for_status=False)
+    result = await client.delete("missing", error_for_status=False)
 
     assert result.status == 404
 
@@ -58,7 +58,7 @@ async def test_head_returns_headers_only_result(client: HTTPClient) -> None:
 
 
 def test_sync_delete_decodes_response_data_type(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.delete("items/7", response_data_type=dict)
+    result = sync_client.delete("items/7", response_data_type=dict).data
 
     assert result == {"id": 7, "deleted": True}
 
