@@ -7,6 +7,8 @@ predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/re
 
 ## [Unreleased]
 
+## [0.0.19] - 2026-09-25
+
 ### Changed
 
 - `get`/`post`/`put`/`patch`/`delete` now return a `Response` instead of the bare body: the
@@ -101,6 +103,7 @@ predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/re
 - Sync streams no longer buffer the whole body in memory behind a slow consumer, and stop their
   worker thread when abandoned while data is still flowing.
 
-[Unreleased]: https://github.com/RogerThomas/lothc/compare/0.0.18...HEAD
+[Unreleased]: https://github.com/RogerThomas/lothc/compare/0.0.19...HEAD
+[0.0.19]: https://github.com/RogerThomas/lothc/compare/0.0.18...0.0.19
 [0.0.18]: https://github.com/RogerThomas/lothc/compare/0.0.17...0.0.18
 [0.0.17]: https://github.com/RogerThomas/lothc/compare/0.0.16...0.0.17
