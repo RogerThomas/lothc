@@ -7,6 +7,22 @@ messages; 0.0.17 to 0.0.19 were hand-written in the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. Releases up to and including
 0.0.16 predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/releases).
 
+## [0.1.0](https://github.com/RogerThomas/lothc/compare/0.0.19...0.1.0) (2026-09-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* download() returns a Response
+
+### Features
+
+* download() returns a Response ([bb4a970](https://github.com/RogerThomas/lothc/commit/bb4a970072449c2f115777fefc7322b67fd73e42))
+
+
+### Documentation
+
+* tidy CLAUDE.md and inline the style guide ([df84580](https://github.com/RogerThomas/lothc/commit/df84580f792b9343a866071a0b5376314ea00e24))
+
 ## [0.0.19] - 2026-09-25
 
 ### Changed
