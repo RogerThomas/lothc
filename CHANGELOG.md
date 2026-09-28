@@ -1,11 +1,11 @@
 # Changelog
 
-All notable changes to lothc are recorded here. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and lothc uses
-[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Releases up to and including 0.0.16
-predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/releases) for them.
-
-## [Unreleased]
+All notable changes to lothc are recorded here, and lothc uses
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). From 0.0.20 on, entries are generated
+by [release-please](https://github.com/googleapis/release-please) from Conventional Commit
+messages; 0.0.17 to 0.0.19 were hand-written in the
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. Releases up to and including
+0.0.16 predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/releases).
 
 ## [0.0.19] - 2026-09-25
 
@@ -103,7 +103,6 @@ predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/re
 - Sync streams no longer buffer the whole body in memory behind a slow consumer, and stop their
   worker thread when abandoned while data is still flowing.
 
-[Unreleased]: https://github.com/RogerThomas/lothc/compare/0.0.19...HEAD
 [0.0.19]: https://github.com/RogerThomas/lothc/compare/0.0.18...0.0.19
 [0.0.18]: https://github.com/RogerThomas/lothc/compare/0.0.17...0.0.18
 [0.0.17]: https://github.com/RogerThomas/lothc/compare/0.0.16...0.0.17

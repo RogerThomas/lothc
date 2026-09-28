@@ -1,14 +1,17 @@
 name: Release
 
+# Dispatched by release-please.yml against the new tag once a release PR is merged. Run it by hand
+# (`gh workflow run release.yml --ref <tag>`) to retry a failed publish.
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
 
 jobs:
   # The full CI workflow (lint, all four type checkers, tests with and without the optional
   # extras) against the exact tagged commit. Publishing used to go straight from `uv build` to
   # `uv publish`, so a release could ship a commit CI had never passed.
   test:
+    # Only ever publish a tag: hatch-vcs would give a branch a `.devN` version.
+    if: startsWith(github.ref, 'refs/tags/')
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read

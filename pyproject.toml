@@ -4,7 +4,7 @@ name = "lothc"
 # [tool.hatch.version] below) — SemVer, not CalVer, because this is a library other packages
 # depend on: the major/minor/patch split is the signal pip's resolver, Dependabot, etc. rely on to
 # know whether an upgrade is safe, which a date can't communicate. An untagged checkout resolves
-# to a `0.1.dev0+gHASH`-style fallback version; `task release` pushes the tag a release builds from.
+# to a `0.1.dev0+gHASH`-style fallback version; release-please (see CLAUDE.md) creates the tag a release builds from.
 dynamic = ["version"]
 description = "Lord Of The Http Clients — a typed HTTP client built on pyreqwest, with first-class pydantic and msgspec support"
 readme = "README.md"
