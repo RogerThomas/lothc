@@ -58,8 +58,10 @@ entries terse: a fact plus the *why*, not a narrative of how it was found.
   Release. There's no `task release` any more.
 - **Pre-1.0, `feat` bumps the patch and a breaking change the minor**
   (`bump-patch-for-minor-pre-major`/`bump-minor-pre-major`), keeping lothc on 0.0.x until a
-  `Release-As:` footer says otherwise. Tags have no `v` prefix (`include-v-in-tag: false`),
-  matching the existing ones hatch-vcs reads. `release-type: python` skips `pyproject.toml`, whose
+  `Release-As:` footer says otherwise. Tags are the bare version (`include-v-in-tag: false`,
+  `include-component-in-tag: false`), matching the existing ones hatch-vcs reads; with the
+  component, release-please looked for `lothc-0.0.19`, missed the real tag and pulled in commits
+  already released. `release-type: python` skips `pyproject.toml`, whose
   version is `dynamic`, so only the manifest and changelog change.
 - **`CHANGELOG.md` up to 0.0.19 is the old hand-written Keep a Changelog.** Don't add an
   `## [Unreleased]` section back: release-please inserts above the first version heading.
