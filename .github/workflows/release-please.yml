@@ -1,0 +1,40 @@
+name: Release Please
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+jobs:
+  # Keeps a release PR open that bumps .release-please-manifest.json and CHANGELOG.md from the
+  # Conventional Commit messages since the last release. Merging that PR tags the release (no "v"
+  # prefix; hatch-vcs derives the package version from the tag) and creates the GitHub Release.
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v5
+
+  # A release created with GITHUB_TOKEN doesn't trigger other workflows (so `release: published`
+  # would never fire), but a workflow_dispatch is the documented exception. Dispatching
+  # release.yml, rather than calling it, keeps it the top-level workflow PyPI's Trusted Publisher
+  # is registered against.
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - run: gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
