@@ -1,15 +1,14 @@
 ---
 name: write-python-code
-description: Python code-style conventions for this repo (lothc) — load before writing or editing any Python code here (lothc/*.py, tests/*.py, examples/*.py, etc.). Covers dataclass/DTO shape, no-nested-defs, private-helper ordering, testing conventions, and when to read style-guide.md in full.
+description: Python code-style conventions for this repo (lothc) — load before writing or editing any Python code here (lothc/*.py, tests/*.py, examples/*.py, etc.). Covers dataclass/DTO shape, no-nested-defs, private-helper ordering, testing conventions, and lothc-specific rules beyond style-guide.md.
 ---
 
 # Writing Python code in lothc
 
-Before editing `lothc/_client.py` specifically (or any file whose conventions you're unsure of),
-**read `./style-guide.md` in full first** — its rules (overload-pairs-over-casts, the type alias
-vocabulary, naming rules) are load-bearing; deviating from them silently reintroduces bugs this
-project has already paid to fix once. Tell the user you've read `CLAUDE.md` and
-`./style-guide.md` before starting code changes on that file.
+`./style-guide.md` is imported into `CLAUDE.md` (`@style-guide.md`), so it's already in context
+in a main session; a subagent without `CLAUDE.md` should read it in full before editing
+`lothc/_client.py`. Its rules are load-bearing: deviating from them silently reintroduces bugs this
+project has already paid to fix once.
 
 The rules below are the ones that come up everywhere in this repo, summarized so you don't have to
 re-derive them each time. `style-guide.md` has the full detail and worked examples for each.
