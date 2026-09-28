@@ -47,9 +47,9 @@ async def test_download_outlasting_the_client_timeout_is_not_killed(
 
 def test_sync_download_outlasting_the_client_timeout_is_not_killed(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, timeout=0.08) as client:
-        body = client.download("events", params={"interval": 0.02, "count": 8})
+        response = client.download("events", params={"interval": 0.02, "count": 8})
 
-    assert body.count(b"data: ") == 8
+    assert response.data.count(b"data: ") == 8
 
 
 async def test_a_stalled_stream_raises_within_the_client_timeout(base_url: str) -> None:

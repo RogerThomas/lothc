@@ -164,7 +164,7 @@ Decoding into a real msgspec `Struct` even edged out the unvalidated dict path i
 
 -   **Every verb**
 
-    `get`, `post`, `put`, `patch`, `delete`, `head` (each returning a `Response`: `.data`, `.status`, `.headers`), `download` — plus `sse`,
+    `get`, `post`, `put`, `patch`, `delete`, `head`, `download` (each returning a `Response`: `.data`, `.status`, `.headers`) — plus `sse`,
     `stream_get`, and `stream_post` for streaming responses. See [Verbs](verbs.md).
 
 -   **Typed *and* raw params/headers**

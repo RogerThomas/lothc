@@ -310,16 +310,22 @@ around, but for something genuinely large (a presigned S3 GET URL, a big export)
 memory copies internally. `download()` is a `get`-shaped verb built to avoid that:
 
 ```python
-body = await client.download("exports/large-file.csv")  # bytes, ~2/3 the peak memory of get()
+response = await client.download("exports/large-file.csv")  # ~2/3 the peak memory of get()
+body = response.data  # bytes
 
-await client.download("exports/large-file.csv", dest="large-file.csv")  # None returned
+response = await client.download("exports/large-file.csv", dest="large-file.csv")
+response.data  # Path("large-file.csv")
 ```
+
+Like `get()`, it returns a `Response`, so `.status`, `.headers` (say, `ETag` or
+`Content-Disposition`), `.request`, `.http_version` and `.elapsed` are all there. `.elapsed`
+runs until the whole body has been read or written.
 
 With no `dest`, the body still ends up fully in memory as `bytes`, just streamed into one buffer
 instead of copied several times along the way: measured on a 50MB body, `download()` peaks at
 about 105MB against `get()`'s 154MB. Pass `dest` (a `str` or any path-like) to stream straight to
-disk instead — memory then stays O(chunk size) regardless of how large the body is, and the call
-returns `None` rather than the body. The client's `timeout` is the longest allowed gap between
+disk instead — memory then stays O(chunk size) regardless of how large the body is, and `.data` is
+`dest` as a `Path` rather than the body. The client's `timeout` is the longest allowed gap between
 chunks here, not a cap on the whole download, so a long download of a big file isn't cut off at
 30s; see [Streaming → Timeouts](streaming.md#timeouts).
 

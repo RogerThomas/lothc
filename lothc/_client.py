@@ -1600,159 +1600,6 @@ def _attach_body_sync[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many
     return request_builder
 
 
-# Discriminated union of what a worker thread hands back to the polling consumer thread via
-# the Queue in `_interruptible_chunk_iter` — a decoded chunk, EOF, or a forwarded exception.
-type _StreamQueueItem = (
-    tuple[Literal["chunk"], bytes]
-    | tuple[Literal["eof"], None]
-    | tuple[Literal["error"], Exception]
-)
-
-
-def _offer_stream_item(
-    item_queue: queue.Queue[_StreamQueueItem], item: _StreamQueueItem, abandoned: threading.Event
-) -> bool:
-    """Hand `item` to the consumer, waiting for room, unless the consumer has gone.
-
-    The queue is bounded so a consumer slower than the network gets backpressure instead of the
-    worker buffering the whole body in memory, which an unbounded queue did (a slow NDJSON
-    consumer would eventually hold the entire stream). Waiting in short slices, rather than one
-    blocking `put`, is what lets a worker whose consumer stopped early notice and exit, which
-    releases the connection; a plain `put` into a full queue would block forever instead.
-    Returns whether the item was delivered.
-    """
-    while not abandoned.is_set():
-        try:
-            item_queue.put(item, timeout=0.2)
-        except queue.Full:
-            continue
-        return True
-    return False
-
-
-def _drain_stream_chunks(
-    request: SyncStreamRequest,
-    check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None,
-    error_type: type[Data] | None,
-    request_info: RequestInfo,
-    item_queue: queue.Queue[_StreamQueueItem],
-    abandoned: threading.Event,
-) -> None:
-    """Worker-thread target for `_interruptible_chunk_iter` — owns the entire
-    `with request as raw_response:` lifecycle itself (entry, status check, read loop, and its
-    own eventual exit), never the calling thread. Confirmed via spike: dropping/exiting a
-    streamed response does NOT cancel an in-flight `read_chunk()` on another thread — it
-    blocks the calling thread until that read resolves. So the thread that does the blocking
-    reads must also be the one that enters and exits this context manager, sequentially, or
-    cleanup itself becomes the new hang.
-    """
-    try:
-        with request as raw_response:
-            if check_status is not None:
-                check_status(raw_response, error_type, request_info)
-            while True:
-                chunk = raw_response.body_reader.read_chunk()
-                if chunk is None:
-                    _offer_stream_item(item_queue, ("eof", None), abandoned)
-                    return
-                if not _offer_stream_item(item_queue, ("chunk", bytes(chunk)), abandoned):
-                    return
-    except Exception as error:  # noqa: BLE001 — forwarded to the consumer thread below, not swallowed — pylint: disable=broad-except
-        _offer_stream_item(item_queue, ("error", error), abandoned)
-
-
-def _interruptible_chunk_iter(
-    request: SyncStreamRequest,
-    check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None,
-    error_type: type[Data] | None,
-    request_info: RequestInfo,
-    *,
-    idle_timeout: float | None = None,
-    poll_timeout: float = 0.2,
-    max_buffered_chunks: int = 64,
-) -> Iterator[bytes]:
-    """Yield a streamed response's chunks with Ctrl-C-interruptible waits between them.
-
-    Also the only way the sync client can bound how long it waits on the server: a blocking
-    `read_chunk()` takes no timeout, but these timed `Queue.get()`s can give up after
-    `idle_timeout` seconds with no chunk (covering the wait for headers too, since the worker
-    opens the response). Time the caller spends between chunks isn't counted: the clock
-    restarts when the caller asks for the next one.
-
-    `read_chunk()` blocks the calling thread with no way to interrupt it from Python — CPython
-    only converts SIGINT into `KeyboardInterrupt` on the main thread while it's executing
-    Python bytecode. Running the read loop on a daemon worker thread (via
-    `_drain_stream_chunks`) and having the main thread only ever do timed `Queue.get()` calls
-    keeps the main thread in interruptible Python bytecode the whole time, so Ctrl-C fires
-    within roughly `poll_timeout`.
-
-    Abandoning iteration (an early `break`, or the generator being garbage-collected) leaves
-    the worker thread parked in `read_chunk()` — there is no cancellation path, see
-    `_drain_stream_chunks`'s docstring. This is a deliberate, documented leak: one thread and
-    one open socket per abandonment, reclaimed only when the peer closes the connection, a
-    timeout fires, or the process exits.
-    """
-    item_queue: queue.Queue[_StreamQueueItem] = queue.Queue(maxsize=max_buffered_chunks)
-    abandoned = threading.Event()
-    worker = threading.Thread(
-        target=_drain_stream_chunks,
-        args=(request, check_status, error_type, request_info, item_queue, abandoned),
-        daemon=True,
-    )
-    worker.start()
-    # A quarter of the idle limit (never more than `poll_timeout`, which Ctrl-C needs): the
-    # limit is only checked when a wait times out, so a coarse poll would let a stall run up
-    # to one extra poll past it, and would make one poll the whole window, so a clock left
-    # running across the caller's own pause between chunks could never be told apart.
-    wait = poll_timeout if idle_timeout is None else min(poll_timeout, idle_timeout / 4)
-    waiting_since = time.monotonic()
-    try:
-        while True:
-            try:
-                item = item_queue.get(timeout=wait)
-            except queue.Empty:
-                if idle_timeout is not None and time.monotonic() - waiting_since > idle_timeout:
-                    raise _idle_timeout_error(idle_timeout) from None
-                continue
-            match item:
-                case ("chunk", bytes_chunk):
-                    yield bytes_chunk
-                    waiting_since = time.monotonic()
-                case ("eof", None):
-                    return
-                case ("error", error):
-                    raise error.with_traceback(error.__traceback__)
-    finally:
-        # However iteration ends (exhausted, an error, an early `break`, garbage collection),
-        # tell the worker to stop rather than leave it waiting to hand over more chunks.
-        abandoned.set()
-
-
-def _sync_stream_chunks(
-    request: SyncStreamRequest,
-    check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None,
-    error_type: type[Data] | None,
-    request_info: RequestInfo,
-    *,
-    interruptible: bool,
-    idle_timeout: float | None = None,
-) -> Iterator[bytes]:
-    # An idle limit needs the worker-thread path too: it's the only one that can stop waiting.
-    if interruptible or idle_timeout is not None:
-        yield from _interruptible_chunk_iter(
-            request, check_status, error_type, request_info, idle_timeout=idle_timeout
-        )
-        return
-    with request as raw_response:
-        if check_status is not None:
-            check_status(raw_response, error_type, request_info)
-        while True:
-            chunk = raw_response.body_reader.read_chunk()
-            if chunk is None:
-                return
-            yield bytes(chunk)
-
-
 # What CaseInsensitiveDict's constructor and update() both accept — mirrors the shapes
 # MutableMapping.update itself takes, which is what keeps the override LSP-compatible.
 type HeaderSource = Mapping[str, str] | SupportsKeysAndGetItem[str, str] | Iterable[tuple[str, str]]
@@ -1904,6 +1751,194 @@ class CaseInsensitiveDict(MutableMapping[str, str]):
         return list(self._store[lowered][1])
 
 
+@dataclass(slots=True)
+class _ResponseHead:
+    """A streamed response's status line and headers, read before its body is."""
+
+    status: int
+    headers: CaseInsensitiveDict
+    http_version: str
+
+
+def _response_head(raw_response: RawResponse | RawSyncResponse) -> _ResponseHead:
+    return _ResponseHead(
+        raw_response.status, CaseInsensitiveDict(raw_response.headers), raw_response.version
+    )
+
+
+# Discriminated union of what a worker thread hands back to the polling consumer thread via
+# the Queue in `_interruptible_chunk_iter` — a decoded chunk, EOF, or a forwarded exception.
+type _StreamQueueItem = (
+    tuple[Literal["chunk"], bytes]
+    | tuple[Literal["eof"], None]
+    | tuple[Literal["error"], Exception]
+)
+
+
+def _offer_stream_item(
+    item_queue: queue.Queue[_StreamQueueItem], item: _StreamQueueItem, abandoned: threading.Event
+) -> bool:
+    """Hand `item` to the consumer, waiting for room, unless the consumer has gone.
+
+    The queue is bounded so a consumer slower than the network gets backpressure instead of the
+    worker buffering the whole body in memory, which an unbounded queue did (a slow NDJSON
+    consumer would eventually hold the entire stream). Waiting in short slices, rather than one
+    blocking `put`, is what lets a worker whose consumer stopped early notice and exit, which
+    releases the connection; a plain `put` into a full queue would block forever instead.
+    Returns whether the item was delivered.
+    """
+    while not abandoned.is_set():
+        try:
+            item_queue.put(item, timeout=0.2)
+        except queue.Full:
+            continue
+        return True
+    return False
+
+
+def _drain_stream_chunks(
+    request: SyncStreamRequest,
+    check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None,
+    error_type: type[Data] | None,
+    request_info: RequestInfo,
+    item_queue: queue.Queue[_StreamQueueItem],
+    abandoned: threading.Event,
+    head_sink: list[_ResponseHead] | None,
+) -> None:
+    """Worker-thread target for `_interruptible_chunk_iter` — owns the entire
+    `with request as raw_response:` lifecycle itself (entry, status check, read loop, and its
+    own eventual exit), never the calling thread. Confirmed via spike: dropping/exiting a
+    streamed response does NOT cancel an in-flight `read_chunk()` on another thread — it
+    blocks the calling thread until that read resolves. So the thread that does the blocking
+    reads must also be the one that enters and exits this context manager, sequentially, or
+    cleanup itself becomes the new hang.
+
+    `head_sink` gets the response's status line and headers before any chunk is queued, so the
+    queue hand-off orders it ahead of the consumer's first `get()`.
+    """
+    try:
+        with request as raw_response:
+            if check_status is not None:
+                check_status(raw_response, error_type, request_info)
+            if head_sink is not None:
+                head_sink.append(_response_head(raw_response))
+            while True:
+                chunk = raw_response.body_reader.read_chunk()
+                if chunk is None:
+                    _offer_stream_item(item_queue, ("eof", None), abandoned)
+                    return
+                if not _offer_stream_item(item_queue, ("chunk", bytes(chunk)), abandoned):
+                    return
+    except Exception as error:  # noqa: BLE001 — forwarded to the consumer thread below, not swallowed — pylint: disable=broad-except
+        _offer_stream_item(item_queue, ("error", error), abandoned)
+
+
+def _interruptible_chunk_iter(
+    request: SyncStreamRequest,
+    check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None,
+    error_type: type[Data] | None,
+    request_info: RequestInfo,
+    *,
+    idle_timeout: float | None = None,
+    head_sink: list[_ResponseHead] | None = None,
+    poll_timeout: float = 0.2,
+    max_buffered_chunks: int = 64,
+) -> Iterator[bytes]:
+    """Yield a streamed response's chunks with Ctrl-C-interruptible waits between them.
+
+    Also the only way the sync client can bound how long it waits on the server: a blocking
+    `read_chunk()` takes no timeout, but these timed `Queue.get()`s can give up after
+    `idle_timeout` seconds with no chunk (covering the wait for headers too, since the worker
+    opens the response). Time the caller spends between chunks isn't counted: the clock
+    restarts when the caller asks for the next one.
+
+    `read_chunk()` blocks the calling thread with no way to interrupt it from Python — CPython
+    only converts SIGINT into `KeyboardInterrupt` on the main thread while it's executing
+    Python bytecode. Running the read loop on a daemon worker thread (via
+    `_drain_stream_chunks`) and having the main thread only ever do timed `Queue.get()` calls
+    keeps the main thread in interruptible Python bytecode the whole time, so Ctrl-C fires
+    within roughly `poll_timeout`.
+
+    Abandoning iteration (an early `break`, or the generator being garbage-collected) leaves
+    the worker thread parked in `read_chunk()` — there is no cancellation path, see
+    `_drain_stream_chunks`'s docstring. This is a deliberate, documented leak: one thread and
+    one open socket per abandonment, reclaimed only when the peer closes the connection, a
+    timeout fires, or the process exits.
+    """
+    item_queue: queue.Queue[_StreamQueueItem] = queue.Queue(maxsize=max_buffered_chunks)
+    abandoned = threading.Event()
+    worker = threading.Thread(
+        target=_drain_stream_chunks,
+        args=(request, check_status, error_type, request_info, item_queue, abandoned, head_sink),
+        daemon=True,
+    )
+    worker.start()
+    # A quarter of the idle limit (never more than `poll_timeout`, which Ctrl-C needs): the
+    # limit is only checked when a wait times out, so a coarse poll would let a stall run up
+    # to one extra poll past it, and would make one poll the whole window, so a clock left
+    # running across the caller's own pause between chunks could never be told apart.
+    wait = poll_timeout if idle_timeout is None else min(poll_timeout, idle_timeout / 4)
+    waiting_since = time.monotonic()
+    try:
+        while True:
+            try:
+                item = item_queue.get(timeout=wait)
+            except queue.Empty:
+                if idle_timeout is not None and time.monotonic() - waiting_since > idle_timeout:
+                    raise _idle_timeout_error(idle_timeout) from None
+                continue
+            match item:
+                case ("chunk", bytes_chunk):
+                    yield bytes_chunk
+                    waiting_since = time.monotonic()
+                case ("eof", None):
+                    return
+                case ("error", error):
+                    raise error.with_traceback(error.__traceback__)
+    finally:
+        # However iteration ends (exhausted, an error, an early `break`, garbage collection),
+        # tell the worker to stop rather than leave it waiting to hand over more chunks.
+        abandoned.set()
+
+
+def _sync_stream_chunks(
+    request: SyncStreamRequest,
+    check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None,
+    error_type: type[Data] | None,
+    request_info: RequestInfo,
+    *,
+    interruptible: bool,
+    idle_timeout: float | None = None,
+    head_sink: list[_ResponseHead] | None = None,
+) -> Iterator[bytes]:
+    """Yield a streamed response's chunks, on a worker thread when a wait must be bounded.
+
+    Pass `head_sink` to have the response's status line and headers appended to it once the
+    response opens, since the response object itself never leaves this generator.
+    """
+    # An idle limit needs the worker-thread path too: it's the only one that can stop waiting.
+    if interruptible or idle_timeout is not None:
+        yield from _interruptible_chunk_iter(
+            request,
+            check_status,
+            error_type,
+            request_info,
+            idle_timeout=idle_timeout,
+            head_sink=head_sink,
+        )
+        return
+    with request as raw_response:
+        if check_status is not None:
+            check_status(raw_response, error_type, request_info)
+        if head_sink is not None:
+            head_sink.append(_response_head(raw_response))
+        while True:
+            chunk = raw_response.body_reader.read_chunk()
+            if chunk is None:
+                return
+            yield bytes(chunk)
+
+
 def _parse_typed_headers(
     headers: Mapping[str, str], response_headers_type: type[TypedHeaders]
 ) -> TypedHeaders:
@@ -1921,8 +1956,8 @@ def _parse_typed_headers(
 
 @dataclass
 class Response[TData, THeaders: TypedHeaders | None = None]:
-    """What `get`/`post`/`put`/`patch`/`delete`/`head` return: the decoded body (`.data`)
-    alongside the status and headers.
+    """What `get`/`post`/`put`/`patch`/`delete`/`head`/`download` return: the decoded body
+    (`.data`) alongside the status and headers.
 
     `.typed_headers` is `None` unless `response_headers_type` was passed to the call that
     produced this. `.request` is the request actually sent — the target you asked for, not
@@ -3650,12 +3685,14 @@ class HTTPClient:
         skip_auth: bool,
         error_for_status: bool,
         error_type: type[Data] | None,
-    ) -> bytes | None:
+    ) -> Response[bytes] | Response[Path]:
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
         idle = self._stream_idle_timeout if timeout is None else None
         request_builder = await self._prepare_request(
             self._client.get(path), params, headers, effective_timeout, skip_auth=skip_auth
         )
+        buffer = bytearray()
+        started = time.monotonic()
         try:
             # `limit(1)` so a chunk is handed over as soon as it arrives. pyreqwest's 64KB default
             # withholds bytes until that much is buffered, so a slow but healthy download (say,
@@ -3668,21 +3705,31 @@ class HTTPClient:
                     raw_response = await stack.enter_async_context(request)
                     if error_for_status:
                         await self._check_status(raw_response, error_type, request_info)
+                head = _response_head(raw_response)
                 if dest is None:
-                    buffer = bytearray()
                     while True:
                         chunk = await _read_chunk_within(raw_response, idle)
                         if chunk is None:
-                            return bytes(buffer)
+                            break
                         buffer += chunk
-                with _atomic_download_file(dest) as file:
-                    while True:
-                        chunk = await _read_chunk_within(raw_response, idle)
-                        if chunk is None:
-                            return None
-                        file.write(chunk)
+                else:
+                    with _atomic_download_file(dest) as file:
+                        while True:
+                            chunk = await _read_chunk_within(raw_response, idle)
+                            if chunk is None:
+                                break
+                            file.write(chunk)
         except (PyreqwestRequestError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
+        elapsed = time.monotonic() - started
+        if dest is None:
+            data = bytes(buffer)
+            return Response(
+                data, head.status, head.headers, None, request_info, head.http_version, elapsed
+            )
+        return Response(
+            dest, head.status, head.headers, None, request_info, head.http_version, elapsed
+        )
 
     @overload
     async def download(
@@ -3696,7 +3743,7 @@ class HTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> bytes: ...
+    ) -> Response[bytes]: ...
     @overload
     async def download(
         self,
@@ -3709,7 +3756,7 @@ class HTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> None: ...
+    ) -> Response[Path]: ...
     async def download(
         self,
         path: str,
@@ -3721,15 +3768,16 @@ class HTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> bytes | None:
+    ) -> Response[bytes] | Response[Path]:
         """Download `path`'s response body, optimized for large objects (e.g. a presigned GET
         URL for a multi-GB file) — much lower peak memory than `get()` for big bodies.
 
-        With no `dest`, streams the body into one pre-grown buffer and returns `bytes` — still
-        O(body size) memory, but about two-thirds of what `get()` peaks at (measured: 105MB vs
-        154MB for a 50MB body), since `get()` goes through pyreqwest's own `.bytes()`. Pass
-        `dest` to stream straight to a file instead — memory then stays O(chunk size) regardless
-        of how large the body is.
+        Returns a `Response` like `get()`. With no `dest`, streams the body into one pre-grown
+        buffer and `.data` is the `bytes` — still O(body size) memory, but about two-thirds of
+        what `get()` peaks at (measured: 105MB vs 154MB for a 50MB body), since `get()` goes
+        through pyreqwest's own `.bytes()`. Pass `dest` to stream straight to a file instead —
+        memory then stays O(chunk size) regardless of how large the body is, and `.data` is
+        `dest` as a `Path`. `.elapsed` runs until the whole body has been read.
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
 
@@ -5573,12 +5621,17 @@ class SyncHTTPClient:
         skip_auth: bool,
         error_for_status: bool,
         error_type: type[Data] | None,
-    ) -> bytes | None:
+    ) -> Response[bytes] | Response[Path]:
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
         idle = self._stream_idle_timeout if timeout is None else None
         request_builder = self._prepare_request(
             self._client.get(path), params, headers, effective_timeout, skip_auth=skip_auth
         )
+        started = time.monotonic()
+        # The response itself stays inside `_sync_stream_chunks` (on a worker thread, when an
+        # idle limit applies), so its status line and headers come back through this instead.
+        head_sink: list[_ResponseHead] = []
+        buffer = bytearray()
         try:
             # See the async mirror: `limit(1)` so the idle limit sees chunks as they arrive.
             request = request_builder.streamed_read_buffer_limit(1).build_streamed()
@@ -5590,18 +5643,27 @@ class SyncHTTPClient:
                 request_info,
                 interruptible=False,
                 idle_timeout=idle,
+                head_sink=head_sink,
             )
             if dest is None:
-                buffer = bytearray()
                 for chunk in chunks:
                     buffer += chunk
-                return bytes(buffer)
-            with _atomic_download_file(dest) as file:
-                for chunk in chunks:
-                    file.write(chunk)
+            else:
+                with _atomic_download_file(dest) as file:
+                    for chunk in chunks:
+                        file.write(chunk)
         except (PyreqwestRequestError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
-        return None
+        elapsed = time.monotonic() - started
+        head = head_sink[0]
+        if dest is None:
+            data = bytes(buffer)
+            return Response(
+                data, head.status, head.headers, None, request_info, head.http_version, elapsed
+            )
+        return Response(
+            dest, head.status, head.headers, None, request_info, head.http_version, elapsed
+        )
 
     @overload
     def download(
@@ -5615,7 +5677,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> bytes: ...
+    ) -> Response[bytes]: ...
     @overload
     def download(
         self,
@@ -5628,7 +5690,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> None: ...
+    ) -> Response[Path]: ...
     def download(
         self,
         path: str,
@@ -5640,15 +5702,16 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         error_for_status: bool = True,
         error_type: type[Data] | None = None,
-    ) -> bytes | None:
+    ) -> Response[bytes] | Response[Path]:
         """Download `path`'s response body, optimized for large objects (e.g. a presigned GET
         URL for a multi-GB file) — much lower peak memory than `get()` for big bodies.
 
-        With no `dest`, streams the body into one pre-grown buffer and returns `bytes` — still
-        O(body size) memory, but about two-thirds of what `get()` peaks at (measured: 105MB vs
-        154MB for a 50MB body), since `get()` goes through pyreqwest's own `.bytes()`. Pass
-        `dest` to stream straight to a file instead — memory then stays O(chunk size) regardless
-        of how large the body is.
+        Returns a `Response` like `get()`. With no `dest`, streams the body into one pre-grown
+        buffer and `.data` is the `bytes` — still O(body size) memory, but about two-thirds of
+        what `get()` peaks at (measured: 105MB vs 154MB for a 50MB body), since `get()` goes
+        through pyreqwest's own `.bytes()`. Pass `dest` to stream straight to a file instead —
+        memory then stays O(chunk size) regardless of how large the body is, and `.data` is
+        `dest` as a `Path`. `.elapsed` runs until the whole body has been read.
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
 

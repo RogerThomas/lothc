@@ -6,16 +6,17 @@ from lothc import HTTPClient, HTTPConnectionError, HTTPResponseError, SyncHTTPCl
 
 
 async def test_download_returns_raw_bytes_by_default(client: HTTPClient) -> None:
-    body = await client.download("binary")
+    response = await client.download("binary")
 
-    assert body == b"AAA\nBBB\x00\nCCC"
+    assert response.data == b"AAA\nBBB\x00\nCCC"
 
 
 async def test_download_writes_to_file_when_dest_given(client: HTTPClient, tmp_path: Path) -> None:
     dest = tmp_path / "dest"
 
-    await client.download("binary", dest)
+    response = await client.download("binary", dest)
 
+    assert response.data == dest
     assert dest.read_bytes() == b"AAA\nBBB\x00\nCCC"
 
 
@@ -27,15 +28,16 @@ async def test_download_raises_response_error_for_status(client: HTTPClient) -> 
 
 
 async def test_download_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
-    body = await client.download("boom", error_for_status=False)
+    response = await client.download("boom", error_for_status=False)
 
-    assert b"internal-server-error" in body
+    assert response.status == 500
+    assert b"internal-server-error" in response.data
 
 
 def test_sync_download_returns_raw_bytes_by_default(sync_client: SyncHTTPClient) -> None:
-    body = sync_client.download("binary")
+    response = sync_client.download("binary")
 
-    assert body == b"AAA\nBBB\x00\nCCC"
+    assert response.data == b"AAA\nBBB\x00\nCCC"
 
 
 def test_sync_download_writes_to_file_when_dest_given(
@@ -43,8 +45,9 @@ def test_sync_download_writes_to_file_when_dest_given(
 ) -> None:
     dest = tmp_path / "dest"
 
-    sync_client.download("binary", dest)
+    response = sync_client.download("binary", dest)
 
+    assert response.data == dest
     assert dest.read_bytes() == b"AAA\nBBB\x00\nCCC"
 
 
@@ -58,9 +61,10 @@ def test_sync_download_raises_response_error_for_status(sync_client: SyncHTTPCli
 def test_sync_download_error_for_status_false_suppresses_raise(
     sync_client: SyncHTTPClient,
 ) -> None:
-    body = sync_client.download("boom", error_for_status=False)
+    response = sync_client.download("boom", error_for_status=False)
 
-    assert b"internal-server-error" in body
+    assert response.status == 500
+    assert b"internal-server-error" in response.data
 
 
 async def test_download_transport_error_mid_stream_raises_connection_error(
@@ -129,14 +133,69 @@ async def test_successful_download_replaces_an_existing_file(
 async def test_download_accepts_a_str_dest(client: HTTPClient, tmp_path: Path) -> None:
     dest = tmp_path / "dest"
 
-    await client.download("binary", dest=str(dest))
+    response = await client.download("binary", dest=str(dest))
 
+    assert response.data == dest
     assert dest.read_bytes() == b"AAA\nBBB\x00\nCCC"
 
 
 def test_sync_download_accepts_a_str_dest(sync_client: SyncHTTPClient, tmp_path: Path) -> None:
     dest = tmp_path / "dest"
 
-    sync_client.download("binary", dest=str(dest))
+    response = sync_client.download("binary", dest=str(dest))
 
+    assert response.data == dest
     assert dest.read_bytes() == b"AAA\nBBB\x00\nCCC"
+
+
+async def test_download_response_carries_status_headers_and_request(
+    client: HTTPClient, base_url: str
+) -> None:
+    response = await client.download("binary")
+
+    assert response.status == 200
+    assert response.headers["Content-Type"] == "application/octet-stream"
+    assert response.typed_headers is None
+    assert response.request.url == f"{base_url}binary"
+    assert response.http_version == "HTTP/1.1"
+    assert response.elapsed > 0
+
+
+async def test_download_to_file_response_carries_status_and_headers(
+    client: HTTPClient, tmp_path: Path
+) -> None:
+    response = await client.download("binary", tmp_path / "dest")
+
+    assert response.status == 200
+    assert response.headers["Content-Length"] == "12"
+
+
+@pytest.mark.parametrize(
+    "timeout",
+    [
+        # No per-call timeout: the idle limit applies, so the body is read on a worker thread.
+        None,
+        # An explicit one is a total cap instead, read on the calling thread.
+        5.0,
+    ],
+)
+def test_sync_download_response_carries_status_headers_and_request(
+    sync_client: SyncHTTPClient, base_url: str, timeout: float | None
+) -> None:
+    response = sync_client.download("binary", timeout=timeout)
+
+    assert response.status == 200
+    assert response.headers["Content-Type"] == "application/octet-stream"
+    assert response.typed_headers is None
+    assert response.request.url == f"{base_url}binary"
+    assert response.http_version == "HTTP/1.1"
+    assert response.elapsed > 0
+
+
+def test_sync_download_to_file_response_carries_status_and_headers(
+    sync_client: SyncHTTPClient, tmp_path: Path
+) -> None:
+    response = sync_client.download("binary", tmp_path / "dest")
+
+    assert response.status == 200
+    assert response.headers["Content-Length"] == "12"
