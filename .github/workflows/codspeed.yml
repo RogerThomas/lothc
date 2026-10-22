@@ -1,0 +1,28 @@
+name: CodSpeed
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  # Lets CodSpeed trigger backtest runs to build an initial performance history.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # OpenID Connect authentication with CodSpeed
+
+jobs:
+  benchmarks:
+    name: Run benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.13"
+      - run: uv sync --all-extras --group dev
+      - name: Run benchmarks
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation
+          run: uv run pytest benchmarks/codspeed --codspeed

@@ -6,6 +6,7 @@
 
 [![PyPI](https://img.shields.io/pypi/v/lothc)](https://pypi.org/project/lothc/)
 [![CI](https://github.com/RogerThomas/lothc/actions/workflows/ci.yml/badge.svg)](https://github.com/RogerThomas/lothc/actions/workflows/ci.yml)
+[![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/RogerThomas/lothc?utm_source=badge)
 [![codecov](https://img.shields.io/codecov/c/github/RogerThomas/lothc/main)](https://codecov.io/gh/RogerThomas/lothc)
 [![Python versions](https://img.shields.io/pypi/pyversions/lothc)](https://pypi.org/project/lothc/)
 [![License](https://img.shields.io/pypi/l/lothc)](https://github.com/RogerThomas/lothc/blob/main/LICENSE)
