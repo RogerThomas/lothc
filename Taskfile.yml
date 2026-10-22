@@ -243,6 +243,12 @@ tasks:
     desc: Serve the asv-publish dashboard locally so you can see the trend graphs
     cmd: uv run asv preview
 
+  bench-codspeed:
+    desc: >
+      Run the CodSpeed pytest benchmarks in benchmarks/codspeed/ (what the CodSpeed CI
+      workflow measures). Plain pytest here, each benchmark run once as a smoke check.
+    cmd: uv run pytest benchmarks/codspeed {{.CLI_ARGS}}
+
   bench-check:
     desc: >
       "I'm mid-edit, no commit, does this help or hurt?" Runs every asv_bench/ time_*

@@ -290,6 +290,15 @@ Gotchas when adding benchmarks:
   only static data there and start live resources in `setup()`.
 - `setup()` resources go on one `contextlib.ExitStack`, closed once in `teardown()`.
 
+### Continuous benchmarking (CodSpeed)
+
+`benchmarks/codspeed/` is a `pytest-codspeed` suite run by `.github/workflows/codspeed.yml` on
+every push to `main` and every PR, in CodSpeed's CPU simulation mode. Every request goes through
+`lothc_mocker`, so no socket is opened: it measures lothc's own request-building and decoding
+overhead deterministically. It lives outside `tests/` (`testpaths`), so the normal suite never
+runs it. `task bench-codspeed` runs it locally (plain pytest, each benchmark once); to measure
+like CI does: `codspeed run --mode simulation -- uv run pytest benchmarks/codspeed --codspeed`.
+
 ### Instant no-git check: `task bench-check`
 
 asv is keyed on commits and can't measure an uncommitted edit. `task bench-check`
