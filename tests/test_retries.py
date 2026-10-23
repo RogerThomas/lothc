@@ -15,9 +15,7 @@ from lothc import HTTPClient, HTTPConnectionError, HTTPResponseError, SyncHTTPCl
 async def test_retries_recovers_from_5xx_then_succeeds(base_url: str) -> None:
     async with HTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
         result = (
-            await client.get(
-                "flaky", params={"key": "flaky-recovers", "fail_times": 2}, response_data_type=dict
-            )
+            await client.get("flaky", params={"key": "flaky-recovers", "fail_times": 2}, into=dict)
         ).data
 
     assert result == {"attempts": 3}
@@ -33,11 +31,7 @@ async def test_retries_exhausted_raises_response_error(base_url: str) -> None:
 
 async def test_retries_honors_retry_after_header(base_url: str) -> None:
     async with HTTPClient(base_url=base_url, max_retries=1) as client:
-        result = (
-            await client.get(
-                "retry-after", params={"key": "retry-after-1"}, response_data_type=dict
-            )
-        ).data
+        result = (await client.get("retry-after", params={"key": "retry-after-1"}, into=dict)).data
 
     assert result == {"attempts": 2}
 
@@ -59,7 +53,7 @@ async def test_retries_can_be_opted_in_for_post(base_url: str) -> None:
             await client.post(
                 "flaky",
                 params={"key": "flaky-post-optin", "fail_times": 2},
-                response_data_type=dict,
+                into=dict,
             )
         ).data
 
@@ -72,7 +66,7 @@ async def test_retries_recovers_from_transport_error(base_url: str) -> None:
             await client.get(
                 "connection-flaky",
                 params={"key": "conn-flaky-1", "fail_times": 2},
-                response_data_type=dict,
+                into=dict,
             )
         ).data
 
@@ -82,7 +76,7 @@ async def test_retries_recovers_from_transport_error(base_url: str) -> None:
 def test_sync_retries_recovers_from_5xx_then_succeeds(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
         result = client.get(
-            "flaky", params={"key": "sync-flaky-recovers", "fail_times": 2}, response_data_type=dict
+            "flaky", params={"key": "sync-flaky-recovers", "fail_times": 2}, into=dict
         ).data
 
     assert result == {"attempts": 3}
@@ -95,7 +89,7 @@ async def test_retries_honors_http_date_retry_after_header(base_url: str) -> Non
             await client.get(
                 "retry-after-custom",
                 params={"key": "retry-after-http-date", "value": retry_after},
-                response_data_type=dict,
+                into=dict,
             )
         ).data
 
@@ -110,7 +104,7 @@ async def test_retries_falls_back_to_backoff_on_malformed_retry_after_header(
             await client.get(
                 "retry-after-custom",
                 params={"key": "retry-after-malformed", "value": "not-a-date"},
-                response_data_type=dict,
+                into=dict,
             )
         ).data
 
@@ -140,7 +134,7 @@ def test_sync_retries_recovers_from_transport_error(base_url: str) -> None:
         result = client.get(
             "connection-flaky",
             params={"key": "sync-conn-flaky-1", "fail_times": 2},
-            response_data_type=dict,
+            into=dict,
         ).data
 
     assert result == {"attempts": 3}
@@ -164,9 +158,7 @@ async def test_backoff_base_scales_the_wait_between_attempts(base_url: str) -> N
     async with HTTPClient(base_url=base_url, max_retries=2, backoff_base=0.02) as client:
         started = time.monotonic()
         result = (
-            await client.get(
-                "flaky", params={"key": "backoff-base", "fail_times": 2}, response_data_type=dict
-            )
+            await client.get("flaky", params={"key": "backoff-base", "fail_times": 2}, into=dict)
         ).data
         elapsed = time.monotonic() - started
 
@@ -178,7 +170,7 @@ def test_sync_backoff_base_scales_the_wait_between_attempts(base_url: str) -> No
     with SyncHTTPClient(base_url=base_url, max_retries=2, backoff_base=0.02) as client:
         started = time.monotonic()
         result = client.get(
-            "flaky", params={"key": "sync-backoff-base", "fail_times": 2}, response_data_type=dict
+            "flaky", params={"key": "sync-backoff-base", "fail_times": 2}, into=dict
         ).data
         elapsed = time.monotonic() - started
 
@@ -196,7 +188,7 @@ async def test_retry_methods_are_case_insensitive(base_url: str) -> None:
             await client.get(
                 "flaky",
                 params={"key": "lowercase-methods", "fail_times": 2},
-                response_data_type=dict,
+                into=dict,
             )
         ).data
 
@@ -219,7 +211,7 @@ def test_sync_retry_methods_accept_a_list(base_url: str) -> None:
         base_url=base_url, max_retries=2, retry_methods=["get"], backoff_base=0.001
     ) as client:
         result = client.get(
-            "flaky", params={"key": "sync-list-methods", "fail_times": 2}, response_data_type=dict
+            "flaky", params={"key": "sync-list-methods", "fail_times": 2}, into=dict
         ).data
 
     assert result == {"attempts": 3}
@@ -247,7 +239,7 @@ async def test_a_retry_after_within_max_retry_after_is_still_honoured(base_url: 
             await client.get(
                 "retry-after-custom",
                 params={"key": "retry-after-within", "value": "0"},
-                response_data_type=dict,
+                into=dict,
             )
         ).data
 
@@ -272,7 +264,7 @@ async def test_max_retry_after_none_honours_any_wait(base_url: str) -> None:
             await client.get(
                 "retry-after-custom",
                 params={"key": "retry-after-no-limit", "value": "0"},
-                response_data_type=dict,
+                into=dict,
             )
         ).data
 
@@ -287,7 +279,7 @@ async def test_a_body_cut_off_partway_is_retried(base_url: str) -> None:
             await client.get(
                 "body-flaky",
                 params={"key": "body-flaky-1", "fail_times": 2},
-                response_data_type=dict,
+                into=dict,
             )
         ).data
 
@@ -299,7 +291,7 @@ def test_sync_a_body_cut_off_partway_is_retried(base_url: str) -> None:
         result = client.get(
             "body-flaky",
             params={"key": "sync-body-flaky-1", "fail_times": 2},
-            response_data_type=dict,
+            into=dict,
         ).data
 
     assert result == {"attempts": 3}
@@ -316,9 +308,7 @@ async def test_a_body_that_cannot_be_decompressed_is_not_retried(base_url: str) 
     async with HTTPClient(base_url=base_url, max_retries=3, backoff_base=0.001) as client:
         with pytest.raises(HTTPConnectionError):
             await client.get("corrupt-gzip", params={"key": "corrupt-gzip-1"})
-        hits = (
-            await client.get("hits", params={"key": "corrupt-gzip-1"}, response_data_type=dict)
-        ).data
+        hits = (await client.get("hits", params={"key": "corrupt-gzip-1"}, into=dict)).data
 
     assert hits == {"hits": 1}
 
@@ -327,9 +317,7 @@ def test_sync_a_body_that_cannot_be_decompressed_is_not_retried(base_url: str) -
     with SyncHTTPClient(base_url=base_url, max_retries=3, backoff_base=0.001) as client:
         with pytest.raises(HTTPConnectionError):
             client.get("corrupt-gzip", params={"key": "sync-corrupt-gzip-1"})
-        hits = client.get(
-            "hits", params={"key": "sync-corrupt-gzip-1"}, response_data_type=dict
-        ).data
+        hits = client.get("hits", params={"key": "sync-corrupt-gzip-1"}, into=dict).data
 
     assert hits == {"hits": 1}
 
@@ -342,9 +330,7 @@ async def test_a_cut_off_body_on_a_post_is_not_retried_by_default(base_url: str)
 
 def test_sync_retries_honors_retry_after_header(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, max_retries=1) as client:
-        result = client.get(
-            "retry-after", params={"key": "sync-retry-after-1"}, response_data_type=dict
-        ).data
+        result = client.get("retry-after", params={"key": "sync-retry-after-1"}, into=dict).data
 
     assert result == {"attempts": 2}
 
@@ -355,7 +341,7 @@ def test_sync_retries_honors_http_date_retry_after_header(base_url: str) -> None
         result = client.get(
             "retry-after-custom",
             params={"key": "sync-retry-after-http-date", "value": retry_after},
-            response_data_type=dict,
+            into=dict,
         ).data
 
     assert result == {"attempts": 2}
@@ -368,7 +354,7 @@ def test_sync_retries_falls_back_to_backoff_on_malformed_retry_after_header(
         result = client.get(
             "retry-after-custom",
             params={"key": "sync-retry-after-malformed", "value": "not-a-date"},
-            response_data_type=dict,
+            into=dict,
         ).data
 
     assert result == {"attempts": 2}
@@ -395,7 +381,7 @@ def test_sync_a_retry_after_within_max_retry_after_is_still_honoured(base_url: s
         result = client.get(
             "retry-after-custom",
             params={"key": "sync-retry-after-within", "value": "0"},
-            response_data_type=dict,
+            into=dict,
         ).data
 
     assert result == {"attempts": 2}
@@ -406,7 +392,7 @@ def test_sync_max_retry_after_none_honours_any_wait(base_url: str) -> None:
         result = client.get(
             "retry-after-custom",
             params={"key": "sync-retry-after-no-limit", "value": "0"},
-            response_data_type=dict,
+            into=dict,
         ).data
 
     assert result == {"attempts": 2}

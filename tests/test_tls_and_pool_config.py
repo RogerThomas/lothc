@@ -26,7 +26,7 @@ async def test_connect_timeout_and_pool_settings_still_allow_a_normal_request(
         pool_max_idle_per_host=5,
         pool_timeout=2.0,
     ) as client:
-        result = (await client.get("items/7", response_data_type=dict)).data
+        result = (await client.get("items/7", into=dict)).data
 
     assert result == {"id": 7, "name": "item-7"}
 
@@ -42,7 +42,7 @@ def test_sync_connect_timeout_and_pool_settings_still_allow_a_normal_request(
         pool_max_idle_per_host=5,
         pool_timeout=2.0,
     ) as client:
-        result = client.get("items/7", response_data_type=dict).data
+        result = client.get("items/7", into=dict).data
 
     assert result == {"id": 7, "name": "item-7"}
 

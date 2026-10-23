@@ -4,6 +4,7 @@ import queue
 import secrets
 import threading
 import time
+from collections import defaultdict
 from collections.abc import (
     AsyncGenerator,
     Awaitable,
@@ -24,7 +25,7 @@ from contextlib import (
     closing,
     contextmanager,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from functools import cache
@@ -36,14 +37,22 @@ from json import loads as _json_loads
 from mimetypes import guess_type as _guess_mime_type
 from os import PathLike
 from pathlib import Path
+from types import get_original_bases
 from typing import (
     TYPE_CHECKING,
+    Annotated,
     Any,
     ClassVar,
     Literal,
     Protocol,
     Self,
+    TypeAliasType,
+    TypeIs,
+    TypeVar,
     cast,
+    get_args,
+    get_origin,
+    get_type_hints,
     overload,
     runtime_checkable,
 )
@@ -70,6 +79,7 @@ from pyreqwest.request import (
 )
 from pyreqwest.response import Response as RawResponse
 from pyreqwest.response import SyncResponse as RawSyncResponse
+from typing_extensions import TypeForm, is_typeddict
 
 from ._compat import (
     BaseModel,
@@ -81,6 +91,8 @@ from ._compat import (
     TypeAdapter,
     TypeAdapterTyping,
     msgspec,
+    msgspec_installed,
+    pydantic_installed,
 )
 
 if TYPE_CHECKING:
@@ -164,7 +176,7 @@ class RequestInfo:
     host: str | None
 
 
-class HTTPResponseError(Exception):
+class HTTPResponseError[E = object](Exception):
     """Raised when a request gets a 4xx/5xx response (`error_for_status=True`, the default).
 
     A response WAS received — for a request that never got one, see `HTTPTransportError`.
@@ -172,8 +184,11 @@ class HTTPResponseError(Exception):
     final response came from if redirects were followed. `.headers` are the error response's own
     (e.g. a `Retry-After` once retries are exhausted, or a request id to quote to support), and
     `.body` is the whole body; `.body_start` is just its first 100 bytes, as used in the message.
-    With `error_type`, `.parsed_body` is the decoded body, or `None` if it didn't match, in which
-    case `.parse_error` holds why (the decode library's own `ValueError`). `.parse_error` isn't
+
+    `.error` is the body decoded: as `E` when a subclass pins it
+    (`class APIError(HTTPResponseError[NotFound | Conflict]): pass`, passed as `raises=`), else
+    as a JSON object (`dict`), else `None` (HTML, text, an array). When a pinned `E` didn't match,
+    `.parse_error` holds why (the decode library's own `ValueError`). `.parse_error` isn't
     carried across pickling, since pydantic's `ValidationError` can't be pickled.
     """
 
@@ -182,7 +197,7 @@ class HTTPResponseError(Exception):
         status: int,
         body: bytes,
         request: RequestInfo,
-        parsed_body: Data | None = None,
+        error: E | dict[str, Any] | None = None,
         *,
         headers: "CaseInsensitiveDict | None" = None,
         parse_error: ValueError | None = None,
@@ -192,7 +207,7 @@ class HTTPResponseError(Exception):
         self.body = body
         self.body_start = body[:100]
         self.request = request
-        self.parsed_body = parsed_body
+        self.error = error
         self.headers = headers if headers is not None else CaseInsensitiveDict()
         snippet = self.body_start.decode(errors="replace")
         truncation_marker = "…" if len(body) > 100 else ""
@@ -201,23 +216,26 @@ class HTTPResponseError(Exception):
     def __reduce__(self) -> tuple[Any, ...]:
         # Exception's own pickling replays `self.args` — just the message here — into `__init__`,
         # which then fails for want of `body`/`request`, so an error could never cross a process
-        # boundary (multiprocessing, a task queue). Rebuild from the real fields instead.
+        # boundary (multiprocessing, a task queue). Rebuild from the real fields instead, as
+        # `type(self)` so a `raises=` subclass comes back as itself (pickle finds it by name, so
+        # it must be a module-level class).
         return (
             _rebuild_http_response_error,
-            (self.status, self.body, self.request, self.parsed_body, self.headers),
+            (type(self), self.status, self.body, self.request, self.error, self.headers),
         )
 
 
 def _rebuild_http_response_error(
+    cls: type[HTTPResponseError[Any]],
     status: int,
     body: bytes,
     request: RequestInfo,
-    parsed_body: Data | None,
+    error: object,
     headers: "CaseInsensitiveDict",
-) -> HTTPResponseError:
+) -> HTTPResponseError[Any]:
     """Unpickling target for `HTTPResponseError.__reduce__` (keyword-only `headers` rules out
     returning the class itself with positional args)."""
-    return HTTPResponseError(status, body, request, parsed_body, headers=headers)
+    return cls(status, body, request, error, headers=headers)
 
 
 class HTTPTransportError(Exception):
@@ -748,8 +766,7 @@ async def _build_file_part(content: bytes | Path | BufferedIOBase) -> PartBuilde
 
 # `value` is typed `object`, not `Form`'s value union — nothing at runtime stops a caller
 # bypassing the type checker, so the `case _` fallback below must stay reachable rather than
-# basedpyright proving it `Never` from a narrower declared type (same reasoning as
-# `_validate_response_data_type`'s `object` parameter).
+# basedpyright proving it `Never` from a narrower declared type.
 async def _apply_form_value(  # pylint: disable=too-many-return-statements
     form_builder: FormBuilder,
     name: str,
@@ -847,7 +864,7 @@ class SSEEvent[TData]:
     """One Server-Sent Event, as yielded by `sse()`.
 
     `.event` defaults to `"message"` and `.id` to `""` when the wire omits them, as the SSE spec
-    (and a browser's `EventSource`) does. `.data` is decoded per `sse()`'s `response_data_type`,
+    (and a browser's `EventSource`) does. `.data` is decoded per `sse()`'s `into`,
     raw `str` by default.
     """
 
@@ -983,30 +1000,32 @@ def _verify_sse_response(state: _SSEStreamState, status: int, content_type: str 
         )
 
 
+# The sync clients' bound `_check_status`, as handed to the chunk iterators that may run it on a
+# worker thread.
+type _SyncStatusCheck = Callable[
+    [RawSyncResponse, type[HTTPResponseError[Any]] | None, RequestInfo], None
+]
+
+
 @dataclass(slots=True)
 class _SyncSSEResponseCheck:
     """Adapter so the sync chunk iterators' single `check_status` hook also runs
     `_verify_sse_response` — the response object only ever exists on whichever thread owns the
     read loop (see `_drain_stream_chunks`), so status/content-type have to be captured there."""
 
-    _check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None
+    _check_status: _SyncStatusCheck | None
     _state: _SSEStreamState
 
     def __call__(
         self,
         raw_response: RawSyncResponse,
-        error_type: type[Data] | None,
+        raises: type[HTTPResponseError[Any]] | None,
         request_info: RequestInfo,
     ) -> None:
         if self._check_status is not None:
-            self._check_status(raw_response, error_type, request_info)
+            self._check_status(raw_response, raises, request_info)
         content_type = raw_response.headers.get("content-type")
         _verify_sse_response(self._state, raw_response.status, content_type)
-
-
-def _validate_response_data_type(response_data_type: object) -> None:
-    if not isinstance(response_data_type, type):
-        raise TypeError(f"response_data_type must be a class, got {response_data_type!r}")
 
 
 def _require_json_object(parsed: object) -> dict[str, Any]:
@@ -1035,78 +1054,299 @@ def _require_json_object(parsed: object) -> dict[str, Any]:
             kind = "number"
     raise ValueError(
         f"Expected a JSON object for a `dict` target, got a JSON {kind}. Decode a top-level array"
-        " with a pydantic `TypeAdapter` or a msgspec `Decoder` as `response_data_type` instead."
+        " with `into=list[...]` (or any other type matching the body) instead."
     )
 
 
-def _decode_error_body(body: bytes, error_type: type[Data]) -> Data:
-    """Decode an error response's body for `HTTPResponseError.parsed_body`. Takes plain bytes,
-    not a live response object — by the time this runs, `.bytes()` has already been consumed once
-    to populate `body_start`, and a pyreqwest response body can't be read twice."""
-    _validate_response_data_type(error_type)
-    if issubclass(error_type, bytes):
-        return body
-    if issubclass(error_type, dict):
-        return error_type(_require_json_object(_json_loads(body)))
-    if issubclass(error_type, Struct):
-        return msgspec.json.decode(body, type=error_type)
-    # Statically, `Data`'s remaining member here is always BaseModel (basedpyright flags the
-    # check itself as unnecessary) — but `error_type` is only actually validated to be *some*
-    # class by `_validate_response_data_type`, not proven to be a `Data` member at runtime, so an
-    # uncovered class must still fall through to the raise below.
-    if issubclass(error_type, BaseModel):  # pyright: ignore[reportUnnecessaryIsInstance] — pylint: disable=line-too-long
-        return error_type.model_validate_json(body)
-    raise TypeError(f"Unsupported error_type: {error_type!r}")
+type _JSONInput = str | bytes | bytearray
 
 
-def _try_decode_error_body(
-    body: bytes, error_type: type[Data]
-) -> tuple[Data | None, ValueError | None]:
-    """Decode an error body for `HTTPResponseError.parsed_body`, best-effort: a body that doesn't
-    match `error_type` gives `(None, the decode error)` instead of raising.
+@dataclass(slots=True)
+class _JSONObjectDecoder:
+    """`into=dict`/`dict[str, Any]`: stdlib `json`, so it works with neither extra installed."""
 
-    Unlike `response_data_type`, where the decode library's own error rightly propagates, an
-    error body is where a server is least likely to honour its own contract: a proxy's 502 HTML
-    page against `error_type=ErrorModel` used to raise pydantic's `ValidationError` in place of
-    the `HTTPResponseError`, losing the status and skipping `except HTTPResponseError` handlers.
-    Every decode failure here is a `ValueError` (pydantic's, msgspec's, `json`'s, and a non-UTF-8
-    body's). An unusable `error_type` itself is a caller bug, not a bad body, so the `TypeError`
-    it raises still propagates.
+    def decode(self, data: _JSONInput) -> dict[str, Any]:
+        # stdlib `json`, not pyreqwest's `.json()`: that raises pyreqwest's own
+        # `JSONDecodeError`, and reading the body separately is what lets a body cut short be
+        # told apart from one that just isn't valid JSON.
+        return _require_json_object(_json_loads(data))
+
+
+@dataclass(slots=True)
+class _DictSubclassDecoder:
+    """`into=` a bare `dict` subclass (`OrderedDict`, `defaultdict`, a caller's own): stdlib
+    `json` like `dict`, then built as that subclass, so it needs no extra. msgspec would reject
+    most of them (it only builds a plain `dict`)."""
+
+    _form: type[dict[Any, Any]]
+
+    def decode(self, data: _JSONInput) -> dict[Any, Any]:
+        parsed = _require_json_object(_json_loads(data))
+        if issubclass(self._form, defaultdict):
+            # `defaultdict`'s first positional argument is its `default_factory`.
+            return self._form(None, parsed)
+        return self._form(parsed)
+
+
+@dataclass(slots=True)
+class _TextDecoder:
+    """`into=str`: the body (or NDJSON line, or SSE `data`) as UTF-8 text, never JSON-parsed,
+    mirroring `bytes` as the raw bytes. Strict, so invalid UTF-8 raises `UnicodeDecodeError`, a
+    `ValueError` like every other decode failure."""
+
+    def decode(self, data: Buffer | str) -> str:
+        return data if isinstance(data, str) else str(data, "utf-8")
+
+
+type _Decoder = (
+    Decoder[Any] | TypeAdapter[Any] | _JSONObjectDecoder | _DictSubclassDecoder | _TextDecoder
+)
+type _Into = TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None
+
+# One decoder per `into` form, shared by both clients and every verb. Building one is the
+# expensive part (measured: msgspec `Decoder(list[User])` ~1.5us, pydantic `TypeAdapter` ~31us),
+# a hit is one dict lookup. Keyed by the form itself: `list[User]` written at two call sites is
+# two equal, equally-hashed objects, so it's one entry. Forms come from source code, not data, but
+# one can still be a new key per call: a form whose metadata compares by identity (see
+# `_FormTraits`) is never stored, and `_decoders_max_size` stops anything that rule misses (an
+# inline lambda validator) growing it forever. Once full, new forms decode uncached; nothing is
+# evicted, so the forms cached first, the hot ones, stay cached.
+_decoders: dict[object, _Decoder] = {}
+_decoders_max_size = 4096
+
+
+@dataclass(slots=True)
+class _FormTraits:
+    """What `_decoder_for` learns from walking an `into` form before building its decoder.
+
+    `model_bases` holds `Struct` and/or `BaseModel`; `BaseModel` also stands for anything only
+    pydantic acts on (see `_is_pydantic_marker`). `identity_keyed` is whether the form, written
+    inline, is a new cache key on every call (see `_compares_by_identity`).
     """
+
+    model_bases: set[type]
+    identity_keyed: bool
+
+
+def _is_pydantic_marker(value: object) -> bool:
+    """Whether `value`, an `Annotated` metadata item or a class, is something only pydantic acts
+    on, which msgspec would silently ignore or reject: pydantic's own metadata (`Field(...)`,
+    `AfterValidator`, `StringConstraints`), an `annotated_types` constraint (`Gt`, `MaxLen`:
+    msgspec has its own `msgspec.Meta`), or anything with pydantic's validator or schema hook (a
+    `BaseModel`, a pydantic dataclass, `HttpUrl`, a caller's custom type)."""
+    if isinstance(value, type):
+        return hasattr(value, "__pydantic_validator__") or hasattr(
+            value, "__get_pydantic_core_schema__"
+        )
+    package = type(value).__module__.partition(".")[0]
+    if package in {"pydantic", "pydantic_core", "annotated_types"}:
+        return True
+    return hasattr(value, "__get_pydantic_core_schema__")
+
+
+def _compares_by_identity(value: object) -> bool:
+    """Whether `value`, an `Annotated` metadata item, is only ever equal to itself, so a form
+    carrying it is a new cache key each time it's written: an instance whose type has no
+    `__eq__` (pydantic's `FieldInfo`, from an inline `Field(...)`), or a dataclass holding one.
+
+    A class or other callable doesn't count: it's usually the same object on every call (a
+    module-level function, so `AfterValidator(check)` is a stable key). An inline lambda or
+    closure isn't, which is what `_decoders_max_size` is the backstop for.
+
+    >>> _compares_by_identity("doc"), _compares_by_identity(len), _compares_by_identity(object())
+    (False, False, True)
+    """
+    if callable(value):
+        return False
+    if type(value).__eq__ is object.__eq__:
+        return True
+    if is_dataclass(value):
+        return any(
+            _compares_by_identity(getattr(value, field.name))
+            for field in fields(value)
+            if field.compare
+        )
+    return False
+
+
+def _is_class(value: object) -> TypeIs[type[object]]:
+    # A `TypeIs`, not an inline `isinstance`: that narrows `object` to a partially unknown
+    # `type[Unknown]`, which strict mode rejects as an argument.
+    return isinstance(value, type)
+
+
+def _class_field_annotations(cls: type[object]) -> list[object]:
+    """The field annotations of a TypedDict, dataclass or NamedTuple, which msgspec and pydantic
+    both decode field by field, so a model inside one decides the library. Empty for any other
+    class, and for one whose annotations don't resolve (the library then says so itself)."""
+    is_named_tuple = tuple in cls.__mro__ and hasattr(cls, "_fields")
+    if not (is_typeddict(cls) or is_dataclass(cls) or is_named_tuple):
+        return []
     try:
-        return _decode_error_body(body, error_type), None
-    except ValueError as error:
-        return None, error
+        hints = get_type_hints(cls, include_extras=True)
+    except (NameError, TypeError):
+        return []
+    return list(hints.values())
 
 
-# Return type is whatever response_data_type is — genuinely dynamic, can't state it statically.
-def _decode_json_line(
-    data: str, response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any]
-) -> Any:  # noqa: ANN401
-    if isinstance(response_data_type, TypeAdapter):
-        return response_data_type.validate_json(data)
-    if isinstance(response_data_type, Decoder):
-        return response_data_type.decode(data)
-    # basedpyright can't narrow past `TypeAdapterTyping`/`DecoderTyping` (structural Protocols —
-    # see _compat.py's `StructTyping` docstring) via the two `isinstance` checks above the way it
-    # can narrow a same-kind `issubclass` chain, so it still sees them as possible here even
-    # though both are already excluded at runtime.
-    response_data_type = cast("type[Any]", response_data_type)
-    _validate_response_data_type(response_data_type)
-    if issubclass(response_data_type, dict):
-        dict_type = cast("type[dict[str, Any]]", response_data_type)
-        return dict_type(_require_json_object(_json_loads(data)))
-    if issubclass(response_data_type, Struct):
-        return msgspec.json.decode(data.encode(), type=response_data_type)
-    if issubclass(response_data_type, BaseModel):
-        return response_data_type.model_validate_json(data)
-    raise TypeError(f"Unsupported response_data_type: {response_data_type!r}")
+def _form_traits(form: object) -> _FormTraits:
+    """Walk `form`: generic arguments, unions, `Annotated` (its type and its metadata), PEP 695
+    `type` aliases, and the fields of TypedDicts, dataclasses and NamedTuples, each alias and
+    class once so a recursive one ends. A model class's own fields aren't walked: they're its
+    library's business."""
+    model_bases: set[type] = set()
+    identity_keyed = False
+    seen: set[object] = set()
+    # Each entry also says whether it sits behind an alias or a class: those compare by their
+    # own (stable) identity as a cache key, so metadata inside them can't make the key unstable.
+    pending: list[tuple[object, bool]] = [(form, False)]
+    while pending:
+        current, behind_stable_key = pending.pop()
+        if isinstance(current, TypeAliasType) or _is_class(current):
+            if current in seen:
+                continue
+            seen.add(current)
+        if isinstance(current, TypeAliasType):
+            pending.append((current.__value__, True))
+        elif _is_class(current):
+            if issubclass(current, Struct):
+                model_bases.add(Struct)
+            elif issubclass(current, BaseModel) or _is_pydantic_marker(current):
+                model_bases.add(BaseModel)
+            pending.extend((annotation, True) for annotation in _class_field_annotations(current))
+        elif get_origin(current) is Annotated:
+            annotated, *metadata = get_args(current)
+            pending.append((annotated, behind_stable_key))
+            for item in metadata:
+                if _is_pydantic_marker(item):
+                    model_bases.add(BaseModel)
+                if not behind_stable_key and _compares_by_identity(item):
+                    identity_keyed = True
+        else:
+            origin = get_origin(current)
+            if origin is not None:
+                pending.append((origin, behind_stable_key))
+            pending.extend((argument, behind_stable_key) for argument in get_args(current))
+    return _FormTraits(model_bases, identity_keyed)
+
+
+def _is_bare_dict_subclass(form: object) -> TypeIs[type[dict[Any, Any]]]:
+    # A TypedDict is a `dict` subclass at runtime too, but means a typed JSON object.
+    return _is_class(form) and not is_typeddict(form) and issubclass(form, dict)
+
+
+def _msgspec_decoder(form: object) -> Decoder[Any]:
+    try:
+        return Decoder(form)
+    except TypeError as error:
+        raise TypeError(f"Unsupported into: {form!r} ({error})") from error
+
+
+def _pydantic_adapter(form: object) -> TypeAdapter[Any]:
+    try:
+        return TypeAdapter(form)
+    # pydantic's schema-generation error is a `RuntimeError` as of 2.13, a `TypeError` before.
+    except (TypeError, RuntimeError) as error:
+        raise TypeError(f"Unsupported into: {form!r} ({error})") from error
+
+
+def _build_decoder(form: object, model_bases: set[type]) -> _Decoder:
+    """The decoder for a type expression: raw text for `str`, stdlib `json` for `dict` and its
+    bare subclasses, else whichever library the form's models (or pydantic-only metadata) belong
+    to, else msgspec (faster), else pydantic."""
+    if form is str:
+        return _TextDecoder()
+    if form is dict or form == dict[str, Any]:
+        return _JSONObjectDecoder()
+    if _is_bare_dict_subclass(form):
+        return _DictSubclassDecoder(form)
+    if Struct in model_bases and BaseModel in model_bases:
+        raise TypeError(
+            f"into={form!r} mixes msgspec Structs and pydantic BaseModels (or pydantic-only"
+            " metadata such as Field(...)); one form can only be decoded by one library, so use"
+            " one library's models throughout."
+        )
+    if BaseModel in model_bases:
+        if not pydantic_installed:
+            raise TypeError(
+                f"into={form!r} carries validation only pydantic enforces (pydantic Field or"
+                " validator metadata, annotated_types constraints, a pydantic type), which"
+                " msgspec would silently skip: install lothc[pydantic]."
+            )
+        return _pydantic_adapter(form)
+    if msgspec_installed:
+        return _msgspec_decoder(form)
+    if pydantic_installed:
+        return _pydantic_adapter(form)
+    raise TypeError(
+        f"into={form!r} needs msgspec or pydantic to decode it: install lothc[msgspec] or"
+        " lothc[pydantic]. Only bytes, str, dict (and its subclasses) and dict[str, Any] work"
+        " without either."
+    )
+
+
+def _is_prebuilt_decoder(into: object) -> TypeIs[Decoder[Any] | TypeAdapter[Any]]:
+    # A `TypeIs`, not an inline `isinstance`: that narrows `into`'s `TypeForm[Any]` member to a
+    # partially unknown `Decoder[Unknown]`.
+    return isinstance(into, (Decoder, TypeAdapter))
+
+
+def _decoder_for(into: object) -> _Decoder | None:
+    """The decoder for `into`, or `None` for raw bytes. A pre-built `TypeAdapter`/`Decoder` is
+    used as-is (never cached: one built per call would grow the cache forever). Takes `object`,
+    not `_Into`, since a `raises=` class's error type comes from its bases at runtime. An
+    unusable form raises `TypeError`, which is why every verb resolves it before sending."""
+    if into is None or into is bytes:
+        return None
+    if _is_prebuilt_decoder(into):
+        return into
+    try:
+        decoder = _decoders.get(into)
+    except TypeError:
+        # An unhashable form (e.g. `Annotated` with a `dict` in its metadata) still works,
+        # just rebuilt on every call.
+        return _build_decoder(into, _form_traits(into).model_bases)
+    if decoder is None:
+        traits = _form_traits(into)
+        decoder = _build_decoder(into, traits.model_bases)
+        # Storing a form that's a new key on every call would grow the cache forever; it's
+        # rebuilt per call instead (hoisting it into a `type` alias makes it a stable key).
+        if not traits.identity_keyed and len(_decoders) < _decoders_max_size:
+            _decoders[into] = decoder
+    return decoder
+
+
+# Return type is whatever the decoder produces — genuinely dynamic, can't state it statically.
+def _decode_body(body: Bytes, decoder: _Decoder | None) -> Any:  # noqa: ANN401
+    """A successful response's whole body, decoded by an already-resolved `decoder` (`None` for
+    raw bytes), resolved before sending so an unusable `into` never sends a request. Shared by
+    both clients, which read the body first: a separate async step would add a frame that every
+    resume of the request's task passes through."""
+    if decoder is None:
+        return body.to_bytes()
+    if isinstance(decoder, Decoder):
+        # msgspec reads the buffer directly; the others need real `bytes`.
+        return decoder.decode(body)
+    if isinstance(decoder, TypeAdapter):
+        return decoder.validate_json(body.to_bytes())
+    return decoder.decode(body.to_bytes())
+
+
+# Return type is whatever the decoder produces — genuinely dynamic, can't state it statically.
+def _decode_json_line(data: _JSONInput, decoder: _Decoder) -> Any:  # noqa: ANN401
+    """One NDJSON line or SSE `data` field (or a whole error body), decoded by an
+    already-resolved `decoder` (resolved once per stream by `_decoder_for`, not once per line).
+    An NDJSON line arrives as the `bytearray` it was split into: every decoder takes it as is."""
+    if isinstance(decoder, TypeAdapter):
+        return decoder.validate_json(data)
+    return decoder.decode(data)
 
 
 def _dispatch_sse_record(
     record: bytes,
     state: _SSEStreamState,
-    response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
+    into: _Into,
+    decoder: _Decoder | None,
 ) -> SSEEvent[Any] | None:
     """Apply one record's `retry:`/`id:` fields to `state`, then build its event (if it has data).
 
@@ -1122,10 +1362,13 @@ def _dispatch_sse_record(
         state.last_event_id = parsed_record.id
     if parsed_record.data is None:
         return None
-    if response_data_type is None:
-        return SSEEvent(id=state.last_event_id, event=parsed_record.event, data=parsed_record.data)
-    decoded = _decode_json_line(parsed_record.data, response_data_type)
-    return SSEEvent(id=state.last_event_id, event=parsed_record.event, data=decoded)
+    if decoder is not None:
+        data = _decode_json_line(parsed_record.data, decoder)
+    elif into is bytes:
+        data = parsed_record.data.encode()
+    else:
+        data = parsed_record.data
+    return SSEEvent(id=state.last_event_id, event=parsed_record.event, data=data)
 
 
 def _sse_reconnect_budget_exhausted(
@@ -1605,7 +1848,7 @@ def _attach_body_sync[TBuilder: BaseRequestBuilder](  # pylint: disable=too-many
 type HeaderSource = Mapping[str, str] | SupportsKeysAndGetItem[str, str] | Iterable[tuple[str, str]]
 
 
-def _header_pairs(data: HeaderSource) -> Iterator[tuple[str, str]]:
+def _header_pairs(data: HeaderSource) -> Iterable[tuple[str, str]]:
     """Every `(key, value)` pair in `data`, repeating a key once per value it holds.
 
     `hasattr(data, "keys")` rather than `isinstance(data, Mapping)` is what tells the two
@@ -1613,28 +1856,28 @@ def _header_pairs(data: HeaderSource) -> Iterator[tuple[str, str]]:
     protocol with no runtime `isinstance` support — it's also exactly how `dict.update` itself
     decides. Each branch then needs a `cast`, because neither `hasattr` nor the `else` narrows
     the union for a checker.
+
+    Returns an iterable rather than being a generator: every response builds a
+    `CaseInsensitiveDict` from pyreqwest's `HeaderMap`, and handing its `.items()` straight to
+    the caller's loop skips a generator resume per header (~0.35us of ~1.1us per response).
     """
     if isinstance(data, CaseInsensitiveDict):
         # `Mapping.items()` is single-valued, so reading another CaseInsensitiveDict through the
         # branch below would drop every repeated header's extra values — the one thing the class
         # exists to keep. Goes through the public `get_all` rather than the other instance's
         # `_store` so there's one definition of "all values for this key", not two.
-        for key in data:
-            for value in data.get_all(key):
-                yield (key, value)
-    elif isinstance(data, Mapping):
+        return [(key, value) for key in data for value in data.get_all(key)]
+    if isinstance(data, Mapping):
         # `.items()`, never `keys()` + `[key]`: pyreqwest's `HeaderMap` is a Mapping whose
         # `keys()` repeats a duplicated name while `[name]` always returns that name's *first*
         # value, so the pair below would yield the same value once per duplicate (caught by
         # `test_get_result_headers_keep_every_value_of_a_repeated_header`). `.items()` is a live
         # view of the real pairs and gets it right.
-        yield from cast("Mapping[str, str]", data).items()
-    elif hasattr(data, "keys"):
+        return cast("Mapping[str, str]", data).items()
+    if hasattr(data, "keys"):
         source = cast("SupportsKeysAndGetItem[str, str]", data)
-        for key in source.keys():  # noqa: SIM118
-            yield (key, source[key])
-    else:
-        yield from cast("Iterable[tuple[str, str]]", data)
+        return [(key, source[key]) for key in source.keys()]  # noqa: SIM118
+    return cast("Iterable[tuple[str, str]]", data)
 
 
 class CaseInsensitiveDict(MutableMapping[str, str]):
@@ -1660,12 +1903,13 @@ class CaseInsensitiveDict(MutableMapping[str, str]):
             # reachable via `get_all`. Iterating pairs is required for that — `dict(data)` would
             # throw the extras away — while appending in arrival order keeps `__getitem__` on the
             # *first* value, which is what a plain `dict(raw_response.headers)` always returned.
+            store = self._store
             for key, value in _header_pairs(data):
                 lowered = key.lower()
-                if lowered in self._store:
-                    self._store[lowered][1].append(value)
+                if lowered in store:
+                    store[lowered][1].append(value)
                 else:
-                    self._store[lowered] = (key, [value])
+                    store[lowered] = (key, [value])
 
     def __getitem__(self, key: str) -> str:
         return self._store[key.lower()][1][0]
@@ -1798,8 +2042,8 @@ def _offer_stream_item(
 
 def _drain_stream_chunks(
     request: SyncStreamRequest,
-    check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None,
-    error_type: type[Data] | None,
+    check_status: _SyncStatusCheck | None,
+    raises: type[HTTPResponseError[Any]] | None,
     request_info: RequestInfo,
     item_queue: queue.Queue[_StreamQueueItem],
     abandoned: threading.Event,
@@ -1819,7 +2063,7 @@ def _drain_stream_chunks(
     try:
         with request as raw_response:
             if check_status is not None:
-                check_status(raw_response, error_type, request_info)
+                check_status(raw_response, raises, request_info)
             if head_sink is not None:
                 head_sink.append(_response_head(raw_response))
             while True:
@@ -1835,8 +2079,8 @@ def _drain_stream_chunks(
 
 def _interruptible_chunk_iter(
     request: SyncStreamRequest,
-    check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None,
-    error_type: type[Data] | None,
+    check_status: _SyncStatusCheck | None,
+    raises: type[HTTPResponseError[Any]] | None,
     request_info: RequestInfo,
     *,
     idle_timeout: float | None = None,
@@ -1869,7 +2113,7 @@ def _interruptible_chunk_iter(
     abandoned = threading.Event()
     worker = threading.Thread(
         target=_drain_stream_chunks,
-        args=(request, check_status, error_type, request_info, item_queue, abandoned, head_sink),
+        args=(request, check_status, raises, request_info, item_queue, abandoned, head_sink),
         daemon=True,
     )
     worker.start()
@@ -1903,8 +2147,8 @@ def _interruptible_chunk_iter(
 
 def _sync_stream_chunks(
     request: SyncStreamRequest,
-    check_status: Callable[[RawSyncResponse, type[Data] | None, RequestInfo], None] | None,
-    error_type: type[Data] | None,
+    check_status: _SyncStatusCheck | None,
+    raises: type[HTTPResponseError[Any]] | None,
     request_info: RequestInfo,
     *,
     interruptible: bool,
@@ -1921,7 +2165,7 @@ def _sync_stream_chunks(
         yield from _interruptible_chunk_iter(
             request,
             check_status,
-            error_type,
+            raises,
             request_info,
             idle_timeout=idle_timeout,
             head_sink=head_sink,
@@ -1929,7 +2173,7 @@ def _sync_stream_chunks(
         return
     with request as raw_response:
         if check_status is not None:
-            check_status(raw_response, error_type, request_info)
+            check_status(raw_response, raises, request_info)
         if head_sink is not None:
             head_sink.append(_response_head(raw_response))
         while True:
@@ -1975,6 +2219,166 @@ class Response[TData, THeaders: TypedHeaders | None = None]:
     elapsed: float
 
 
+@dataclass(slots=True)
+class _ErrorBodyDecoding:
+    """How a `raises=` class decodes a 4xx/5xx body. `pinned` is whether it pins an `E` at all,
+    since `decoder` is `None` both when it doesn't and when it pins `E = bytes`."""
+
+    pinned: bool
+    decoder: _Decoder | None
+
+
+# One per `raises=` class, shared by both clients, like `_decoders` (which caches the decoder
+# itself): what this saves is the walk through the class's bases on every error. Unbounded,
+# since the classes come from source code, not data.
+_error_body_decodings: dict[type, _ErrorBodyDecoding] = {}
+
+
+def _is_response_error_class(value: object) -> TypeIs[type[HTTPResponseError[Any]]]:
+    return isinstance(value, type) and issubclass(value, HTTPResponseError)
+
+
+def _has_free_type_params(form: object) -> bool:
+    """Whether `form` is, or still contains, a type parameter nothing bound."""
+    if isinstance(form, TypeVar):
+        return True
+    return get_origin(form) is not None and bool(getattr(form, "__parameters__", ()))
+
+
+def _bound_type_param(parameter: TypeVar, bindings: Mapping[TypeVar, object]) -> object:
+    """What `parameter` stands for: its binding, else its PEP 696 default (checkers read a bare
+    `class Base[T = APIError]` as `Base[APIError]`), else itself, still free."""
+    if parameter in bindings:
+        return bindings[parameter]
+    if parameter.has_default():
+        # A default may name an earlier parameter (`[T, U = list[T]]`).
+        return _bind_type_params(parameter.__default__, bindings)
+    return parameter
+
+
+def _bind_type_params(form: object, bindings: Mapping[TypeVar, object]) -> object:
+    """`form` with its type parameters replaced by their bindings, else their defaults
+    (`T` -> `int`, `list[T]` -> `list[int]`); anything with neither is left as it was."""
+    if isinstance(form, TypeVar):
+        return _bound_type_param(form, bindings)
+    parameters: tuple[TypeVar, ...] = getattr(form, "__parameters__", ())
+    if get_origin(form) is None or not parameters:
+        return form
+    # A parametrized alias with free parameters (`list[T]`) is subscriptable, which `object`
+    # can't say.
+    alias: Any = form
+    return alias[tuple(_bound_type_param(parameter, bindings) for parameter in parameters)]
+
+
+def _pinned_error_form(cls: type, bindings: Mapping[TypeVar, object]) -> tuple[()] | tuple[object]:
+    """`(E,)` for the `E` that `cls` pins on `HTTPResponseError`, or `()` if nothing does.
+
+    Walks the bases as written (`types.get_original_bases`, which keeps their type arguments,
+    unlike `__mro__`), depth first in declaration order, so a subclass of a subclass finds what
+    its parent pinned. Type parameters bound along the way are carried down, so
+    `class Base[T](HTTPResponseError[T])` then `class Final(Base[NotFound])` resolves to
+    `NotFound`.
+    """
+    for base in get_original_bases(cls):
+        origin = get_origin(base)
+        if origin is HTTPResponseError:
+            return (_bind_type_params(get_args(base)[0], bindings),)
+        if origin is None:
+            parent, parent_bindings = base, {}
+        else:
+            parent = origin
+            arguments = (_bind_type_params(argument, bindings) for argument in get_args(base))
+            parameters: tuple[TypeVar, ...] = getattr(origin, "__parameters__", ())
+            parent_bindings = dict(zip(parameters, arguments, strict=False))
+        if _is_response_error_class(parent) and parent is not HTTPResponseError:
+            pinned = _pinned_error_form(parent, parent_bindings)
+            if pinned:
+                return pinned
+    return ()
+
+
+def _resolve_error_body_decoding(raises: object) -> _ErrorBodyDecoding:
+    if not _is_response_error_class(raises):
+        raise TypeError(
+            f"raises= must be HTTPResponseError or a subclass of it, got {raises!r}. To decode"
+            " error bodies as a type E, subclass it: `class APIError(HTTPResponseError[E]): pass`."
+        )
+    pinned = _pinned_error_form(raises, {})
+    if not pinned:
+        return _ErrorBodyDecoding(pinned=False, decoder=None)
+    (form,) = pinned
+    if _has_free_type_params(form):
+        raise TypeError(
+            f"{raises.__qualname__} leaves HTTPResponseError's error type unbound ({form!r}), so"
+            " there is nothing to decode an error body as. Pin it directly:"
+            f" `class {raises.__name__}(HTTPResponseError[YourErrorType]): pass`."
+        )
+    return _ErrorBodyDecoding(pinned=True, decoder=_decoder_for(form))
+
+
+def _error_body_decoding(raises: type[HTTPResponseError[Any]]) -> _ErrorBodyDecoding:
+    """`raises`'s resolved `E` and its decoder, cached per class. An unusable `raises` (not an
+    `HTTPResponseError` subclass, an unbound `E`, an `E` no library can decode) raises
+    `TypeError`: a caller bug, so it's never cached and never swallowed."""
+    decoding = _error_body_decodings.get(raises)
+    if decoding is None:
+        decoding = _error_body_decodings[raises] = _resolve_error_body_decoding(raises)
+    return decoding
+
+
+def _validate_raises(raises: type[HTTPResponseError[Any]] | None) -> None:
+    """Resolve a per-call `raises=` before anything is sent, so a bad class is a `TypeError` on
+    every call rather than one that only surfaces on a real 4xx/5xx, in place of that error.
+    `None` (the client's own, already resolved at construction) costs nothing."""
+    if raises is not None:
+        _error_body_decoding(raises)
+
+
+def _json_object_or_none(body: bytes) -> dict[str, Any] | None:
+    """`body` as a JSON object, or `None` if it isn't one (HTML, text, an array, `null`)."""
+    try:
+        return _JSONObjectDecoder().decode(body)
+    except ValueError:
+        return None
+
+
+# Whatever the pinned `E` decodes to — genuinely dynamic, can't state it statically.
+def _decode_pinned_error(body: bytes, decoder: _Decoder | None) -> Any:  # noqa: ANN401
+    return body if decoder is None else _decode_json_line(body, decoder)
+
+
+def _status_error(
+    raises: type[HTTPResponseError[Any]],
+    status: int,
+    body: bytes,
+    request_info: RequestInfo,
+    headers: CaseInsensitiveDict,
+) -> HTTPResponseError[Any]:
+    """The `raises` error for a 4xx/5xx whose whole body has already been read.
+
+    Decoding is best-effort, since an error body is where a server is least likely to honour its
+    own contract: a body that doesn't match the pinned `E` (a proxy's HTML 502, an error shape
+    the union doesn't cover) keeps the decode library's `ValueError` on `.parse_error` and falls
+    back to a JSON object, else `None`, rather than replacing the status error with a
+    `ValidationError`. Nothing pinned: a JSON object, else `None`.
+    """
+    decoding = _error_body_decoding(raises)
+    if not decoding.pinned:
+        return raises(status, body, request_info, _json_object_or_none(body), headers=headers)
+    try:
+        error = _decode_pinned_error(body, decoding.decoder)
+    except ValueError as parse_error:
+        return raises(
+            status,
+            body,
+            request_info,
+            _json_object_or_none(body),
+            headers=headers,
+            parse_error=parse_error,
+        )
+    return raises(status, body, request_info, error, headers=headers)
+
+
 class HTTPClient:
     """Async typed HTTP client: `async with HTTPClient(base_url=...) as client:`.
 
@@ -1992,6 +2396,7 @@ class HTTPClient:
     _bearer_token: str | None
     _bearer_auth: AuthProvider | None
     _basic_auth: tuple[str, str | None] | None
+    _raises: type[HTTPResponseError[Any]]
     # The longest gap `stream_get`/`stream_post`/`download` tolerate between chunks: the client's
     # `timeout`, unless `read_timeout` was set, in which case pyreqwest already enforces that
     # itself at the socket and this stays `None`. Not applied to `sse`.
@@ -2040,6 +2445,7 @@ class HTTPClient:
         pool_idle_timeout: float | None = None,
         pool_max_idle_per_host: int | None = None,
         pool_timeout: float | None = None,
+        raises: type[HTTPResponseError[Any]] = HTTPResponseError,
     ) -> None:
         """The client's settings. Nothing opens until it's entered, as
         `async with HTTPClient(...) as client:`.
@@ -2072,11 +2478,19 @@ class HTTPClient:
         falling back to HTTP/1.1 otherwise. `resolve` maps hostnames to IP addresses, skipping
         DNS for them (the URL's port is still used); `local_address` is the source IP to connect
         from; `tcp_keepalive` (seconds) turns on TCP keepalive probes for idle connections.
+
+        `raises` is the `HTTPResponseError` class every 4xx/5xx is raised as (each verb's own
+        `raises=` overrides it). A subclass that pins the error type,
+        `class APIError(HTTPResponseError[NotFound | Conflict]): pass`, decodes the body onto
+        `.error` as that type; a bad class raises `TypeError` here, not on the first error.
         """
         if sum(value is not None for value in (bearer_token, bearer_auth, basic_auth)) > 1:
             raise ValueError(
                 "Provide at most one of 'bearer_token', 'bearer_auth', or 'basic_auth'"
             )
+        # Resolved now, so a bad class fails here rather than on the first 4xx/5xx.
+        _error_body_decoding(raises)
+        self._raises = raises
         self._bearer_token = bearer_token
         self._bearer_auth = bearer_auth
         self._basic_auth = basic_auth
@@ -2180,68 +2594,21 @@ class HTTPClient:
         return _prepare(request_builder, params, headers, timeout)
 
     async def _check_status(
-        self, raw_response: RawResponse, error_type: type[Data] | None, request_info: RequestInfo
+        self,
+        raw_response: RawResponse,
+        raises: type[HTTPResponseError[Any]] | None,
+        request_info: RequestInfo,
     ) -> None:
         if raw_response.status < 400:
             return
         body = (await _read_body(raw_response)).to_bytes()
-        parsed_body, parse_error = (
-            (None, None) if error_type is None else _try_decode_error_body(body, error_type)
-        )
-        raise HTTPResponseError(
+        raise _status_error(
+            raises if raises is not None else self._raises,
             raw_response.status,
             body,
             request_info,
-            parsed_body,
-            headers=CaseInsensitiveDict(raw_response.headers),
-            parse_error=parse_error,
+            CaseInsensitiveDict(raw_response.headers),
         )
-
-    async def _decode_body(
-        self,
-        raw_response: RawResponse,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-    ) -> Data:
-        body = await _read_body(raw_response)
-        # A pydantic `TypeAdapter` or msgspec `Decoder` is how a top-level JSON array (or any
-        # non-model shape) gets a typed decode, e.g. `TypeAdapter(list[Item])`, the same targets
-        # `sse()`/`stream_*` already accept for each line.
-        if isinstance(response_data_type, TypeAdapter):
-            return response_data_type.validate_json(body.to_bytes())
-        if isinstance(response_data_type, Decoder):
-            return response_data_type.decode(body)
-        # See `_decode_json_line`: the two structural Protocols can't be narrowed away above.
-        response_data_type = cast("type[Data]", response_data_type)
-        _validate_response_data_type(response_data_type)
-        if issubclass(response_data_type, bytes):
-            return body.to_bytes()
-        if issubclass(response_data_type, dict):
-            # stdlib `json`, not pyreqwest's `.json()`: that raises pyreqwest's own
-            # `JSONDecodeError`, and reading the body separately is what lets a body cut short be
-            # told apart from one that just isn't valid JSON.
-            return response_data_type(_require_json_object(_json_loads(body.to_bytes())))
-        if issubclass(response_data_type, Struct):
-            return msgspec.json.decode(body, type=response_data_type)
-        # Statically, `Data`'s remaining member here is always BaseModel (basedpyright flags the
-        # check itself as unnecessary) — but `response_data_type` is only actually validated to
-        # be *some* class by `_validate_response_data_type`, not proven to be a `Data` member at
-        # runtime, so an uncovered class must still fall through to the raise below.
-        if issubclass(response_data_type, BaseModel):  # pyright: ignore[reportUnnecessaryIsInstance] — pylint: disable=line-too-long
-            return response_data_type.model_validate_json(body.to_bytes())
-        raise TypeError(f"Unsupported response_data_type: {response_data_type!r}")
-
-    async def _parse(
-        self,
-        raw_response: RawResponse,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-        request_info: RequestInfo,
-        *,
-        error_for_status: bool,
-        error_type: type[Data] | None,
-    ) -> Data:
-        if error_for_status:
-            await self._check_status(raw_response, error_type, request_info)
-        return await self._decode_body(raw_response, response_data_type)
 
     async def _send_method(
         self,
@@ -2254,52 +2621,26 @@ class HTTPClient:
         data: Params | None,
         form: Form | None,
         content: str | bytes | None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
+        into: _Into,
         response_headers_type: type[TypedHeaders] | None,
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
-        error_type: type[Data] | None,
+        raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[Any, Any]:
-        """Every body verb's shared path, taking the HTTP method as a string."""
-        return await self._send_with_body(
-            self._client.request(method, path),
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
+        """Every body verb's shared path, taking the HTTP method as a string.
 
-    async def _send_with_body(
-        self,
-        request_builder: RequestBuilder,
-        params: Params | None,
-        headers: Headers | None,
-        timeout: float | None,
-        json: JSONPayload | None,
-        data: Params | None,
-        form: Form | None,
-        content: str | bytes | None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-        response_headers_type: type[TypedHeaders] | None,
-        *,
-        skip_auth: bool,
-        infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
-        error_type: type[Data] | None,
-    ) -> Response[Any, Any]:
+        The one hot path of every non-streaming request, so it calls `_send` and `_read_body`
+        directly and does the rest inline: each extra async layer between a verb and pyreqwest's
+        coroutine is another frame every resume of the request's task passes through.
+        """
+        _validate_raises(raises)
+        # Resolved before sending, so an unusable `into` fails without a request (a POST that
+        # ran and then raised `TypeError` would have done its side effect for nothing).
+        decoder = _decoder_for(into)
         request_builder = await self._prepare_request(
-            request_builder, params, headers, timeout, skip_auth=skip_auth
+            self._client.request(method, path), params, headers, timeout, skip_auth=skip_auth
         )
         request_builder = await _attach_body(
             request_builder,
@@ -2313,8 +2654,8 @@ class HTTPClient:
         raw_response, request_info = await _send(request_builder)
         elapsed = time.monotonic() - started
         if error_for_status:
-            await self._check_status(raw_response, error_type, request_info)
-        decoded = await self._decode_body(raw_response, response_data_type)
+            await self._check_status(raw_response, raises, request_info)
+        decoded = _decode_body(await _read_body(raw_response), decoder)
         response_headers = CaseInsensitiveDict(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
@@ -2339,8 +2680,9 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        into: None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     async def get(
@@ -2351,23 +2693,10 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any]]: ...
-    @overload
-    async def get[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[TData],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData]: ...
     @overload
     async def get[TAdapted](
         self,
@@ -2377,10 +2706,23 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted]: ...
+    @overload
+    async def get[TData](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        into: TypeForm[TData],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData]: ...
     @overload
     async def get[THeaders: TypedHeaders](
         self,
@@ -2390,9 +2732,10 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        into: None = None,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     async def get[THeaders: TypedHeaders](
@@ -2403,25 +2746,11 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
-    @overload
-    async def get[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData, THeaders]: ...
     @overload
     async def get[TAdapted, THeaders: TypedHeaders](
         self,
@@ -2431,11 +2760,25 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
+    @overload
+    async def get[TData, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        into: TypeForm[TData],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData, THeaders]: ...
     async def get(
         self,
         path: str,
@@ -2444,22 +2787,22 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[Any, Any]:
         """GET `path`, returning a `Response` whose `.data` is the body decoded as
-        `response_data_type` (raw `bytes` by default), alongside `.status`, `.headers`,
+        `into` (raw `bytes` by default), alongside `.status`, `.headers`,
         `.request`, `.http_version` and `.elapsed`. Pass `response_headers_type` to also get the
         headers parsed into `.typed_headers`.
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return await self._send_method(
             "GET",
@@ -2471,12 +2814,12 @@ class HTTPClient:
             None,
             None,
             None,
-            response_data_type,
+            into,
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     @overload
@@ -2492,9 +2835,10 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     async def post(
@@ -2509,29 +2853,11 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any]]: ...
-    @overload
-    async def post[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData]: ...
     @overload
     async def post[TAdapted](
         self,
@@ -2545,11 +2871,29 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted]: ...
+    @overload
+    async def post[TData](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData]: ...
     @overload
     async def post[THeaders: TypedHeaders](
         self,
@@ -2563,10 +2907,11 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     async def post[THeaders: TypedHeaders](
@@ -2581,31 +2926,12 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
-    @overload
-    async def post[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData, THeaders]: ...
     @overload
     async def post[TAdapted, THeaders: TypedHeaders](
         self,
@@ -2619,12 +2945,31 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
+    @overload
+    async def post[TData, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData, THeaders]: ...
     async def post(
         self,
         path: str,
@@ -2637,20 +2982,20 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[Any, Any]:
         """POST to `path` with at most one of `json`/`data`/`form`/`content` (raises
         `ValueError` if more than one is given), returning a `Response` like `get`'s.
         `data` is a urlencoded body (`a=1&b=2`), `form` a `multipart/form-data` one.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return await self._send_method(
             "POST",
@@ -2662,12 +3007,12 @@ class HTTPClient:
             data,
             form,
             content,
-            response_data_type,
+            into,
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     @overload
@@ -2683,9 +3028,10 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     async def put(
@@ -2700,29 +3046,11 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any]]: ...
-    @overload
-    async def put[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData]: ...
     @overload
     async def put[TAdapted](
         self,
@@ -2736,11 +3064,29 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted]: ...
+    @overload
+    async def put[TData](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData]: ...
     @overload
     async def put[THeaders: TypedHeaders](
         self,
@@ -2754,10 +3100,11 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     async def put[THeaders: TypedHeaders](
@@ -2772,31 +3119,12 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
-    @overload
-    async def put[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData, THeaders]: ...
     @overload
     async def put[TAdapted, THeaders: TypedHeaders](
         self,
@@ -2810,12 +3138,31 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
+    @overload
+    async def put[TData, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData, THeaders]: ...
     async def put(
         self,
         path: str,
@@ -2828,18 +3175,18 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[Any, Any]:
         """PUT to `path`. Same body/decode rules as `post`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return await self._send_method(
             "PUT",
@@ -2851,12 +3198,12 @@ class HTTPClient:
             data,
             form,
             content,
-            response_data_type,
+            into,
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     @overload
@@ -2872,9 +3219,10 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     async def patch(
@@ -2889,29 +3237,11 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any]]: ...
-    @overload
-    async def patch[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData]: ...
     @overload
     async def patch[TAdapted](
         self,
@@ -2925,11 +3255,29 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted]: ...
+    @overload
+    async def patch[TData](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData]: ...
     @overload
     async def patch[THeaders: TypedHeaders](
         self,
@@ -2943,10 +3291,11 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     async def patch[THeaders: TypedHeaders](
@@ -2961,31 +3310,12 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
-    @overload
-    async def patch[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData, THeaders]: ...
     @overload
     async def patch[TAdapted, THeaders: TypedHeaders](
         self,
@@ -2999,12 +3329,31 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
+    @overload
+    async def patch[TData, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData, THeaders]: ...
     async def patch(
         self,
         path: str,
@@ -3017,18 +3366,18 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[Any, Any]:
         """PATCH `path`. Same body/decode rules as `post`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return await self._send_method(
             "PATCH",
@@ -3040,12 +3389,12 @@ class HTTPClient:
             data,
             form,
             content,
-            response_data_type,
+            into,
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     @overload
@@ -3062,8 +3411,9 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
+        into: None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     async def delete(
@@ -3079,28 +3429,10 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any]]: ...
-    @overload
-    async def delete[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[TData],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData]: ...
     @overload
     async def delete[TAdapted](
         self,
@@ -3115,10 +3447,28 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted]: ...
+    @overload
+    async def delete[TData](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        into: TypeForm[TData],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData]: ...
     @overload
     async def delete[THeaders: TypedHeaders](
         self,
@@ -3133,9 +3483,10 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
+        into: None = None,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     async def delete[THeaders: TypedHeaders](
@@ -3151,30 +3502,11 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
-    @overload
-    async def delete[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData, THeaders]: ...
     @overload
     async def delete[TAdapted, THeaders: TypedHeaders](
         self,
@@ -3189,11 +3521,30 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
+    @overload
+    async def delete[TData, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        into: TypeForm[TData],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData, THeaders]: ...
     async def delete(
         self,
         path: str,
@@ -3207,18 +3558,18 @@ class HTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[Any, Any]:
         """DELETE `path`, returning a `Response` like `get`'s. A body is rare on a DELETE but
         allowed: the same `json`/`data`/`form`/`content` options as `post`, at most one.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return await self._send_method(
             "DELETE",
@@ -3230,22 +3581,23 @@ class HTTPClient:
             data,
             form,
             content,
-            response_data_type,
+            into,
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     async def _sse_connection(
         self,
         request_builder: RequestBuilder,
         state: _SSEStreamState,
-        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
+        into: _Into,
+        decoder: _Decoder | None,
         *,
         error_for_status: bool,
-        error_type: type[Data] | None,
+        raises: type[HTTPResponseError[Any]] | None,
     ) -> AsyncGenerator[SSEEvent[Any]]:
         """One connection's worth of an SSE stream: yields its events, returns on clean EOF."""
         try:
@@ -3258,7 +3610,7 @@ class HTTPClient:
             request_info = _request_info(request)
             async with request as raw_response:
                 if error_for_status:
-                    await self._check_status(raw_response, error_type, request_info)
+                    await self._check_status(raw_response, raises, request_info)
                 _verify_sse_response(
                     state, raw_response.status, raw_response.headers.get("content-type")
                 )
@@ -3279,11 +3631,7 @@ class HTTPClient:
                     records, tail = _split_sse_records(bytes(buffer))
                     buffer = bytearray(tail)
                     for record in records:
-                        event = _dispatch_sse_record(
-                            record,
-                            state,
-                            response_data_type,
-                        )
+                        event = _dispatch_sse_record(record, state, into, decoder)
                         if event is not None:
                             yield event
         except (PyreqwestRequestError, PyreqwestBuilderError) as error:
@@ -3295,15 +3643,18 @@ class HTTPClient:
         params: Params | None,
         headers: Headers | None,
         timeout: float | None,
-        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
+        into: _Into,
         *,
         skip_auth: bool,
         error_for_status: bool,
-        error_type: type[Data] | None,
+        raises: type[HTTPResponseError[Any]] | None,
         max_reconnects: int | None,
         reconnect_delay: float,
         reconnect_on_close: bool,
     ) -> AsyncGenerator[SSEEvent[Any]]:
+        _validate_raises(raises)
+        # Resolved once per stream, not per event or per reconnect.
+        decoder = _decoder_for(into)
         state = _SSEStreamState(retry_delay=reconnect_delay)
         consecutive_reconnects = 0
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
@@ -3317,9 +3668,10 @@ class HTTPClient:
             connection = self._sse_connection(
                 request_builder,
                 state,
-                response_data_type,
+                into,
+                decoder,
                 error_for_status=error_for_status,
-                error_type=error_type,
+                raises=raises,
             )
             try:
                 # `aclosing` so an early `break` by the caller closes this connection right
@@ -3356,8 +3708,9 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        into: None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -3371,9 +3724,9 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -3387,9 +3740,25 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
+        into: TypeAdapterTyping[TData] | DecoderTyping[TData],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
+    ) -> AsyncGenerator[SSEEvent[TData]]: ...
+    @overload
+    def sse[TData](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        into: TypeForm[TData],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -3402,25 +3771,25 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
     ) -> AsyncGenerator[SSEEvent[Any]]:
         """Open `path` as a Server-Sent Events stream, yielding one `SSEEvent` per event.
 
-        `response_data_type` decodes `.data` (a class, `TypeAdapter`, or msgspec `Decoder`);
-        `.event`/`.id` are always populated regardless (`"message"`/`""` when the server omits
-        them).
+        `into` decodes `.data` (any type, e.g. `list[Model]`, or a pre-built `TypeAdapter`/
+        msgspec `Decoder`); `.event`/`.id` are always populated regardless (`"message"`/`""`
+        when the server omits them).
 
         The client's `timeout` never applies here — an SSE stream is open-ended, and a total
         request timeout would kill every healthy stream on schedule. `timeout` bounds one
         connection attempt only; use the client's `read_timeout` to detect a stalled stream.
         `skip_auth` omits the `Authorization` header (and skips invoking `bearer_auth`) for this
-        call; `error_type` decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead
-        of leaving it `None`.
+        call; `raises` overrides the client's own `raises` (the `HTTPResponseError` subclass a
+        4xx/5xx is raised as) for this call.
 
         A dropped connection (transport error or timeout) reconnects automatically, after
         `reconnect_delay` seconds — or the server's own `retry:` value once it has sent one —
@@ -3435,10 +3804,10 @@ class HTTPClient:
             params,
             headers,
             timeout,
-            response_data_type,
+            into,
             skip_auth=skip_auth,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
             max_reconnects=max_reconnects,
             reconnect_delay=reconnect_delay,
             reconnect_on_close=reconnect_on_close,
@@ -3454,13 +3823,16 @@ class HTTPClient:
         data: Params | None,
         form: Form | None,
         content: str | bytes | None,
-        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
+        into: _Into,
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
-        error_type: type[Data] | None,
+        raises: type[HTTPResponseError[Any]] | None,
     ) -> AsyncGenerator[Any]:
+        _validate_raises(raises)
+        # Resolved before connecting, so an unusable `into` fails without a request.
+        decoder = _decoder_for(into)
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
         idle = self._stream_idle_timeout if timeout is None else None
         request_builder = await self._prepare_request(
@@ -3484,8 +3856,8 @@ class HTTPClient:
                 async with _within_idle_limit(idle):
                     raw_response = await stack.enter_async_context(request)
                     if error_for_status:
-                        await self._check_status(raw_response, error_type, request_info)
-                if response_data_type is None:
+                        await self._check_status(raw_response, raises, request_info)
+                if decoder is None:
                     while True:
                         chunk = await _read_chunk_within(raw_response, idle)
                         if chunk is None:
@@ -3497,9 +3869,9 @@ class HTTPClient:
                     if chunk is None:
                         break
                     for line in _complete_ndjson_lines(pending, chunk):
-                        yield _decode_json_line(line.decode(), response_data_type)
+                        yield _decode_json_line(line, decoder)
                 if pending.strip():
-                    yield _decode_json_line(pending.decode(), response_data_type)
+                    yield _decode_json_line(pending, decoder)
         except (PyreqwestRequestError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
 
@@ -3512,8 +3884,9 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        into: None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> AsyncGenerator[bytes]: ...
     @overload
     def stream_get(
@@ -3524,9 +3897,9 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any]]: ...
     @overload
     def stream_get[TLine](
@@ -3537,9 +3910,22 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TLine] | TypeAdapterTyping[TLine] | DecoderTyping[TLine],
+        into: TypeAdapterTyping[TLine] | DecoderTyping[TLine],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> AsyncGenerator[TLine]: ...
+    @overload
+    def stream_get[TLine](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        into: TypeForm[TLine],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> AsyncGenerator[TLine]: ...
     def stream_get(
         self,
@@ -3549,19 +3935,19 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> AsyncGenerator[Any]:
         """Stream GET `path`'s response as raw `bytes` chunks (unbuffered, safe for binary).
 
-        Pass `response_data_type` to switch to newline-buffered NDJSON-style decoding instead —
+        Pass `into` to switch to newline-buffered NDJSON-style decoding instead —
         each complete line is parsed and decoded as its own value.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return self._line_stream(
             self._client.get(path),
@@ -3572,11 +3958,11 @@ class HTTPClient:
             None,
             None,
             None,
-            response_data_type,
+            into,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     @overload
@@ -3592,9 +3978,10 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> AsyncGenerator[bytes]: ...
     @overload
     def stream_post(
@@ -3609,10 +3996,10 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any]]: ...
     @overload
     def stream_post[TLine](
@@ -3627,10 +4014,28 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[TLine] | TypeAdapterTyping[TLine] | DecoderTyping[TLine],
+        into: TypeAdapterTyping[TLine] | DecoderTyping[TLine],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> AsyncGenerator[TLine]: ...
+    @overload
+    def stream_post[TLine](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TLine],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> AsyncGenerator[TLine]: ...
     def stream_post(
         self,
@@ -3644,19 +4049,19 @@ class HTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> AsyncGenerator[Any]:
         """Like `stream_get`, but POST a body first — same `json`/`data`/`form`/`content`
         options as `post` (at most one), same raw-bytes-by-default / NDJSON-via-
-        `response_data_type` split.
+        `into` split.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return self._line_stream(
             self._client.post(path),
@@ -3667,11 +4072,11 @@ class HTTPClient:
             data,
             form,
             content,
-            response_data_type,
+            into,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     async def _download(
@@ -3684,8 +4089,9 @@ class HTTPClient:
         *,
         skip_auth: bool,
         error_for_status: bool,
-        error_type: type[Data] | None,
+        raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[bytes] | Response[Path]:
+        _validate_raises(raises)
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
         idle = self._stream_idle_timeout if timeout is None else None
         request_builder = await self._prepare_request(
@@ -3704,7 +4110,7 @@ class HTTPClient:
                 async with _within_idle_limit(idle):
                     raw_response = await stack.enter_async_context(request)
                     if error_for_status:
-                        await self._check_status(raw_response, error_type, request_info)
+                        await self._check_status(raw_response, raises, request_info)
                 head = _response_head(raw_response)
                 if dest is None:
                     while True:
@@ -3742,7 +4148,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     async def download(
@@ -3755,7 +4161,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[Path]: ...
     async def download(
         self,
@@ -3767,7 +4173,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes] | Response[Path]:
         """Download `path`'s response body, optimized for large objects (e.g. a presigned GET
         URL for a multi-GB file) — much lower peak memory than `get()` for big bodies.
@@ -3782,9 +4188,9 @@ class HTTPClient:
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return await self._download(
             path,
@@ -3794,7 +4200,7 @@ class HTTPClient:
             timeout,
             skip_auth=skip_auth,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     @overload
@@ -3807,7 +4213,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[None]: ...
     @overload
     async def head[THeaders: TypedHeaders](
@@ -3820,7 +4226,7 @@ class HTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[None, THeaders]: ...
     async def head(
         self,
@@ -3832,16 +4238,17 @@ class HTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[None, Any]:
         """HEAD `path` — headers-only, no body is ever decoded. Pass
         `response_headers_type` to get the response headers parsed into `.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
+        _validate_raises(raises)
         request_builder = await self._prepare_request(
             self._client.head(path), params, headers, timeout, skip_auth=skip_auth
         )
@@ -3849,7 +4256,7 @@ class HTTPClient:
         raw_response, request_info = await _send(request_builder)
         elapsed = time.monotonic() - started
         if error_for_status:
-            await self._check_status(raw_response, error_type, request_info)
+            await self._check_status(raw_response, raises, request_info)
         response_headers = CaseInsensitiveDict(raw_response.headers)
         typed_headers = (
             None
@@ -3884,6 +4291,7 @@ class SyncHTTPClient:
     _bearer_token: str | None
     _bearer_auth: SyncAuthProvider | None
     _basic_auth: tuple[str, str | None] | None
+    _raises: type[HTTPResponseError[Any]]
     # The longest gap `stream_get`/`stream_post`/`download` tolerate between chunks: the client's
     # `timeout`, unless `read_timeout` was set, in which case pyreqwest already enforces that
     # itself at the socket and this stays `None`. Not applied to `sse`.
@@ -3932,6 +4340,7 @@ class SyncHTTPClient:
         pool_idle_timeout: float | None = None,
         pool_max_idle_per_host: int | None = None,
         pool_timeout: float | None = None,
+        raises: type[HTTPResponseError[Any]] = HTTPResponseError,
     ) -> None:
         """The client's settings. Nothing opens until it's entered, as
         `with SyncHTTPClient(...) as client:`.
@@ -3964,11 +4373,19 @@ class SyncHTTPClient:
         falling back to HTTP/1.1 otherwise. `resolve` maps hostnames to IP addresses, skipping
         DNS for them (the URL's port is still used); `local_address` is the source IP to connect
         from; `tcp_keepalive` (seconds) turns on TCP keepalive probes for idle connections.
+
+        `raises` is the `HTTPResponseError` class every 4xx/5xx is raised as (each verb's own
+        `raises=` overrides it). A subclass that pins the error type,
+        `class APIError(HTTPResponseError[NotFound | Conflict]): pass`, decodes the body onto
+        `.error` as that type; a bad class raises `TypeError` here, not on the first error.
         """
         if sum(value is not None for value in (bearer_token, bearer_auth, basic_auth)) > 1:
             raise ValueError(
                 "Provide at most one of 'bearer_token', 'bearer_auth', or 'basic_auth'"
             )
+        # Resolved now, so a bad class fails here rather than on the first 4xx/5xx.
+        _error_body_decoding(raises)
+        self._raises = raises
         self._bearer_token = bearer_token
         self._bearer_auth = bearer_auth
         self._basic_auth = basic_auth
@@ -4074,64 +4491,19 @@ class SyncHTTPClient:
     def _check_status(
         self,
         raw_response: RawSyncResponse,
-        error_type: type[Data] | None,
+        raises: type[HTTPResponseError[Any]] | None,
         request_info: RequestInfo,
     ) -> None:
         if raw_response.status < 400:
             return
         body = _read_body_sync(raw_response).to_bytes()
-        parsed_body, parse_error = (
-            (None, None) if error_type is None else _try_decode_error_body(body, error_type)
-        )
-        raise HTTPResponseError(
+        raise _status_error(
+            raises if raises is not None else self._raises,
             raw_response.status,
             body,
             request_info,
-            parsed_body,
-            headers=CaseInsensitiveDict(raw_response.headers),
-            parse_error=parse_error,
+            CaseInsensitiveDict(raw_response.headers),
         )
-
-    def _decode_body(
-        self,
-        raw_response: RawSyncResponse,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-    ) -> Data:
-        body = _read_body_sync(raw_response)
-        # A pydantic `TypeAdapter` or msgspec `Decoder` is how a top-level JSON array (or any
-        # non-model shape) gets a typed decode, e.g. `TypeAdapter(list[Item])`, the same targets
-        # `sse()`/`stream_*` already accept for each line.
-        if isinstance(response_data_type, TypeAdapter):
-            return response_data_type.validate_json(body.to_bytes())
-        if isinstance(response_data_type, Decoder):
-            return response_data_type.decode(body)
-        # See `_decode_json_line`: the two structural Protocols can't be narrowed away above.
-        response_data_type = cast("type[Data]", response_data_type)
-        _validate_response_data_type(response_data_type)
-        if issubclass(response_data_type, bytes):
-            return body.to_bytes()
-        if issubclass(response_data_type, dict):
-            # See the async mirror's note on stdlib `json` here.
-            return response_data_type(_require_json_object(_json_loads(body.to_bytes())))
-        if issubclass(response_data_type, Struct):
-            return msgspec.json.decode(body, type=response_data_type)
-        # See the async `_decode_body`'s comment above the equivalent check — same reasoning.
-        if issubclass(response_data_type, BaseModel):  # pyright: ignore[reportUnnecessaryIsInstance] — pylint: disable=line-too-long
-            return response_data_type.model_validate_json(body.to_bytes())
-        raise TypeError(f"Unsupported response_data_type: {response_data_type!r}")
-
-    def _parse(
-        self,
-        raw_response: RawSyncResponse,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-        request_info: RequestInfo,
-        *,
-        error_for_status: bool,
-        error_type: type[Data] | None,
-    ) -> Data:
-        if error_for_status:
-            self._check_status(raw_response, error_type, request_info)
-        return self._decode_body(raw_response, response_data_type)
 
     def _send_method(
         self,
@@ -4144,52 +4516,24 @@ class SyncHTTPClient:
         data: Params | None,
         form: Form | None,
         content: str | bytes | None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
+        into: _Into,
         response_headers_type: type[TypedHeaders] | None,
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
-        error_type: type[Data] | None,
+        raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[Any, Any]:
-        """Every body verb's shared path, taking the HTTP method as a string."""
-        return self._send_with_body(
-            self._client.request(method, path),
-            params,
-            headers,
-            timeout,
-            json,
-            data,
-            form,
-            content,
-            response_data_type,
-            response_headers_type,
-            skip_auth=skip_auth,
-            infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
-            error_type=error_type,
-        )
+        """Every body verb's shared path, taking the HTTP method as a string.
 
-    def _send_with_body(
-        self,
-        request_builder: SyncRequestBuilder,
-        params: Params | None,
-        headers: Headers | None,
-        timeout: float | None,
-        json: JSONPayload | None,
-        data: Params | None,
-        form: Form | None,
-        content: str | bytes | None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any],
-        response_headers_type: type[TypedHeaders] | None,
-        *,
-        skip_auth: bool,
-        infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
-        error_type: type[Data] | None,
-    ) -> Response[Any, Any]:
+        Mirrors the async client's, where keeping this one layer deep is what makes it fast.
+        """
+        _validate_raises(raises)
+        # Resolved before sending, so an unusable `into` fails without a request (a POST that
+        # ran and then raised `TypeError` would have done its side effect for nothing).
+        decoder = _decoder_for(into)
         request_builder = self._prepare_request(
-            request_builder, params, headers, timeout, skip_auth=skip_auth
+            self._client.request(method, path), params, headers, timeout, skip_auth=skip_auth
         )
         request_builder = _attach_body_sync(
             request_builder,
@@ -4203,8 +4547,8 @@ class SyncHTTPClient:
         raw_response, request_info = _send_sync(request_builder)
         elapsed = time.monotonic() - started
         if error_for_status:
-            self._check_status(raw_response, error_type, request_info)
-        decoded = self._decode_body(raw_response, response_data_type)
+            self._check_status(raw_response, raises, request_info)
+        decoded = _decode_body(_read_body_sync(raw_response), decoder)
         response_headers = CaseInsensitiveDict(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
@@ -4229,8 +4573,9 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        into: None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     def get(
@@ -4241,23 +4586,10 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any]]: ...
-    @overload
-    def get[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[TData],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData]: ...
     @overload
     def get[TAdapted](
         self,
@@ -4267,10 +4599,23 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted]: ...
+    @overload
+    def get[TData](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        into: TypeForm[TData],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData]: ...
     @overload
     def get[THeaders: TypedHeaders](
         self,
@@ -4280,9 +4625,10 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        into: None = None,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     def get[THeaders: TypedHeaders](
@@ -4293,25 +4639,11 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
-    @overload
-    def get[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData, THeaders]: ...
     @overload
     def get[TAdapted, THeaders: TypedHeaders](
         self,
@@ -4321,11 +4653,25 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
+    @overload
+    def get[TData, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        into: TypeForm[TData],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData, THeaders]: ...
     def get(
         self,
         path: str,
@@ -4334,22 +4680,22 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[Any, Any]:
         """GET `path`, returning a `Response` whose `.data` is the body decoded as
-        `response_data_type` (raw `bytes` by default), alongside `.status`, `.headers`,
+        `into` (raw `bytes` by default), alongside `.status`, `.headers`,
         `.request`, `.http_version` and `.elapsed`. Pass `response_headers_type` to also get the
         headers parsed into `.typed_headers`.
 
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return self._send_method(
             "GET",
@@ -4361,12 +4707,12 @@ class SyncHTTPClient:
             None,
             None,
             None,
-            response_data_type,
+            into,
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     @overload
@@ -4382,9 +4728,10 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     def post(
@@ -4399,29 +4746,11 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any]]: ...
-    @overload
-    def post[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData]: ...
     @overload
     def post[TAdapted](
         self,
@@ -4435,11 +4764,29 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted]: ...
+    @overload
+    def post[TData](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData]: ...
     @overload
     def post[THeaders: TypedHeaders](
         self,
@@ -4453,10 +4800,11 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     def post[THeaders: TypedHeaders](
@@ -4471,31 +4819,12 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
-    @overload
-    def post[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData, THeaders]: ...
     @overload
     def post[TAdapted, THeaders: TypedHeaders](
         self,
@@ -4509,12 +4838,31 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
+    @overload
+    def post[TData, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData, THeaders]: ...
     def post(
         self,
         path: str,
@@ -4527,20 +4875,20 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[Any, Any]:
         """POST to `path` with at most one of `json`/`data`/`form`/`content` (raises
         `ValueError` if more than one is given), returning a `Response` like `get`'s.
         `data` is a urlencoded body (`a=1&b=2`), `form` a `multipart/form-data` one.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return self._send_method(
             "POST",
@@ -4552,12 +4900,12 @@ class SyncHTTPClient:
             data,
             form,
             content,
-            response_data_type,
+            into,
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     @overload
@@ -4573,9 +4921,10 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     def put(
@@ -4590,29 +4939,11 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any]]: ...
-    @overload
-    def put[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData]: ...
     @overload
     def put[TAdapted](
         self,
@@ -4626,11 +4957,29 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted]: ...
+    @overload
+    def put[TData](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData]: ...
     @overload
     def put[THeaders: TypedHeaders](
         self,
@@ -4644,10 +4993,11 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     def put[THeaders: TypedHeaders](
@@ -4662,31 +5012,12 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
-    @overload
-    def put[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData, THeaders]: ...
     @overload
     def put[TAdapted, THeaders: TypedHeaders](
         self,
@@ -4700,12 +5031,31 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
+    @overload
+    def put[TData, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData, THeaders]: ...
     def put(
         self,
         path: str,
@@ -4718,18 +5068,18 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[Any, Any]:
         """PUT to `path`. Same body/decode rules as `post`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return self._send_method(
             "PUT",
@@ -4741,12 +5091,12 @@ class SyncHTTPClient:
             data,
             form,
             content,
-            response_data_type,
+            into,
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     @overload
@@ -4762,9 +5112,10 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     def patch(
@@ -4779,29 +5130,11 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any]]: ...
-    @overload
-    def patch[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData]: ...
     @overload
     def patch[TAdapted](
         self,
@@ -4815,11 +5148,29 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted]: ...
+    @overload
+    def patch[TData](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TData],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData]: ...
     @overload
     def patch[THeaders: TypedHeaders](
         self,
@@ -4833,10 +5184,11 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     def patch[THeaders: TypedHeaders](
@@ -4851,31 +5203,12 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
-    @overload
-    def patch[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData, THeaders]: ...
     @overload
     def patch[TAdapted, THeaders: TypedHeaders](
         self,
@@ -4889,12 +5222,31 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
+    @overload
+    def patch[TData, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TData],
+        response_headers_type: type[THeaders],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData, THeaders]: ...
     def patch(
         self,
         path: str,
@@ -4907,18 +5259,18 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[Any, Any]:
         """PATCH `path`. Same body/decode rules as `post`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return self._send_method(
             "PATCH",
@@ -4930,12 +5282,12 @@ class SyncHTTPClient:
             data,
             form,
             content,
-            response_data_type,
+            into,
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     @overload
@@ -4952,8 +5304,9 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
+        into: None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     def delete(
@@ -4969,28 +5322,10 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any]]: ...
-    @overload
-    def delete[TData: Data](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[TData],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData]: ...
     @overload
     def delete[TAdapted](
         self,
@@ -5005,10 +5340,28 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted]: ...
+    @overload
+    def delete[TData](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        into: TypeForm[TData],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData]: ...
     @overload
     def delete[THeaders: TypedHeaders](
         self,
@@ -5023,9 +5376,10 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
+        into: None = None,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     def delete[THeaders: TypedHeaders](
@@ -5041,30 +5395,11 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
-    @overload
-    def delete[TData: Data, THeaders: TypedHeaders](
-        self,
-        path: str,
-        *,
-        params: Params | None = None,
-        headers: Headers | None = None,
-        timeout: float | None = None,
-        skip_auth: bool = False,
-        json: JSONPayload | None = None,
-        data: Params | None = None,
-        form: Form | None = None,
-        content: str | bytes | None = None,
-        infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[TData],
-        response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        error_type: type[Data] | None = None,
-    ) -> Response[TData, THeaders]: ...
     @overload
     def delete[TAdapted, THeaders: TypedHeaders](
         self,
@@ -5079,11 +5414,30 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        response_data_type: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
+        into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
+    @overload
+    def delete[TData, THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        infer_mime_type_from_file_extension: bool = True,
+        into: TypeForm[TData],
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[TData, THeaders]: ...
     def delete(
         self,
         path: str,
@@ -5097,18 +5451,18 @@ class SyncHTTPClient:
         form: Form | None = None,
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        response_data_type: type[Data] | TypeAdapterTyping[Any] | DecoderTyping[Any] = bytes,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[Any, Any]:
         """DELETE `path`, returning a `Response` like `get`'s. A body is rare on a DELETE but
         allowed: the same `json`/`data`/`form`/`content` options as `post`, at most one.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return self._send_method(
             "DELETE",
@@ -5120,22 +5474,23 @@ class SyncHTTPClient:
             data,
             form,
             content,
-            response_data_type,
+            into,
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     def _sse_connection(
         self,
         request_builder: SyncRequestBuilder,
         state: _SSEStreamState,
-        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
+        into: _Into,
+        decoder: _Decoder | None,
         *,
         error_for_status: bool,
-        error_type: type[Data] | None,
+        raises: type[HTTPResponseError[Any]] | None,
         interruptible: bool,
     ) -> Generator[SSEEvent[Any]]:
         """One connection's worth of an SSE stream: yields its events, returns on clean EOF."""
@@ -5152,7 +5507,7 @@ class SyncHTTPClient:
             buffer = bytearray()
             strip_bom = True
             for chunk in _sync_stream_chunks(
-                request, response_check, error_type, request_info, interruptible=interruptible
+                request, response_check, raises, request_info, interruptible=interruptible
             ):
                 new_from = len(buffer)
                 buffer += chunk
@@ -5165,11 +5520,7 @@ class SyncHTTPClient:
                 records, tail = _split_sse_records(bytes(buffer))
                 buffer = bytearray(tail)
                 for record in records:
-                    event = _dispatch_sse_record(
-                        record,
-                        state,
-                        response_data_type,
-                    )
+                    event = _dispatch_sse_record(record, state, into, decoder)
                     if event is not None:
                         yield event
         except (PyreqwestRequestError, PyreqwestBuilderError) as error:
@@ -5181,16 +5532,19 @@ class SyncHTTPClient:
         params: Params | None,
         headers: Headers | None,
         timeout: float | None,
-        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
+        into: _Into,
         *,
         skip_auth: bool,
         error_for_status: bool,
-        error_type: type[Data] | None,
+        raises: type[HTTPResponseError[Any]] | None,
         max_reconnects: int | None,
         reconnect_delay: float,
         reconnect_on_close: bool,
         interruptible: bool,
     ) -> Generator[SSEEvent[Any]]:
+        _validate_raises(raises)
+        # Resolved once per stream, not per event or per reconnect.
+        decoder = _decoder_for(into)
         state = _SSEStreamState(retry_delay=reconnect_delay)
         consecutive_reconnects = 0
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
@@ -5204,9 +5558,10 @@ class SyncHTTPClient:
             connection = self._sse_connection(
                 request_builder,
                 state,
-                response_data_type,
+                into,
+                decoder,
                 error_for_status=error_for_status,
-                error_type=error_type,
+                raises=raises,
                 interruptible=interruptible,
             )
             try:
@@ -5242,8 +5597,9 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        into: None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -5258,9 +5614,9 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -5275,9 +5631,26 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TData] | TypeAdapterTyping[TData] | DecoderTyping[TData],
+        into: TypeAdapterTyping[TData] | DecoderTyping[TData],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
+        max_reconnects: int | None = 5,
+        reconnect_delay: float = 3.0,
+        reconnect_on_close: bool = False,
+        interruptible: bool = False,
+    ) -> Generator[SSEEvent[TData]]: ...
+    @overload
+    def sse[TData](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        into: TypeForm[TData],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -5291,9 +5664,9 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -5301,16 +5674,16 @@ class SyncHTTPClient:
     ) -> Generator[SSEEvent[Any]]:
         """Open `path` as a Server-Sent Events stream, yielding one `SSEEvent` per event.
 
-        `response_data_type` decodes `.data` (a class, `TypeAdapter`, or msgspec `Decoder`);
-        `.event`/`.id` are always populated regardless (`"message"`/`""` when the server omits
-        them).
+        `into` decodes `.data` (any type, e.g. `list[Model]`, or a pre-built `TypeAdapter`/
+        msgspec `Decoder`); `.event`/`.id` are always populated regardless (`"message"`/`""`
+        when the server omits them).
 
         The client's `timeout` never applies here — an SSE stream is open-ended, and a total
         request timeout would kill every healthy stream on schedule. `timeout` bounds one
         connection attempt only; use the client's `read_timeout` to detect a stalled stream.
         `skip_auth` omits the `Authorization` header (and skips invoking `bearer_auth`) for this
-        call; `error_type` decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead
-        of leaving it `None`.
+        call; `raises` overrides the client's own `raises` (the `HTTPResponseError` subclass a
+        4xx/5xx is raised as) for this call.
 
         A dropped connection (transport error or timeout) reconnects automatically, after
         `reconnect_delay` seconds — or the server's own `retry:` value once it has sent one —
@@ -5337,10 +5710,10 @@ class SyncHTTPClient:
             params,
             headers,
             timeout,
-            response_data_type,
+            into,
             skip_auth=skip_auth,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
             max_reconnects=max_reconnects,
             reconnect_delay=reconnect_delay,
             reconnect_on_close=reconnect_on_close,
@@ -5357,14 +5730,17 @@ class SyncHTTPClient:
         data: Params | None,
         form: Form | None,
         content: str | bytes | None,
-        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None,
+        into: _Into,
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
-        error_type: type[Data] | None,
+        raises: type[HTTPResponseError[Any]] | None,
         interruptible: bool,
     ) -> Generator[Any]:
+        _validate_raises(raises)
+        # Resolved before connecting, so an unusable `into` fails without a request.
+        decoder = _decoder_for(into)
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
         idle = self._stream_idle_timeout if timeout is None else None
         request_builder = self._prepare_request(
@@ -5388,20 +5764,20 @@ class SyncHTTPClient:
             chunks = _sync_stream_chunks(
                 request,
                 check_status,
-                error_type,
+                raises,
                 request_info,
                 interruptible=interruptible,
                 idle_timeout=idle,
             )
-            if response_data_type is None:
+            if decoder is None:
                 yield from chunks
                 return
             pending = bytearray()
             for chunk in chunks:
                 for line in _complete_ndjson_lines(pending, chunk):
-                    yield _decode_json_line(line.decode(), response_data_type)
+                    yield _decode_json_line(line, decoder)
             if pending.strip():
-                yield _decode_json_line(pending.decode(), response_data_type)
+                yield _decode_json_line(pending, decoder)
         except (PyreqwestRequestError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
 
@@ -5414,8 +5790,9 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
+        into: None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
         interruptible: bool = False,
     ) -> Generator[bytes]: ...
     @overload
@@ -5427,9 +5804,9 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
         interruptible: bool = False,
     ) -> Generator[dict[str, Any]]: ...
     @overload
@@ -5441,9 +5818,23 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[TLine] | TypeAdapterTyping[TLine] | DecoderTyping[TLine],
+        into: TypeAdapterTyping[TLine] | DecoderTyping[TLine],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
+        interruptible: bool = False,
+    ) -> Generator[TLine]: ...
+    @overload
+    def stream_get[TLine](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        into: TypeForm[TLine],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
         interruptible: bool = False,
     ) -> Generator[TLine]: ...
     def stream_get(
@@ -5454,20 +5845,20 @@ class SyncHTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
         interruptible: bool = False,
     ) -> Generator[Any]:
         """Stream GET `path`'s response as raw `bytes` chunks (unbuffered, safe for binary).
 
-        Pass `response_data_type` to switch to newline-buffered NDJSON-style decoding instead —
+        Pass `into` to switch to newline-buffered NDJSON-style decoding instead —
         each complete line is parsed and decoded as its own value.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
 
         `interruptible=True` runs the blocking read loop on a daemon worker thread so Ctrl-C
         works while waiting between chunks (the default `False` leaves Ctrl-C dead in that
@@ -5490,11 +5881,11 @@ class SyncHTTPClient:
             None,
             None,
             None,
-            response_data_type,
+            into,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
             interruptible=interruptible,
         )
 
@@ -5511,9 +5902,10 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
+        into: None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
         interruptible: bool = False,
     ) -> Generator[bytes]: ...
     @overload
@@ -5529,10 +5921,10 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[dict[str, Any]],
+        into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
         interruptible: bool = False,
     ) -> Generator[dict[str, Any]]: ...
     @overload
@@ -5548,10 +5940,29 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[TLine] | TypeAdapterTyping[TLine] | DecoderTyping[TLine],
+        into: TypeAdapterTyping[TLine] | DecoderTyping[TLine],
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
+        interruptible: bool = False,
+    ) -> Generator[TLine]: ...
+    @overload
+    def stream_post[TLine](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        json: JSONPayload | None = None,
+        data: Params | None = None,
+        form: Form | None = None,
+        content: str | bytes | None = None,
+        into: TypeForm[TLine],
+        infer_mime_type_from_file_extension: bool = True,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
         interruptible: bool = False,
     ) -> Generator[TLine]: ...
     def stream_post(
@@ -5566,20 +5977,20 @@ class SyncHTTPClient:
         data: Params | None = None,
         form: Form | None = None,
         content: str | bytes | None = None,
-        response_data_type: type[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
+        into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
         interruptible: bool = False,
     ) -> Generator[Any]:
         """Like `stream_get`, but POST a body first — same `json`/`data`/`form`/`content`
         options as `post` (at most one), same raw-bytes-by-default / NDJSON-via-
-        `response_data_type` split.
+        `into` split.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
 
         `interruptible=True` runs the blocking read loop on a daemon worker thread so Ctrl-C
         works while waiting between chunks (the default `False` leaves Ctrl-C dead in that
@@ -5602,11 +6013,11 @@ class SyncHTTPClient:
             data,
             form,
             content,
-            response_data_type,
+            into,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
             interruptible=interruptible,
         )
 
@@ -5620,8 +6031,9 @@ class SyncHTTPClient:
         *,
         skip_auth: bool,
         error_for_status: bool,
-        error_type: type[Data] | None,
+        raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[bytes] | Response[Path]:
+        _validate_raises(raises)
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
         idle = self._stream_idle_timeout if timeout is None else None
         request_builder = self._prepare_request(
@@ -5639,7 +6051,7 @@ class SyncHTTPClient:
             chunks = _sync_stream_chunks(
                 request,
                 self._check_status if error_for_status else None,
-                error_type,
+                raises,
                 request_info,
                 interruptible=False,
                 idle_timeout=idle,
@@ -5676,7 +6088,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     def download(
@@ -5689,7 +6101,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[Path]: ...
     def download(
         self,
@@ -5701,7 +6113,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[bytes] | Response[Path]:
         """Download `path`'s response body, optimized for large objects (e.g. a presigned GET
         URL for a multi-GB file) — much lower peak memory than `get()` for big bodies.
@@ -5716,9 +6128,9 @@ class SyncHTTPClient:
         Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
         return self._download(
             path,
@@ -5728,7 +6140,7 @@ class SyncHTTPClient:
             timeout,
             skip_auth=skip_auth,
             error_for_status=error_for_status,
-            error_type=error_type,
+            raises=raises,
         )
 
     @overload
@@ -5741,7 +6153,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[None]: ...
     @overload
     def head[THeaders: TypedHeaders](
@@ -5754,7 +6166,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[THeaders],
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[None, THeaders]: ...
     def head(
         self,
@@ -5766,16 +6178,17 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[TypedHeaders] | None = None,
         error_for_status: bool = True,
-        error_type: type[Data] | None = None,
+        raises: type[HTTPResponseError[Any]] | None = None,
     ) -> Response[None, Any]:
         """HEAD `path` — headers-only, no body is ever decoded. Pass
         `response_headers_type` to get the response headers parsed into `.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
-        `Authorization` header (and skips invoking `bearer_auth`) for this call; `error_type`
-        decodes a 4xx/5xx body onto `HTTPResponseError.parsed_body` instead of leaving it
-        `None`.
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
         """
+        _validate_raises(raises)
         request_builder = self._prepare_request(
             self._client.head(path), params, headers, timeout, skip_auth=skip_auth
         )
@@ -5783,7 +6196,7 @@ class SyncHTTPClient:
         raw_response, request_info = _send_sync(request_builder)
         elapsed = time.monotonic() - started
         if error_for_status:
-            self._check_status(raw_response, error_type, request_info)
+            self._check_status(raw_response, raises, request_info)
         response_headers = CaseInsensitiveDict(raw_response.headers)
         typed_headers = (
             None

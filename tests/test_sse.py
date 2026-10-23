@@ -24,7 +24,7 @@ async def test_sse_yields_raw_events(client: HTTPClient) -> None:
 
 
 async def test_sse_yields_typed_events_via_decoder(client: HTTPClient) -> None:
-    events = [event async for event in client.sse("events", response_data_type=Decoder(TickEvent))]
+    events = [event async for event in client.sse("events", into=Decoder(TickEvent))]
 
     assert events[0].data == TickEvent(msg="hello 0", now=0)
     assert events[-1].data == TickEvent(msg="hello 9", now=900)
@@ -68,7 +68,7 @@ async def test_sse_error_for_status_false_suppresses_raise(client: HTTPClient) -
 
 
 async def test_sse_yields_typed_events_via_struct_class(client: HTTPClient) -> None:
-    events = [event async for event in client.sse("events", response_data_type=TickEvent)]
+    events = [event async for event in client.sse("events", into=TickEvent)]
 
     assert events[0].data == TickEvent(msg="hello 0", now=0)
 
@@ -79,15 +79,13 @@ class TickModel(BaseModel):
 
 
 async def test_sse_yields_typed_events_via_pydantic_model(client: HTTPClient) -> None:
-    events = [event async for event in client.sse("events", response_data_type=TickModel)]
+    events = [event async for event in client.sse("events", into=TickModel)]
 
     assert events[0].data == TickModel(msg="hello 0", now=0)
 
 
 async def test_sse_yields_typed_events_via_pydantic_type_adapter(client: HTTPClient) -> None:
-    events = [
-        event async for event in client.sse("events", response_data_type=TypeAdapter(TickModel))
-    ]
+    events = [event async for event in client.sse("events", into=TypeAdapter(TickModel))]
 
     assert events[0].data == TickModel(msg="hello 0", now=0)
 
@@ -138,7 +136,7 @@ def test_sync_sse_error_for_status_false_suppresses_raise(sync_client: SyncHTTPC
 
 
 def test_sync_sse_yields_typed_events_via_struct_class(sync_client: SyncHTTPClient) -> None:
-    events = list(sync_client.sse("events", response_data_type=TickEvent))
+    events = list(sync_client.sse("events", into=TickEvent))
 
     assert events[0].data == TickEvent(msg="hello 0", now=0)
 
@@ -229,10 +227,7 @@ async def test_sse_reconnects_after_a_dropped_connection_with_last_event_id(
 ) -> None:
     key = str(uuid.uuid4())
     events = [
-        event
-        async for event in client.sse(
-            "events-reconnect", params={"key": key}, response_data_type=dict
-        )
+        event async for event in client.sse("events-reconnect", params={"key": key}, into=dict)
     ]
 
     assert [event.id for event in events] == ["0", "1", "2", "3"]
@@ -249,7 +244,7 @@ def test_sync_sse_reconnects_after_a_dropped_connection_with_last_event_id(
         sync_client.sse(
             "events-reconnect",
             params={"key": key},
-            response_data_type=dict,
+            into=dict,
             interruptible=interruptible,
         )
     )
@@ -295,7 +290,7 @@ async def test_sse_reconnect_on_close_reconnects_until_the_budget_is_spent(
         async for event in client.sse(
             "events-close-count",
             params={"key": str(uuid.uuid4()), "events": 3},
-            response_data_type=dict,
+            into=dict,
             max_reconnects=1,
             reconnect_delay=0.01,
             reconnect_on_close=True,
@@ -313,7 +308,7 @@ def test_sync_sse_reconnect_on_close_reconnects_until_the_budget_is_spent(
         sync_client.sse(
             "events-close-count",
             params={"key": str(uuid.uuid4()), "events": 3},
-            response_data_type=dict,
+            into=dict,
             max_reconnects=1,
             reconnect_delay=0.01,
             reconnect_on_close=True,

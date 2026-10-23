@@ -198,7 +198,7 @@ who can read the secret can mint a fresh token anyway.
 
 Plenty of real APIs hand out bearer tokens without speaking RFC 6749: a JSON body instead of
 form-encoding, every field renamed. Describe such an endpoint with your own pydantic/msgspec
-models, and lothc reuses its existing `json=`/`response_data_type` machinery to send and decode
+models, and lothc reuses its existing `json=`/`into` machinery to send and decode
 them. The contract is on the *attribute* names, never the *wire* names:
 
 - `token_request` must be constructible as `Cls(client_id=..., client_secret=...)`; any other

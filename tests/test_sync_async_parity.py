@@ -309,7 +309,7 @@ def test_implementation_pairs_were_discovered() -> None:
         "HTTPClient.get",
         "HTTPClient.__enter__",
         "HTTPClient.post",
-        "HTTPClient._send_with_body",
+        "HTTPClient._send_method",
         "_RetryMiddleware.__call__",
         "_ReauthMiddleware.__call__",
         "OAuthProvider._renew",

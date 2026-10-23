@@ -24,6 +24,11 @@ _not_found_body = {
     "title": "Not found",
     "status": 404,
 }
+_not_authorized_body = {
+    "type": "not-authorized",
+    "title": "Not authorized",
+    "status": 401,
+}
 _server_error_body = {
     "type": "internal-server-error",
     "title": "Internal server error",
@@ -240,10 +245,19 @@ class TestAppHandler(BaseHTTPRequestHandler):
         else:
             self._write_json(200, {"attempts": attempt})
 
+    @staticmethod
+    def _ndjson_line(i: int, shape: str) -> str:
+        # `array`: every line `[i]`; `mixed`: objects on even lines, arrays on odd ones (for
+        # union `into=` forms); anything else: every line `{"i": i}`.
+        if shape == "array" or (shape == "mixed" and i % 2):
+            return json.dumps([i])
+        return json.dumps({"i": i})
+
     def _handle_ndjson(self, query: str) -> None:
         params = parse_qs(query)
         count = int(params.get("count", ["5"])[0])
-        body = "\n".join(json.dumps({"i": i}) for i in range(count)).encode()
+        shape = params.get("shape", ["object"])[0]
+        body = "\n".join(self._ndjson_line(i, shape) for i in range(count)).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Content-Length", str(len(body)))
@@ -253,7 +267,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
     def _handle_ndjson_echo(self) -> None:
         posted = self._read_json_body()
         count = cast(int, posted["n"])
-        body = ("\n".join(json.dumps({"i": i}) for i in range(count)) + "\n").encode()
+        shape = cast(str, posted.get("shape", "object"))
+        body = ("\n".join(self._ndjson_line(i, shape) for i in range(count)) + "\n").encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson")
         self.send_header("Content-Length", str(len(body)))
@@ -264,6 +279,14 @@ class TestAppHandler(BaseHTTPRequestHandler):
         body = b"AAA\nBBB\x00\nCCC"
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_invalid_utf8(self) -> None:
+        body = b"\xff\xfe"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -541,6 +564,9 @@ class TestAppHandler(BaseHTTPRequestHandler):
     def _handle_boom(self) -> None:
         self._write_json(500, _server_error_body)
 
+    def _handle_unauthorized(self) -> None:
+        self._write_json(401, _not_authorized_body)
+
     def _handle_boom_large(self) -> None:
         # Longer than `HTTPResponseError.body_start`'s 100 bytes, with a header worth quoting.
         self._write_json(500, {"detail": "x" * 300}, {"X-Request-Id": "request-id"})
@@ -652,6 +678,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/events-wrong-content-type": self._write_sse_wrong_content_type,
             "/events-spec-edge-cases": self._write_sse_spec_edge_cases,
             "/boom": self._handle_boom,
+            "/unauthorized": self._handle_unauthorized,
             "/boom-large": self._handle_boom_large,
             "/set-cookie": self._handle_set_cookie,
             "/multi-set-cookie": self._handle_multi_set_cookie,
@@ -659,6 +686,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/redirect": self._handle_redirect,
             "/redirect-loop": self._handle_redirect_loop,
             "/binary": self._handle_binary,
+            "/invalid-utf8": self._handle_invalid_utf8,
             "/truncated": self._handle_truncated,
             "/truncated-content-length": self._handle_truncated_content_length,
             "/truncated-after-first-chunk": self._handle_truncated_after_first_chunk,

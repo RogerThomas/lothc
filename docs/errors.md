@@ -9,7 +9,8 @@ Two separate failure classes, never unified:
 - **`HTTPResponseError`** — the server answered with a 4xx/5xx. Carries `.status`, `.headers` (the
   error response's own, e.g. a `Retry-After` once retries are exhausted, or a request id to quote
   to support), `.body` (the whole body) and `.body_start` (its first 100 bytes, as used in the
-  message), `.parsed_body`, and `.request` (the request that got this response —
+  message), `.error` (the body decoded, see [Typed error bodies](#typed-error-bodies)), and
+  `.request` (the request that got this response —
   method/url/path/host; handy for telling which call failed when several are in flight at once).
   It pickles, so it can cross a process boundary (multiprocessing, a task queue).
 - **`HTTPTransportError`** — no usable response: either none arrived at all, or the connection
@@ -19,7 +20,7 @@ Two separate failure classes, never unified:
 
 Using a client after its `with`/`async with` block has exited raises a plain `RuntimeError`: that's
 a bug in the calling code, not a network failure, so it deliberately isn't an `HTTPTransportError`
-that a retry handler would swallow. And a `response_data_type=dict` body that isn't valid JSON
+that a retry handler would swallow. And an `into=dict` body that isn't valid JSON
 raises the stdlib's own `json.JSONDecodeError`, like any other decode failure.
 
 ```python
@@ -39,41 +40,87 @@ async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
 
 ## Typed error bodies
 
-`.parsed_body` is `None` unless you pass `error_type` — every verb takes it, mirroring
-`response_data_type`, and it decodes the 4xx/5xx body onto `HTTPResponseError.parsed_body`
-instead of leaving it `None`:
+Every `HTTPResponseError` decodes its body onto `.error`, best-effort, with one of three outcomes:
+
+| Body | `.error` | `.parse_error` |
+| --- | --- | --- |
+| JSON matching the error type you pinned (below) | that type | `None` |
+| any other JSON object | `dict[str, Any]` | why it didn't match, if you pinned a type |
+| not a JSON object (HTML, text, an array, empty) | `None` | as above; the raw bytes stay on `.body` |
+
+With nothing pinned, the first row never applies: a JSON object is a `dict`, anything else `None`.
+
+To get your own type, pin it on a one-line subclass and pass that as `raises=`. Set it once on the
+client, since an API's error schema is usually the same on every endpoint, and override it on a
+call that answers with a different shape:
 
 ```python
-from pydantic import BaseModel
+from msgspec import Struct
+
+from lothc import HTTPClient, HTTPResponseError
 
 
-class APIError(BaseModel):
-    type: str
+class NotFound(Struct, tag_field="type", tag="not-found"):
     title: str
-    status: int
 
 
-async with HTTPClient(base_url="https://api.example.com/") as client:
+class NotAuthorized(Struct, tag_field="type", tag="not-authorized"):
+    title: str
+
+
+class LoginFailed(Struct):
+    reason: str
+
+
+type APIError = NotFound | NotAuthorized
+
+
+class MyAPIError(HTTPResponseError[APIError]):
+    pass
+
+
+class LoginError(HTTPResponseError[LoginFailed]):
+    pass
+
+
+async with HTTPClient(base_url="https://api.example.com/", raises=MyAPIError) as client:
     try:
-        await client.get("items/7", error_type=APIError)
-    except HTTPResponseError as e:
-        print(e.parsed_body)  # APIError(type=..., title=..., status=...)
+        await client.get("items/7")
+    except MyAPIError as e:
+        match e.error:  # NotFound | NotAuthorized | dict[str, Any] | None
+            case NotFound():
+                print("no such item:", e.error.title)
+            case NotAuthorized():
+                print("log in first")
+            case dict():
+                print("unexpected JSON:", e.error, "because", e.parse_error)
+            case None:
+                print("not JSON:", e.status, e.body)
+
+    try:
+        await client.post("login", json={"user": "user"}, raises=LoginError)
+    except LoginError as e:
+        print(e.error)  # LoginFailed | dict[str, Any] | None
 ```
 
-Decoding an error body is best-effort. If the body doesn't match `error_type` (the classic case:
-a proxy in front of a JSON API answers 502 with an HTML page), you still get the
-`HTTPResponseError`, with its real status, headers and body; `.parsed_body` is `None` and
-`.parse_error` holds why it didn't parse (the decode library's own exception):
+Why a subclass rather than `raises=HTTPResponseError[APIError]`: Python can't `except` a
+parametrized generic (`except HTTPResponseError[APIError]` is a `TypeError`), so the type has to
+live on a real class for the `except` clause to both catch it and tell your type checker what
+`.error` is. lothc reads the pinned type back off the class at runtime, so it's written exactly
+once. A subclass of your subclass inherits it, `except HTTPResponseError` still catches all of
+them, and they pickle as themselves (define them at module level, as pickle needs). The pinned
+type can be anything `into=` takes, including a `type` alias, a union, or a pydantic model. A
+`raises=` lothc can't use (not an `HTTPResponseError` subclass, or a type no installed library can
+decode) raises `TypeError` when the client is constructed, or, passed to a verb, before that
+request is sent, never only once a real error comes back.
 
-```python
-try:
-    await client.get("items/7", error_type=APIError)
-except HTTPResponseError as e:
-    if e.parsed_body is None:
-        print(e.status, e.parse_error)  # 502, ValidationError(...)
-```
+Decoding an error body is best-effort because an error body is where a server is least likely to
+honour its own contract (the classic case: a proxy in front of a JSON API answers 502 with an HTML
+page). You always get the `raises=` error, with its real status, headers and body; a body that
+doesn't match only means `.error` is a `dict` or `None` and `.parse_error` holds the decode
+library's own exception.
 
-On the success path it's the opposite: a `response_data_type` body that doesn't match raises the
+On the success path it's the opposite: an `into` body that doesn't match raises the
 decode library's own error (`pydantic.ValidationError`, `msgspec.ValidationError`), unwrapped,
 since choosing that library is opting into its exception too. An error body is where a server is
 least likely to honour its own contract, so failing to decode one must never hide the error
@@ -103,5 +150,5 @@ async with HTTPClient(base_url=..., bearer_auth=OAuthProvider(...)) as client:
         print(e.status)  # an error from "items/7" itself
 ```
 
-A `response_data_type` decode error is never wrapped because it already belongs to the call that
+A `into` decode error is never wrapped because it already belongs to the call that
 raised it; a token decode error is wrapped because it doesn't.

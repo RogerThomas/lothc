@@ -103,34 +103,43 @@ replayed but the next call gets a fresh token; a second 401 is raised. `invalida
 and a no-op if the provider has already renewed. Any `bearer_auth` with an
 `invalidate(stale_access_token=None)` method gets this; the client knows nothing about OAuth.
 
-## Decode targets (`response_data_type`, default `bytes`)
+## Decode targets (`into`, default `None` = raw `bytes`)
 
-- `bytes` — raw, default
-- `dict` — plain `dict[str, Any]` for a JSON *object*; any other JSON value raises `ValueError`
-- pydantic `BaseModel` subclass
-- msgspec `Struct` subclass
-- pydantic `TypeAdapter` / msgspec `Decoder` — any other shape, e.g. a top-level array:
-  `TypeAdapter(list[Item])` → `list[Item]`
-- `dict[str, Any]` (subscripted) — NOT allowed, raises `TypeError` (not a real class)
+- `None`/`bytes` — raw, default
+- `str` — raw text (UTF-8, never JSON-parsed): the body, each SSE `data`, each streamed line, or a
+  pinned `HTTPResponseError[str]`'s body
+- `dict` / `dict[str, Any]` — plain `dict[str, Any]` for a JSON *object* (stdlib `json`, no extra
+  needed); any other JSON value raises `ValueError`. A bare `dict` subclass (`OrderedDict`,
+  `defaultdict`, your own) decodes the same way and is built as that subclass
+- any type expression (PEP 747 `TypeForm`): a `BaseModel`/`Struct` subclass, `list[Item]` for a
+  top-level array, `Item | None`, a union, a `type` alias, a TypedDict/dataclass/NamedTuple (its
+  fields are walked too). A `Struct` inside → msgspec; a `BaseModel`, pydantic `Annotated`
+  metadata (`Field(...)`, validators), `annotated_types` constraints, a pydantic dataclass or
+  pydantic type → pydantic (`TypeError` if pydantic isn't installed); both → `TypeError`; neither
+  (`list[int]`) → msgspec, else pydantic, else `TypeError` naming the extra to install. One decoder
+  is built per type and reused (cache capped at 4096 types), except a type whose `Annotated`
+  metadata compares by identity (`Field(...)` inline): rebuilt per call, so hoist it into a `type`
+  alias. `AfterValidator(module_function)` inline is cached fine.
+- a pre-built pydantic `TypeAdapter` / msgspec `Decoder` instance — used as-is
 
 ## Verbs
 
-Every body verb returns a `Response[TData]`: `.data` (the body decoded as `response_data_type`),
+Every body verb returns a `Response[TData]`: `.data` (the body decoded as `into`),
 `.status`, `.headers`, `.typed_headers` (set with `response_headers_type=`), `.request`,
 `.http_version` (e.g. `"HTTP/1.1"`) and `.elapsed` (seconds, including retries).
 
-- `get(path, *, params=None, headers=None, response_data_type=bytes, response_headers_type=None, error_for_status=True, error_type=None) -> Response[Data]`
-- `post/put/patch(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, response_data_type=bytes, response_headers_type=None, error_for_status=True, error_type=None) -> Response[Data]` —
+- `get(path, *, params=None, headers=None, into=None, response_headers_type=None, error_for_status=True, raises=None) -> Response[Data]`
+- `post/put/patch(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, into=None, response_headers_type=None, error_for_status=True, raises=None) -> Response[Data]` —
   at most one of `json`/`data`/`form`/`content`, else `ValueError`
-- `delete(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, response_data_type=bytes, ...) -> Response[Data]` — a body is optional
+- `delete(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, into=None, ...) -> Response[Data]` — a body is optional
 - `head(path, *, params=None, headers=None, response_headers_type=None, error_for_status=True) -> Response[None]`
-- `sse(path, *, params=None, headers=None, response_data_type=None, error_for_status=True) -> Generator[SSEEvent[TData]]` —
+- `sse(path, *, params=None, headers=None, into=None, error_for_status=True) -> Generator[SSEEvent[TData]]` —
   yields `SSEEvent(id=, event=, data=)` (kw-only dataclass, `SSEEvent[TData]`).
-  `response_data_type` controls `.data` only (default `str`); class | `TypeAdapter` | `Decoder`.
+  `into` controls `.data` only (default `str`); any type expression | `TypeAdapter` | `Decoder`.
   `.event` and `.id` are always `str`, defaulting to `"message"` and `""` as the spec does.
-- `stream_get(path, *, params=None, headers=None, response_data_type=None, error_for_status=True) -> Generator[bytes | TLine]` —
-  raw unbuffered bytes by default; `response_data_type` switches to newline-buffered per-line decode
-- `stream_post(path, *, ..., json=None, data=None, form=None, content=None, response_data_type=None, ...) -> Generator[bytes | TLine]`
+- `stream_get(path, *, params=None, headers=None, into=None, error_for_status=True) -> Generator[bytes | TLine]` —
+  raw unbuffered bytes by default; `into` switches to newline-buffered per-line decode
+- `stream_post(path, *, ..., json=None, data=None, form=None, content=None, into=None, ...) -> Generator[bytes | TLine]`
   (async: `AsyncGenerator`). Generators so a caller can `close()`/`aclose()` one it stops reading early.
 - `download(path, dest=None, *, params=None, headers=None, error_for_status=True) -> bytes | None` —
   large bodies: no `dest` returns `bytes` (~2/3 the peak memory of `get()`), `dest` (`str` or
@@ -154,14 +163,20 @@ lookups, `get_all(name)` for a repeated header's every value.
 
 ## Errors
 
-- `HTTPResponseError` — 4xx/5xx when `error_for_status=True` (default). `.status`, `.headers`,
-  `.body` (whole), `.body_start` (first 100 bytes), `.request`, `.parsed_body` (with `error_type`),
-  `.parse_error`; pickles. `error_type` decoding is best-effort: a body that doesn't match gives
-  `parsed_body=None` and `.parse_error`, never replaces the error.
+- `HTTPResponseError[E = object]` — 4xx/5xx when `error_for_status=True` (default). `.status`,
+  `.headers`, `.body` (whole), `.body_start` (first 100 bytes), `.request`, `.error`,
+  `.parse_error`; pickles (as its own subclass). `.error` is `E | dict[str, Any] | None`: the body
+  as the pinned `E`, else a JSON object, else `None`; `.parse_error` says why a pinned `E` didn't
+  match, never replacing the error. Pin `E` on a subclass,
+  `class MyAPIError(HTTPResponseError[NotFound | NotAuthorized]): pass` (Python can't `except` a
+  parametrized generic), and pass it as `raises=` on the client constructor (default for every
+  call; a bad class is a `TypeError` at construction) or on any verb (overrides for that call).
+  A generic subclass's PEP 696 default counts as pinned (`class Base[T = APIError](HTTPResponseError[T])`
+  as `raises=Base` decodes as `APIError`).
 - `HTTPTransportError` base; `HTTPTimeoutError`, `HTTPConnectionError` subclasses — no usable
   response (none at all, or the connection failed partway through one)
 - Using a closed client → `RuntimeError`
-- `response_data_type` validation errors (pydantic/msgspec/`json`) propagate unwrapped
+- `into` validation errors (pydantic/msgspec/`json`) propagate unwrapped
 
 ## Retries
 

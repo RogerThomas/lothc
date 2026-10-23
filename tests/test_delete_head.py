@@ -13,29 +13,27 @@ async def test_delete_returns_raw_bytes_by_default(client: HTTPClient) -> None:
     assert body == b'{"id": 7, "deleted": true}'
 
 
-async def test_delete_decodes_response_data_type(client: HTTPClient) -> None:
-    result = (await client.delete("items/7", response_data_type=dict)).data
+async def test_delete_decodes_into(client: HTTPClient) -> None:
+    result = (await client.delete("items/7", into=dict)).data
 
     assert result == {"id": 7, "deleted": True}
 
 
 async def test_response_delete_includes_status_and_data(client: HTTPClient) -> None:
-    result = await client.delete("items/7", response_data_type=dict)
+    result = await client.delete("items/7", into=dict)
 
     assert result.status == 200
     assert result.data == {"id": 7, "deleted": True}
 
 
 async def test_response_delete_with_typed_headers(client: HTTPClient) -> None:
-    result = await client.delete(
-        "items/7", response_data_type=dict, response_headers_type=EchoedHeaders
-    )
+    result = await client.delete("items/7", into=dict, response_headers_type=EchoedHeaders)
 
     assert result.typed_headers is not None
 
 
 def test_sync_delete_result_includes_status_and_data(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.delete("items/7", response_data_type=dict)
+    result = sync_client.delete("items/7", into=dict)
 
     assert result.status == 200
     assert result.data == {"id": 7, "deleted": True}
@@ -57,8 +55,8 @@ async def test_head_returns_headers_only_result(client: HTTPClient) -> None:
     assert result.headers["x-item-exists"] == "true"
 
 
-def test_sync_delete_decodes_response_data_type(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.delete("items/7", response_data_type=dict).data
+def test_sync_delete_decodes_into(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.delete("items/7", into=dict).data
 
     assert result == {"id": 7, "deleted": True}
 

@@ -14,11 +14,9 @@ async def _hangups(client: HTTPClient, key: str) -> int:
     # The server only notices on its next write, a few milliseconds after the close.
     deadline = time.monotonic() + 2.0
     while True:
-        hangups = (
-            (
-                await client.get("hits", params={"key": f"{key}-hangups"}, response_data_type=dict)
-            ).data
-        )["hits"]
+        hangups = ((await client.get("hits", params={"key": f"{key}-hangups"}, into=dict)).data)[
+            "hits"
+        ]
         if hangups or time.monotonic() > deadline:
             return hangups
         await asyncio.sleep(0.01)
@@ -27,9 +25,7 @@ async def _hangups(client: HTTPClient, key: str) -> int:
 def _sync_hangups(sync_client: SyncHTTPClient, key: str) -> int:
     deadline = time.monotonic() + 2.0
     while True:
-        hangups = sync_client.get(
-            "hits", params={"key": f"{key}-hangups"}, response_data_type=dict
-        ).data["hits"]
+        hangups = sync_client.get("hits", params={"key": f"{key}-hangups"}, into=dict).data["hits"]
         if hangups or time.monotonic() > deadline:
             return hangups
         time.sleep(0.01)

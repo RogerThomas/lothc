@@ -17,14 +17,14 @@ class SSEEvent[TData]:
     data: TData
 ```
 
-`SSEEvent` is generic in `TData` — `response_data_type` controls what `.data` becomes (raw
+`SSEEvent` is generic in `TData` — `into` controls what `.data` becomes (raw
 `str`, or decoded into a typed object). `.event` and `.id` are always plain `str`, never `None`,
 with the same defaults a browser's `EventSource` uses: an event with no `event:` field is type
 `"message"`, and a stream that has sent no `id:` gives `""`.
 
 ## Raw events (default)
 
-If you don't pass `response_data_type`, `.data` is exactly the text the server sent in the
+If you don't pass `into`, `.data` is exactly the text the server sent in the
 event's `data:` line(s) (multiple `data:` lines get joined with `\n`) — untouched, no JSON
 parsing, no model construction, just a plain `str`:
 
@@ -46,8 +46,9 @@ one, and an explicit empty `id:` line resets it to `""`. The same buffer is what
 
 ## Decoding events
 
-Pass `response_data_type` to decode `.data` into a typed object instead of leaving it as `str` —
-`.event`/`.id` come along for the ride unchanged. Same decode targets as everywhere else:
+Pass `into` to decode `.data` into a typed object instead of leaving it as `str` —
+`.event`/`.id` come along for the ride unchanged. Same decode targets as everywhere else (any
+type expression, e.g. `list[ItemModel]` for array payloads):
 
 === "msgspec"
 
@@ -60,7 +61,7 @@ Pass `response_data_type` to decode `.data` into a typed object instead of leavi
         name: str
 
 
-    async for event in client.sse("events", response_data_type=ItemModel):
+    async for event in client.sse("events", into=ItemModel):
         print(event.data)  # e.g. ItemModel(id=25, name='pikachu')
         print(event.event)  # still populated, e.g. 'tick'
     ```
@@ -76,7 +77,7 @@ Pass `response_data_type` to decode `.data` into a typed object instead of leavi
         name: str
 
 
-    async for event in client.sse("events", response_data_type=ItemModel):
+    async for event in client.sse("events", into=ItemModel):
         print(event.data)  # e.g. id=25 name='pikachu'
         print(event.event)  # still populated, e.g. 'tick'
     ```
@@ -84,24 +85,19 @@ Pass `response_data_type` to decode `.data` into a typed object instead of leavi
 === "dict"
 
     ```python
-    async for event in client.sse("events", response_data_type=dict):
+    async for event in client.sse("events", into=dict):
         print(event.data)  # e.g. {'id': 25, 'name': 'pikachu', ...}
         print(event.event)  # still populated, e.g. 'tick'
     ```
 
 ## Discriminated-union event streams
 
-`response_data_type` also accepts a pydantic `TypeAdapter` or a prebuilt msgspec `Decoder`, so a
-stream mixing different event shapes decodes natively:
+`into` takes a union directly, so a stream mixing different event shapes decodes natively:
 
 === "msgspec"
 
     ```python
-    from msgspec.json import Decoder
-
-    item_event_decoder = Decoder(ItemCreated | ItemDeleted)
-
-    async for event in client.sse("events", response_data_type=item_event_decoder):
+    async for event in client.sse("events", into=ItemCreated | ItemDeleted):
         match event.data:
             case ItemCreated():
                 ...
@@ -112,16 +108,12 @@ stream mixing different event shapes decodes natively:
     msgspec dispatches on a tagged union by default — give `ItemCreated`/`ItemDeleted` a
     distinguishing `tag`/`tag_field` (see the
     [msgspec docs on tagged unions](https://jcristharif.com/msgspec/structs.html#tagged-unions))
-    so `Decoder` knows which one to build.
+    so msgspec knows which one to build.
 
 === "pydantic"
 
     ```python
-    from pydantic import TypeAdapter
-
-    item_event_adapter = TypeAdapter(ItemCreated | ItemDeleted)
-
-    async for event in client.sse("events", response_data_type=item_event_adapter):
+    async for event in client.sse("events", into=ItemCreated | ItemDeleted):
         match event.data:
             case ItemCreated():
                 ...
@@ -132,6 +124,9 @@ stream mixing different event shapes decodes natively:
     pydantic can also dispatch on an explicit discriminator field instead of trying each member
     in turn — see the
     [pydantic docs on discriminated unions](https://docs.pydantic.dev/latest/concepts/unions/#discriminated-unions).
+
+A pre-built pydantic `TypeAdapter` or msgspec `Decoder` (e.g. `Decoder(ItemCreated | ItemDeleted)`)
+is still accepted as `into`, used as-is.
 
 ## Timeouts
 

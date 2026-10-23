@@ -5,6 +5,11 @@ if TYPE_CHECKING:
     from msgspec import Struct
     from msgspec.json import Decoder
     from pydantic import BaseModel, TypeAdapter
+
+    # Plain `bool`s rather than `msgspec is not None`: under `TYPE_CHECKING` the module is always
+    # bound, so a strict checker flags that comparison as unnecessary.
+    msgspec_installed: bool
+    pydantic_installed: bool
 else:
     try:
         import msgspec
@@ -12,6 +17,7 @@ else:
         from msgspec.json import Decoder
     except ImportError:
         msgspec = None
+        msgspec_installed = False
 
         # `_client.py` has plenty of unquoted `Decoder[Any]` annotations, evaluated eagerly at
         # import time (no `from __future__ import annotations` in that file) — without
@@ -25,9 +31,14 @@ else:
             def __class_getitem__(cls, _item: object) -> type[Self]:
                 return cls
 
+    else:
+        msgspec_installed = True
+
     try:
         from pydantic import BaseModel, TypeAdapter
     except ImportError:
+        pydantic_installed = False
+
         # Same reasoning as Struct/Decoder above, for _client.py's `TypeAdapter[Any]` annotations.
         class BaseModel:
             def __class_getitem__(cls, _item: object) -> type[Self]:
@@ -36,6 +47,9 @@ else:
         class TypeAdapter:
             def __class_getitem__(cls, _item: object) -> type[Self]:
                 return cls
+
+    else:
+        pydantic_installed = True
 
 
 class StructTyping(Protocol):
@@ -55,7 +69,7 @@ class StructTyping(Protocol):
     `__struct_fields__` directly on `Struct` itself (see `msgspec/__init__.pyi`), so any real
     `Struct` subclass structurally satisfies this protocol — confirmed live across basedpyright,
     mypy, ty, and zuban, both with and without msgspec present, that a real subclass passed as
-    `response_data_type=` still resolves to its own precise type, never `Unknown`.
+    `into=` still resolves to its own precise type, never `Unknown`.
     """
 
     __struct_fields__: ClassVar[tuple[str, ...]]
@@ -63,8 +77,9 @@ class StructTyping(Protocol):
 
 class BaseModelTyping(Protocol):
     """Same reasoning as `StructTyping`, for `pydantic.BaseModel` — matches on
-    `model_validate_json`'s call shape alone (the same method `_decode_body`/`_decode_error_body`
-    already call), not a `ClassVar`.
+    `model_validate_json`'s call shape alone (a method every real model has), not a `ClassVar`.
+    lothc itself never calls it: a model `into` decodes through a cached `TypeAdapter`, like
+    any other type expression.
 
     A `ClassVar[Any] model_config` marker was tried first and rejected: confirmed live that a
     *subclass* re-declaring `model_config = ConfigDict(...)` without repeating `ClassVar` — the
@@ -86,9 +101,8 @@ class BaseModelTyping(Protocol):
 
 class TypeAdapterTyping[TData](Protocol):
     """Same reasoning as `StructTyping`/`BaseModelTyping`, for a pre-built `pydantic.TypeAdapter`
-    instance (used by `sse`/`stream_get`/`stream_post`'s `response_data_type`, alongside a bare
-    class) — matches on `validate_json`'s call shape alone, the only method those verbs ever call
-    on it."""
+    instance (accepted as `into` on every verb, alongside any type expression) — matches on
+    `validate_json`'s call shape alone, the only method lothc ever calls on it."""
 
     def validate_json(self, data: str | bytes, /) -> TData: ...
 
@@ -110,4 +124,6 @@ __all__ = [
     "TypeAdapter",
     "TypeAdapterTyping",
     "msgspec",
+    "msgspec_installed",
+    "pydantic_installed",
 ]

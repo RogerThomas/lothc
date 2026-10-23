@@ -42,7 +42,7 @@ top-right corner to copy a one-liner that runs it via `uv run`, no local install
 
     async def main() -> None:
         async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
-            response = await client.get("pokemon/pikachu", response_data_type=Pokemon)
+            response = await client.get("pokemon/pikachu", into=Pokemon)
             print(response.status, response.data)  # 200 Pokemon(id=25, name='pikachu')
 
 
@@ -64,7 +64,7 @@ top-right corner to copy a one-liner that runs it via `uv run`, no local install
 
     async def main() -> None:
         async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
-            response = await client.get("pokemon/pikachu", response_data_type=Pokemon)
+            response = await client.get("pokemon/pikachu", into=Pokemon)
             print(response.status, response.data)  # 200 id=25 name='pikachu'
 
 
@@ -80,7 +80,7 @@ top-right corner to copy a one-liner that runs it via `uv run`, no local install
 
     async def main() -> None:
         async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
-            response = await client.get("pokemon/pikachu", response_data_type=dict)
+            response = await client.get("pokemon/pikachu", into=dict)
             print(response.status, response.data)  # 200 {'id': 25, 'name': 'pikachu', ...}
 
 
@@ -89,7 +89,7 @@ top-right corner to copy a one-liner that runs it via `uv run`, no local install
 
     !!! warning
 
-        `response_data_type=dict` gets you a plain `dict[str, Any]` — no schema, no extra
+        `into=dict` gets you a plain `dict[str, Any]` — no schema, no extra
         dependency, just parsed JSON. There's no validation at all: the shape is fully trusted,
         on your say-so alone.
 
@@ -132,7 +132,7 @@ overhead is almost nil, as the benchmarks below show.
 ![HTTP client throughput race — lothc and pyreqwest finish in well under a fifth of a second, other libraries take much longer](assets/perf-race.svg){: .perf-race-img }
 
 Benchmarked with `perf.py` against a tiny Rust-based static JSON server, 10,000 requests at
-concurrency 100 — including lothc's fully-typed decode targets (`response_data_type=` a msgspec
+concurrency 100 — including lothc's fully-typed decode targets (`into=` a msgspec
 `Struct` or a pydantic `BaseModel`), not just raw bytes or an untyped dict. The object handed back
 from those runs isn't just parsed JSON — it's a real, constructed, field-validated instance of
 your own type, and that validation cost is included in the numbers, not benchmarked around.
@@ -145,15 +145,15 @@ Decoding into a real msgspec `Struct` even edged out the unvalidated dict path i
 
 -   **Type-safe I/O boundaries, not bolted on**
 
-    `response_data_type` gets you a real, constructed, field-validated pydantic `BaseModel` or
+    `into` gets you a real, constructed, field-validated pydantic `BaseModel` or
     msgspec `Struct` straight from the client, instead of the plain `dict` a `.json()` call
     leaves you to validate yourself. See [Benchmarks](benchmarks.md) for what that actually costs
     (usually nothing).
 
 -   **Typed decode targets**
 
-    Pick a pydantic `BaseModel`, a msgspec `Struct`, plain `dict`, or raw `bytes` (the default)
-    per call. No cast-laden internals — every verb is built from paired `@overload`s, so every
+    Pick a pydantic `BaseModel`, a msgspec `Struct`, plain `dict`, raw `bytes` (the default), or
+    any type built from them (`list[Item]`, `Item | None`) per call. No cast-laden internals — every verb is built from paired `@overload`s, so every
     call site gets a precise static type.
 
 -   **Typed request bodies too**
@@ -179,8 +179,9 @@ Decoding into a real msgspec `Struct` even edged out the unvalidated dict path i
 
 -   **SSE support**
 
-    Decode targets accept a class, a pydantic `TypeAdapter`, or a prebuilt msgspec `Decoder` — so
-    even discriminated-union event streams decode natively. See [SSE](sse.md).
+    Decode targets accept any type expression (`ItemCreated | ItemDeleted`, `list[Item]`), or a
+    pre-built pydantic `TypeAdapter`/msgspec `Decoder` — so even discriminated-union event streams
+    decode natively. See [SSE](sse.md).
 
 -   **Retries with real backoff**
 
