@@ -37,7 +37,7 @@ ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
 # asv (regression-benchmark tracking of lothc's own history, unrelated to this cross-library
 # perf.py comparison) needs a C compiler to build from source and this slim image has none —
 # excluded here since perf.py never imports it; task perf doesn't need it installed.
-RUN uv sync --frozen --group dev --no-install-package asv
+RUN uv sync --frozen --group dev --group perf --no-install-package asv
 
 COPY benchmarks/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
