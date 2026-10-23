@@ -134,8 +134,9 @@ anything else raises a `TypeError` naming the extra to install.
 `into=str` means the raw text, never JSON-parsed, just as `into=bytes` means the raw bytes:
 `get(into=str)` gives the body decoded as UTF-8 (invalid UTF-8 raises `UnicodeDecodeError`, a
 `ValueError`), `sse(into=str)` gives each event's `data` as is (the same as the default),
-`stream_get`/`stream_post` with `into=str` give each line as text (split on `\n`, blank lines
-skipped, like the NDJSON decode), and a pinned `HTTPResponseError[str]` gets the error body's text
+`stream_get`/`stream_post` with `into=str` give each line as text (split on `\n`, with one
+trailing `\r` stripped so CRLF lines come out clean, and blank lines kept as `""`, unlike the
+NDJSON decode, which skips them), and a pinned `HTTPResponseError[str]` gets the error body's text
 on `.error`.
 
 A bare `dict` subclass (`OrderedDict`, `defaultdict`, your own) decodes a JSON object like

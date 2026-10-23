@@ -57,7 +57,11 @@ Same decode targets as everywhere else — any type expression: a pydantic `Base
 `Struct`, plain `dict`, `list[ItemModel]` for lines that are arrays, or a union such as
 `ItemCreated | ItemDeleted` for a discriminated union (see [SSE](sse.md) for the equivalent
 pattern). A pre-built pydantic `TypeAdapter`/msgspec `Decoder` works too. A trailing line with no
-final `\n` is still decoded once the connection closes.
+final `\n` is still decoded once the connection closes. Blank lines are skipped, as NDJSON allows.
+
+`into=str` is the exception: it means raw text lines, not NDJSON, so every line is yielded,
+blank ones as `""`, with one trailing `\r` stripped from a CRLF line (the final unterminated
+line too).
 
 !!! warning
 

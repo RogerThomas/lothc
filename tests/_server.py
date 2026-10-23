@@ -485,6 +485,24 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_deeply_nested_error(self) -> None:
+        # Nested far past any JSON parser's recursion limit.
+        body = b"[" * 200000
+        self.send_response(500)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_crlf_text(self) -> None:
+        # A CRLF line, an LF line, a blank line, then a final line with no terminator.
+        body = b"a\r\nb\n\nc"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _handle_json_literal(self, query: str) -> None:
         # A top-level JSON value that isn't an object, sent verbatim (`value=` is raw JSON).
         body = parse_qs(query)["value"][0].encode()
@@ -699,6 +717,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/invalid-json-error": self._handle_invalid_json_error,
             "/rejects-first-token": self._handle_rejects_first_token,
             "/json-array": self._handle_json_array,
+            "/deeply-nested-error": self._handle_deeply_nested_error,
+            "/crlf-text": self._handle_crlf_text,
         }
         route = plain_routes.get(parsed.path)
         if route is None:
