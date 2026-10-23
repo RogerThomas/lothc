@@ -46,6 +46,7 @@ from typing import (
     Literal,
     Protocol,
     Self,
+    SupportsIndex,
     TypeAliasType,
     TypeIs,
     TypeVar,
@@ -67,6 +68,7 @@ from pyreqwest.exceptions import NetworkError as PyreqwestNetworkError
 from pyreqwest.exceptions import RequestError as PyreqwestRequestError
 from pyreqwest.exceptions import RequestTimeoutError as PyreqwestRequestTimeoutError
 from pyreqwest.exceptions import TransportError as PyreqwestTransportError
+from pyreqwest.http import HeaderMap
 from pyreqwest.middleware import Next, SyncNext
 from pyreqwest.multipart import FormBuilder, PartBuilder
 from pyreqwest.proxy import ProxyBuilder
@@ -1857,9 +1859,9 @@ def _header_pairs(data: HeaderSource) -> Iterable[tuple[str, str]]:
     decides. Each branch then needs a `cast`, because neither `hasattr` nor the `else` narrows
     the union for a checker.
 
-    Returns an iterable rather than being a generator: every response builds a
-    `CaseInsensitiveDict` from pyreqwest's `HeaderMap`, and handing its `.items()` straight to
-    the caller's loop skips a generator resume per header (~0.35us of ~1.1us per response).
+    Returns an iterable rather than being a generator: handing a mapping's `.items()` straight to
+    the caller's loop skips a generator resume per header (~0.35us of ~1.1us for a response's
+    headers). A plain `HeaderMap` doesn't come through here at all (`_store_from_header_map`).
     """
     if isinstance(data, CaseInsensitiveDict):
         # `Mapping.items()` is single-valued, so reading another CaseInsensitiveDict through the
@@ -1880,6 +1882,27 @@ def _header_pairs(data: HeaderSource) -> Iterable[tuple[str, str]]:
     return cast("Iterable[tuple[str, str]]", data)
 
 
+# `{lowercased key: (key as stored, every value)}`, `CaseInsensitiveDict`'s one field.
+type _HeaderStore = dict[str, tuple[str, list[str]]]
+
+
+def _store_from_header_map(headers: HeaderMap) -> _HeaderStore:
+    """`CaseInsensitiveDict`'s store for pyreqwest's `HeaderMap`, the shape every response hands
+    over. Its names are always lowercase already (the `http` crate's `HeaderName` lowercases on
+    parse), so each key is its own lookup key and the `.lower()` per header is skipped; with the
+    `_header_pairs` dispatch also skipped, that's ~20% of the conversion (2.48us to 1.98us for 13
+    headers, of which 1.23us is `HeaderMap.items()` itself). `.items()`, never `keys()` +
+    `[key]`, for the repeated-name reason `_header_pairs` gives.
+    """
+    store: _HeaderStore = {}
+    for key, value in headers.items():
+        if key in store:
+            store[key][1].append(value)
+        else:
+            store[key] = (key, [value])
+    return store
+
+
 class CaseInsensitiveDict(MutableMapping[str, str]):
     """A mapping whose keys compare case-insensitively, as HTTP field names do (RFC 9110 §5.1).
 
@@ -1897,7 +1920,10 @@ class CaseInsensitiveDict(MutableMapping[str, str]):
     # normalized `{lowercased key: (key as stored, every value)}` store rather than anything a
     # caller passes in, and a generated __init__ can't express that translation.
     def __init__(self, data: HeaderSource | None = None) -> None:
-        self._store: dict[str, tuple[str, list[str]]] = {}
+        if isinstance(data, HeaderMap):  # not subclassable, so no `.items()` override to fear
+            self._store: _HeaderStore = _store_from_header_map(data)
+            return
+        self._store = {}
         if data is not None:
             # Appending rather than overwriting is what keeps every value of a repeated header
             # reachable via `get_all`. Iterating pairs is required for that — `dict(data)` would
@@ -1995,6 +2021,49 @@ class CaseInsensitiveDict(MutableMapping[str, str]):
         return list(self._store[lowered][1])
 
 
+class _LazyHeaders(CaseInsensitiveDict):
+    """`Response.headers` as handed out: a `CaseInsensitiveDict` holding pyreqwest's `HeaderMap`
+    until something first reads it, since most callers never do and converting cost ~15% of
+    throughput (see CLAUDE.md).
+
+    `_store` is deliberately left unset, so the first method that touches it, whichever it is,
+    lands in `__getattr__`, which builds it and turns this object into a plain
+    `CaseInsensitiveDict` for good: from then on there's no laziness left to pay for, and
+    `type()`, `repr()`, pickling and copying are exactly a `CaseInsensitiveDict`'s. The object
+    itself never changes, so repeated `.headers` reads are the same object and mutations stick.
+
+    Holding the `HeaderMap` keeps only the headers alive, not the response, which caches its body
+    (measured over 10MB bodies: holding 40 or 150 maps peaked at ~100MB RSS against ~85MB for
+    holding nothing, while holding 40 responses peaked at ~470MB). It reads fine from any thread
+    and after the client has closed.
+    """
+
+    def __init__(self, raw_headers: HeaderMap) -> None:  # pylint: disable=super-init-not-called
+        # No `super().__init__()`: building `_store` is precisely the work being deferred.
+        self._raw_headers = raw_headers
+
+    def __getattr__(self, name: str) -> _HeaderStore:
+        # Only reached for an attribute normal lookup didn't find, so it costs nothing once
+        # `_store` exists. Atomic `__dict__` operations, in this order (store set before the
+        # source goes), so two threads making the first read at once return the same store.
+        if name != "_store":
+            raise AttributeError(name)
+        state = self.__dict__
+        raw_headers = state.get("_raw_headers")
+        if raw_headers is not None:
+            state.setdefault("_store", _store_from_header_map(raw_headers))
+            state.pop("_raw_headers", None)
+            object.__setattr__(self, "__class__", CaseInsensitiveDict)
+        return state["_store"]
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[Any, ...]:
+        # `pickle`/`copy` look this up on the class, which `__getattr__` never sees, so
+        # materialize first: they then capture a plain `CaseInsensitiveDict`, never the
+        # `HeaderMap` (`object`'s, since `super()` no longer applies once the class has changed).
+        _ = self._store
+        return object.__reduce_ex__(self, protocol)
+
+
 @dataclass(slots=True)
 class _ResponseHead:
     """A streamed response's status line and headers, read before its body is."""
@@ -2006,7 +2075,7 @@ class _ResponseHead:
 
 def _response_head(raw_response: RawResponse | RawSyncResponse) -> _ResponseHead:
     return _ResponseHead(
-        raw_response.status, CaseInsensitiveDict(raw_response.headers), raw_response.version
+        raw_response.status, _LazyHeaders(raw_response.headers), raw_response.version
     )
 
 
@@ -2656,7 +2725,7 @@ class HTTPClient:
         if error_for_status:
             await self._check_status(raw_response, raises, request_info)
         decoded = _decode_body(await _read_body(raw_response), decoder)
-        response_headers = CaseInsensitiveDict(raw_response.headers)
+        response_headers = _LazyHeaders(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
@@ -4257,7 +4326,7 @@ class HTTPClient:
         elapsed = time.monotonic() - started
         if error_for_status:
             await self._check_status(raw_response, raises, request_info)
-        response_headers = CaseInsensitiveDict(raw_response.headers)
+        response_headers = _LazyHeaders(raw_response.headers)
         typed_headers = (
             None
             if response_headers_type is None
@@ -4549,7 +4618,7 @@ class SyncHTTPClient:
         if error_for_status:
             self._check_status(raw_response, raises, request_info)
         decoded = _decode_body(_read_body_sync(raw_response), decoder)
-        response_headers = CaseInsensitiveDict(raw_response.headers)
+        response_headers = _LazyHeaders(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
@@ -6197,7 +6266,7 @@ class SyncHTTPClient:
         elapsed = time.monotonic() - started
         if error_for_status:
             self._check_status(raw_response, raises, request_info)
-        response_headers = CaseInsensitiveDict(raw_response.headers)
+        response_headers = _LazyHeaders(raw_response.headers)
         typed_headers = (
             None
             if response_headers_type is None
