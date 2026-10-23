@@ -12,14 +12,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.13", "3.14"]
+        python-version: ["3.13", "3.14", "3.15"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.3.0
         with:
           python-version: ${{ matrix.python-version }}
-      - run: uv sync --all-extras --group dev
+      - run: uv sync --all-extras --group dev --group perf
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run basedpyright .
@@ -45,6 +45,30 @@ jobs:
           fail_ci_if_error: true
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  # The whole suite with the GIL actually off, since lothc shares process-wide state across
+  # threads (the decoder cache, the `raises=` cache, lazy `Response.headers`' first read) and
+  # users share one client across threads and event loops. Tests only: lint and type-checking
+  # don't depend on the GIL, and the jobs above already run them. --no-default-groups leaves out
+  # the `perf` group (perf.py's comparison clients), whose qh3 has no free-threaded 3.15 wheel,
+  # and --no-sync keeps `uv run` from syncing it back in. PYTHON_GIL=0 keeps the GIL off even if
+  # an extension module doesn't declare free-threading support (CPython would re-enable it).
+  test-free-threaded:
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.14t", "3.15t"]
+    runs-on: ubuntu-latest
+    env:
+      PYTHON_GIL: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --all-extras --no-default-groups --group dev
+      - run: uv run --no-sync python -c "import sys; assert not sys._is_gil_enabled(), 'GIL is on'"
+      - run: uv run --no-sync pytest tests
 
   # pydantic and msgspec are optional extras, but the `test` job above always has both installed,
   # so a stray unguarded import of either would pass CI and then crash `import lothc` for anyone
