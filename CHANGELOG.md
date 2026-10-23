@@ -7,6 +7,15 @@ messages; 0.0.17 to 0.0.19 were hand-written in the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. Releases up to and including
 0.0.16 predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/releases).
 
+## [0.2.1](https://github.com/RogerThomas/lothc/compare/0.2.0...0.2.1) (2026-10-23)
+
+
+### Bug Fixes
+
+* harden error-body decoding and raw text stream lines ([44b4228](https://github.com/RogerThomas/lothc/commit/44b42288a47c69dca435963742ec9e7ca816a91e))
+* route into= forms msgspec can't decode to pydantic, normalise dict/Mapping[str, Any] ([52044b5](https://github.com/RogerThomas/lothc/commit/52044b56160b56d773094609fa002d42e7d5b2f1))
+* route into= forms msgspec can't decode to pydantic, normalise dict/Mapping[str, Any] ([c3fc9b8](https://github.com/RogerThomas/lothc/commit/c3fc9b8e723e4ef15c29ff2a4c19cbf57a20a650))
+
 ## [0.2.0](https://github.com/RogerThomas/lothc/compare/0.1.0...0.2.0) (2026-10-23)
 
 
