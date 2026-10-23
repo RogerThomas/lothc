@@ -605,6 +605,11 @@ class TestAppHandler(BaseHTTPRequestHandler):
         if is_refresh and refresh_failure_status is not None:
             self._write_json(refresh_failure_status, {"error": "invalid_grant"})
             return
+        # `later_mint_status=<int>`: every mint after the key's first request fails with that
+        # status, e.g. client credentials revoked after the first token was issued.
+        if not is_refresh and attempt > 1 and "later_mint_status" in params:
+            self._write_json(int(params["later_mint_status"][0]), {"error": "invalid_client"})
+            return
         payload: dict[str, object] = {"access_token": f"token-{attempt}", "token_type": "Bearer"}
         if params.get("omit_expires_in", ["0"])[0] != "1":
             payload["expires_in"] = int(params.get("expires_in", ["3600"])[0])

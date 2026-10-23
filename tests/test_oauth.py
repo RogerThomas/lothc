@@ -1255,7 +1255,7 @@ def test_sync_custom_models_missing_expires_in_uses_default_expires_in(
     assert json.loads(_cache_file(tmp_path).read_text())["expires_in"] == 900
 
 
-async def test_refresh_rejected_with_a_non_400_is_not_retried_as_a_mint(
+async def test_refresh_rejected_with_neither_400_nor_401_is_not_retried_as_a_mint(
     base_url: str, client: HTTPClient
 ) -> None:
     key = str(uuid4())
@@ -1278,7 +1278,7 @@ async def test_refresh_rejected_with_a_non_400_is_not_retried_as_a_mint(
     assert grant_types == ["client_credentials", "refresh_token"]
 
 
-def test_sync_refresh_rejected_with_a_non_400_is_not_retried_as_a_mint(
+def test_sync_refresh_rejected_with_neither_400_nor_401_is_not_retried_as_a_mint(
     base_url: str, sync_client: SyncHTTPClient
 ) -> None:
     key = str(uuid4())
@@ -1299,6 +1299,100 @@ def test_sync_refresh_rejected_with_a_non_400_is_not_retried_as_a_mint(
     assert cause.status == 429
     grant_types = [r["body"]["grant_type"] for r in _sync_token_requests(sync_client, key)]
     assert grant_types == ["client_credentials", "refresh_token"]
+
+
+# RFC 6749 says 400 `invalid_grant`, but some servers answer a revoked refresh token with a 401;
+# raising on it would leave every process loading the disk cache stuck on the same refresh token.
+async def test_refresh_rejected_with_a_401_falls_back_to_minting(
+    base_url: str, client: HTTPClient
+) -> None:
+    key = str(uuid4())
+    provider = OAuthProvider(
+        token_url=f"{base_url}oauth/token?key={key}&expires_in=0&with_refresh=1&refresh_status=401",
+        client_id="client-id",
+        client_secret="client-secret",
+    )
+
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        first = await _bearer(api)
+        second = await _bearer(api)
+
+    assert (first, second) == ("Bearer token-1", "Bearer token-3")
+    grant_types = [r["body"]["grant_type"] for r in await _token_requests(client, key)]
+    assert grant_types == ["client_credentials", "refresh_token", "client_credentials"]
+
+
+def test_sync_refresh_rejected_with_a_401_falls_back_to_minting(
+    base_url: str, sync_client: SyncHTTPClient
+) -> None:
+    key = str(uuid4())
+    provider = SyncOAuthProvider(
+        token_url=f"{base_url}oauth/token?key={key}&expires_in=0&with_refresh=1&refresh_status=401",
+        client_id="client-id",
+        client_secret="client-secret",
+    )
+
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        first = _sync_bearer(api)
+        second = _sync_bearer(api)
+
+    assert (first, second) == ("Bearer token-1", "Bearer token-3")
+    grant_types = [r["body"]["grant_type"] for r in _sync_token_requests(sync_client, key)]
+    assert grant_types == ["client_credentials", "refresh_token", "client_credentials"]
+
+
+async def test_a_401_from_the_mint_after_a_refresh_401_is_an_oauth_token_error(
+    base_url: str, client: HTTPClient
+) -> None:
+    key = str(uuid4())
+    provider = OAuthProvider(
+        token_url=(
+            f"{base_url}oauth/token?key={key}&expires_in=0&with_refresh=1&refresh_status=401"
+            "&later_mint_status=401"
+        ),
+        client_id="client-id",
+        client_secret="client-secret",
+    )
+
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        await _bearer(api)
+        with pytest.raises(OAuthTokenError) as error_info:
+            await _bearer(api)
+
+    mint_error = error_info.value.__cause__
+    assert isinstance(mint_error, HTTPResponseError)
+    refresh_error = mint_error.__cause__  # the rejected refresh, chained onto the failed mint
+    assert isinstance(refresh_error, HTTPResponseError)
+    assert (mint_error.status, refresh_error.status) == (401, 401)
+    grant_types = [r["body"]["grant_type"] for r in await _token_requests(client, key)]
+    assert grant_types == ["client_credentials", "refresh_token", "client_credentials"]
+
+
+def test_sync_a_401_from_the_mint_after_a_refresh_401_is_an_oauth_token_error(
+    base_url: str, sync_client: SyncHTTPClient
+) -> None:
+    key = str(uuid4())
+    provider = SyncOAuthProvider(
+        token_url=(
+            f"{base_url}oauth/token?key={key}&expires_in=0&with_refresh=1&refresh_status=401"
+            "&later_mint_status=401"
+        ),
+        client_id="client-id",
+        client_secret="client-secret",
+    )
+
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        _sync_bearer(api)
+        with pytest.raises(OAuthTokenError) as error_info:
+            _sync_bearer(api)
+
+    mint_error = error_info.value.__cause__
+    assert isinstance(mint_error, HTTPResponseError)
+    refresh_error = mint_error.__cause__  # the rejected refresh, chained onto the failed mint
+    assert isinstance(refresh_error, HTTPResponseError)
+    assert (mint_error.status, refresh_error.status) == (401, 401)
+    grant_types = [r["body"]["grant_type"] for r in _sync_token_requests(sync_client, key)]
+    assert grant_types == ["client_credentials", "refresh_token", "client_credentials"]
 
 
 async def test_client_factory_builds_the_token_endpoint_client(
@@ -1387,3 +1481,252 @@ async def test_providers_sharing_a_cache_dir_get_their_own_readable_files(
     ]
     client_ids = sorted(json.loads((tmp_path / name).read_text())["client_id"] for name in names)
     assert client_ids == ["first-client", "second/client"]
+
+
+# A token revoked before it expires used to stay in the cache file: a POST's 401 is never retried,
+# so every new process reloaded the dead token and failed until it expired naturally.
+
+
+def _cached_provider(token_url: str, cache_dir: Path) -> OAuthProvider:
+    return OAuthProvider(
+        token_url=token_url,
+        client_id="client-id",
+        client_secret="client-secret",
+        token_cache_dir=cache_dir,
+    )
+
+
+def _sync_cached_provider(token_url: str, cache_dir: Path) -> SyncOAuthProvider:
+    return SyncOAuthProvider(
+        token_url=token_url,
+        client_id="client-id",
+        client_secret="client-secret",
+        token_cache_dir=cache_dir,
+    )
+
+
+def _damage_cache_file(cache_file: Path, damage: str) -> None:
+    match damage:
+        case "corrupt":
+            cache_file.write_bytes(b"not json")
+        case "unreadable":
+            cache_file.chmod(0o000)
+        case _:
+            cache_file.unlink()
+
+
+async def test_a_cached_token_rejected_by_a_post_is_not_reloaded_by_a_new_provider(
+    base_url: str, client: HTTPClient, tmp_path: Path
+) -> None:
+    key = str(uuid4())
+    token_url = f"{base_url}oauth/token?key={key}&expires_in=3600"
+    async with HTTPClient(
+        base_url=base_url, bearer_auth=_cached_provider(token_url, tmp_path)
+    ) as api:
+        with pytest.raises(HTTPResponseError) as exc_info:
+            await api.post("rejects-first-token", json={"a": 1})
+
+    async with HTTPClient(
+        base_url=base_url, bearer_auth=_cached_provider(token_url, tmp_path)
+    ) as api:
+        result = (await api.post("rejects-first-token", json={"a": 1}, into=dict)).data
+
+    assert exc_info.value.status == 401
+    assert result == {"authorization": "Bearer token-2"}
+    assert len(await _token_requests(client, key)) == 2
+
+
+def test_sync_a_cached_token_rejected_by_a_post_is_not_reloaded_by_a_new_provider(
+    base_url: str, sync_client: SyncHTTPClient, tmp_path: Path
+) -> None:
+    key = str(uuid4())
+    token_url = f"{base_url}oauth/token?key={key}&expires_in=3600"
+    with (
+        SyncHTTPClient(
+            base_url=base_url, bearer_auth=_sync_cached_provider(token_url, tmp_path)
+        ) as api,
+        pytest.raises(HTTPResponseError) as exc_info,
+    ):
+        api.post("rejects-first-token", json={"a": 1})
+
+    with SyncHTTPClient(
+        base_url=base_url, bearer_auth=_sync_cached_provider(token_url, tmp_path)
+    ) as api:
+        result = api.post("rejects-first-token", json={"a": 1}, into=dict).data
+
+    assert exc_info.value.status == 401
+    assert result == {"authorization": "Bearer token-2"}
+    assert len(_sync_token_requests(sync_client, key)) == 2
+
+
+async def test_a_rejected_cached_token_keeps_its_refresh_token_for_a_new_provider(
+    base_url: str, client: HTTPClient, tmp_path: Path
+) -> None:
+    key = str(uuid4())
+    token_url = f"{base_url}oauth/token?key={key}&expires_in=3600&with_refresh=1"
+    async with HTTPClient(
+        base_url=base_url, bearer_auth=_cached_provider(token_url, tmp_path)
+    ) as api:
+        with pytest.raises(HTTPResponseError):
+            await api.post("rejects-first-token", json={"a": 1})
+
+    async with HTTPClient(
+        base_url=base_url, bearer_auth=_cached_provider(token_url, tmp_path)
+    ) as api:
+        result = (await api.post("rejects-first-token", json={"a": 1}, into=dict)).data
+
+    assert result == {"authorization": "Bearer token-2"}
+    _, refresh = await _token_requests(client, key)
+    assert refresh["body"] == {"grant_type": "refresh_token", "refresh_token": "refresh-1"}
+
+
+def test_sync_a_rejected_cached_token_keeps_its_refresh_token_for_a_new_provider(
+    base_url: str, sync_client: SyncHTTPClient, tmp_path: Path
+) -> None:
+    key = str(uuid4())
+    token_url = f"{base_url}oauth/token?key={key}&expires_in=3600&with_refresh=1"
+    with (
+        SyncHTTPClient(
+            base_url=base_url, bearer_auth=_sync_cached_provider(token_url, tmp_path)
+        ) as api,
+        pytest.raises(HTTPResponseError),
+    ):
+        api.post("rejects-first-token", json={"a": 1})
+
+    with SyncHTTPClient(
+        base_url=base_url, bearer_auth=_sync_cached_provider(token_url, tmp_path)
+    ) as api:
+        result = api.post("rejects-first-token", json={"a": 1}, into=dict).data
+
+    assert result == {"authorization": "Bearer token-2"}
+    _, refresh = _sync_token_requests(sync_client, key)
+    assert refresh["body"] == {"grant_type": "refresh_token", "refresh_token": "refresh-1"}
+
+
+async def test_a_rejection_leaves_a_cache_file_another_provider_already_renewed(
+    base_url: str, client: HTTPClient, tmp_path: Path
+) -> None:
+    key = str(uuid4())
+    token_url = f"{base_url}oauth/token?key={key}&expires_in=3600"
+    first_provider = _cached_provider(token_url, tmp_path)
+    assert await first_provider() == "token-1"
+    async with HTTPClient(
+        base_url=base_url, bearer_auth=_cached_provider(token_url, tmp_path)
+    ) as api:
+        await api.get("rejects-first-token")  # 401, re-mints `token-2` and caches it
+
+    async with HTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
+        with pytest.raises(HTTPResponseError):
+            await api.post("rejects-first-token", json={"a": 1})  # still sends `token-1`
+    async with HTTPClient(
+        base_url=base_url, bearer_auth=_cached_provider(token_url, tmp_path)
+    ) as api:
+        bearer = await _bearer(api)
+
+    assert bearer == "Bearer token-2"
+    assert len(await _token_requests(client, key)) == 2
+
+
+def test_sync_a_rejection_leaves_a_cache_file_another_provider_already_renewed(
+    base_url: str, sync_client: SyncHTTPClient, tmp_path: Path
+) -> None:
+    key = str(uuid4())
+    token_url = f"{base_url}oauth/token?key={key}&expires_in=3600"
+    first_provider = _sync_cached_provider(token_url, tmp_path)
+    assert first_provider() == "token-1"
+    with SyncHTTPClient(
+        base_url=base_url, bearer_auth=_sync_cached_provider(token_url, tmp_path)
+    ) as api:
+        api.get("rejects-first-token")  # 401, re-mints `token-2` and caches it
+
+    with (
+        SyncHTTPClient(base_url=base_url, bearer_auth=first_provider) as api,
+        pytest.raises(HTTPResponseError),
+    ):
+        api.post("rejects-first-token", json={"a": 1})  # still sends `token-1`
+    with SyncHTTPClient(
+        base_url=base_url, bearer_auth=_sync_cached_provider(token_url, tmp_path)
+    ) as api:
+        bearer = _sync_bearer(api)
+
+    assert bearer == "Bearer token-2"
+    assert len(_sync_token_requests(sync_client, key)) == 2
+
+
+async def test_a_cached_token_rejected_twice_by_a_get_is_retried_only_once(
+    base_url: str, client: HTTPClient, tmp_path: Path
+) -> None:
+    key = str(uuid4())
+    token_url = f"{base_url}oauth/token?key={key}&expires_in=3600"
+    async with HTTPClient(
+        base_url=base_url, bearer_auth=_cached_provider(token_url, tmp_path)
+    ) as api:
+        with pytest.raises(HTTPResponseError) as exc_info:
+            await api.get("always-unauthorized", params={"key": f"{key}-api"})
+
+    assert exc_info.value.error == {"hits": 2}  # the original request plus exactly one retry
+    assert len(await _token_requests(client, key)) == 2
+
+
+def test_sync_a_cached_token_rejected_twice_by_a_get_is_retried_only_once(
+    base_url: str, sync_client: SyncHTTPClient, tmp_path: Path
+) -> None:
+    key = str(uuid4())
+    token_url = f"{base_url}oauth/token?key={key}&expires_in=3600"
+    with (
+        SyncHTTPClient(
+            base_url=base_url, bearer_auth=_sync_cached_provider(token_url, tmp_path)
+        ) as api,
+        pytest.raises(HTTPResponseError) as exc_info,
+    ):
+        api.get("always-unauthorized", params={"key": f"{key}-api"})
+
+    assert exc_info.value.error == {"hits": 2}  # the original request plus exactly one retry
+    assert len(_sync_token_requests(sync_client, key)) == 2
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "unreadable", "missing"])
+async def test_invalidate_ignores_an_unusable_cache_file(
+    base_url: str, tmp_path: Path, damage: str
+) -> None:
+    provider = _cached_provider(f"{base_url}oauth/token?key={uuid4()}&expires_in=3600", tmp_path)
+    assert await provider() == "token-1"
+    _damage_cache_file(_cache_file(tmp_path), damage)
+
+    provider.invalidate()
+
+    assert await provider() == "token-2"
+    assert json.loads(_cache_file(tmp_path).read_text())["access_token"] == "token-2"
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "unreadable", "missing"])
+def test_sync_invalidate_ignores_an_unusable_cache_file(
+    base_url: str, tmp_path: Path, damage: str
+) -> None:
+    provider = _sync_cached_provider(
+        f"{base_url}oauth/token?key={uuid4()}&expires_in=3600", tmp_path
+    )
+    assert provider() == "token-1"
+    _damage_cache_file(_cache_file(tmp_path), damage)
+
+    provider.invalidate()
+
+    assert provider() == "token-2"
+    assert json.loads(_cache_file(tmp_path).read_text())["access_token"] == "token-2"
+
+
+async def test_failing_to_mark_the_token_cache_expired_warns_rather_than_raises(
+    base_url: str, tmp_path: Path
+) -> None:
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    provider = _cached_provider(f"{base_url}oauth/token?key={uuid4()}&expires_in=3600", cache_dir)
+    assert await provider() == "token-1"
+    cache_dir.chmod(0o500)  # the file can't be replaced any more
+    try:
+        with pytest.warns(RuntimeWarning, match="Could not mark the OAuth token cache"):
+            provider.invalidate()
+    finally:
+        cache_dir.chmod(0o700)
+
+    assert await provider() == "token-2"

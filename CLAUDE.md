@@ -663,7 +663,8 @@ directional only.
   clamped to `expires_in / 2` (the 300s default against a 60s token was expired at birth).
   `default_expires_in` covers servers that omit `expires_in`; neither is a `ValueError`. A refresh
   response without `refresh_token` keeps the old one (RFC 6749 §6). Refresh falls back to minting
-  only on a 400.
+  only on a 400 (RFC 6749's `invalid_grant` for a revoked refresh token) or a 401, which some
+  servers send instead and which, with the disk cache, would otherwise wedge every process.
 - **`OAuthTokenError`** (`.token_url`, original as `__cause__`) wraps everything `_renew` raises,
   because `bearer_auth` runs inside the caller's own verb call and an unwrapped error would be
   misattributed.
@@ -680,6 +681,13 @@ directional only.
   + `Path.replace`, plain sync IO. Not encrypted: stdlib has no cipher, a key derived from the
   client secret protects little (the secret can mint tokens itself), and AWS CLI and gcloud also
   use `0600` plaintext.
+- **`invalidate()` marks the cache file's token expired too**, if the file still holds the
+  rejected token. Only memory was cleared, so after a revocation every new process reloaded the
+  dead token, and a POST's 401 is never retried. Marked expired rather than deleted (as in
+  memory), so the next process can still use the refresh token. A file holding another token
+  (already renewed elsewhere) is left alone; an unusable one is ignored; a failed write warns.
+  The sync provider takes its lock so a concurrent renewal can't land between the read and the
+  rewrite; the async one has no `await` in `invalidate`, so it's already atomic.
 
 ### `lothc.testing`
 

@@ -61,6 +61,11 @@ def _differing_implementations() -> dict[str, str]:
         "HTTPClient._sse_connection": reads_through_sync_stream_chunks,
         "OAuthProvider.__init__": lazy_loop_lock,
         "OAuthProvider.__call__": lazy_loop_lock,
+        "OAuthProvider.invalidate": (
+            "sync takes the `threading.Lock` so a renewal on another thread can't write the cache "
+            "file between its read and rewrite; async `invalidate` has no `await`, so it already "
+            "runs atomically against `__call__`'s update and write"
+        ),
     }
 
 
