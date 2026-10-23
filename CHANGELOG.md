@@ -7,6 +7,30 @@ messages; 0.0.17 to 0.0.19 were hand-written in the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. Releases up to and including
 0.0.16 predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/releases).
 
+## [0.2.0](https://github.com/RogerThomas/lothc/compare/0.1.0...0.2.0) (2026-10-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* `response_data_type=` is now `into=`; `error_type=` and `HTTPResponseError.parsed_body` are replaced by `raises=` and `.error`.
+
+### Features
+
+* into= takes any type expression; raises= gives typed error bodies ([a35cef9](https://github.com/RogerThomas/lothc/commit/a35cef9a2d2c294e436d53364e3f57e8103f26aa))
+
+
+### Bug Fixes
+
+* route, cache and resolve into= forms correctly ([ed74e85](https://github.com/RogerThomas/lothc/commit/ed74e850dad63213847c15cd45fbb04c3e184d22))
+* stop reloading a revoked OAuth token from the disk cache ([4e6e4be](https://github.com/RogerThomas/lothc/commit/4e6e4bea1b34dc0e2a790617c31016587e954dd2))
+* stop reloading a revoked OAuth token from the disk cache ([81b60fa](https://github.com/RogerThomas/lothc/commit/81b60fabab8914e46ba22fd666c11d0306447994))
+
+
+### Performance Improvements
+
+* build Response.headers on first read ([d6be065](https://github.com/RogerThomas/lothc/commit/d6be06508053a7ded4494147cff82d3587db0500))
+* build Response.headers on first read ([3971080](https://github.com/RogerThomas/lothc/commit/3971080c62b51d87d06c7e98b5feb457a96c31f7))
+
 ## [0.1.0](https://github.com/RogerThomas/lothc/compare/0.0.19...0.1.0) (2026-09-28)
 
 
