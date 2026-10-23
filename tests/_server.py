@@ -736,6 +736,12 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self.send_header("X-Item-Exists", "true")
             self.send_header("Content-Length", "0")
             self.end_headers()
+        elif parsed.path == "/slow":
+            # GET's `/slow` delay with no body, so HEAD's own `.elapsed` can be bracketed too.
+            sleep(float(parse_qs(parsed.query).get("seconds", ["0.5"])[0]))
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         else:
             self.send_response(404)
             self.send_header("Content-Length", "0")

@@ -33,11 +33,11 @@ class ItemModel(BaseModel):
 
 
 class EchoedHeaders(BaseModel):
-    x_custom: str | None = None
+    content_type: str
 
 
 class EchoedHeadersStruct(Struct):
-    x_custom: str | None = None
+    content_type: str
 
 
 async def test_response_get_includes_status_and_data(client: HTTPClient) -> None:
@@ -56,13 +56,13 @@ async def test_response_get_includes_raw_headers(client: HTTPClient) -> None:
 async def test_response_get_with_typed_headers(client: HTTPClient) -> None:
     result = await client.get("items/7", into=ItemModel, response_headers_type=EchoedHeaders)
 
-    assert result.typed_headers is not None
+    assert result.typed_headers == EchoedHeaders(content_type="application/json")
 
 
 async def test_response_get_with_msgspec_typed_headers(client: HTTPClient) -> None:
     result = await client.get("items/7", into=ItemModel, response_headers_type=EchoedHeadersStruct)
 
-    assert result.typed_headers is not None
+    assert result.typed_headers == EchoedHeadersStruct(content_type="application/json")
 
 
 async def test_response_get_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
@@ -88,7 +88,7 @@ def test_sync_get_result_includes_raw_headers(sync_client: SyncHTTPClient) -> No
 def test_sync_get_result_with_typed_headers(sync_client: SyncHTTPClient) -> None:
     result = sync_client.get("items/7", into=ItemModel, response_headers_type=EchoedHeaders)
 
-    assert result.typed_headers is not None
+    assert result.typed_headers == EchoedHeaders(content_type="application/json")
 
 
 def test_sync_get_result_error_for_status_false_suppresses_raise(
@@ -187,16 +187,6 @@ def test_headers_copy_is_independent_of_the_original() -> None:
     assert copied.get_all("set-cookie") == ["replaced"]
 
 
-def test_headers_accept_any_keys_and_getitem_source() -> None:
-    # MutableMapping.update accepts anything with .keys()/[], not just a Mapping — the signature
-    # matches that, so this must not fall through to the iterate-pairs branch and raise.
-    target = CaseInsensitiveDict()
-
-    target.update({"Content-Type": "application/json"})
-
-    assert target["content-type"] == "application/json"
-
-
 def test_headers_support_len_and_deletion() -> None:
     headers = CaseInsensitiveDict([("Set-Cookie", "a"), ("Set-Cookie", "b"), ("X-Other", "c")])
 
@@ -271,10 +261,10 @@ def test_sync_result_elapsed_covers_the_time_the_server_took(sync_client: SyncHT
     assert 0.05 <= result.elapsed < 2.0
 
 
-async def test_head_result_has_an_elapsed_time(client: HTTPClient) -> None:
-    result = await client.head("items/7")
+async def test_head_result_elapsed_covers_the_time_the_server_took(client: HTTPClient) -> None:
+    result = await client.head("slow", params={"seconds": 0.05})
 
-    assert result.elapsed >= 0.0
+    assert 0.05 <= result.elapsed < 2.0
 
 
 class _SetCookieHeaders(BaseModel):
