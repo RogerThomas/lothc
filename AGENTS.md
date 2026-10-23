@@ -106,12 +106,20 @@ and a no-op if the provider has already renewed. Any `bearer_auth` with an
 ## Decode targets (`into`, default `None` = raw `bytes`)
 
 - `None`/`bytes` — raw, default
+- `str` — raw text (UTF-8, never JSON-parsed): the body, each SSE `data`, each streamed line, or a
+  pinned `HTTPResponseError[str]`'s body
 - `dict` / `dict[str, Any]` — plain `dict[str, Any]` for a JSON *object* (stdlib `json`, no extra
-  needed); any other JSON value raises `ValueError`
+  needed); any other JSON value raises `ValueError`. A bare `dict` subclass (`OrderedDict`,
+  `defaultdict`, your own) decodes the same way and is built as that subclass
 - any type expression (PEP 747 `TypeForm`): a `BaseModel`/`Struct` subclass, `list[Item]` for a
-  top-level array, `Item | None`, a union, a `type` alias. A `Struct` inside → msgspec, a
-  `BaseModel` inside → pydantic, both → `TypeError`, neither (`list[int]`) → msgspec, else
-  pydantic, else `TypeError` naming the extra to install. One decoder is built per type and reused.
+  top-level array, `Item | None`, a union, a `type` alias, a TypedDict/dataclass/NamedTuple (its
+  fields are walked too). A `Struct` inside → msgspec; a `BaseModel`, pydantic `Annotated`
+  metadata (`Field(...)`, validators), `annotated_types` constraints, a pydantic dataclass or
+  pydantic type → pydantic (`TypeError` if pydantic isn't installed); both → `TypeError`; neither
+  (`list[int]`) → msgspec, else pydantic, else `TypeError` naming the extra to install. One decoder
+  is built per type and reused (cache capped at 4096 types), except a type whose `Annotated`
+  metadata compares by identity (`Field(...)` inline): rebuilt per call, so hoist it into a `type`
+  alias. `AfterValidator(module_function)` inline is cached fine.
 - a pre-built pydantic `TypeAdapter` / msgspec `Decoder` instance — used as-is
 
 ## Verbs
@@ -163,6 +171,8 @@ lookups, `get_all(name)` for a repeated header's every value.
   `class MyAPIError(HTTPResponseError[NotFound | NotAuthorized]): pass` (Python can't `except` a
   parametrized generic), and pass it as `raises=` on the client constructor (default for every
   call; a bad class is a `TypeError` at construction) or on any verb (overrides for that call).
+  A generic subclass's PEP 696 default counts as pinned (`class Base[T = APIError](HTTPResponseError[T])`
+  as `raises=Base` decodes as `APIError`).
 - `HTTPTransportError` base; `HTTPTimeoutError`, `HTTPConnectionError` subclasses — no usable
   response (none at all, or the connection failed partway through one)
 - Using a closed client → `RuntimeError`

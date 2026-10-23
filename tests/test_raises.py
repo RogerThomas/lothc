@@ -51,6 +51,18 @@ class ChainedError(GenericError[NotFound]):
     pass
 
 
+class DefaultedError[T = NotFound](HTTPResponseError[T]):
+    pass
+
+
+class DefaultedChildError(DefaultedError):
+    pass
+
+
+class OverriddenDefaultError(DefaultedError[NotAuthorized]):
+    pass
+
+
 class MixedError(HTTPResponseError[NotFound | NotAuthorizedModel]):
     pass
 
@@ -208,6 +220,31 @@ async def test_a_type_parameter_bound_further_down_the_chain_is_resolved(
         await client.get("missing", raises=ChainedError)
 
     assert exc_info.value.error == NotFound(title="Not found", status=404)
+
+
+async def test_an_unbound_type_parameter_falls_back_to_its_default(client: HTTPClient) -> None:
+    # Checkers read a bare `DefaultedError` as `DefaultedError[NotFound]`, so lothc does too.
+    with pytest.raises(DefaultedError) as exc_info:
+        await client.get("missing", raises=DefaultedError)
+
+    assert exc_info.value.error == NotFound(title="Not found", status=404)
+
+
+def test_sync_an_unbound_type_parameter_falls_back_to_its_default(base_url: str) -> None:
+    with (
+        SyncHTTPClient(base_url=base_url, raises=DefaultedChildError) as client,
+        pytest.raises(DefaultedChildError) as exc_info,
+    ):
+        client.get("missing")
+
+    assert exc_info.value.error == NotFound(title="Not found", status=404)
+
+
+async def test_a_bound_type_parameter_overrides_its_default(client: HTTPClient) -> None:
+    with pytest.raises(OverriddenDefaultError) as exc_info:
+        await client.get("unauthorized", raises=OverriddenDefaultError)
+
+    assert exc_info.value.error == NotAuthorized(title="Not authorized", status=401)
 
 
 @pytest.mark.parametrize(

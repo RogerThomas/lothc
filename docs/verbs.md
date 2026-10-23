@@ -98,12 +98,48 @@ response.data  # list[ItemStruct]
 response = await client.get("items/7", into=ItemStruct | None)  # a `null` body gives None
 ```
 
-The library is picked from the models inside the type: a `Struct` anywhere means msgspec, a
-`BaseModel` anywhere means pydantic, and mixing the two in one type raises `TypeError`. A type
-with neither (`list[int]`) uses msgspec if it's installed, else pydantic. lothc builds the decoder
-once per type and reuses it, so writing `into=list[ItemModel]` inline on every call costs nothing
-extra. Without either extra only `bytes`, `dict` and `dict[str, Any]` work; anything else raises a
-`TypeError` naming the extra to install.
+The library is picked from the models inside the type, including the fields of a `TypedDict`,
+dataclass or `NamedTuple`: a `Struct` anywhere means msgspec, a `BaseModel` anywhere means
+pydantic, and mixing the two in one type raises `TypeError`. Validation only pydantic enforces
+also means pydantic, since msgspec would silently skip it: `Annotated` metadata from pydantic
+(`Field(gt=0)`, `AfterValidator(...)`) or `annotated_types` (`Gt(0)`), a pydantic dataclass, or a
+pydantic type such as `HttpUrl`. Without pydantic installed, such a type raises `TypeError` rather
+than decoding unvalidated. Plain metadata (`Annotated[int, "doc"]`, `msgspec.Meta(gt=0)`) doesn't
+count. A type with none of these (`list[int]`) uses msgspec if it's installed, else pydantic.
+
+lothc builds the decoder once per type and reuses it, so writing `into=list[ItemModel]` inline on
+every call costs nothing extra, and so does `Annotated[int, AfterValidator(check)]` with a
+module-level `check`. The exception is `Annotated` metadata that's only ever equal to itself,
+pydantic's `Field(...)` above all: written inline, each call makes a new, unequal type, so lothc
+rebuilds its decoder on every call rather than caching a new one per call forever. Hoist such a
+type into a module-level `type` alias to have it built once:
+
+```python
+from typing import Annotated
+
+from pydantic import Field
+
+type PositiveInts = list[Annotated[int, Field(gt=0)]]
+
+response = await client.get("counts", into=PositiveInts)  # built once, then reused
+```
+
+An inline `lambda` validator is likewise a new type per call: it decodes correctly but builds a
+new decoder every time. lothc stops caching new types once it holds 4096, so that can't grow
+memory without limit; use a module-level function (or a `type` alias) to have it built once.
+
+Without either extra only `bytes`, `str`, `dict`, `dict[str, Any]` and `dict` subclasses work;
+anything else raises a `TypeError` naming the extra to install.
+
+`into=str` means the raw text, never JSON-parsed, just as `into=bytes` means the raw bytes:
+`get(into=str)` gives the body decoded as UTF-8 (invalid UTF-8 raises `UnicodeDecodeError`, a
+`ValueError`), `sse(into=str)` gives each event's `data` as is (the same as the default),
+`stream_get`/`stream_post` with `into=str` give each line as text (split on `\n`, blank lines
+skipped, like the NDJSON decode), and a pinned `HTTPResponseError[str]` gets the error body's text
+on `.error`.
+
+A bare `dict` subclass (`OrderedDict`, `defaultdict`, your own) decodes a JSON object like
+`into=dict` and is built as that subclass (a `defaultdict` with no `default_factory`).
 
 A pre-built pydantic `TypeAdapter` or msgspec `Decoder` is still accepted, used as-is:
 

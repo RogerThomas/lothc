@@ -77,8 +77,9 @@ class StructTyping(Protocol):
 
 class BaseModelTyping(Protocol):
     """Same reasoning as `StructTyping`, for `pydantic.BaseModel` — matches on
-    `model_validate_json`'s call shape alone (the same method `_decode_body`/`_decode_error_body`
-    already call), not a `ClassVar`.
+    `model_validate_json`'s call shape alone (a method every real model has), not a `ClassVar`.
+    lothc itself never calls it: a model `into` decodes through a cached `TypeAdapter`, like
+    any other type expression.
 
     A `ClassVar[Any] model_config` marker was tried first and rejected: confirmed live that a
     *subclass* re-declaring `model_config = ConfigDict(...)` without repeating `ClassVar` — the

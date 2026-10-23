@@ -150,3 +150,33 @@ def test_into_without_either_extra(base_url: str) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "install lothc[msgspec] or lothc[pydantic]" in result.stdout
+
+
+def test_into_with_pydantic_only_metadata_without_pydantic(base_url: str) -> None:
+    # msgspec alone would decode this form but silently skip the `Gt(0)` constraint, so with
+    # pydantic absent it's a `TypeError`, never an unvalidated result. A fresh subprocess with
+    # only pydantic blocked, for the same reason as `test_into_without_either_extra`.
+    script = (
+        "import builtins, sys\n"
+        "from typing import Annotated\n"
+        "_real_import = builtins.__import__\n"
+        "def _blocking_import(name, globals=None, locals=None, fromlist=(), level=0):\n"
+        "    if name.split('.')[0] == 'pydantic':\n"
+        "        raise ImportError(f'blocked for test: {name}')\n"
+        "    return _real_import(name, globals, locals, fromlist, level)\n"
+        "builtins.__import__ = _blocking_import\n"
+        "import annotated_types\n"
+        "from lothc import SyncHTTPClient\n"
+        "with SyncHTTPClient(base_url=sys.argv[1]) as client:\n"
+        "    assert client.get('json-array', into=list[Annotated[dict, 'doc']]).data\n"
+        "    try:\n"
+        "        client.get('json-array', into=list[Annotated[int, annotated_types.Gt(0)]])\n"
+        "    except TypeError as error:\n"
+        "        print(error)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, base_url], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "install lothc[pydantic]" in result.stdout

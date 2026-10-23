@@ -283,6 +283,14 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_invalid_utf8(self) -> None:
+        body = b"\xff\xfe"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _handle_upload(self) -> None:
         length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(length)
@@ -678,6 +686,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/redirect": self._handle_redirect,
             "/redirect-loop": self._handle_redirect_loop,
             "/binary": self._handle_binary,
+            "/invalid-utf8": self._handle_invalid_utf8,
             "/truncated": self._handle_truncated,
             "/truncated-content-length": self._handle_truncated_content_length,
             "/truncated-after-first-chunk": self._handle_truncated_after_first_chunk,

@@ -419,19 +419,54 @@ directional only.
 - **`into` takes any type expression (`TypeForm`, from `typing_extensions>=4.13.0`)**, so
   `into=list[Item]` decodes a top-level array with no wrapper. `_decoder_for` (shared by
   `_decode_body` and the per-line/per-event `_decode_json_line`) maps a form to one decoder:
-  `None`/`bytes` raw, exactly `dict`/`dict[str, Any]` stdlib `json` (works with no extra), a
-  `TypeAdapter`/`Decoder` instance as-is (never cached, so one built per call can't grow the
-  cache). Anything else is walked (generic args, unions, `Annotated`, `type` aliases via
-  `__value__`, each alias once): a `Struct` → msgspec `Decoder`, a `BaseModel` → pydantic
-  `TypeAdapter`, both → `TypeError`, neither → msgspec, else pydantic, else a `TypeError` naming
-  the extras. A class msgspec doesn't know (a plain class) is a msgspec "custom type": it builds
-  fine and fails at decode with `ValidationError`.
+  `None`/`bytes` raw, `str` raw text, exactly `dict`/`dict[str, Any]` stdlib `json` (works with no
+  extra), a bare `dict` subclass the same then `form(obj)`, a `TypeAdapter`/`Decoder` instance
+  as-is (never cached, so one built per call can't grow the cache). Anything else is walked
+  (`_form_traits`: generic args, unions, `Annotated` type and metadata, `type` aliases via
+  `__value__`, TypedDict/dataclass/NamedTuple fields via `get_type_hints(include_extras=True)`,
+  each alias and class once so recursive ones end): a `Struct` → msgspec `Decoder`, a pydantic
+  marker → pydantic `TypeAdapter`, both → `TypeError`, neither → msgspec, else pydantic, else a
+  `TypeError` naming the extras. A class msgspec doesn't know (a plain class) is a msgspec "custom
+  type": it builds fine and fails at decode with `ValidationError`. Every verb resolves it before
+  sending (`_send_method` too, then hands the decoder to `_decode_body`), since resolving it in
+  `_decode_body` let a POST run and only then raise `TypeError`.
+  - **A pydantic marker is a `BaseModel`, pydantic or `annotated_types` `Annotated` metadata, a
+    pydantic dataclass, or anything with `__get_pydantic_core_schema__`/`__pydantic_validator__`**
+    (`_is_pydantic_marker`, by metadata's package name plus those hooks). msgspec ignores all of
+    them, so with both extras `list[Annotated[int, Field(gt=0)]]` used to return `[-5]`. Without
+    pydantic, a marker is a `TypeError`, never an unvalidated decode. `Annotated[int, "doc"]` and
+    `msgspec.Meta` don't count.
+  - **Container fields are walked because both libraries decode them field by field**: a
+    TypedDict holding a `BaseModel` went to msgspec and always failed. Model classes' own fields
+    aren't walked (their library's business).
+  - **A bare `dict` subclass is stdlib `json` plus `form(obj)`** (`defaultdict` gets `form(None,
+    obj)`, its first argument being `default_factory`), as before `into=` took type forms; msgspec
+    rejects `OrderedDict` and friends. A TypedDict is a `dict` subclass at runtime, so it's
+    excluded (`typing_extensions.is_typeddict`).
+  - **`str` means raw text, mirroring `bytes`**: the body as UTF-8 (strict, so bad bytes are a
+    `UnicodeDecodeError`, still a `ValueError`), SSE `data` as is, each streamed line, a pinned
+    `HTTPResponseError[str]`'s body. It used to be JSON-parsed, so `sse(into=str)` failed on
+    `data: hello`. A streamed `str` line is exactly what sat between `\n`s (a CRLF stream keeps its
+    `\r`), blank lines skipped like NDJSON. NDJSON lines go to every decoder as the `bytearray`
+    they were split into; the old per-line `.decode()` was a copy nothing needed.
   - **Cached in `_client.py`'s module-level `_decoders`, keyed by the form.** Measured: an
     uncached msgspec `Decoder(list[User])` ~1.5us and pydantic `TypeAdapter` ~31us per call,
     against ~100ns for the cached lookup (the old per-call `isinstance`/`issubclass` chain was
     ~150-270ns). Equal forms hash equal, so `list[User]` written inline on every call is one entry.
     An unhashable form (e.g. `Annotated[..., {}]`) still works, rebuilt per call. Streams resolve
     once per stream, before connecting.
+  - **A form whose `Annotated` metadata compares by identity is never cached**
+    (`identity_keyed`: a non-callable metadata object whose type keeps `object.__eq__`, or a
+    dataclass holding one). pydantic's `FieldInfo` has no `__eq__`, so an inline
+    `Annotated[int, Field(gt=0)]` is a new key per call: the cache grew without limit and every
+    call rebuilt a TypeAdapter anyway. Rebuilt per call instead; metadata behind a `type` alias or
+    inside a class doesn't count, since the alias/class is the (stable, identity-hashed) key, which
+    is why the docs say to hoist `Field(...)`-style forms into an alias. Callables don't count
+    either: `AfterValidator(check)` with a module-level `check` is equal across calls, and
+    excluding it rebuilt the most common validator idiom (~31us) on every request.
+  - **`_decoders_max_size` (4096) is the backstop** for a fresh-per-call key the rule misses (an
+    inline lambda validator, a closure). Once full, new forms decode uncached and nothing is
+    evicted, so the hot forms, cached first, stay cached.
   - `msgspec_installed`/`pydantic_installed` are `bool`s in `_compat.py`, not `msgspec is not None`,
     which strict basedpyright flags as unnecessary under `TYPE_CHECKING`.
   - `dict` on a non-object body raises `ValueError` (`_require_json_object`), keeping "every decode
@@ -447,7 +482,10 @@ directional only.
   argument (`error_type=` plus an untyped `.parsed_body` before). Python can't `except` a
   parametrized generic, so `E` must live on a real class for the `except` to type `.error`
   (`E | dict[str, Any] | None`); it's read back at runtime from the original bases
-  (`_pinned_error_form`, which also binds a `Base[T]` chain), cached per class. A plain parameter,
+  (`_pinned_error_form`, which also binds a `Base[T]` chain), cached per class. An unbound
+  parameter falls back to its PEP 696 default (`_bound_type_param`), since checkers read a bare
+  `class Base[T = APIError](HTTPResponseError[T])` as `Base[APIError]`; it used to be a
+  `TypeError`. A plain parameter,
   not a verb type parameter, so it adds no overloads. The constructor resolves it eagerly, so a bad
   class (unbound `E`, Struct/BaseModel mix) is a `TypeError` at `__init__`; a per-call one is
   resolved before sending (`_validate_raises`, one cached lookup, skipped for `None`), since
