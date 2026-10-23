@@ -82,6 +82,15 @@ entries terse: a fact plus the *why*, not a narrative of how it was found.
   pydantic/msgspec with both uninstalled (`--no-install-package`, then `uv run --no-sync`, since a
   plain `uv run` re-syncs them), because the main job always has both and would miss an unguarded
   import.
+- **CI tests 3.13/3.14/3.15, plus free-threaded 3.14t/3.15t** (`test-free-threaded`: tests only,
+  `PYTHON_GIL=0`, asserts the GIL really is off). lothc keeps process-wide state shared across
+  threads (decoder cache, `raises=` cache, lazy `Response.headers`' first read) and users share
+  one client across threads and loops, so the suite must pass with no GIL to lean on.
+- **perf.py's comparison clients live in their own `perf` dependency group** (httpx, httpx2,
+  aiohttp, aiosonic, niquests, requests), not `dev`: nothing in lothc/ or tests/ imports them, and
+  niquests → urllib3-future → qh3 has no free-threaded 3.15 wheel. `default-groups` includes it,
+  so local `uv run`/`task check` (whose basedpyright covers perf.py) still get it; the
+  free-threaded jobs pass `--no-default-groups --group dev`.
 - **Only pyreqwest `>=0.13.0` is supported**, so there's no lower-bound job (the suite also passed
   on 0.11.6-0.12.x).
 - **README.md uses absolute URLs only.** It's the PyPI description, and PyPI can't resolve
