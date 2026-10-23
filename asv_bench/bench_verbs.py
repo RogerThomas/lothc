@@ -81,22 +81,22 @@ class VerbSuite:
         self._client.get("items/7")
 
     def time_get_typed(self) -> None:
-        self._client.get("items/7", response_data_type=dict)
+        self._client.get("items/7", into=dict)
 
     def peakmem_get_typed(self) -> None:
-        self._client.get("items/7", response_data_type=dict)
+        self._client.get("items/7", into=dict)
 
     def time_get_pydantic(self) -> None:
-        self._client.get("items/7", response_data_type=ItemModel)
+        self._client.get("items/7", into=ItemModel)
 
     def peakmem_get_pydantic(self) -> None:
-        self._client.get("items/7", response_data_type=ItemModel)
+        self._client.get("items/7", into=ItemModel)
 
     def time_get_msgspec(self) -> None:
-        self._client.get("items/7", response_data_type=ItemStruct)
+        self._client.get("items/7", into=ItemStruct)
 
     def peakmem_get_msgspec(self) -> None:
-        self._client.get("items/7", response_data_type=ItemStruct)
+        self._client.get("items/7", into=ItemStruct)
 
     def time_post(self) -> None:
         self._client.post("items", json={"id": 1, "name": "item-1"})

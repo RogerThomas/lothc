@@ -102,16 +102,18 @@ entries terse: a fact plus the *why*, not a narrative of how it was found.
 Done: typed and raw query params/headers, per-verb `timeout=`, transport error wrapping
 (`HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError`), `put`/`patch`/`delete`/`head`,
 bodies on `delete`, SSE (`TypeAdapter`/`Decoder`, spec-compliant reconnect), `stream_get`/
-`stream_post` (raw chunks by default, NDJSON decode via `response_data_type`), `download`, the
-`Data` decode targets (`bytes` default, `dict`, `BaseModel`, `Struct`), auth (`bearer_token` /
+`stream_post` (raw chunks by default, NDJSON decode via `into`), `download`, the
+`into=` decode targets (`bytes` default, `dict`, any type expression via PEP 747 `TypeForm`
+such as `list[Model]`, a pre-built `TypeAdapter`/`Decoder`), auth (`bearer_token` /
 `bearer_auth` callable / `basic_auth` pair, at most one; per-verb `skip_auth=True`), OAuth 2
 client credentials (`OAuthProvider`/`SyncOAuthProvider`), cookies (`cookie_store=True`), redirects
 (`follow_redirects`/`max_redirects`), `proxy=`/`no_proxy=`, `user_agent=` (default
 `python-lothc/<version>`), `http2=`, `resolve=`, `local_address=`, `tcp_keepalive=`, retries
 (`max_retries`/`retry_methods`, idempotent verbs by default, via pyreqwest's `with_middleware`),
-typed error bodies (`error_type=`), TLS/mTLS/pool settings (`connect_timeout`, `read_timeout`,
-`root_certificates`, `identity_pem`, `min_tls_version`/`max_tls_version`,
-`danger_accept_invalid_certs`, `https_only`, `max_connections`, `pool_idle_timeout`,
+typed error bodies (`raises=`, `HTTPResponseError[E]`), TLS/mTLS/pool settings
+(`connect_timeout`, `read_timeout`, `root_certificates`, `identity_pem`,
+`min_tls_version`/`max_tls_version`, `danger_accept_invalid_certs`, `https_only`,
+`max_connections`, `pool_idle_timeout`,
 `pool_max_idle_per_host`, `pool_timeout`), request metadata (`.request: RequestInfo` on
 `Response` and `HTTPResponseError`; `Response.http_version`/`.elapsed`), and a pytest mocking
 plugin (`lothc[testing]`).
@@ -130,6 +132,13 @@ Deliberately not exposed: per-algorithm compression toggles, `interface`, `tcp_n
 - **`lothc/_client.py` holds everything**, deliberately one file until it earns a split.
   `lothc/__init__.py` re-exports the public surface. `lothc/_compat.py` isolates the optional
   imports (a `TYPE_CHECKING` block plus runtime `try/except ImportError` with stub fallbacks).
+- **pyreqwest stays; a direct reqwest binding was prototyped and rejected (2026-10-04).** A
+  one-call PyO3 binding (`send()` returns status, headers and the read body together, same
+  pyo3/reqwest/tokio pins) gave async `get()` + msgspec +5% sequential / +12% at 64 concurrent
+  (~8us of ~50us CPU/request), nearly all from the binding, not lothc's Python layer: that layer
+  costs ~5.4us/request with the network patched out, ~3.9us of it irreducible. Not worth compiled
+  wheels per platform plus reimplementing sync, streaming, multipart, TLS/pool settings, the error
+  taxonomy and `lothc.testing`'s mocking. The same pass trimmed `_send_method` (0.35us).
 - **`lothc/_oauth.py`** is separate not because `_client.py` earned a split but because it's built
   *on* the client: it opens a short-lived `HTTPClient` per token request and plugs into the
   existing `bearer_auth` slot as a plain callable. The clients know nothing about it.
@@ -392,37 +401,69 @@ directional only.
   known API: typed SDKs return the body, while requests, httpx, aiohttp and axios return a
   response, and most callers need status/headers. A flag (`as_response=True`) was never an option:
   a return type that depends on a runtime `bool` multiplies overloads, and a non-literal `bool`
-  matches none. The verbs share `_send_method` → `_send_with_body`.
-- **Overloads over one generic-with-cast signature.** Every verb has a no-`response_data_type`
-  overload (`bytes`), a bare-`dict` one, a generic one, an adapter one, and one non-generic
-  implementation, which is why there are almost no `cast()`s: the implementation never claims to
-  return the type parameter. A single generic method with a value default forced `cast()` at every
-  internal branch.
-- **Bare `dict` is a valid `response_data_type`; `dict[str, Any]` is not.** A generic
-  `type[TData]` overload resolves bare `dict` to `dict[Unknown, Unknown]` under basedpyright strict,
-  hence the extra non-generic overload hardcoding `type[dict[str, Any]]` (which replaced a
-  dedicated `JSON` class). Never claim something is "rejected" from a basedpyright result alone;
-  check runtime behaviour.
-- **`TypeAdapter`/`Decoder` are valid `response_data_type`s on every verb**: the way to decode a
-  top-level JSON array (`TypeAdapter(list[Item])`). The plain-verb implementations return `object`,
-  since an overload returning an unbounded `TAdapted` is otherwise inconsistent with them.
-  `_decode_body` handles adapters before its "must be a class" check. `dict` on a non-object body
-  raises `ValueError` (`_require_json_object`), keeping "every decode failure is a `ValueError`"
-  true.
-- **`response_data_type` defaults to `bytes`**, except `sse()` (`SSEEvent[str]`: a stream of named
-  records has no raw-bytes analogue). On `stream_get`/`stream_post` it decodes each NDJSON line,
+  matches none. The verbs share `_send_method`, kept one layer deep (each extra async layer is
+  another frame every resume of the request's task passes through).
+- **Overloads over one generic-with-cast signature.** Every verb has an `into: None = None`
+  overload (`bytes`), a bare-`dict` one, an adapter one, a `TypeForm[T]` one (crossed with
+  `response_headers_type` on the body verbs: 8 each, 4 on `sse`/`stream_*`), and one non-generic
+  implementation. The adapter overload must precede the `TypeForm` one: ty otherwise matches a
+  `TypeAdapter(...)` call against `TypeForm` and rejects it as a type expression. This is why
+  there are almost no `cast()`s: the implementation never claims to return the type parameter. A
+  single generic method with a value default forced `cast()` at every internal branch.
+- **Bare `dict` gets its own overload, `type[dict[Any, Any]]` → `dict[str, Any]`.** `TypeForm[T]`
+  resolves bare `dict` to `dict[Unknown, Unknown]` under basedpyright strict. `dict[Any, Any]`,
+  not `dict[str, Any]`: with the latter zuban reveals bare `dict` as `Any`. The cost: every
+  parametrized `dict[K, V]` also lands on it and types as `dict[str, Any]`, though it decodes
+  (validated) via the library. Never claim something is "rejected" from a basedpyright result
+  alone; check runtime behaviour.
+- **`into` takes any type expression (`TypeForm`, from `typing_extensions>=4.13.0`)**, so
+  `into=list[Item]` decodes a top-level array with no wrapper. `_decoder_for` (shared by
+  `_decode_body` and the per-line/per-event `_decode_json_line`) maps a form to one decoder:
+  `None`/`bytes` raw, exactly `dict`/`dict[str, Any]` stdlib `json` (works with no extra), a
+  `TypeAdapter`/`Decoder` instance as-is (never cached, so one built per call can't grow the
+  cache). Anything else is walked (generic args, unions, `Annotated`, `type` aliases via
+  `__value__`, each alias once): a `Struct` → msgspec `Decoder`, a `BaseModel` → pydantic
+  `TypeAdapter`, both → `TypeError`, neither → msgspec, else pydantic, else a `TypeError` naming
+  the extras. A class msgspec doesn't know (a plain class) is a msgspec "custom type": it builds
+  fine and fails at decode with `ValidationError`.
+  - **Cached in `_client.py`'s module-level `_decoders`, keyed by the form.** Measured: an
+    uncached msgspec `Decoder(list[User])` ~1.5us and pydantic `TypeAdapter` ~31us per call,
+    against ~100ns for the cached lookup (the old per-call `isinstance`/`issubclass` chain was
+    ~150-270ns). Equal forms hash equal, so `list[User]` written inline on every call is one entry.
+    An unhashable form (e.g. `Annotated[..., {}]`) still works, rebuilt per call. Streams resolve
+    once per stream, before connecting.
+  - `msgspec_installed`/`pydantic_installed` are `bool`s in `_compat.py`, not `msgspec is not None`,
+    which strict basedpyright flags as unnecessary under `TYPE_CHECKING`.
+  - `dict` on a non-object body raises `ValueError` (`_require_json_object`), keeping "every decode
+    failure is a `ValueError`" true.
+- **`into` defaults to `None`, raw `bytes`**, except `sse()` (`SSEEvent[str]`: a stream of
+  named records has no raw-bytes analogue; explicit `into=bytes` gives `SSEEvent[bytes]`). On `stream_get`/`stream_post` it decodes each NDJSON line,
   not the whole body: a deliberate reuse of the name, called out in `docs/streaming.md`.
 - **The type aliases (`Data`, `JSONPayload`, `Params`, `Headers`, `Form`, `File`) are named at the
   instance level.** `JSONPayload`, not `Json`, avoided a case-only clash with the old `JSON` class.
-- **Decode-library validation errors propagate unwrapped** for `response_data_type`: the caller
+- **Decode-library validation errors propagate unwrapped** for `into`: the caller
   chose pydantic/msgspec, so its `ValidationError` is the expected one.
-- **`error_type` is best-effort, and decodes from already-fetched bytes.** `_check_status` has
-  already read the body for `body_start`, and a body can't be read twice, so `_decode_error_body`
-  mirrors `_decode_body`'s branch order on bytes. A body that doesn't match gives
-  `parsed_body=None` plus `.parse_error` and still raises `HTTPResponseError`; it used to
-  propagate, so a proxy's HTML 502 against `error_type=ErrorModel` surfaced as pydantic's
-  `ValidationError`, losing the status. An unusable `error_type` (a caller bug) still raises its
-  `TypeError`. `.parse_error` isn't pickled (pydantic's `ValidationError` can't be).
+- **Typed error bodies are `raises=`, a subclass pinning `HTTPResponseError[E]`**, not a type
+  argument (`error_type=` plus an untyped `.parsed_body` before). Python can't `except` a
+  parametrized generic, so `E` must live on a real class for the `except` to type `.error`
+  (`E | dict[str, Any] | None`); it's read back at runtime from the original bases
+  (`_pinned_error_form`, which also binds a `Base[T]` chain), cached per class. A plain parameter,
+  not a verb type parameter, so it adds no overloads. The constructor resolves it eagerly, so a bad
+  class (unbound `E`, Struct/BaseModel mix) is a `TypeError` at `__init__`; a per-call one is
+  resolved before sending (`_validate_raises`, one cached lookup, skipped for `None`), since
+  resolving it only on a real 4xx/5xx let a bad class hide until production and then replace that
+  status error with a `TypeError`. A `isinstance(x, HTTPResponseError)`
+  narrows to `HTTPResponseError[Unknown]` under basedpyright (defaults aren't applied when
+  narrowing), so tests bind `__cause__` to a local first.
+- **Error decoding is best-effort, from already-fetched bytes.** `_check_status` has already read
+  the body for `body_start`, and a body can't be read twice, so `_status_error` decodes bytes with
+  `_decoder_for(E)`. A `ValueError` (malformed JSON, pydantic's and msgspec's validation errors)
+  goes on `.parse_error` and `.error` falls back to a JSON object, else `None`; it used to
+  propagate, so a proxy's HTML 502 against a pydantic error model surfaced as `ValidationError`,
+  losing the status. An unusable `E` (a caller bug) still raises its `TypeError`.
+- **`HTTPResponseError` pickles as `type(self)`, carrying `.error`**, so a `raises=` subclass
+  survives a process boundary (module-level classes only, as pickle finds them by name).
+  `.parse_error` isn't pickled (pydantic's `ValidationError` can't be).
 - **`Response.headers`/`MockRequest.headers` are a `CaseInsensitiveDict`**, a `MutableMapping`, not
   a `dict` subclass. `dict(raw_response.headers)` made `["Content-Type"]` raise and dropped
   repeated values. A `dict` subclass would silently revert to exact-match keys under
@@ -513,7 +554,7 @@ directional only.
   `id_type=` plus `allow_missing_id=`, which cost twelve overloads per client, a second type
   parameter and a hand-written covariant class (a dataclass's `__replace__` makes it invariant).
   Convert with `int(event.id)`. Not `frozen=True`, since `.data` can be a `dict`.
-  `response_data_type` applies to `.data` only; `sse()` always yields a full `SSEEvent`.
+  `into` applies to `.data` only; `sse()` always yields a full `SSEEvent`.
 - **`sse`/`stream_get`/`stream_post` are typed `Generator`/`AsyncGenerator`, not `Iterator`**,
   so callers can `close()`/`aclose()` after stopping early; an async generator abandoned by
   `break` otherwise stays open until the loop's finalizer runs. `tests/test_stream_close.py` checks
@@ -541,7 +582,7 @@ directional only.
   absent, strict checkers showed `Unknown` on unrelated public overloads, even for consumers who
   never touch that library, and a `try/except` around the `TYPE_CHECKING` import doesn't help
   (pyright ignores the `except` once `TYPE_CHECKING` is `True`). So `Data`/`Params`/`Headers`/
-  `JSONPayload`/`response_data_type` use `StructTyping`/`BaseModelTyping`/etc. (`_compat.py`),
+  `JSONPayload`/`into` use `StructTyping`/`BaseModelTyping`/etc. (`_compat.py`),
   which import nothing; real subclasses satisfy them structurally. Runtime dispatch still uses the
   real classes. basedpyright can't exclude a nominal class from a `match` fallback once a union's
   members are Protocols, so affected sites have an explicit narrowing guard, not a suppression.

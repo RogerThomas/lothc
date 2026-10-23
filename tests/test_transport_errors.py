@@ -74,18 +74,14 @@ async def test_per_call_timeout_longer_than_client_overrides_it(base_url: str) -
     # client timeout stays 5x shorter than it (0.02 vs 0.1), which is all the override has to
     # beat — a client that ignored the per-call value would abort long before 0.1s.
     async with HTTPClient(base_url=base_url, timeout=0.02) as client:
-        result = (
-            await client.get("slow", params={"seconds": 0.1}, timeout=10.0, response_data_type=dict)
-        ).data
+        result = (await client.get("slow", params={"seconds": 0.1}, timeout=10.0, into=dict)).data
 
     assert result == {"finally": True}
 
 
 def test_sync_per_call_timeout_longer_than_client_overrides_it(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, timeout=0.02) as client:
-        result = client.get(
-            "slow", params={"seconds": 0.1}, timeout=10.0, response_data_type=dict
-        ).data
+        result = client.get("slow", params={"seconds": 0.1}, timeout=10.0, into=dict).data
 
     assert result == {"finally": True}
 
@@ -171,19 +167,19 @@ def test_sync_sse_does_not_reconnect_after_a_permanently_unbuildable_request(
     assert elapsed < 1.0
 
 
-@pytest.mark.parametrize("response_data_type", [bytes, dict, ItemModel])
+@pytest.mark.parametrize("into", [bytes, dict, ItemModel])
 async def test_body_cut_short_raises_connection_error(
-    client: HTTPClient, response_data_type: type[bytes | dict[str, object] | ItemModel]
+    client: HTTPClient, into: type[bytes | dict[str, object] | ItemModel]
 ) -> None:
     # A Content-Length body whose connection dies early surfaces as pyreqwest's `DecodeError`,
     # which the old catch lists missed entirely: it leaked past `except HTTPTransportError`.
     with pytest.raises(HTTPConnectionError):
-        await client.get("truncated-content-length", response_data_type=response_data_type)
+        await client.get("truncated-content-length", into=into)
 
 
 def test_sync_body_cut_short_raises_connection_error(sync_client: SyncHTTPClient) -> None:
     with pytest.raises(HTTPConnectionError):
-        sync_client.get("truncated-content-length", response_data_type=dict)
+        sync_client.get("truncated-content-length", into=dict)
 
 
 async def test_streamed_body_cut_short_raises_connection_error(client: HTTPClient) -> None:
@@ -205,7 +201,7 @@ async def test_invalid_json_body_raises_the_stdlib_json_error(client: HTTPClient
     # Malformed JSON is a decode failure, not a transport one, so it must not be reported as a
     # dropped connection even though pyreqwest's own JSON error descends from its DecodeError.
     with pytest.raises(json.JSONDecodeError) as exc_info:
-        await client.get("invalid-json", response_data_type=dict)
+        await client.get("invalid-json", into=dict)
 
     assert type(exc_info.value) is json.JSONDecodeError
 

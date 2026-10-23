@@ -87,22 +87,20 @@ def _headers(result: dict[str, Any]) -> dict[str, str]:
 
 
 async def _bearer(client: HTTPClient) -> str:
-    return _headers((await client.get("echo-headers", response_data_type=dict)).data)[
-        "authorization"
-    ]
+    return _headers((await client.get("echo-headers", into=dict)).data)["authorization"]
 
 
 def _sync_bearer(client: SyncHTTPClient) -> str:
-    return _headers(client.get("echo-headers", response_data_type=dict).data)["authorization"]
+    return _headers(client.get("echo-headers", into=dict).data)["authorization"]
 
 
 async def _token_requests(client: HTTPClient, key: str) -> list[dict[str, Any]]:
-    result = (await client.get(f"oauth/token-requests?key={key}", response_data_type=dict)).data
+    result = (await client.get(f"oauth/token-requests?key={key}", into=dict)).data
     return result["requests"]
 
 
 def _sync_token_requests(client: SyncHTTPClient, key: str) -> list[dict[str, Any]]:
-    result = client.get(f"oauth/token-requests?key={key}", response_data_type=dict).data
+    result = client.get(f"oauth/token-requests?key={key}", into=dict).data
     return result["requests"]
 
 
@@ -846,8 +844,9 @@ async def test_token_endpoint_server_error_is_an_oauth_token_error(base_url: str
             await _bearer(api)
 
     assert error_info.value.token_url == token_url
-    assert isinstance(error_info.value.__cause__, HTTPResponseError)
-    assert error_info.value.__cause__.status == 500
+    cause = error_info.value.__cause__
+    assert isinstance(cause, HTTPResponseError)
+    assert cause.status == 500
 
 
 def test_sync_token_endpoint_server_error_is_an_oauth_token_error(base_url: str) -> None:
@@ -863,8 +862,9 @@ def test_sync_token_endpoint_server_error_is_an_oauth_token_error(base_url: str)
         _sync_bearer(api)
 
     assert error_info.value.token_url == token_url
-    assert isinstance(error_info.value.__cause__, HTTPResponseError)
-    assert error_info.value.__cause__.status == 500
+    cause = error_info.value.__cause__
+    assert isinstance(cause, HTTPResponseError)
+    assert cause.status == 500
 
 
 def test_token_refresh_request_without_token_request_is_rejected() -> None:
@@ -1271,8 +1271,9 @@ async def test_refresh_rejected_with_a_non_400_is_not_retried_as_a_mint(
             await _bearer(api)
 
     assert first == "Bearer token-1"
-    assert isinstance(error_info.value.__cause__, HTTPResponseError)
-    assert error_info.value.__cause__.status == 429
+    cause = error_info.value.__cause__
+    assert isinstance(cause, HTTPResponseError)
+    assert cause.status == 429
     grant_types = [r["body"]["grant_type"] for r in await _token_requests(client, key)]
     assert grant_types == ["client_credentials", "refresh_token"]
 
@@ -1293,8 +1294,9 @@ def test_sync_refresh_rejected_with_a_non_400_is_not_retried_as_a_mint(
             _sync_bearer(api)
 
     assert first == "Bearer token-1"
-    assert isinstance(error_info.value.__cause__, HTTPResponseError)
-    assert error_info.value.__cause__.status == 429
+    cause = error_info.value.__cause__
+    assert isinstance(cause, HTTPResponseError)
+    assert cause.status == 429
     grant_types = [r["body"]["grant_type"] for r in _sync_token_requests(sync_client, key)]
     assert grant_types == ["client_credentials", "refresh_token"]
 

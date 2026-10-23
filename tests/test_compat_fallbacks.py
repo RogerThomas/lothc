@@ -63,6 +63,13 @@ def test_msgspec_falls_back_to_none(compat_without_optional_deps: ModuleType) ->
     assert compat_without_optional_deps.msgspec is None
 
 
+def test_installed_flags_are_false_without_either_extra(
+    compat_without_optional_deps: ModuleType,
+) -> None:
+    assert compat_without_optional_deps.msgspec_installed is False
+    assert compat_without_optional_deps.pydantic_installed is False
+
+
 def test_struct_and_decoder_fall_back_to_empty_stub_classes(
     compat_without_optional_deps: ModuleType,
 ) -> None:
@@ -112,3 +119,34 @@ def test_import_lothc_succeeds_without_msgspec_or_pydantic() -> None:
         [sys.executable, "-c", script], capture_output=True, text=True, check=False
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_into_without_either_extra(base_url: str) -> None:
+    # A fresh subprocess, for the same reason as the test above: `lothc._client` binds the real
+    # libraries at import. It talks to this session's test server, which keeps serving on its
+    # own thread while this one waits.
+    script = (
+        "import builtins, sys\n"
+        "from typing import Any\n"
+        "_real_import = builtins.__import__\n"
+        "def _blocking_import(name, globals=None, locals=None, fromlist=(), level=0):\n"
+        "    if name.split('.')[0] in {'msgspec', 'pydantic'}:\n"
+        "        raise ImportError(f'blocked for test: {name}')\n"
+        "    return _real_import(name, globals, locals, fromlist, level)\n"
+        "builtins.__import__ = _blocking_import\n"
+        "from lothc import SyncHTTPClient\n"
+        "with SyncHTTPClient(base_url=sys.argv[1]) as client:\n"
+        "    assert client.get('items/7', into=bytes).data.startswith(b'{')\n"
+        "    assert client.get('items/7', into=dict).data['id'] == 7\n"
+        "    assert client.get('items/7', into=dict[str, Any]).data['id'] == 7\n"
+        "    try:\n"
+        "        client.get('json-array', into=list[int])\n"
+        "    except TypeError as error:\n"
+        "        print(error)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script, base_url], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "install lothc[msgspec] or lothc[pydantic]" in result.stdout

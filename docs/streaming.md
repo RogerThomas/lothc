@@ -34,9 +34,9 @@ async for chunk in client.stream_get("download/large-file"):
 This is the safe default for arbitrary binary content, including bytes that happen to contain a
 literal `\n` — nothing here ever inspects or splits the chunk boundaries.
 
-## NDJSON (`response_data_type`)
+## NDJSON (`into`)
 
-Pass `response_data_type` to switch to newline-buffered decoding instead: chunks are
+Pass `into` to switch to newline-buffered decoding instead: chunks are
 buffered internally and split on `\n`, and each complete line is parsed and decoded as it
 arrives:
 
@@ -49,18 +49,19 @@ arrives:
     reading a call site.
 
 ```python
-async for item in client.stream_get("stream/items", response_data_type=ItemModel):
+async for item in client.stream_get("stream/items", into=ItemModel):
     print(item)  # ItemModel(...), one per NDJSON line
 ```
 
-Same decode targets as everywhere else — a pydantic `BaseModel`, a msgspec `Struct`,
-plain `dict`, or a pydantic `TypeAdapter`/msgspec `Decoder` for a discriminated union (see
-[SSE](sse.md) for the equivalent pattern). A trailing line with no final `\n` is still decoded
-once the connection closes.
+Same decode targets as everywhere else — any type expression: a pydantic `BaseModel`, a msgspec
+`Struct`, plain `dict`, `list[ItemModel]` for lines that are arrays, or a union such as
+`ItemCreated | ItemDeleted` for a discriminated union (see [SSE](sse.md) for the equivalent
+pattern). A pre-built pydantic `TypeAdapter`/msgspec `Decoder` works too. A trailing line with no
+final `\n` is still decoded once the connection closes.
 
 !!! warning
 
-    The buffering is strictly conditional on `response_data_type` being passed — without
+    The buffering is strictly conditional on `into` being passed — without
     it, chunks are never split on `\n`. Passing binary data through the raw path is always safe;
     it's only the NDJSON path that assumes line-delimited text.
 
@@ -71,13 +72,11 @@ them), so you can stream the *response* to a request that itself has a body — 
 back the results of a search:
 
 ```python
-async for item in client.stream_post(
-    "stream/search", json={"q": "pikachu"}, response_data_type=ItemModel
-):
+async for item in client.stream_post("stream/search", json={"q": "pikachu"}, into=ItemModel):
     print(item)
 ```
 
-The raw-chunks default applies here too — omit `response_data_type` to get unbuffered
+The raw-chunks default applies here too — omit `into` to get unbuffered
 `bytes` back from a `stream_post` call.
 
 ## Timeouts

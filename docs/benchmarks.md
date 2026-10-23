@@ -9,13 +9,13 @@ Raw numbers behind the throughput race on the [home page](index.md#performance),
 100 (plus a 1,000-request warm-up, untimed).
 
 `lothc`, `lothc-msgspec`, and `lothc-pydantic` are the same `HTTPClient`, differing only in
-`response_data_type`: `lothc` decodes into a plain `dict` (unvalidated),
+`into`: `lothc` decodes into a plain `dict` (unvalidated),
 `lothc-msgspec` into a real nested msgspec `Struct`, and `lothc-pydantic` into a real nested
 pydantic `BaseModel` — both "typed" rows decode the exact same nested `user`/`data`/`pagination`
 response shape the server returns, fully parsed and constructed, not a shortcut subset of it.
 
 Every other library in this table gets exactly one row, because none of them have an equivalent
-to `response_data_type` at all — `httpx`/`httpx2`/`aiohttp`/`niquests`/`aiosonic`/`pyreqwest`'s
+to `into` at all — `httpx`/`httpx2`/`aiohttp`/`niquests`/`aiosonic`/`pyreqwest`'s
 `.json()` (or similar) hands back a plain `dict`, full stop. Decoding that into a real, validated
 object of your own type is something you'd write and maintain yourself on top of any of them,
 because it isn't a feature those clients offer — it's a first-class, built-in part of lothc.
