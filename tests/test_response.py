@@ -1,10 +1,15 @@
+import copy
+import pickle
 from collections.abc import KeysView
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Any
 
+import pytest
 from msgspec import Struct
 from pydantic import BaseModel
 
-from lothc import CaseInsensitiveDict, HTTPClient, SyncHTTPClient
+from lothc import CaseInsensitiveDict, HTTPClient, Response, SyncHTTPClient
 
 
 @dataclass
@@ -270,3 +275,234 @@ async def test_head_result_has_an_elapsed_time(client: HTTPClient) -> None:
     result = await client.head("items/7")
 
     assert result.elapsed >= 0.0
+
+
+class _SetCookieHeaders(BaseModel):
+    set_cookie: str
+
+
+def _read_headers_first(headers: CaseInsensitiveDict, operation: str) -> None:
+    match operation:
+        case "repr":
+            repr(headers)
+        case "eq":
+            _ = CaseInsensitiveDict() == headers
+        case "iter":
+            list(headers)
+        case "len":
+            len(headers)
+        case "contains":
+            _ = "set-cookie" in headers
+        case "get_all":
+            headers.get_all("set-cookie")
+        case "setitem":
+            headers["X-Added"] = "added"
+        case "delitem":
+            del headers["content-length"]
+        case "update":
+            headers.update({"X-Added": "added"})
+        case "copy":
+            headers.copy()
+        case "pickle":
+            pickle.dumps(headers)
+        case _:
+            raise AssertionError(operation)
+
+
+# Response headers are converted on first read, so every way in must see the whole set.
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "repr",
+        "eq",
+        "iter",
+        "len",
+        "contains",
+        "get_all",
+        "setitem",
+        "delitem",
+        "update",
+        "copy",
+        "pickle",
+    ],
+)
+async def test_response_headers_are_complete_whichever_operation_reads_them_first(
+    client: HTTPClient, operation: str
+) -> None:
+    result = await client.get("multi-set-cookie", into=dict)
+
+    _read_headers_first(result.headers, operation)
+
+    assert result.headers.get_all("set-cookie") == [
+        "session=abc; Path=/",
+        "csrf=xyz; Path=/",
+        "theme=dark; Path=/",
+    ]
+    assert result.headers["Content-Type"] == "application/json"
+    assert repr(result.headers).startswith("CaseInsensitiveDict([")
+
+
+async def test_response_headers_keep_the_names_and_order_they_arrived_in(
+    client: HTTPClient,
+) -> None:
+    result = await client.get("multi-set-cookie", into=dict)
+
+    assert list(result.headers) == [
+        "server",
+        "date",
+        "content-type",
+        "content-length",
+        "set-cookie",
+    ]
+    assert type(result.headers) is CaseInsensitiveDict
+
+
+def test_sync_response_headers_keep_the_names_and_order_they_arrived_in(
+    sync_client: SyncHTTPClient,
+) -> None:
+    result = sync_client.get("multi-set-cookie", into=dict)
+
+    assert list(result.headers) == [
+        "server",
+        "date",
+        "content-type",
+        "content-length",
+        "set-cookie",
+    ]
+    assert type(result.headers) is CaseInsensitiveDict
+
+
+async def test_response_headers_are_one_object_whose_mutations_persist(client: HTTPClient) -> None:
+    result = await client.get("multi-set-cookie", into=dict)
+
+    headers = result.headers
+    headers["X-Added"] = "added"
+    del headers["content-length"]
+
+    assert result.headers is headers
+    assert result.headers["x-added"] == "added"
+    assert "content-length" not in result.headers
+    assert result.headers.get_all("set-cookie") == [
+        "session=abc; Path=/",
+        "csrf=xyz; Path=/",
+        "theme=dark; Path=/",
+    ]
+
+
+def test_sync_response_headers_are_one_object_whose_mutations_persist(
+    sync_client: SyncHTTPClient,
+) -> None:
+    result = sync_client.get("multi-set-cookie", into=dict)
+
+    headers = result.headers
+    headers["X-Added"] = "added"
+    del headers["content-length"]
+
+    assert result.headers is headers
+    assert result.headers["x-added"] == "added"
+    assert "content-length" not in result.headers
+    assert result.headers.get_all("set-cookie") == [
+        "session=abc; Path=/",
+        "csrf=xyz; Path=/",
+        "theme=dark; Path=/",
+    ]
+
+
+async def test_head_and_download_headers_are_one_object_whose_mutations_persist(
+    client: HTTPClient,
+) -> None:
+    head = await client.head("items/7")
+    downloaded = await client.download("multi-set-cookie")
+
+    head.headers["X-Added"] = "added"
+    downloaded.headers["X-Added"] = "added"
+
+    assert head.headers is head.headers
+    assert head.headers["x-added"] == "added"
+    assert head.headers["X-Item-Exists"] == "true"
+    assert downloaded.headers is downloaded.headers
+    assert downloaded.headers["x-added"] == "added"
+    assert downloaded.headers.get_all("set-cookie") == [
+        "session=abc; Path=/",
+        "csrf=xyz; Path=/",
+        "theme=dark; Path=/",
+    ]
+
+
+def test_sync_head_and_download_headers_are_one_object_whose_mutations_persist(
+    sync_client: SyncHTTPClient,
+) -> None:
+    head = sync_client.head("items/7")
+    downloaded = sync_client.download("multi-set-cookie")
+
+    head.headers["X-Added"] = "added"
+    downloaded.headers["X-Added"] = "added"
+
+    assert head.headers is head.headers
+    assert head.headers["x-added"] == "added"
+    assert head.headers["X-Item-Exists"] == "true"
+    assert downloaded.headers is downloaded.headers
+    assert downloaded.headers["x-added"] == "added"
+    assert downloaded.headers.get_all("set-cookie") == [
+        "session=abc; Path=/",
+        "csrf=xyz; Path=/",
+        "theme=dark; Path=/",
+    ]
+
+
+async def test_typed_headers_and_headers_both_come_from_the_response(client: HTTPClient) -> None:
+    result = await client.get(
+        "multi-set-cookie", into=dict, response_headers_type=_SetCookieHeaders
+    )
+
+    assert result.typed_headers.set_cookie == "session=abc; Path=/"
+    assert result.headers is result.headers
+    assert len(result.headers.get_all("set-cookie")) == 3
+
+
+def test_sync_typed_headers_and_headers_both_come_from_the_response(
+    sync_client: SyncHTTPClient,
+) -> None:
+    result = sync_client.get("multi-set-cookie", into=dict, response_headers_type=_SetCookieHeaders)
+
+    assert result.typed_headers.set_cookie == "session=abc; Path=/"
+    assert result.headers is result.headers
+    assert len(result.headers.get_all("set-cookie")) == 3
+
+
+async def test_unread_response_headers_survive_pickling_and_copying(client: HTTPClient) -> None:
+    pickled = await client.get("multi-set-cookie", into=dict)
+    copied = await client.get("multi-set-cookie", into=dict)
+
+    restored: Response[dict[str, Any]] = pickle.loads(pickle.dumps(pickled))  # noqa: S301 — round-tripping our own object
+    deep_copy = copy.deepcopy(copied)
+
+    for response in (restored, deep_copy):
+        assert type(response.headers) is CaseInsensitiveDict
+        assert response.headers.get_all("set-cookie") == [
+            "session=abc; Path=/",
+            "csrf=xyz; Path=/",
+            "theme=dark; Path=/",
+        ]
+    assert restored.headers == pickled.headers
+    assert deep_copy.headers == copied.headers
+    assert deep_copy.headers is not copied.headers
+
+
+async def test_response_headers_can_be_read_after_the_client_closes(base_url: str) -> None:
+    async with HTTPClient(base_url=base_url) as client:
+        result = await client.get("multi-set-cookie", into=dict)
+
+    assert len(result.headers.get_all("set-cookie")) == 3
+
+
+def test_sync_response_headers_can_be_read_on_another_thread_after_the_client_closes(
+    base_url: str,
+) -> None:
+    with SyncHTTPClient(base_url=base_url) as client:
+        result = client.get("multi-set-cookie", into=dict)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        set_cookies = pool.submit(result.headers.get_all, "set-cookie").result()
+
+    assert len(set_cookies) == 3

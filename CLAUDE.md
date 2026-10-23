@@ -518,6 +518,22 @@ directional only.
   - `__repr__` switches to the pair-list form once a name repeats.
   - The one `cast` in `__init__` covers a basedpyright artifact (it synthesizes an impossible
     `Mapping[tuple[str, str], Unknown]`).
+  - **Built on first read, not per response** (`_LazyHeaders`). Eager conversion was ~2.7us of
+    every request and cost ~15% throughput in `task perf` (46.9k → 39.7k req/s), and most
+    callers never read `.headers`. Lazy costs 0.17us unread, 2.57us read once. `task perf` (100k
+    requests, concurrency 100, 6 interleaved runs a side, medians): `lothc` 40.1k → 44.5k req/s,
+    `lothc-msgspec` 49.8k → 52.1k, pyreqwest control 53.9k → 55.3k.
+    - The subclass holds pyreqwest's `HeaderMap` and leaves `_store` unset, so the first access
+      of any kind lands in `__getattr__`, which builds it and swaps `__class__` to plain
+      `CaseInsensitiveDict`: `type()`, `repr`, pickling, identity and mutation are unchanged,
+      and so is `Response`'s constructor. `__reduce_ex__` materializes first, since pickle/copy
+      look it up on the class.
+    - It holds the `HeaderMap`, not the response, because a read response caches its body
+      (holding 40 10MB responses: ~470MB RSS; holding 150 maps: ~100MB vs ~85MB holding none).
+    - `_check_status`'s error headers stay eager: off the hot path.
+  - **`HeaderMap` gets its own `__init__` path** (`_store_from_header_map`): its names are
+    always lowercase, so the per-header `.lower()` and the `_header_pairs` dispatch are skipped,
+    2.48us → 1.98us for 13 headers (1.23us of that is `.items()` itself).
 - **`.to_bytes()`, never `bytes(x.bytes())`**, to turn a `pyreqwest.bytes.Bytes` into `bytes`. And
   don't convert when the target accepts a buffer: `msgspec.json.decode()` does, so the `Struct`
   branch decodes the raw bytes directly; `pydantic.model_validate_json()` needs real `bytes`, so
