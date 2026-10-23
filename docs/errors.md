@@ -118,7 +118,9 @@ Decoding an error body is best-effort because an error body is where a server is
 honour its own contract (the classic case: a proxy in front of a JSON API answers 502 with an HTML
 page). You always get the `raises=` error, with its real status, headers and body; a body that
 doesn't match only means `.error` is a `dict` or `None` and `.parse_error` holds the decode
-library's own exception.
+library's own exception. `.parse_error` is always a `ValueError`: anything else decoding raises
+(a `RecursionError` for a body nested too deeply to parse, a `TypeError` from a pinned `dict`
+subclass's own constructor) is wrapped in one, with the original as its `__cause__`.
 
 On the success path it's the opposite: an `into` body that doesn't match raises the
 decode library's own error (`pydantic.ValidationError`, `msgspec.ValidationError`), unwrapped,

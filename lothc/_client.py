@@ -190,7 +190,9 @@ class HTTPResponseError[E = object](Exception):
     `.error` is the body decoded: as `E` when a subclass pins it
     (`class APIError(HTTPResponseError[NotFound | Conflict]): pass`, passed as `raises=`), else
     as a JSON object (`dict`), else `None` (HTML, text, an array). When a pinned `E` didn't match,
-    `.parse_error` holds why (the decode library's own `ValueError`). `.parse_error` isn't
+    `.parse_error` holds why (the decode library's own `ValueError`, or a `ValueError` chained to
+    whatever else decoding raised, e.g. a `RecursionError` for a body nested too deep to parse).
+    `.parse_error` isn't
     carried across pickling, since pydantic's `ValidationError` can't be pickled.
     """
 
@@ -310,16 +312,14 @@ def _atomic_download_file(dest: Path) -> Generator[BufferedWriter]:
         raise
 
 
-def _complete_ndjson_lines(pending: bytearray, chunk: Buffer) -> list[bytearray]:
-    """Append `chunk` to `pending` and return the non-blank lines it completes, leaving only the
+def _take_completed_lines(pending: bytearray, chunk: Buffer) -> list[bytearray]:
+    """Append `chunk` to `pending` and return every line it completes, leaving only the
     still-unterminated tail in `pending`.
 
     Linear in the bytes received. The old `line, buffer = buffer.split(b"\\n", 1)` loop copied the
     whole remainder once per line (a 4MB chunk took ~4.7s; this takes ~15ms), and only the newly
     appended bytes are searched for a newline, since everything before the last one has already
-    been consumed; rescanning all of `pending` made one long line quadratic instead. A line that
-    is only whitespace is skipped rather than decoded, which covers the `\\r` a CRLF-terminated
-    stream leaves on its blank lines.
+    been consumed; rescanning all of `pending` made one long line quadratic instead.
     """
     start = len(pending)
     pending += chunk
@@ -328,7 +328,32 @@ def _complete_ndjson_lines(pending: bytearray, chunk: Buffer) -> list[bytearray]
         return []
     lines = pending[:end].split(b"\n")
     del pending[: end + 1]
-    return [line for line in lines if line.strip()]
+    return lines
+
+
+def _complete_ndjson_lines(pending: bytearray, chunk: Buffer) -> list[bytearray]:
+    """The non-blank NDJSON lines `chunk` completes (see `_take_completed_lines`). A line that is
+    only whitespace is skipped rather than decoded, which covers the `\\r` a CRLF-terminated
+    stream leaves on its blank lines; a JSON decoder tolerates the `\\r` ending any other line."""
+    return [line for line in _take_completed_lines(pending, chunk) if line.strip()]
+
+
+def _strip_carriage_return(line: bytearray) -> bytearray:
+    return line[:-1] if line.endswith(b"\r") else line
+
+
+def _complete_text_lines(pending: bytearray, chunk: Buffer) -> list[bytearray]:
+    """The raw text lines `chunk` completes, for `into=str` (see `_take_completed_lines`): every
+    one, blank lines included, with one trailing `\\r` (from a CRLF terminator) stripped."""
+    return [_strip_carriage_return(line) for line in _take_completed_lines(pending, chunk)]
+
+
+def _final_line(pending: bytearray, *, raw_text: bool) -> bytearray | None:
+    """The unterminated tail left in `pending` when a line stream ends, if it holds a line: any
+    bytes at all for `into=str` (CR-stripped like the others), else only a non-blank one."""
+    if raw_text:
+        return _strip_carriage_return(pending) if pending else None
+    return pending if pending.strip() else None
 
 
 def _idle_timeout_error(idle: float) -> HTTPTimeoutError:
@@ -2404,16 +2429,29 @@ def _validate_raises(raises: type[HTTPResponseError[Any]] | None) -> None:
 
 
 def _json_object_or_none(body: bytes) -> dict[str, Any] | None:
-    """`body` as a JSON object, or `None` if it isn't one (HTML, text, an array, `null`)."""
+    """`body` as a JSON object, or `None` if it isn't one (HTML, text, an array, `null`, or
+    nested too deep to parse)."""
     try:
         return _JSONObjectDecoder().decode(body)
-    except ValueError:
+    except (ValueError, RecursionError):  # `RecursionError`: nested too deep for stdlib `json`
         return None
 
 
 # Whatever the pinned `E` decodes to — genuinely dynamic, can't state it statically.
 def _decode_pinned_error(body: bytes, decoder: _Decoder | None) -> Any:  # noqa: ANN401
     return body if decoder is None else _decode_json_line(body, decoder)
+
+
+def _as_parse_error(error: Exception) -> ValueError:
+    """`error` as the `ValueError` `.parse_error` promises: itself if it already is one (every
+    decode library's own failure), else a `ValueError` chained to it (`__cause__`), for the
+    `RecursionError` a deeply nested body raises and the `TypeError` a pinned `dict` subclass's
+    own constructor can raise."""
+    if isinstance(error, ValueError):
+        return error
+    parse_error = ValueError(f"error body could not be decoded: {error!r}")
+    parse_error.__cause__ = error
+    return parse_error
 
 
 def _status_error(
@@ -2429,21 +2467,26 @@ def _status_error(
     own contract: a body that doesn't match the pinned `E` (a proxy's HTML 502, an error shape
     the union doesn't cover) keeps the decode library's `ValueError` on `.parse_error` and falls
     back to a JSON object, else `None`, rather than replacing the status error with a
-    `ValidationError`. Nothing pinned: a JSON object, else `None`.
+    `ValidationError`. A body too deeply nested to parse, or one a pinned `dict` subclass's
+    constructor rejects, is treated the same, its error wrapped in a `ValueError`. Nothing pinned:
+    a JSON object, else `None`.
     """
     decoding = _error_body_decoding(raises)
     if not decoding.pinned:
         return raises(status, body, request_info, _json_object_or_none(body), headers=headers)
     try:
         error = _decode_pinned_error(body, decoding.decoder)
-    except ValueError as parse_error:
+    # An unusable `E` was already rejected when `raises` was resolved, so anything decoding
+    # raises here is the body's fault: too deeply nested (`RecursionError`), or refused by a
+    # pinned `dict` subclass's own constructor (`TypeError`).
+    except (ValueError, RecursionError, TypeError) as decode_error:
         return raises(
             status,
             body,
             request_info,
             _json_object_or_none(body),
             headers=headers,
-            parse_error=parse_error,
+            parse_error=_as_parse_error(decode_error),
         )
     return raises(status, body, request_info, error, headers=headers)
 
@@ -3932,15 +3975,18 @@ class HTTPClient:
                         if chunk is None:
                             return
                         yield bytes(chunk)
+                raw_text = isinstance(decoder, _TextDecoder)
+                complete_lines = _complete_text_lines if raw_text else _complete_ndjson_lines
                 pending = bytearray()
                 while True:
                     chunk = await _read_chunk_within(raw_response, idle)
                     if chunk is None:
                         break
-                    for line in _complete_ndjson_lines(pending, chunk):
+                    for line in complete_lines(pending, chunk):
                         yield _decode_json_line(line, decoder)
-                if pending.strip():
-                    yield _decode_json_line(pending, decoder)
+                final_line = _final_line(pending, raw_text=raw_text)
+                if final_line is not None:
+                    yield _decode_json_line(final_line, decoder)
         except (PyreqwestRequestError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
 
@@ -5841,12 +5887,15 @@ class SyncHTTPClient:
             if decoder is None:
                 yield from chunks
                 return
+            raw_text = isinstance(decoder, _TextDecoder)
+            complete_lines = _complete_text_lines if raw_text else _complete_ndjson_lines
             pending = bytearray()
             for chunk in chunks:
-                for line in _complete_ndjson_lines(pending, chunk):
+                for line in complete_lines(pending, chunk):
                     yield _decode_json_line(line, decoder)
-            if pending.strip():
-                yield _decode_json_line(pending, decoder)
+            final_line = _final_line(pending, raw_text=raw_text)
+            if final_line is not None:
+                yield _decode_json_line(final_line, decoder)
         except (PyreqwestRequestError, PyreqwestBuilderError) as error:
             raise _translate_transport_error(error) from error
 

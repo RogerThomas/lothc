@@ -251,8 +251,8 @@ max-attributes = 15 # `OAuthProvider`/`SyncOAuthProvider` (lothc/_oauth.py) stor
 max-locals = 29 # one real case (the streaming line-buffering generator) legitimately needs a
 # couple more than pylint's default 15 — matches this project's own mccabe complexity ceiling
 # ([tool.ruff.lint.mccabe] max-complexity = 15) in spirit, just a different metric. Bumped again,
-# 20 -> 21, after `_sse_stream`/its sync mirror gained a 21st local (the new `error_type` param,
-# threaded through for typed error bodies), then 21 -> 27 after `build`/its sync mirror gained
+# 20 -> 21, after `_sse_stream`/its sync mirror gained a 21st local (the then-new `error_type`
+# param, since replaced by `raises`, threaded through for typed error bodies), then 21 -> 27 after `build`/its sync mirror gained
 # the TLS/connection-pool config params (`connect_timeout`, `root_certificates`, `identity_pem`,
 # `min_tls_version`, `max_tls_version`, `danger_accept_invalid_certs`, `https_only`,
 # `max_connections`, `pool_idle_timeout`, `pool_max_idle_per_host`, `pool_timeout`), then

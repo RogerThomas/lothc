@@ -498,7 +498,13 @@ directional only.
   `_decoder_for(E)`. A `ValueError` (malformed JSON, pydantic's and msgspec's validation errors)
   goes on `.parse_error` and `.error` falls back to a JSON object, else `None`; it used to
   propagate, so a proxy's HTML 502 against a pydantic error model surfaced as `ValidationError`,
-  losing the status. An unusable `E` (a caller bug) still raises its `TypeError`.
+  losing the status. An unusable `E` (a caller bug) still raises its `TypeError`, but at
+  resolution, so a `RecursionError` (a deeply nested body) or `TypeError` (a pinned `dict`
+  subclass's constructor) from the decode is the body's fault too: caught alongside `ValueError`
+  and wrapped in one (`__cause__` is the original), keeping `.parse_error: ValueError | None`
+  and "every decode failure is a `ValueError`". The default fallback catches `RecursionError` too.
+- **`stream_get`/`stream_post` with `into=str` yield raw text lines, not NDJSON**: every line,
+  blank ones as `""`, one trailing `\r` stripped. NDJSON targets still skip blank lines.
 - **`HTTPResponseError` pickles as `type(self)`, carrying `.error`**, so a `raises=` subclass
   survives a process boundary (module-level classes only, as pickle finds them by name).
   `.parse_error` isn't pickled (pydantic's `ValidationError` can't be).

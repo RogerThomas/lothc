@@ -170,3 +170,107 @@ def test_sync_a_str_pinned_error_is_the_body_text(sync_client: SyncHTTPClient) -
         sync_client.get("invalid-json-error", raises=TextError)
 
     assert exc_info.value.error == "<html><body>502 Bad Gateway</body></html>"
+
+
+class DeepDict(dict[str, Any]):
+    pass
+
+
+class DeepDictError(HTTPResponseError[DeepDict]):
+    pass
+
+
+class RejectingDict(dict[str, Any]):
+    def __init__(self, *args: object) -> None:
+        raise TypeError(f"rejected {args!r}")
+
+
+class RejectingDictError(HTTPResponseError[RejectingDict]):
+    pass
+
+
+async def test_a_deeply_nested_error_body_gives_no_error(client: HTTPClient) -> None:
+    with pytest.raises(HTTPResponseError) as exc_info:
+        await client.get("deeply-nested-error")
+
+    assert exc_info.value.status == 500
+    assert exc_info.value.error is None
+
+
+def test_sync_a_deeply_nested_error_body_gives_no_error(sync_client: SyncHTTPClient) -> None:
+    with pytest.raises(HTTPResponseError) as exc_info:
+        sync_client.get("deeply-nested-error")
+
+    assert exc_info.value.status == 500
+    assert exc_info.value.error is None
+
+
+async def test_a_deeply_nested_body_for_a_pinned_error_sets_parse_error(
+    client: HTTPClient,
+) -> None:
+    with pytest.raises(DeepDictError) as exc_info:
+        await client.get("deeply-nested-error", raises=DeepDictError)
+
+    assert exc_info.value.error is None
+    assert isinstance(exc_info.value.parse_error, ValueError)
+    assert isinstance(exc_info.value.parse_error.__cause__, RecursionError)
+
+
+def test_sync_a_deeply_nested_body_for_a_pinned_error_sets_parse_error(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(DeepDictError) as exc_info:
+        sync_client.get("deeply-nested-error", raises=DeepDictError)
+
+    assert exc_info.value.error is None
+    assert isinstance(exc_info.value.parse_error, ValueError)
+    assert isinstance(exc_info.value.parse_error.__cause__, RecursionError)
+
+
+async def test_a_pinned_dict_subclass_rejecting_the_body_sets_parse_error(
+    client: HTTPClient,
+) -> None:
+    with pytest.raises(RejectingDictError) as exc_info:
+        await client.get("boom", raises=RejectingDictError)
+
+    assert exc_info.value.status == 500
+    assert type(exc_info.value.error) is dict
+    assert isinstance(exc_info.value.parse_error, ValueError)
+    assert isinstance(exc_info.value.parse_error.__cause__, TypeError)
+
+
+def test_sync_a_pinned_dict_subclass_rejecting_the_body_sets_parse_error(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(RejectingDictError) as exc_info:
+        sync_client.get("boom", raises=RejectingDictError)
+
+    assert exc_info.value.status == 500
+    assert type(exc_info.value.error) is dict
+    assert isinstance(exc_info.value.parse_error, ValueError)
+    assert isinstance(exc_info.value.parse_error.__cause__, TypeError)
+
+
+async def test_stream_get_into_str_keeps_blank_lines_and_strips_crlf(client: HTTPClient) -> None:
+    lines = [line async for line in client.stream_get("crlf-text", into=str)]
+
+    assert lines == ["a", "b", "", "c"]
+
+
+def test_sync_stream_get_into_str_keeps_blank_lines_and_strips_crlf(
+    sync_client: SyncHTTPClient,
+) -> None:
+    lines = list(sync_client.stream_get("crlf-text", into=str))
+
+    assert lines == ["a", "b", "", "c"]
+
+
+async def test_stream_get_into_dict_still_skips_blank_crlf_lines(client: HTTPClient) -> None:
+    lines = [
+        line
+        async for line in client.stream_get(
+            "ndjson-blank-line", params={"count": 2, "newline": "crlf"}, into=dict
+        )
+    ]
+
+    assert lines == [{"i": 0}, {"i": 1}]
