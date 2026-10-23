@@ -419,15 +419,14 @@ directional only.
 - **`into` takes any type expression (`TypeForm`, from `typing_extensions>=4.13.0`)**, so
   `into=list[Item]` decodes a top-level array with no wrapper. `_decoder_for` (shared by
   `_decode_body` and the per-line/per-event `_decode_json_line`) maps a form to one decoder:
-  `None`/`bytes` raw, `str` raw text, exactly `dict`/`dict[str, Any]` stdlib `json` (works with no
-  extra), a bare `dict` subclass the same then `form(obj)`, a `TypeAdapter`/`Decoder` instance
+  `None`/`bytes` raw, `str` raw text, a JSON object (`dict`, `dict[str, Any]` or `typing.Dict[str,
+  Any]`, `Mapping[str, Any]`) stdlib `json` (works with no extra), a bare `dict` subclass the same then `form(obj)`, a `TypeAdapter`/`Decoder` instance
   as-is (never cached, so one built per call can't grow the cache). Anything else is walked
   (`_form_traits`: generic args, unions, `Annotated` type and metadata, `type` aliases via
   `__value__`, TypedDict/dataclass/NamedTuple fields via `get_type_hints(include_extras=True)`,
   each alias and class once so recursive ones end): a `Struct` → msgspec `Decoder`, a pydantic
   marker → pydantic `TypeAdapter`, both → `TypeError`, neither → msgspec, else pydantic, else a
-  `TypeError` naming the extras. A class msgspec doesn't know (a plain class) is a msgspec "custom
-  type": it builds fine and fails at decode with `ValidationError`. Every verb resolves it before
+  `TypeError` naming the extras. Every verb resolves it before
   sending (`_send_method` too, then hands the decoder to `_decode_body`), since resolving it in
   `_decode_body` let a POST run and only then raise `TypeError`.
   - **A pydantic marker is a `BaseModel`, pydantic or `annotated_types` `Annotated` metadata, a
@@ -436,6 +435,18 @@ directional only.
     them, so with both extras `list[Annotated[int, Field(gt=0)]]` used to return `[-5]`. Without
     pydantic, a marker is a `TypeError`, never an unvalidated decode. `Annotated[int, "doc"]` and
     `msgspec.Meta` don't count.
+  - **A form msgspec can't decode goes to pydantic, or is a `TypeError` without it.** msgspec
+    builds a `Decoder` for a "custom type" (`Path`, `deque[int]`, `IPv4Address`, a plain class)
+    and then rejects every body, after the request was sent. `_has_msgspec_custom_type` walks
+    `msgspec.inspect.type_info(form)` for a `CustomType` node, skipping `object` (a custom type to
+    `inspect`, decoded as `Any`). A form with a `Struct` stays on msgspec: pydantic can't build one.
+  - **A parametrized `dict` subclass (`OrderedDict[str, int]`, `Counter[str]`) is that same
+    custom-type case**, so it's pydantic, which validates the parameters and builds the subclass.
+    Without pydantic it's the `TypeError`, not the bare-subclass path, which would skip the
+    parameters' validation; a bare `into=OrderedDict` still needs no extra.
+  - **The JSON-object fast path matches the origin plus args, not `form == dict[str, Any]`**, which
+    `typing.Dict[str, Any]` fails, so it needed an extra and took a different path.
+    `Mapping[str, Any]` is included, since the `dict` it gets is one (`_is_json_object_form`).
   - **Container fields are walked because both libraries decode them field by field**: a
     TypedDict holding a `BaseModel` went to msgspec and always failed. Model classes' own fields
     aren't walked (their library's business).

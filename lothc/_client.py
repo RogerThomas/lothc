@@ -1125,8 +1125,22 @@ class _TextDecoder:
         return data if isinstance(data, str) else str(data, "utf-8")
 
 
+@dataclass(slots=True)
+class _SSEBytesDecoder:
+    """`sse(into=bytes)`: an event's `data`, which arrives as text, back as its UTF-8 bytes.
+    Only `sse()` uses it; everywhere else `bytes` is no decoder at all (`None`)."""
+
+    def decode(self, data: _JSONInput) -> bytes:
+        return data.encode() if isinstance(data, str) else bytes(data)
+
+
 type _Decoder = (
-    Decoder[Any] | TypeAdapter[Any] | _JSONObjectDecoder | _DictSubclassDecoder | _TextDecoder
+    Decoder[Any]
+    | TypeAdapter[Any]
+    | _JSONObjectDecoder
+    | _DictSubclassDecoder
+    | _TextDecoder
+    | _SSEBytesDecoder
 )
 type _Into = TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None
 
@@ -1262,6 +1276,53 @@ def _is_bare_dict_subclass(form: object) -> TypeIs[type[dict[Any, Any]]]:
     return _is_class(form) and not is_typeddict(form) and issubclass(form, dict)
 
 
+def _is_json_object_form(form: object) -> bool:
+    """Whether `form` means "any JSON object", which stdlib `json` decodes with no extra: `dict`,
+    `dict[str, Any]` however it's spelled (`typing.Dict[str, Any]`, bare `typing.Dict`), and
+    `Mapping[str, Any]`, since the `dict` it gets is one.
+
+    >>> from typing import Dict
+    >>> [_is_json_object_form(f) for f in (dict, Dict[str, Any], Mapping[str, Any], dict[str, int])]
+    [True, True, True, False]
+    """
+    if form is dict:
+        return True
+    # `in` a tuple, not a set: an argument can be unhashable (`Annotated` with a `dict` in it).
+    return get_origin(form) in {dict, Mapping} and get_args(form) in ((), (str, Any))
+
+
+def _is_tuple(value: object) -> TypeIs[tuple[object, ...]]:
+    # A `TypeIs`, not an inline `isinstance`: that narrows to a partially unknown tuple.
+    return isinstance(value, tuple)
+
+
+def _has_msgspec_custom_type(form: object) -> bool:
+    """Whether msgspec reads some part of `form` as a "custom type" (`Path`, `deque[int]`,
+    `IPv4Address`, a parametrized `dict` subclass such as `OrderedDict[str, int]`): one it only
+    decodes through a `dec_hook`, which lothc doesn't pass, so its `Decoder` builds fine and then
+    rejects every body. Walks `msgspec.inspect.type_info`'s tree, a recursive one ending at the
+    first node seen twice. `object` is a custom type to `type_info` but decodes as `Any`."""
+    try:
+        root = msgspec.inspect.type_info(form)
+    except TypeError:
+        # Not a type msgspec knows at all: its `Decoder` reports that itself.
+        return False
+    seen: set[int] = set()
+    pending: list[object] = [root]
+    while pending:
+        node = pending.pop()
+        if _is_tuple(node):
+            pending.extend(node)
+            continue
+        if not isinstance(node, (msgspec.inspect.Type, msgspec.inspect.Field)) or id(node) in seen:
+            continue
+        if isinstance(node, msgspec.inspect.CustomType) and node.cls is not object:
+            return True
+        seen.add(id(node))
+        pending.extend(getattr(node, name) for name in node.__struct_fields__)
+    return False
+
+
 def _msgspec_decoder(form: object) -> Decoder[Any]:
     try:
         return Decoder(form)
@@ -1278,12 +1339,13 @@ def _pydantic_adapter(form: object) -> TypeAdapter[Any]:
 
 
 def _build_decoder(form: object, model_bases: set[type]) -> _Decoder:
-    """The decoder for a type expression: raw text for `str`, stdlib `json` for `dict` and its
-    bare subclasses, else whichever library the form's models (or pydantic-only metadata) belong
-    to, else msgspec (faster), else pydantic."""
+    """The decoder for a type expression: raw text for `str`, stdlib `json` for a JSON object
+    (`dict`, `dict[str, Any]`, `Mapping[str, Any]`) and bare `dict` subclasses, else whichever
+    library the form's models (or pydantic-only metadata) belong to, else msgspec (faster) unless
+    it can't decode part of the form, else pydantic."""
     if form is str:
         return _TextDecoder()
-    if form is dict or form == dict[str, Any]:
+    if _is_json_object_form(form):
         return _JSONObjectDecoder()
     if _is_bare_dict_subclass(form):
         return _DictSubclassDecoder(form)
@@ -1301,14 +1363,22 @@ def _build_decoder(form: object, model_bases: set[type]) -> _Decoder:
                 " msgspec would silently skip: install lothc[pydantic]."
             )
         return _pydantic_adapter(form)
-    if msgspec_installed:
+    # A Struct form stays with msgspec whatever its fields are: pydantic can't build a Struct.
+    if msgspec_installed and (Struct in model_bases or not _has_msgspec_custom_type(form)):
         return _msgspec_decoder(form)
+    if msgspec_installed and not pydantic_installed:
+        raise TypeError(
+            f"into={form!r} contains a type msgspec can't decode from JSON (e.g. Path, deque,"
+            " IPv4Address, or a parametrized dict subclass such as OrderedDict[str, int]), so"
+            " every response would fail to decode: install lothc[pydantic], which can. A bare"
+            " dict subclass (into=OrderedDict) needs neither extra."
+        )
     if pydantic_installed:
         return _pydantic_adapter(form)
     raise TypeError(
         f"into={form!r} needs msgspec or pydantic to decode it: install lothc[msgspec] or"
-        " lothc[pydantic]. Only bytes, str, dict (and its subclasses) and dict[str, Any] work"
-        " without either."
+        " lothc[pydantic]. Only bytes, str, dict (and its bare subclasses), dict[str, Any] and"
+        " Mapping[str, Any] work without either."
     )
 
 
@@ -1369,11 +1439,18 @@ def _decode_json_line(data: _JSONInput, decoder: _Decoder) -> Any:  # noqa: ANN4
     return decoder.decode(data)
 
 
+def _sse_data_decoder(into: _Into) -> _Decoder:
+    """The decoder for each SSE event's `data`, resolved once per stream. Never `None`, unlike
+    `_decoder_for`'s: `data` arrives as text, so the default (`into=None`) keeps it as text and
+    `into=bytes` encodes it back."""
+    if into is bytes:
+        return _SSEBytesDecoder()
+    decoder = _decoder_for(into)
+    return _TextDecoder() if decoder is None else decoder
+
+
 def _dispatch_sse_record(
-    record: bytes,
-    state: _SSEStreamState,
-    into: _Into,
-    decoder: _Decoder | None,
+    record: bytes, state: _SSEStreamState, decoder: _Decoder
 ) -> SSEEvent[Any] | None:
     """Apply one record's `retry:`/`id:` fields to `state`, then build its event (if it has data).
 
@@ -1389,12 +1466,7 @@ def _dispatch_sse_record(
         state.last_event_id = parsed_record.id
     if parsed_record.data is None:
         return None
-    if decoder is not None:
-        data = _decode_json_line(parsed_record.data, decoder)
-    elif into is bytes:
-        data = parsed_record.data.encode()
-    else:
-        data = parsed_record.data
+    data = _decode_json_line(parsed_record.data, decoder)
     return SSEEvent(id=state.last_event_id, event=parsed_record.event, data=data)
 
 
@@ -2322,12 +2394,6 @@ class _ErrorBodyDecoding:
     decoder: _Decoder | None
 
 
-# One per `raises=` class, shared by both clients, like `_decoders` (which caches the decoder
-# itself): what this saves is the walk through the class's bases on every error. Unbounded,
-# since the classes come from source code, not data.
-_error_body_decodings: dict[type, _ErrorBodyDecoding] = {}
-
-
 def _is_response_error_class(value: object) -> TypeIs[type[HTTPResponseError[Any]]]:
     return isinstance(value, type) and issubclass(value, HTTPResponseError)
 
@@ -2391,7 +2457,15 @@ def _pinned_error_form(cls: type, bindings: Mapping[TypeVar, object]) -> tuple[(
     return ()
 
 
-def _resolve_error_body_decoding(raises: object) -> _ErrorBodyDecoding:
+# One per `raises=` class, shared by both clients, like `_decoders` (which caches the decoder
+# itself): what this saves is the walk through the class's bases on every error. Unbounded, since
+# the classes come from source code, not data. `cache` stores nothing when the call raises, so an
+# unusable `raises` (not an `HTTPResponseError` subclass, an unbound `E`, an `E` no library can
+# decode) is a `TypeError` on every call: a caller bug, never cached and never swallowed.
+@cache
+def _error_body_decoding(raises: object) -> _ErrorBodyDecoding:
+    """`raises`'s resolved `E` and its decoder. Takes `object`, since nothing has checked yet
+    that `raises` really is an `HTTPResponseError` subclass."""
     if not _is_response_error_class(raises):
         raise TypeError(
             f"raises= must be HTTPResponseError or a subclass of it, got {raises!r}. To decode"
@@ -2408,16 +2482,6 @@ def _resolve_error_body_decoding(raises: object) -> _ErrorBodyDecoding:
             f" `class {raises.__name__}(HTTPResponseError[YourErrorType]): pass`."
         )
     return _ErrorBodyDecoding(pinned=True, decoder=_decoder_for(form))
-
-
-def _error_body_decoding(raises: type[HTTPResponseError[Any]]) -> _ErrorBodyDecoding:
-    """`raises`'s resolved `E` and its decoder, cached per class. An unusable `raises` (not an
-    `HTTPResponseError` subclass, an unbound `E`, an `E` no library can decode) raises
-    `TypeError`: a caller bug, so it's never cached and never swallowed."""
-    decoding = _error_body_decodings.get(raises)
-    if decoding is None:
-        decoding = _error_body_decodings[raises] = _resolve_error_body_decoding(raises)
-    return decoding
 
 
 def _validate_raises(raises: type[HTTPResponseError[Any]] | None) -> None:
@@ -3705,8 +3769,7 @@ class HTTPClient:
         self,
         request_builder: RequestBuilder,
         state: _SSEStreamState,
-        into: _Into,
-        decoder: _Decoder | None,
+        decoder: _Decoder,
         *,
         error_for_status: bool,
         raises: type[HTTPResponseError[Any]] | None,
@@ -3743,7 +3806,7 @@ class HTTPClient:
                     records, tail = _split_sse_records(bytes(buffer))
                     buffer = bytearray(tail)
                     for record in records:
-                        event = _dispatch_sse_record(record, state, into, decoder)
+                        event = _dispatch_sse_record(record, state, decoder)
                         if event is not None:
                             yield event
         except (PyreqwestRequestError, PyreqwestBuilderError) as error:
@@ -3766,7 +3829,7 @@ class HTTPClient:
     ) -> AsyncGenerator[SSEEvent[Any]]:
         _validate_raises(raises)
         # Resolved once per stream, not per event or per reconnect.
-        decoder = _decoder_for(into)
+        decoder = _sse_data_decoder(into)
         state = _SSEStreamState(retry_delay=reconnect_delay)
         consecutive_reconnects = 0
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
@@ -3780,7 +3843,6 @@ class HTTPClient:
             connection = self._sse_connection(
                 request_builder,
                 state,
-                into,
                 decoder,
                 error_for_status=error_for_status,
                 raises=raises,
@@ -5601,8 +5663,7 @@ class SyncHTTPClient:
         self,
         request_builder: SyncRequestBuilder,
         state: _SSEStreamState,
-        into: _Into,
-        decoder: _Decoder | None,
+        decoder: _Decoder,
         *,
         error_for_status: bool,
         raises: type[HTTPResponseError[Any]] | None,
@@ -5635,7 +5696,7 @@ class SyncHTTPClient:
                 records, tail = _split_sse_records(bytes(buffer))
                 buffer = bytearray(tail)
                 for record in records:
-                    event = _dispatch_sse_record(record, state, into, decoder)
+                    event = _dispatch_sse_record(record, state, decoder)
                     if event is not None:
                         yield event
         except (PyreqwestRequestError, PyreqwestBuilderError) as error:
@@ -5659,7 +5720,7 @@ class SyncHTTPClient:
     ) -> Generator[SSEEvent[Any]]:
         _validate_raises(raises)
         # Resolved once per stream, not per event or per reconnect.
-        decoder = _decoder_for(into)
+        decoder = _sse_data_decoder(into)
         state = _SSEStreamState(retry_delay=reconnect_delay)
         consecutive_reconnects = 0
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
@@ -5673,7 +5734,6 @@ class SyncHTTPClient:
             connection = self._sse_connection(
                 request_builder,
                 state,
-                into,
                 decoder,
                 error_for_status=error_for_status,
                 raises=raises,

@@ -105,7 +105,9 @@ also means pydantic, since msgspec would silently skip it: `Annotated` metadata 
 (`Field(gt=0)`, `AfterValidator(...)`) or `annotated_types` (`Gt(0)`), a pydantic dataclass, or a
 pydantic type such as `HttpUrl`. Without pydantic installed, such a type raises `TypeError` rather
 than decoding unvalidated. Plain metadata (`Annotated[int, "doc"]`, `msgspec.Meta(gt=0)`) doesn't
-count. A type with none of these (`list[int]`) uses msgspec if it's installed, else pydantic.
+count. A type with none of these (`list[int]`) uses msgspec if it's installed, else pydantic,
+unless msgspec can't decode part of it from JSON (`Path`, `deque[int]`, `IPv4Address`, a plain
+class): that needs pydantic, and raises `TypeError` before sending without it.
 
 lothc builds the decoder once per type and reuses it, so writing `into=list[ItemModel]` inline on
 every call costs nothing extra, and so does `Annotated[int, AfterValidator(check)]` with a
@@ -128,8 +130,9 @@ An inline `lambda` validator is likewise a new type per call: it decodes correct
 new decoder every time. lothc stops caching new types once it holds 4096, so that can't grow
 memory without limit; use a module-level function (or a `type` alias) to have it built once.
 
-Without either extra only `bytes`, `str`, `dict`, `dict[str, Any]` and `dict` subclasses work;
-anything else raises a `TypeError` naming the extra to install.
+Without either extra only `bytes`, `str`, `dict`, `dict[str, Any]` (or `typing.Dict[str, Any]`),
+`Mapping[str, Any]` and bare `dict` subclasses work; anything else raises a `TypeError` naming the
+extra to install.
 
 `into=str` means the raw text, never JSON-parsed, just as `into=bytes` means the raw bytes:
 `get(into=str)` gives the body decoded as UTF-8 (invalid UTF-8 raises `UnicodeDecodeError`, a
@@ -140,7 +143,9 @@ NDJSON decode, which skips them), and a pinned `HTTPResponseError[str]` gets the
 on `.error`.
 
 A bare `dict` subclass (`OrderedDict`, `defaultdict`, your own) decodes a JSON object like
-`into=dict` and is built as that subclass (a `defaultdict` with no `default_factory`).
+`into=dict` and is built as that subclass (a `defaultdict` with no `default_factory`). A
+parametrized one (`OrderedDict[str, int]`, `Counter[str]`) also validates its keys and values, so
+it needs pydantic.
 
 A pre-built pydantic `TypeAdapter` or msgspec `Decoder` is still accepted, used as-is:
 

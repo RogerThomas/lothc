@@ -180,3 +180,52 @@ def test_into_with_pydantic_only_metadata_without_pydantic(base_url: str) -> Non
 
     assert result.returncode == 0, result.stderr
     assert "install lothc[pydantic]" in result.stdout
+
+
+def test_into_a_type_msgspec_cannot_decode_without_pydantic() -> None:
+    # msgspec builds a Decoder for these but rejects every body, so with pydantic absent it's a
+    # `TypeError` up front. The base URL has nothing listening: a request actually sent would
+    # raise `HTTPConnectionError` instead, so the `TypeError` proves nothing was sent.
+    script = (
+        "import asyncio, builtins\n"
+        "from collections import OrderedDict, deque\n"
+        "from ipaddress import IPv4Address\n"
+        "from pathlib import Path\n"
+        "_real_import = builtins.__import__\n"
+        "def _blocking_import(name, globals=None, locals=None, fromlist=(), level=0):\n"
+        "    if name.split('.')[0] == 'pydantic':\n"
+        "        raise ImportError(f'blocked for test: {name}')\n"
+        "    return _real_import(name, globals, locals, fromlist, level)\n"
+        "builtins.__import__ = _blocking_import\n"
+        "from lothc import HTTPClient, HTTPConnectionError, SyncHTTPClient\n"
+        "forms = [Path, deque[int], IPv4Address, list[Path], OrderedDict[str, int]]\n"
+        "base_url = 'http://127.0.0.1:9/'\n"
+        "with SyncHTTPClient(base_url=base_url) as client:\n"
+        "    for form in forms:\n"
+        "        try:\n"
+        "            client.get('items/7', into=form)\n"
+        "        except TypeError as error:\n"
+        "            print(error)\n"
+        "    # `object` is a custom type to `msgspec.inspect` too, but msgspec decodes it as Any,\n"
+        "    # so it's sent (and fails to connect) rather than rejected.\n"
+        "    try:\n"
+        "        client.get('items/7', into=list[object])\n"
+        "    except HTTPConnectionError:\n"
+        "        print('sent')\n"
+        "async def main():\n"
+        "    async with HTTPClient(base_url=base_url) as client:\n"
+        "        for form in forms:\n"
+        "            try:\n"
+        "                await client.get('items/7', into=form)\n"
+        "            except TypeError as error:\n"
+        "                print(error)\n"
+        "asyncio.run(main())\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("can't decode from JSON") == 10
+    assert result.stdout.count("install lothc[pydantic]") == 10
+    assert "sent" in result.stdout.splitlines()
