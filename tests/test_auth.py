@@ -1,6 +1,7 @@
 import base64
 
 import pytest
+from _helpers import echoed_headers
 
 from lothc import HTTPClient, SyncHTTPClient
 
@@ -32,7 +33,7 @@ async def test_bearer_token_sends_authorization_header(base_url: str) -> None:
     async with HTTPClient(base_url=base_url, bearer_token="token-value") as client:
         result = (await client.get("echo-headers", into=dict)).data
 
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     assert headers["authorization"] == "Bearer token-value"
 
 
@@ -43,8 +44,8 @@ async def test_bearer_auth_callable_is_invoked_per_request(base_url: str) -> Non
         first = (await client.get("echo-headers", into=dict)).data
         second = (await client.get("echo-headers", into=dict)).data
 
-    first_headers = {h["name"].lower(): h["value"] for h in first["headers"]}
-    second_headers = {h["name"].lower(): h["value"] for h in second["headers"]}
+    first_headers = echoed_headers(first)
+    second_headers = echoed_headers(second)
     assert first_headers["authorization"] == "Bearer token-1"
     assert second_headers["authorization"] == "Bearer token-2"
 
@@ -53,7 +54,7 @@ def test_sync_bearer_token_sends_authorization_header(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, bearer_token="token-value") as client:
         result = client.get("echo-headers", into=dict).data
 
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     assert headers["authorization"] == "Bearer token-value"
 
 
@@ -64,8 +65,8 @@ def test_sync_bearer_auth_callable_is_invoked_per_request(base_url: str) -> None
         first = client.get("echo-headers", into=dict).data
         second = client.get("echo-headers", into=dict).data
 
-    first_headers = {h["name"].lower(): h["value"] for h in first["headers"]}
-    second_headers = {h["name"].lower(): h["value"] for h in second["headers"]}
+    first_headers = echoed_headers(first)
+    second_headers = echoed_headers(second)
     assert first_headers["authorization"] == "Bearer token-1"
     assert second_headers["authorization"] == "Bearer token-2"
 
@@ -74,7 +75,7 @@ async def test_skip_auth_omits_authorization_header_with_bearer_token(base_url: 
     async with HTTPClient(base_url=base_url, bearer_token="token-value") as client:
         result = (await client.get("echo-headers", into=dict, skip_auth=True)).data
 
-    headers = {h["name"].lower() for h in result["headers"]}
+    headers = echoed_headers(result)
     assert "authorization" not in headers
 
 
@@ -88,8 +89,8 @@ async def test_skip_auth_does_not_invoke_bearer_auth_callable(base_url: str) -> 
         # own private `_calls` counter.
         subsequent = (await client.get("echo-headers", into=dict)).data
 
-    skipped_headers = {h["name"].lower() for h in skipped["headers"]}
-    subsequent_headers = {h["name"].lower(): h["value"] for h in subsequent["headers"]}
+    skipped_headers = echoed_headers(skipped)
+    subsequent_headers = echoed_headers(subsequent)
     assert "authorization" not in skipped_headers
     assert subsequent_headers["authorization"] == "Bearer token-1"
 
@@ -98,7 +99,7 @@ def test_sync_skip_auth_omits_authorization_header_with_bearer_token(base_url: s
     with SyncHTTPClient(base_url=base_url, bearer_token="token-value") as client:
         result = client.get("echo-headers", into=dict, skip_auth=True).data
 
-    headers = {h["name"].lower() for h in result["headers"]}
+    headers = echoed_headers(result)
     assert "authorization" not in headers
 
 
@@ -111,8 +112,8 @@ def test_sync_skip_auth_does_not_invoke_bearer_auth_callable(base_url: str) -> N
         # proves the skipped call never invoked `provider`, without touching its private state.
         subsequent = client.get("echo-headers", into=dict).data
 
-    skipped_headers = {h["name"].lower() for h in skipped["headers"]}
-    subsequent_headers = {h["name"].lower(): h["value"] for h in subsequent["headers"]}
+    skipped_headers = echoed_headers(skipped)
+    subsequent_headers = echoed_headers(subsequent)
     assert "authorization" not in skipped_headers
     assert subsequent_headers["authorization"] == "Bearer token-1"
 
@@ -121,7 +122,7 @@ async def test_basic_auth_sends_authorization_header(base_url: str) -> None:
     async with HTTPClient(base_url=base_url, basic_auth=("username", "password")) as client:
         result = (await client.get("echo-headers", into=dict)).data
 
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     expected = base64.b64encode(b"username:password").decode()
     assert headers["authorization"] == f"Basic {expected}"
 
@@ -130,7 +131,7 @@ def test_sync_basic_auth_sends_authorization_header(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, basic_auth=("username", "password")) as client:
         result = client.get("echo-headers", into=dict).data
 
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     expected = base64.b64encode(b"username:password").decode()
     assert headers["authorization"] == f"Basic {expected}"
 

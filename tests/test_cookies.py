@@ -1,10 +1,9 @@
 from lothc import HTTPClient
 
 
-async def test_cookie_store_disabled_by_default(base_url: str) -> None:
-    async with HTTPClient(base_url=base_url) as client:
-        await client.get("set-cookie")
-        result = (await client.get("read-cookie", into=dict)).data
+async def test_cookie_store_disabled_by_default(client: HTTPClient) -> None:
+    await client.get("set-cookie")
+    result = (await client.get("read-cookie", into=dict)).data
 
     assert result["cookie"] is None
 

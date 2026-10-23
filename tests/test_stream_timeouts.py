@@ -112,12 +112,12 @@ async def test_a_slow_consumer_is_not_mistaken_for_a_stalled_server(base_url: st
     # The idle clock must only ever run while waiting on the server: here the caller takes longer
     # than `timeout` over every chunk, and the stream must still complete.
     async with HTTPClient(base_url=base_url, timeout=0.1) as client:
-        seen = 0
-        async for _ in client.stream_get("events", params={"interval": 0.001, "count": 1}):
-            seen += 1
+        chunks: list[bytes] = []
+        async for chunk in client.stream_get("events", params={"interval": 0.001, "count": 1}):
+            chunks.append(chunk)
             time.sleep(0.25)
 
-    assert seen >= 1
+    assert b"".join(chunks) == b'event: tick\nid: 0\ndata: {"msg": "hello 0", "now": 0}\n\n'
 
 
 def test_sync_a_slow_consumer_is_not_mistaken_for_a_stalled_server(base_url: str) -> None:

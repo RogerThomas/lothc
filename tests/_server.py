@@ -13,6 +13,9 @@ import json
 import socket
 import sys
 import time
+from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from time import sleep
@@ -815,3 +818,17 @@ class _QuietOnDisconnectServer(ThreadingHTTPServer):
 
 def make_server() -> ThreadingHTTPServer:
     return _QuietOnDisconnectServer(("127.0.0.1", 0), TestAppHandler)
+
+
+@contextmanager
+def serve_in_background(server: ThreadingHTTPServer) -> Generator[ThreadingHTTPServer]:
+    """Run `server` on a background thread for the duration of the block, then shut it down."""
+    with server, ThreadPoolExecutor(max_workers=1) as pool:
+        # `poll_interval=0.01`, not the 0.5s default: `shutdown()` blocks until
+        # `serve_forever`'s loop next wakes up, so the default makes every teardown pay up
+        # to half a second of pure waiting (measured).
+        pool.submit(server.serve_forever, 0.01)
+        try:
+            yield server
+        finally:
+            server.shutdown()

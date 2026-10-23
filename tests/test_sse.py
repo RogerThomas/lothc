@@ -1,5 +1,4 @@
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -31,7 +30,7 @@ async def test_sse_yields_typed_events_via_decoder(client: HTTPClient) -> None:
     assert events[0].event == "tick"
 
 
-@pytest.mark.parametrize("interruptible", [False, True])
+@pytest.mark.parametrize("interruptible", [False, True], ids=["blocking", "interruptible"])
 def test_sync_sse_yields_raw_events(sync_client: SyncHTTPClient, *, interruptible: bool) -> None:
     events = list(sync_client.sse("events", interruptible=interruptible))
 
@@ -141,7 +140,7 @@ def test_sync_sse_yields_typed_events_via_struct_class(sync_client: SyncHTTPClie
     assert events[0].data == TickEvent(msg="hello 0", now=0)
 
 
-@pytest.mark.parametrize("interruptible", [False, True])
+@pytest.mark.parametrize("interruptible", [False, True], ids=["blocking", "interruptible"])
 def test_sync_sse_transport_error_mid_stream_raises_connection_error(
     sync_client: SyncHTTPClient, *, interruptible: bool
 ) -> None:
@@ -223,11 +222,11 @@ def test_sync_sse_read_timeout_bounds_the_idle_gap_between_events(base_url: str)
 
 
 async def test_sse_reconnects_after_a_dropped_connection_with_last_event_id(
-    client: HTTPClient,
+    client: HTTPClient, server_key: str
 ) -> None:
-    key = str(uuid.uuid4())
     events = [
-        event async for event in client.sse("events-reconnect", params={"key": key}, into=dict)
+        event
+        async for event in client.sse("events-reconnect", params={"key": server_key}, into=dict)
     ]
 
     assert [event.id for event in events] == ["0", "1", "2", "3"]
@@ -235,15 +234,14 @@ async def test_sse_reconnects_after_a_dropped_connection_with_last_event_id(
     assert [event.data["last"] for event in events] == [None, None, "1", "1"]
 
 
-@pytest.mark.parametrize("interruptible", [False, True])
+@pytest.mark.parametrize("interruptible", [False, True], ids=["blocking", "interruptible"])
 def test_sync_sse_reconnects_after_a_dropped_connection_with_last_event_id(
-    sync_client: SyncHTTPClient, *, interruptible: bool
+    sync_client: SyncHTTPClient, server_key: str, *, interruptible: bool
 ) -> None:
-    key = str(uuid.uuid4())
     events = list(
         sync_client.sse(
             "events-reconnect",
-            params={"key": key},
+            params={"key": server_key},
             into=dict,
             interruptible=interruptible,
         )
@@ -254,7 +252,7 @@ def test_sync_sse_reconnects_after_a_dropped_connection_with_last_event_id(
 
 
 async def test_sse_honours_the_server_retry_field_for_the_reconnect_delay(
-    client: HTTPClient,
+    client: HTTPClient, server_key: str
 ) -> None:
     # The server sends `retry: 20` (ms) before dropping; the caller's own 5s `reconnect_delay`
     # must be overridden by it, or this test takes 5 seconds.
@@ -262,7 +260,7 @@ async def test_sse_honours_the_server_retry_field_for_the_reconnect_delay(
     events = [
         event
         async for event in client.sse(
-            "events-reconnect", params={"key": str(uuid.uuid4())}, reconnect_delay=5.0
+            "events-reconnect", params={"key": server_key}, reconnect_delay=5.0
         )
     ]
 
@@ -270,18 +268,20 @@ async def test_sse_honours_the_server_retry_field_for_the_reconnect_delay(
     assert time.perf_counter() - start < 2.0
 
 
-async def test_sse_max_reconnects_zero_raises_the_transport_error(client: HTTPClient) -> None:
+async def test_sse_max_reconnects_zero_raises_the_transport_error(
+    client: HTTPClient, server_key: str
+) -> None:
     with pytest.raises(HTTPConnectionError):
         [
             event
             async for event in client.sse(
-                "events-reconnect", params={"key": str(uuid.uuid4())}, max_reconnects=0
+                "events-reconnect", params={"key": server_key}, max_reconnects=0
             )
         ]
 
 
 async def test_sse_reconnect_on_close_reconnects_until_the_budget_is_spent(
-    client: HTTPClient,
+    client: HTTPClient, server_key: str
 ) -> None:
     # 3 connections each yield one event then close; each event resets the consecutive-reconnect
     # budget, so `max_reconnects=1` still sees all three — then one empty reconnect spends it.
@@ -289,7 +289,7 @@ async def test_sse_reconnect_on_close_reconnects_until_the_budget_is_spent(
         event
         async for event in client.sse(
             "events-close-count",
-            params={"key": str(uuid.uuid4()), "events": 3},
+            params={"key": server_key, "events": 3},
             into=dict,
             max_reconnects=1,
             reconnect_delay=0.01,
@@ -302,12 +302,12 @@ async def test_sse_reconnect_on_close_reconnects_until_the_budget_is_spent(
 
 
 def test_sync_sse_reconnect_on_close_reconnects_until_the_budget_is_spent(
-    sync_client: SyncHTTPClient,
+    sync_client: SyncHTTPClient, server_key: str
 ) -> None:
     events = list(
         sync_client.sse(
             "events-close-count",
-            params={"key": str(uuid.uuid4()), "events": 3},
+            params={"key": server_key, "events": 3},
             into=dict,
             max_reconnects=1,
             reconnect_delay=0.01,
@@ -319,11 +319,13 @@ def test_sync_sse_reconnect_on_close_reconnects_until_the_budget_is_spent(
     assert [event.data["last"] for event in events] == [None, "1", "2"]
 
 
-async def test_sse_clean_close_ends_the_stream_by_default(client: HTTPClient) -> None:
+async def test_sse_clean_close_ends_the_stream_by_default(
+    client: HTTPClient, server_key: str
+) -> None:
     events = [
         event
         async for event in client.sse(
-            "events-close-count", params={"key": str(uuid.uuid4())}, reconnect_delay=0.01
+            "events-close-count", params={"key": server_key}, reconnect_delay=0.01
         )
     ]
 
