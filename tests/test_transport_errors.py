@@ -114,36 +114,13 @@ def test_sync_https_only_against_plain_http_raises_transport_error(base_url: str
         client.get("anything")
 
 
-async def test_https_only_against_plain_http_raises_transport_error_for_sse(
-    base_url: str,
-) -> None:
-    # No `reconnect_delay=0` needed: an `https_only` rejection is a BuilderError, which can never
-    # succeed on a reconnect, so `sse()` raises on the first attempt rather than sleeping through
-    # its whole 5 x 3.0s budget. The timing assertion below is what actually pins that down.
-    async with HTTPClient(base_url=base_url, https_only=True) as client:
-        with pytest.raises(HTTPTransportError):
-            async for _ in client.sse("events"):
-                pass
-
-
-def test_sync_https_only_against_plain_http_raises_transport_error_for_sse(
-    base_url: str,
-) -> None:
-    # See the async twin above for why no `reconnect_delay` override is needed.
-    with (
-        SyncHTTPClient(base_url=base_url, https_only=True) as client,
-        pytest.raises(HTTPTransportError),
-    ):
-        for _ in client.sse("events"):
-            pass
-
-
 async def test_sse_does_not_reconnect_after_a_permanently_unbuildable_request(
     base_url: str,
 ) -> None:
-    # The real assertion is the elapsed time: with the default max_reconnects=5 and
-    # reconnect_delay=3.0, retrying this at all would take ~15s. A permanent BuilderError has to
-    # propagate on the first attempt instead.
+    # No `reconnect_delay=0` needed: an `https_only` rejection is a BuilderError, which can never
+    # succeed on a reconnect. The real assertion is the elapsed time: with the default
+    # max_reconnects=5 and reconnect_delay=3.0, retrying this at all would take ~15s. A permanent
+    # BuilderError has to propagate on the first attempt instead.
     async with HTTPClient(base_url=base_url, https_only=True) as client:
         started = time.monotonic()
         with pytest.raises(HTTPTransportError):
@@ -157,6 +134,7 @@ async def test_sse_does_not_reconnect_after_a_permanently_unbuildable_request(
 def test_sync_sse_does_not_reconnect_after_a_permanently_unbuildable_request(
     base_url: str,
 ) -> None:
+    # See the async twin above for why there's no `reconnect_delay` override.
     with SyncHTTPClient(base_url=base_url, https_only=True) as client:
         started = time.monotonic()
         with pytest.raises(HTTPTransportError):

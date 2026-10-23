@@ -5,7 +5,6 @@ call, leaving an abandoned stream open until garbage collection got to it.
 
 import asyncio
 import time
-from uuid import uuid4
 
 from lothc import HTTPClient, SyncHTTPClient
 
@@ -31,48 +30,48 @@ def _sync_hangups(sync_client: SyncHTTPClient, key: str) -> int:
         time.sleep(0.01)
 
 
-async def test_closing_a_stream_get_early_releases_the_connection(client: HTTPClient) -> None:
-    key = str(uuid4())
-    chunks = client.stream_get("endless", params={"key": key})
+async def test_closing_a_stream_get_early_releases_the_connection(
+    client: HTTPClient, server_key: str
+) -> None:
+    chunks = client.stream_get("endless", params={"key": server_key})
     await anext(chunks)
 
     await chunks.aclose()
 
-    assert await _hangups(client, key) == 1
+    assert await _hangups(client, server_key) == 1
 
 
-async def test_closing_a_stream_post_early_releases_the_connection(client: HTTPClient) -> None:
-    key = str(uuid4())
-    chunks = client.stream_post("endless", params={"key": key}, content=b"body")
+async def test_closing_a_stream_post_early_releases_the_connection(
+    client: HTTPClient, server_key: str
+) -> None:
+    chunks = client.stream_post("endless", params={"key": server_key}, content=b"body")
     await anext(chunks)
 
     await chunks.aclose()
 
-    assert await _hangups(client, key) == 1
+    assert await _hangups(client, server_key) == 1
 
 
 def test_sync_closing_a_stream_get_early_releases_the_connection(
-    sync_client: SyncHTTPClient,
+    sync_client: SyncHTTPClient, server_key: str
 ) -> None:
-    key = str(uuid4())
-    chunks = sync_client.stream_get("endless", params={"key": key})
+    chunks = sync_client.stream_get("endless", params={"key": server_key})
     next(chunks)
 
     chunks.close()
 
-    assert _sync_hangups(sync_client, key) == 1
+    assert _sync_hangups(sync_client, server_key) == 1
 
 
 def test_sync_closing_a_stream_post_early_releases_the_connection(
-    sync_client: SyncHTTPClient,
+    sync_client: SyncHTTPClient, server_key: str
 ) -> None:
-    key = str(uuid4())
-    chunks = sync_client.stream_post("endless", params={"key": key}, content=b"body")
+    chunks = sync_client.stream_post("endless", params={"key": server_key}, content=b"body")
     next(chunks)
 
     chunks.close()
 
-    assert _sync_hangups(sync_client, key) == 1
+    assert _sync_hangups(sync_client, server_key) == 1
 
 
 async def test_an_sse_stream_can_be_closed_early(client: HTTPClient) -> None:

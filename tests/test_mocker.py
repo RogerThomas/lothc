@@ -8,41 +8,6 @@ from pyreqwest.pytest_plugin.mock import ClientMocker
 from lothc import CaseInsensitiveDict, HTTPClient, HTTPResponseError, SyncHTTPClient
 from lothc.testing import LOTHCMocker, MockRequest, MockResponse
 
-# Every method `_MockTyping`/`_ClientMockerTyping` (lothc/testing.py) declare against pyreqwest's
-# real `Mock`/`ClientMocker` — kept in sync manually so a future pyreqwest rename/removal fails
-# this test loudly instead of surfacing as a runtime AttributeError the first time a consumer
-# hits the changed method (the `cast` at the fixture boundary hides this from type checkers).
-_MOCK_METHODS = (
-    "with_status",
-    "with_headers",
-    "with_body_bytes",
-    "with_body_json",
-    "match_query",
-    "match_query_param",
-    "match_header",
-    "match_body_json",
-    "match_request",
-    "match_request_with_response",
-    "assert_called",
-    "get_requests",
-    "get_call_count",
-    "reset_requests",
-)
-_CLIENT_MOCKER_METHODS = (
-    "mock",
-    "get",
-    "post",
-    "put",
-    "patch",
-    "delete",
-    "head",
-    "strict",
-    "get_requests",
-    "get_call_count",
-    "clear",
-    "reset_requests",
-)
-
 
 class ItemModel(BaseModel):
     id: int
@@ -121,13 +86,9 @@ async def test_add_get_response_with_headers(client: HTTPClient, lothc_mocker: L
 async def test_add_get_response_with_data_and_headers_together(
     client: HTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
-    """`add_*_response` always applies `data=` before `headers=` internally (see `_add_response`'s
-    own comment) so a caller's own `headers={"content-type": ...}` wins over `.body_json()`'s
-    default Content-Type rather than leaving two Content-Type values on the wire — this is the
-    same invariant `test_with_headers_then_with_data_content_type_not_duplicated` exercises for
-    the chainable `with_headers`/`with_data` API, covered here for `add_*_response`'s own (data-
-    then-headers) call order instead, since neither call order was previously exercised together
-    with both `data=` and `headers=` passed in the same call."""
+    """A caller's own `headers={"content-type": ...}` replaces `data=`'s default Content-Type
+    rather than leaving two Content-Type values on the wire: the same invariant
+    `test_with_headers_then_with_data_content_type_not_duplicated` checks for the chainable API."""
     lothc_mocker.add_get_response(
         path="/items/7", data={"id": 7}, headers={"content-type": "text/plain"}
     )
@@ -135,7 +96,7 @@ async def test_add_get_response_with_data_and_headers_together(
     result = await client.get("items/7", into=dict)
 
     assert result.data == {"id": 7}
-    assert result.headers["content-type"] == "text/plain"
+    assert result.headers.get_all("content-type") == ["text/plain"]
 
 
 async def test_add_get_response_matches_on_params(
@@ -463,18 +424,15 @@ async def test_with_headers_then_with_data_content_type_not_duplicated(
 ) -> None:
     """`.with_headers(...).with_data(...)` — the natural order to chain them in — used to leave
     two `Content-Type` headers on the wire (pyreqwest's `.body_json()` *appends* its own,
-    `.headers()` only *replaces* a same-key value if called afterward). Not directly observable
-    through `Response.headers` here (it already collapses to the first wire value, which happened
-    to be the correct one even before the fix — same reason `_add_response`'s own version of this
-    bug in CLAUDE.md's dev notes has no automated duplicate-detection test either); this at least
-    exercises the code path and asserts the value a real caller would actually read is correct."""
+    `.headers()` only *replaces* a same-key value if called afterward). `get_all` sees every
+    value, so a duplicate fails here even when the first one is the right one."""
     lothc_mocker.mock("GET", path="/items").with_headers({"content-type": "text/plain"}).with_data({
         "a": 1
     })
 
     result = await client.get("items")
 
-    assert result.headers["content-type"] == "text/plain"
+    assert result.headers.get_all("content-type") == ["text/plain"]
 
 
 async def test_with_headers_snapshots_the_dict_instead_of_aliasing_it(
@@ -597,22 +555,61 @@ async def test_clear_removes_all_registered_mocks(
         await client.get("items/7")
 
 
-def test_pyreqwest_client_mocker_protocol_surface(client_mocker: ClientMocker) -> None:
-    """Existence-only smoke test for `_MOCK_METHODS`/`_CLIENT_MOCKER_METHODS` (lothc/testing.py's
-    `_MockTyping`/`_ClientMockerTyping`) — catches a method being renamed or removed on
-    pyreqwest's real `Mock`/`ClientMocker`. Deliberately does NOT check parameter signatures (a
-    renamed/removed *parameter* on a method that still exists isn't caught here) — the tests
-    above call every one of these methods through the real public API with real arguments, which
-    is what would actually catch that."""
-    for name in _CLIENT_MOCKER_METHODS:
-        assert callable(getattr(client_mocker, name))
+# Every method `_MockTyping`/`_ClientMockerTyping` (lothc/testing.py) declare against pyreqwest's
+# real `Mock`/`ClientMocker`, kept in sync manually, so a pyreqwest rename/removal fails here
+# loudly instead of surfacing as a runtime AttributeError the first time a consumer hits the
+# changed method (the `cast` at the fixture boundary hides this from type checkers). Existence
+# only: a renamed or removed *parameter* isn't caught here, but the tests above call every one of
+# these methods through the real public API with real arguments, which is what catches that.
+@pytest.mark.parametrize(
+    "name",
+    [
+        "mock",
+        "get",
+        "post",
+        "put",
+        "patch",
+        "delete",
+        "head",
+        "strict",
+        "get_requests",
+        "get_call_count",
+        "clear",
+        "reset_requests",
+    ],
+)
+def test_pyreqwest_client_mocker_has_the_method_lothc_types(
+    client_mocker: ClientMocker, name: str
+) -> None:
+    assert callable(getattr(client_mocker, name))
 
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "with_status",
+        "with_headers",
+        "with_body_bytes",
+        "with_body_json",
+        "match_query",
+        "match_query_param",
+        "match_header",
+        "match_body_json",
+        "match_request",
+        "match_request_with_response",
+        "assert_called",
+        "get_requests",
+        "get_call_count",
+        "reset_requests",
+    ],
+)
+def test_pyreqwest_mock_has_the_method_lothc_types(client_mocker: ClientMocker, name: str) -> None:
     # pyreqwest's own dirty_equals-related stub gap (see lothc/testing.py's module docstring)
     # leaks an Unknown into `.get`'s own inferred signature here, since this calls pyreqwest's
     # raw API directly rather than through lothc's re-typed Protocol wrapper.
     mock = client_mocker.get(path="/items/7")  # pyright: ignore[reportUnknownMemberType]
-    for name in _MOCK_METHODS:
-        assert callable(getattr(mock, name))
+
+    assert callable(getattr(mock, name))
 
 
 async def test_get_requests_headers_are_case_insensitive(

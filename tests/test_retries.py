@@ -12,37 +12,37 @@ from lothc import HTTPClient, HTTPConnectionError, HTTPResponseError, SyncHTTPCl
 # no assertion changes; the suite just stops paying 0.1s + 0.2s for every recovering call.
 
 
-async def test_retries_recovers_from_5xx_then_succeeds(base_url: str) -> None:
+async def test_retries_recovers_from_5xx_then_succeeds(base_url: str, server_key: str) -> None:
     async with HTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
         result = (
-            await client.get("flaky", params={"key": "flaky-recovers", "fail_times": 2}, into=dict)
+            await client.get("flaky", params={"key": server_key, "fail_times": 2}, into=dict)
         ).data
 
     assert result == {"attempts": 3}
 
 
-async def test_retries_exhausted_raises_response_error(base_url: str) -> None:
+async def test_retries_exhausted_raises_response_error(base_url: str, server_key: str) -> None:
     async with HTTPClient(base_url=base_url, max_retries=1, backoff_base=0.001) as client:
         with pytest.raises(HTTPResponseError) as exc_info:
-            await client.get("flaky", params={"key": "flaky-exhausted", "fail_times": 5})
+            await client.get("flaky", params={"key": server_key, "fail_times": 5})
 
     assert exc_info.value.status == 503
 
 
-async def test_retries_honors_retry_after_header(base_url: str) -> None:
+async def test_retries_honors_retry_after_header(base_url: str, server_key: str) -> None:
     async with HTTPClient(base_url=base_url, max_retries=1) as client:
-        result = (await client.get("retry-after", params={"key": "retry-after-1"}, into=dict)).data
+        result = (await client.get("retry-after", params={"key": server_key}, into=dict)).data
 
     assert result == {"attempts": 2}
 
 
-async def test_retries_not_applied_to_post_by_default(base_url: str) -> None:
+async def test_retries_not_applied_to_post_by_default(base_url: str, server_key: str) -> None:
     async with HTTPClient(base_url=base_url, max_retries=3) as client:
         with pytest.raises(HTTPResponseError):
-            await client.post("flaky", params={"key": "flaky-post-default", "fail_times": 1})
+            await client.post("flaky", params={"key": server_key, "fail_times": 1})
 
 
-async def test_retries_can_be_opted_in_for_post(base_url: str) -> None:
+async def test_retries_can_be_opted_in_for_post(base_url: str, server_key: str) -> None:
     async with HTTPClient(
         base_url=base_url,
         max_retries=2,
@@ -52,7 +52,7 @@ async def test_retries_can_be_opted_in_for_post(base_url: str) -> None:
         result = (
             await client.post(
                 "flaky",
-                params={"key": "flaky-post-optin", "fail_times": 2},
+                params={"key": server_key, "fail_times": 2},
                 into=dict,
             )
         ).data
@@ -60,12 +60,12 @@ async def test_retries_can_be_opted_in_for_post(base_url: str) -> None:
     assert result == {"attempts": 3}
 
 
-async def test_retries_recovers_from_transport_error(base_url: str) -> None:
+async def test_retries_recovers_from_transport_error(base_url: str, server_key: str) -> None:
     async with HTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
         result = (
             await client.get(
                 "connection-flaky",
-                params={"key": "conn-flaky-1", "fail_times": 2},
+                params={"key": server_key, "fail_times": 2},
                 into=dict,
             )
         ).data
@@ -73,22 +73,20 @@ async def test_retries_recovers_from_transport_error(base_url: str) -> None:
     assert result == {"attempts": 3}
 
 
-def test_sync_retries_recovers_from_5xx_then_succeeds(base_url: str) -> None:
+def test_sync_retries_recovers_from_5xx_then_succeeds(base_url: str, server_key: str) -> None:
     with SyncHTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
-        result = client.get(
-            "flaky", params={"key": "sync-flaky-recovers", "fail_times": 2}, into=dict
-        ).data
+        result = client.get("flaky", params={"key": server_key, "fail_times": 2}, into=dict).data
 
     assert result == {"attempts": 3}
 
 
-async def test_retries_honors_http_date_retry_after_header(base_url: str) -> None:
+async def test_retries_honors_http_date_retry_after_header(base_url: str, server_key: str) -> None:
     retry_after = format_datetime(datetime.now(UTC))
     async with HTTPClient(base_url=base_url, max_retries=1) as client:
         result = (
             await client.get(
                 "retry-after-custom",
-                params={"key": "retry-after-http-date", "value": retry_after},
+                params={"key": server_key, "value": retry_after},
                 into=dict,
             )
         ).data
@@ -97,13 +95,13 @@ async def test_retries_honors_http_date_retry_after_header(base_url: str) -> Non
 
 
 async def test_retries_falls_back_to_backoff_on_malformed_retry_after_header(
-    base_url: str,
+    base_url: str, server_key: str
 ) -> None:
     async with HTTPClient(base_url=base_url, max_retries=1, backoff_base=0.001) as client:
         result = (
             await client.get(
                 "retry-after-custom",
-                params={"key": "retry-after-malformed", "value": "not-a-date"},
+                params={"key": server_key, "value": "not-a-date"},
                 into=dict,
             )
         ).data
@@ -112,28 +110,26 @@ async def test_retries_falls_back_to_backoff_on_malformed_retry_after_header(
 
 
 async def test_retries_exhausted_via_transport_error_raises_transport_error(
-    base_url: str,
+    base_url: str, server_key: str
 ) -> None:
     async with HTTPClient(base_url=base_url, max_retries=1, backoff_base=0.001) as client:
         with pytest.raises(HTTPConnectionError):
-            await client.get(
-                "connection-flaky", params={"key": "conn-flaky-exhausted", "fail_times": 5}
-            )
+            await client.get("connection-flaky", params={"key": server_key, "fail_times": 5})
 
 
-def test_sync_retries_not_applied_to_post_by_default(base_url: str) -> None:
+def test_sync_retries_not_applied_to_post_by_default(base_url: str, server_key: str) -> None:
     with (
         SyncHTTPClient(base_url=base_url, max_retries=3) as client,
         pytest.raises(HTTPResponseError),
     ):
-        client.post("flaky", params={"key": "sync-flaky-post-default", "fail_times": 1})
+        client.post("flaky", params={"key": server_key, "fail_times": 1})
 
 
-def test_sync_retries_recovers_from_transport_error(base_url: str) -> None:
+def test_sync_retries_recovers_from_transport_error(base_url: str, server_key: str) -> None:
     with SyncHTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
         result = client.get(
             "connection-flaky",
-            params={"key": "sync-conn-flaky-1", "fail_times": 2},
+            params={"key": server_key, "fail_times": 2},
             into=dict,
         ).data
 
@@ -141,16 +137,18 @@ def test_sync_retries_recovers_from_transport_error(base_url: str) -> None:
 
 
 def test_sync_retries_exhausted_via_transport_error_raises_transport_error(
-    base_url: str,
+    base_url: str, server_key: str
 ) -> None:
     with (
         SyncHTTPClient(base_url=base_url, max_retries=1, backoff_base=0.001) as client,
         pytest.raises(HTTPConnectionError),
     ):
-        client.get("connection-flaky", params={"key": "sync-conn-flaky-exhausted", "fail_times": 5})
+        client.get("connection-flaky", params={"key": server_key, "fail_times": 5})
 
 
-async def test_backoff_base_scales_the_wait_between_attempts(base_url: str) -> None:
+async def test_backoff_base_scales_the_wait_between_attempts(
+    base_url: str, server_key: str
+) -> None:
     # backoff_base * 2 ** attempt, so two retries at 0.02 wait 0.02s + 0.04s = 0.06s minimum —
     # the floor below. The ceiling is what pins the parameter down: the 0.1 default would wait
     # 0.1s + 0.2s = 0.3s, so a client that ignored `backoff_base` blows straight past 0.2s.
@@ -158,7 +156,7 @@ async def test_backoff_base_scales_the_wait_between_attempts(base_url: str) -> N
     async with HTTPClient(base_url=base_url, max_retries=2, backoff_base=0.02) as client:
         started = time.monotonic()
         result = (
-            await client.get("flaky", params={"key": "backoff-base", "fail_times": 2}, into=dict)
+            await client.get("flaky", params={"key": server_key, "fail_times": 2}, into=dict)
         ).data
         elapsed = time.monotonic() - started
 
@@ -166,19 +164,17 @@ async def test_backoff_base_scales_the_wait_between_attempts(base_url: str) -> N
     assert 0.06 <= elapsed < 0.2
 
 
-def test_sync_backoff_base_scales_the_wait_between_attempts(base_url: str) -> None:
+def test_sync_backoff_base_scales_the_wait_between_attempts(base_url: str, server_key: str) -> None:
     with SyncHTTPClient(base_url=base_url, max_retries=2, backoff_base=0.02) as client:
         started = time.monotonic()
-        result = client.get(
-            "flaky", params={"key": "sync-backoff-base", "fail_times": 2}, into=dict
-        ).data
+        result = client.get("flaky", params={"key": server_key, "fail_times": 2}, into=dict).data
         elapsed = time.monotonic() - started
 
     assert result == {"attempts": 3}
     assert 0.06 <= elapsed < 0.2
 
 
-async def test_retry_methods_are_case_insensitive(base_url: str) -> None:
+async def test_retry_methods_are_case_insensitive(base_url: str, server_key: str) -> None:
     # pyreqwest reports methods upper-case, so a lower-case `{"get"}` used to match nothing and
     # silently turned retries off entirely.
     async with HTTPClient(
@@ -187,7 +183,7 @@ async def test_retry_methods_are_case_insensitive(base_url: str) -> None:
         result = (
             await client.get(
                 "flaky",
-                params={"key": "lowercase-methods", "fail_times": 2},
+                params={"key": server_key, "fail_times": 2},
                 into=dict,
             )
         ).data
@@ -195,37 +191,35 @@ async def test_retry_methods_are_case_insensitive(base_url: str) -> None:
     assert result == {"attempts": 3}
 
 
-async def test_empty_retry_methods_retries_nothing(base_url: str) -> None:
+async def test_empty_retry_methods_retries_nothing(base_url: str, server_key: str) -> None:
     # An empty set used to fall back to the defaults (via `or`), so GET still retried.
     async with HTTPClient(
         base_url=base_url, max_retries=2, retry_methods=set(), backoff_base=0.001
     ) as client:
         with pytest.raises(HTTPResponseError) as exc_info:
-            await client.get("flaky", params={"key": "empty-methods", "fail_times": 1})
+            await client.get("flaky", params={"key": server_key, "fail_times": 1})
 
     assert exc_info.value.status == 503
 
 
-def test_sync_retry_methods_accept_a_list(base_url: str) -> None:
+def test_sync_retry_methods_accept_a_list(base_url: str, server_key: str) -> None:
     with SyncHTTPClient(
         base_url=base_url, max_retries=2, retry_methods=["get"], backoff_base=0.001
     ) as client:
-        result = client.get(
-            "flaky", params={"key": "sync-list-methods", "fail_times": 2}, into=dict
-        ).data
+        result = client.get("flaky", params={"key": server_key, "fail_times": 2}, into=dict).data
 
     assert result == {"attempts": 3}
 
 
-async def test_a_retry_after_longer_than_max_retry_after_stops_retrying(base_url: str) -> None:
+async def test_a_retry_after_longer_than_max_retry_after_stops_retrying(
+    base_url: str, server_key: str
+) -> None:
     # The server asks for 120s; rather than block inside the call that long, lothc stops and
     # raises the 429 so the caller can schedule its own retry from the header.
     async with HTTPClient(base_url=base_url, max_retries=2, max_retry_after=60) as client:
         started = time.monotonic()
         with pytest.raises(HTTPResponseError) as exc_info:
-            await client.get(
-                "retry-after-custom", params={"key": "retry-after-too-long", "value": "120"}
-            )
+            await client.get("retry-after-custom", params={"key": server_key, "value": "120"})
         elapsed = time.monotonic() - started
 
     assert exc_info.value.status == 429
@@ -233,12 +227,14 @@ async def test_a_retry_after_longer_than_max_retry_after_stops_retrying(base_url
     assert elapsed < 1.0
 
 
-async def test_a_retry_after_within_max_retry_after_is_still_honoured(base_url: str) -> None:
+async def test_a_retry_after_within_max_retry_after_is_still_honoured(
+    base_url: str, server_key: str
+) -> None:
     async with HTTPClient(base_url=base_url, max_retries=1, max_retry_after=60) as client:
         result = (
             await client.get(
                 "retry-after-custom",
-                params={"key": "retry-after-within", "value": "0"},
+                params={"key": server_key, "value": "0"},
                 into=dict,
             )
         ).data
@@ -246,24 +242,26 @@ async def test_a_retry_after_within_max_retry_after_is_still_honoured(base_url: 
     assert result == {"attempts": 2}
 
 
-def test_sync_a_retry_after_longer_than_max_retry_after_stops_retrying(base_url: str) -> None:
+def test_sync_a_retry_after_longer_than_max_retry_after_stops_retrying(
+    base_url: str, server_key: str
+) -> None:
     with (
         SyncHTTPClient(base_url=base_url, max_retries=2, max_retry_after=0.05) as client,
         pytest.raises(HTTPResponseError) as exc_info,
     ):
-        client.get("retry-after-custom", params={"key": "sync-retry-after-too-long", "value": "1"})
+        client.get("retry-after-custom", params={"key": server_key, "value": "1"})
 
     assert exc_info.value.status == 429
 
 
-async def test_max_retry_after_none_honours_any_wait(base_url: str) -> None:
+async def test_max_retry_after_none_honours_any_wait(base_url: str, server_key: str) -> None:
     # `None` restores the old behaviour. A 0s wait keeps the test fast while still going through
     # the no-limit branch.
     async with HTTPClient(base_url=base_url, max_retries=1, max_retry_after=None) as client:
         result = (
             await client.get(
                 "retry-after-custom",
-                params={"key": "retry-after-no-limit", "value": "0"},
+                params={"key": server_key, "value": "0"},
                 into=dict,
             )
         ).data
@@ -271,14 +269,14 @@ async def test_max_retry_after_none_honours_any_wait(base_url: str) -> None:
     assert result == {"attempts": 2}
 
 
-async def test_a_body_cut_off_partway_is_retried(base_url: str) -> None:
+async def test_a_body_cut_off_partway_is_retried(base_url: str, server_key: str) -> None:
     # Shorter than its `Content-Length`: pyreqwest reports this as a decode error, not a transport
     # error, so it used to fail the call even with retries left.
     async with HTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
         result = (
             await client.get(
                 "body-flaky",
-                params={"key": "body-flaky-1", "fail_times": 2},
+                params={"key": server_key, "fail_times": 2},
                 into=dict,
             )
         ).data
@@ -286,61 +284,69 @@ async def test_a_body_cut_off_partway_is_retried(base_url: str) -> None:
     assert result == {"attempts": 3}
 
 
-def test_sync_a_body_cut_off_partway_is_retried(base_url: str) -> None:
+def test_sync_a_body_cut_off_partway_is_retried(base_url: str, server_key: str) -> None:
     with SyncHTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
         result = client.get(
             "body-flaky",
-            params={"key": "sync-body-flaky-1", "fail_times": 2},
+            params={"key": server_key, "fail_times": 2},
             into=dict,
         ).data
 
     assert result == {"attempts": 3}
 
 
-async def test_a_body_cut_off_on_every_attempt_raises_a_connection_error(base_url: str) -> None:
+async def test_a_body_cut_off_on_every_attempt_raises_a_connection_error(
+    base_url: str, server_key: str
+) -> None:
     async with HTTPClient(base_url=base_url, max_retries=1, backoff_base=0.001) as client:
         with pytest.raises(HTTPConnectionError):
-            await client.get("body-flaky", params={"key": "body-flaky-exhausted", "fail_times": 5})
+            await client.get("body-flaky", params={"key": server_key, "fail_times": 5})
 
 
-async def test_a_body_that_cannot_be_decompressed_is_not_retried(base_url: str) -> None:
+async def test_a_body_that_cannot_be_decompressed_is_not_retried(
+    base_url: str, server_key: str
+) -> None:
     # Unlike a cut-off body, a corrupt one comes back the same on every attempt.
     async with HTTPClient(base_url=base_url, max_retries=3, backoff_base=0.001) as client:
         with pytest.raises(HTTPConnectionError):
-            await client.get("corrupt-gzip", params={"key": "corrupt-gzip-1"})
-        hits = (await client.get("hits", params={"key": "corrupt-gzip-1"}, into=dict)).data
+            await client.get("corrupt-gzip", params={"key": server_key})
+        hits = (await client.get("hits", params={"key": server_key}, into=dict)).data
 
     assert hits == {"hits": 1}
 
 
-def test_sync_a_body_that_cannot_be_decompressed_is_not_retried(base_url: str) -> None:
+def test_sync_a_body_that_cannot_be_decompressed_is_not_retried(
+    base_url: str, server_key: str
+) -> None:
     with SyncHTTPClient(base_url=base_url, max_retries=3, backoff_base=0.001) as client:
         with pytest.raises(HTTPConnectionError):
-            client.get("corrupt-gzip", params={"key": "sync-corrupt-gzip-1"})
-        hits = client.get("hits", params={"key": "sync-corrupt-gzip-1"}, into=dict).data
+            client.get("corrupt-gzip", params={"key": server_key})
+        hits = client.get("hits", params={"key": server_key}, into=dict).data
 
     assert hits == {"hits": 1}
 
 
-async def test_a_cut_off_body_on_a_post_is_not_retried_by_default(base_url: str) -> None:
+async def test_a_cut_off_body_on_a_post_is_not_retried_by_default(
+    base_url: str, server_key: str
+) -> None:
     async with HTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
         with pytest.raises(HTTPConnectionError):
-            await client.post("body-flaky", params={"key": "body-flaky-post", "fail_times": 1})
+            await client.post("body-flaky", params={"key": server_key, "fail_times": 1})
 
 
-def test_sync_retries_honors_retry_after_header(base_url: str) -> None:
+def test_sync_retries_honors_retry_after_header(base_url: str, server_key: str) -> None:
     with SyncHTTPClient(base_url=base_url, max_retries=1) as client:
-        result = client.get("retry-after", params={"key": "sync-retry-after-1"}, into=dict).data
+        result = client.get("retry-after", params={"key": server_key}, into=dict).data
 
     assert result == {"attempts": 2}
 
 
-def test_sync_retries_honors_http_date_retry_after_header(base_url: str) -> None:
+def test_sync_retries_honors_http_date_retry_after_header(base_url: str, server_key: str) -> None:
     retry_after = format_datetime(datetime.now(UTC))
     with SyncHTTPClient(base_url=base_url, max_retries=1) as client:
         result = client.get(
             "retry-after-custom",
-            params={"key": "sync-retry-after-http-date", "value": retry_after},
+            params={"key": server_key, "value": retry_after},
             into=dict,
         ).data
 
@@ -348,12 +354,12 @@ def test_sync_retries_honors_http_date_retry_after_header(base_url: str) -> None
 
 
 def test_sync_retries_falls_back_to_backoff_on_malformed_retry_after_header(
-    base_url: str,
+    base_url: str, server_key: str
 ) -> None:
     with SyncHTTPClient(base_url=base_url, max_retries=1, backoff_base=0.001) as client:
         result = client.get(
             "retry-after-custom",
-            params={"key": "sync-retry-after-malformed", "value": "not-a-date"},
+            params={"key": server_key, "value": "not-a-date"},
             into=dict,
         ).data
 
@@ -361,14 +367,14 @@ def test_sync_retries_falls_back_to_backoff_on_malformed_retry_after_header(
 
 
 def test_sync_a_retry_after_longer_than_max_retry_after_raises_with_the_header(
-    base_url: str,
+    base_url: str, server_key: str
 ) -> None:
     # Mirrors the async test with the same 120s wait, so the elapsed ceiling proves the sync client
     # stopped rather than slept.
     with SyncHTTPClient(base_url=base_url, max_retries=2, max_retry_after=60) as client:
         started = time.monotonic()
         with pytest.raises(HTTPResponseError) as exc_info:
-            client.get("retry-after-custom", params={"key": "sync-retry-after-120", "value": "120"})
+            client.get("retry-after-custom", params={"key": server_key, "value": "120"})
         elapsed = time.monotonic() - started
 
     assert exc_info.value.status == 429
@@ -376,22 +382,24 @@ def test_sync_a_retry_after_longer_than_max_retry_after_raises_with_the_header(
     assert elapsed < 1.0
 
 
-def test_sync_a_retry_after_within_max_retry_after_is_still_honoured(base_url: str) -> None:
+def test_sync_a_retry_after_within_max_retry_after_is_still_honoured(
+    base_url: str, server_key: str
+) -> None:
     with SyncHTTPClient(base_url=base_url, max_retries=1, max_retry_after=60) as client:
         result = client.get(
             "retry-after-custom",
-            params={"key": "sync-retry-after-within", "value": "0"},
+            params={"key": server_key, "value": "0"},
             into=dict,
         ).data
 
     assert result == {"attempts": 2}
 
 
-def test_sync_max_retry_after_none_honours_any_wait(base_url: str) -> None:
+def test_sync_max_retry_after_none_honours_any_wait(base_url: str, server_key: str) -> None:
     with SyncHTTPClient(base_url=base_url, max_retries=1, max_retry_after=None) as client:
         result = client.get(
             "retry-after-custom",
-            params={"key": "sync-retry-after-no-limit", "value": "0"},
+            params={"key": server_key, "value": "0"},
             into=dict,
         ).data
 

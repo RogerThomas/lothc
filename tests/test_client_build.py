@@ -3,6 +3,7 @@ from importlib.metadata import version
 from urllib.parse import urlsplit
 
 import pytest
+from _helpers import echoed_headers
 from pydantic import BaseModel
 
 from lothc import HTTPClient, HTTPConnectionError, SyncHTTPClient
@@ -43,11 +44,6 @@ async def test_build_with_max_redirects_still_follows_redirect(base_url: str) ->
     assert result.status == 200
 
 
-async def test_build_with_proxy_configured_does_not_error(base_url: str) -> None:
-    async with HTTPClient(base_url=base_url, proxy="http://127.0.0.1:1"):
-        pass
-
-
 def test_sync_build_rejects_both_bearer_token_and_bearer_auth(base_url: str) -> None:
     with (
         pytest.raises(ValueError, match="at most one"),
@@ -69,7 +65,7 @@ def test_sync_build_with_default_headers_sent_on_every_request(base_url: str) ->
     with SyncHTTPClient(base_url=base_url, default_headers={"x-api-key": "secret"}) as client:
         result = client.get("echo-headers", into=dict).data
 
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     assert headers["x-api-key"] == "secret"
 
 
@@ -80,11 +76,6 @@ def test_sync_build_with_max_redirects_still_follows_redirect(base_url: str) -> 
     assert result.status == 200
 
 
-def test_sync_build_with_proxy_configured_does_not_error(base_url: str) -> None:
-    with SyncHTTPClient(base_url=base_url, proxy="http://127.0.0.1:1"):
-        pass
-
-
 async def test_build_accepts_a_model_as_default_headers(base_url: str) -> None:
     # Encoded like per-request `headers=`: `_` becomes `-`, and a `None` field is omitted.
     async with HTTPClient(
@@ -92,7 +83,7 @@ async def test_build_accepts_a_model_as_default_headers(base_url: str) -> None:
     ) as client:
         result = (await client.get("echo-headers", into=dict)).data
 
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     assert headers["x-api-key"] == "secret"
     assert "x-unset" not in headers
 
@@ -198,7 +189,7 @@ async def test_user_agent_is_sent_on_every_request(base_url: str) -> None:
     async with HTTPClient(base_url=base_url, user_agent="agent-name/1.0") as client:
         result = (await client.get("echo-headers", into=dict)).data
 
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     assert headers["user-agent"] == "agent-name/1.0"
 
 
@@ -206,7 +197,7 @@ def test_sync_user_agent_is_sent_on_every_request(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, user_agent="agent-name/1.0") as client:
         result = client.get("echo-headers", into=dict).data
 
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     assert headers["user-agent"] == "agent-name/1.0"
 
 
@@ -254,14 +245,12 @@ async def test_no_proxy_that_does_not_match_still_uses_the_proxy(base_url: str) 
             await client.get("items/7")
 
 
-def test_no_proxy_without_a_proxy_is_rejected() -> None:
+@pytest.mark.parametrize("client_class", [HTTPClient, SyncHTTPClient], ids=["async", "sync"])
+def test_no_proxy_without_a_proxy_is_rejected(
+    client_class: type[HTTPClient] | type[SyncHTTPClient],
+) -> None:
     with pytest.raises(ValueError, match="'no_proxy' needs a 'proxy'"):
-        HTTPClient(no_proxy=["localhost"])
-
-
-def test_sync_no_proxy_without_a_proxy_is_rejected() -> None:
-    with pytest.raises(ValueError, match="'no_proxy' needs a 'proxy'"):
-        SyncHTTPClient(no_proxy=["localhost"])
+        client_class(no_proxy=["localhost"])
 
 
 async def test_http2_falls_back_to_http1_against_an_http1_only_server(base_url: str) -> None:
@@ -282,7 +271,7 @@ async def test_the_default_user_agent_names_lothc_and_its_version(base_url: str)
     async with HTTPClient(base_url=base_url) as client:
         result = (await client.get("echo-headers", into=dict)).data
 
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     assert headers["user-agent"] == f"python-lothc/{version('lothc')}"
 
 
@@ -290,7 +279,7 @@ def test_sync_the_default_user_agent_names_lothc_and_its_version(base_url: str) 
     with SyncHTTPClient(base_url=base_url) as client:
         result = client.get("echo-headers", into=dict).data
 
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     assert headers["user-agent"] == f"python-lothc/{version('lothc')}"
 
 
@@ -335,12 +324,10 @@ async def test_tcp_keepalive_is_accepted(base_url: str) -> None:
     assert result == {"id": 7, "name": "item-7"}
 
 
+@pytest.mark.parametrize("client_class", [HTTPClient, SyncHTTPClient], ids=["async", "sync"])
 @pytest.mark.parametrize("base_url", ["http://host/api", "http://host/api/?key=value"])
-def test_an_unjoinable_base_url_is_rejected_at_construction(base_url: str) -> None:
+def test_an_unjoinable_base_url_is_rejected_at_construction(
+    client_class: type[HTTPClient] | type[SyncHTTPClient], base_url: str
+) -> None:
     with pytest.raises(ValueError, match="trailing slash"):
-        HTTPClient(base_url=base_url)
-
-
-def test_sync_an_unjoinable_base_url_is_rejected_at_construction() -> None:
-    with pytest.raises(ValueError, match="trailing slash"):
-        SyncHTTPClient(base_url="http://host/api")
+        client_class(base_url=base_url)

@@ -185,27 +185,47 @@ uv run basedpyright lothc tests
 
 - **Fix, don't suppress, anything a real user of that checker would hit on the public API.** A
   scoped ignore for one checker is fine only for test-internal scaffolding no consumer could write
-  (e.g. the `builtins.__import__` monkeypatch in `tests/test_compat_fallbacks.py`).
-- **Look for a real fix even then.** That monkeypatch needed `__import__`'s exact signature instead
-  of `*args, **kwargs` before three checkers agreed; only ty still objected, printing two
-  identical signatures as incompatible (a genuine ty bug, hence one `# ty: ignore[...]`). The
-  callable `bearer_auth` test providers in `tests/test_auth.py` looked like the same zuban-only
-  bug, but dropping `@dataclass` for a plain class with an explicit `__init__` satisfied all four.
-  Check whether a small, unrelated-looking change removes a disagreement before calling it a tool
-  bug.
+  (e.g. `tests/test_mocker.py`'s `pyright: ignore` on a direct call to pyreqwest's own
+  `ClientMocker`, which lothc never exposes).
+- **Look for a real fix even then.** The callable `bearer_auth` test providers in
+  `tests/test_auth.py` looked like a zuban bug (it printed identical "expected"/"got" signatures
+  yet rejected a `@dataclass` with `__call__`), but a plain class with an explicit `__init__`
+  satisfied all four. Check whether a small, unrelated-looking change removes a disagreement
+  before calling it a tool bug.
+
+### Shared fixtures and helpers
+
+- **`server_key` (`conftest.py`) for every per-key server state** (`/flaky`, `/retry-after*`,
+  `/hits`, `/endless`, SSE reconnect counters, OAuth request logs): a fresh `uuid4` per test. The
+  server lives for the session, so hand-picked keys collided silently when copy-pasted and leaked
+  state into a re-run (a second `/retry-after` hit returns 200). A second key is a suffix
+  (`f"{server_key}-api"`).
+- **`token_server` (`tests/_oauth_server.py`) for OAuth tests.** `TokenEndpoint(...)` spells the
+  `/oauth/token*` handler's query options as typed fields (checked with `is not None`, so
+  `expires_in=0` is still sent). `TokenServer.provider()`/`.sync_provider()` build a provider on the
+  test's key (`cached=True` uses a per-test cache dir); `.requests()`/`.grant_types()` read the
+  endpoint's log. Unusual settings (`token_request=`, `client_factory=`) build their own provider
+  on `token_server.url(...)`. Overrides are an `Unpack`ed `TypedDict`, so all four checkers type
+  the result precisely (ty alone doesn't reject an unknown key).
+- **`tests/_helpers.py`**: `echoed_headers(result)` turns `/echo-headers`' body into a lowercased
+  name → value dict (last value wins; a duplicate-header test reads the raw list). Keep it free of
+  pydantic/msgspec: `task test-no-extras` picks modules by grepping their own text, so an import
+  through a helper would slip past it.
+- **The `client`/`sync_client` fixtures over an inline default client**, unless the test is about
+  the client's lifecycle (reading after close, re-entry).
 
 ### Test suite speed
 
-~7.6s for ~650 tests; the growth since ~3.0s/385 tests is deliberate timing tests (stream idle
-limits, retries), not overhead. The fixed floor (interpreter, plugins, `import lothc`,
+~8.7s for ~850 tests; the growth since ~3.0s/385 tests is deliberate timing tests (stream idle
+limits, retries) and per-verb/per-case parametrization, not overhead. The fixed floor (interpreter, plugins, `import lothc`,
 collection) is ~0.45s, and a typical test costs ~2ms *including* a real HTTP round trip and its
 own event loop, so sharing a client or a broader-scoped loop buys nothing and costs isolation.
 
 What got it down from ~45s:
 
-- **`serve_forever(poll_interval=0.01)`**, not the 0.5s default (`tests/conftest.py`,
-  `tests/test_sse_interrupt.py`): `shutdown()` blocks until the loop next wakes, which charged up
-  to 0.5s per server teardown, invisible in any test's own duration.
+- **`serve_forever(poll_interval=0.01)`**, not the 0.5s default (`serve_in_background` in
+  `tests/_server.py`, which every test server uses): `shutdown()` blocks until the loop next wakes,
+  which charged up to 0.5s per server teardown, invisible in any test's own duration.
 - **Scale a timing *pair* down together, never a lone margin.** The SSE total-timeout tests went
   from 0.6s stream vs 0.3s timeout to 0.15s vs 0.05s: a wider 3x margin at a quarter the cost.
 - **`backoff_base=0.001`** on retry tests that assert *that* a retry happened. Non-zero so the real

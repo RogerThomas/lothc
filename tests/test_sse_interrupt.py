@@ -15,28 +15,15 @@ import select
 import signal
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
+from _server import serve_in_background
 
 # `pty` is POSIX-only — importorskip converts an ImportError on Windows into a clean skip,
 # rather than a collection error (a plain `import pty` would blow up before any marker on this
 # module gets a chance to run).
 pty = pytest.importorskip("pty")
-
-_GOT_EVENT_MARKER = b"GOT_EVENT"
-
-_CLIENT_SCRIPT = """
-import sys
-
-from lothc import SyncHTTPClient
-
-base_url, interruptible = sys.argv[1], sys.argv[2] == "true"
-with SyncHTTPClient(base_url=base_url) as client:
-    for event in client.sse("stall", interruptible=interruptible):
-        print(f"GOT_EVENT:{event.data}", flush=True)
-"""
 
 
 class _StallingSSEHandler(BaseHTTPRequestHandler):
@@ -106,69 +93,70 @@ def test_sync_sse_ctrl_c_interruptibility(*, interruptible: bool) -> None:
     stalled sync SSE stream promptly; `interruptible=False` (the default) reproduces the
     original bug — Ctrl-C is dead while blocked in `read_chunk()` — as the negative control.
     """
-    with _make_stalling_server() as server, ThreadPoolExecutor(max_workers=1) as pool:
-        # `poll_interval=0.01`, not the 0.5s default: `shutdown()` blocks until
-        # `serve_forever`'s loop next wakes up, so the default makes every teardown pay up
-        # to half a second of pure waiting (measured).
-        pool.submit(server.serve_forever, 0.01)
-        try:
-            base_url = f"http://127.0.0.1:{server.server_port}/"
-            pid, master_fd = pty.fork()
-            if pid == 0:
-                # execvp never returns on success — it replaces this process image outright.
-                # The try/finally guards only the failure case: if exec itself raises, this
-                # forked child must never fall through into the parent's own test/fixture
-                # code (a duplicate pytest process running is a much worse failure mode than
-                # a confusing exit code), so os._exit() unconditionally on the way out.
-                try:
-                    os.execvp(  # noqa: S606 — fixed interpreter path, no shell, no untrusted input
-                        sys.executable,
-                        [
-                            sys.executable,
-                            "-c",
-                            _CLIENT_SCRIPT,
-                            base_url,
-                            "true" if interruptible else "false",
-                        ],
-                    )
-                finally:
-                    os._exit(127)
+    client_script = (
+        "import sys\n"
+        "from lothc import SyncHTTPClient\n"
+        "base_url, interruptible = sys.argv[1], sys.argv[2] == 'true'\n"
+        "with SyncHTTPClient(base_url=base_url) as client:\n"
+        "    for event in client.sse('stall', interruptible=interruptible):\n"
+        "        print(f'GOT_EVENT:{event.data}', flush=True)\n"
+    )
+    with serve_in_background(_make_stalling_server()) as server:
+        base_url = f"http://127.0.0.1:{server.server_port}/"
+        pid, master_fd = pty.fork()
+        if pid == 0:
+            # execvp never returns on success — it replaces this process image outright.
+            # The try/finally guards only the failure case: if exec itself raises, this
+            # forked child must never fall through into the parent's own test/fixture
+            # code (a duplicate pytest process running is a much worse failure mode than
+            # a confusing exit code), so os._exit() unconditionally on the way out.
             try:
-                assert _read_until(master_fd, _GOT_EVENT_MARKER, time.monotonic() + 10)
-                # Let the child get from printing the event back into its blocking `read_chunk()`
-                # before Ctrl-C arrives. Without this, a loaded machine could deliver the byte
-                # while the child was still running Python bytecode, where a KeyboardInterrupt
-                # lands immediately either way: the negative control then failed (reproduced 1/25
-                # under a 12-way CPU burn), and the `True` case could pass without ever proving a
-                # *blocked* read was interrupted. A child that isn't blocked by then is a failure
-                # of this harness, not something either case is meant to measure.
-                time.sleep(0.2)
-                os.write(master_fd, b"\x03")
-                # These two deadlines are not the same kind of number, which is why they differ.
-                # For `interruptible=True` it's a generous upper bound that a passing run never
-                # reaches (a working Ctrl-C exits in ~15-25ms, measured over repeated runs), so
-                # its size is free and only bounds how long a genuine regression takes to fail.
-                # For the negative control it's a dwell time paid in full on every green run, so
-                # every extra second is pure suite latency — 0.5s still leaves ~20x headroom over
-                # the slowest exit observed, which is ample for a loaded CI box.
-                deadline = 2.0 if interruptible else 0.5
-                exited = _wait_exited(pid, master_fd, time.monotonic() + deadline)
-                if interruptible:
-                    assert exited
-                else:
-                    # Note what guards this: were the `\x03` write silently not reaching the
-                    # child at all, this assertion would still pass — for the wrong reason. The
-                    # `interruptible=True` twin is what rules that out, since it exercises the
-                    # identical PTY write and fails if delivery breaks.
-                    assert not exited
+                os.execvp(  # noqa: S606 — fixed interpreter path, no shell, no untrusted input
+                    sys.executable,
+                    [
+                        sys.executable,
+                        "-c",
+                        client_script,
+                        base_url,
+                        "true" if interruptible else "false",
+                    ],
+                )
             finally:
-                if not interruptible:
-                    with contextlib.suppress(ProcessLookupError):
-                        os.kill(pid, signal.SIGKILL)
-                    # Already reaped if `_wait_exited` saw it exit, which is exactly when the
-                    # negative control fails; raising here would bury that assertion.
-                    with contextlib.suppress(ChildProcessError):
-                        os.waitpid(pid, 0)
-                os.close(master_fd)
+                os._exit(127)
+        try:
+            assert _read_until(master_fd, b"GOT_EVENT", time.monotonic() + 10)
+            # Let the child get from printing the event back into its blocking `read_chunk()`
+            # before Ctrl-C arrives. Without this, a loaded machine could deliver the byte
+            # while the child was still running Python bytecode, where a KeyboardInterrupt
+            # lands immediately either way: the negative control then failed (reproduced 1/25
+            # under a 12-way CPU burn), and the `True` case could pass without ever proving a
+            # *blocked* read was interrupted. A child that isn't blocked by then is a failure
+            # of this harness, not something either case is meant to measure.
+            time.sleep(0.2)
+            os.write(master_fd, b"\x03")
+            # These two deadlines are not the same kind of number, which is why they differ.
+            # For `interruptible=True` it's a generous upper bound that a passing run never
+            # reaches (a working Ctrl-C exits in ~15-25ms, measured over repeated runs), so
+            # its size is free and only bounds how long a genuine regression takes to fail.
+            # For the negative control it's a dwell time paid in full on every green run, so
+            # every extra second is pure suite latency — 0.5s still leaves ~20x headroom over
+            # the slowest exit observed, which is ample for a loaded CI box.
+            deadline = 2.0 if interruptible else 0.5
+            exited = _wait_exited(pid, master_fd, time.monotonic() + deadline)
+            if interruptible:
+                assert exited
+            else:
+                # Note what guards this: were the `\x03` write silently not reaching the
+                # child at all, this assertion would still pass — for the wrong reason. The
+                # `interruptible=True` twin is what rules that out, since it exercises the
+                # identical PTY write and fails if delivery breaks.
+                assert not exited
         finally:
-            server.shutdown()
+            if not interruptible:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)
+                # Already reaped if `_wait_exited` saw it exit, which is exactly when the
+                # negative control fails; raising here would bury that assertion.
+                with contextlib.suppress(ChildProcessError):
+                    os.waitpid(pid, 0)
+            os.close(master_fd)

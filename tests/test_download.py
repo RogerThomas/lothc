@@ -178,6 +178,7 @@ async def test_download_to_file_response_carries_status_and_headers(
         # An explicit one is a total cap instead, read on the calling thread.
         5.0,
     ],
+    ids=["idle-limit-worker-thread", "total-cap-calling-thread"],
 )
 def test_sync_download_response_carries_status_headers_and_request(
     sync_client: SyncHTTPClient, base_url: str, timeout: float | None
