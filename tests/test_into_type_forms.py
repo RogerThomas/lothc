@@ -1,4 +1,8 @@
+from collections import Counter, OrderedDict, deque
 from dataclasses import dataclass
+from datetime import datetime
+from ipaddress import IPv4Address
+from pathlib import Path
 from typing import Annotated, Any, Literal, NamedTuple, TypedDict
 
 import annotated_types
@@ -554,3 +558,75 @@ def test_sync_get_decodes_an_inline_lambda_validator(sync_client: SyncHTTPClient
         ).data
 
         assert numbers == [2]
+
+
+async def test_get_decodes_types_msgspec_cannot_with_pydantic(client: HTTPClient) -> None:
+    # msgspec accepts these forms but can't decode any of them from JSON, so pydantic does.
+    path = (await client.get("json-literal", params={"value": '"a/b"'}, into=Path)).data
+    numbers = (await client.get("json-literal", params={"value": "[1, 2]"}, into=deque[int])).data
+    address = (
+        await client.get("json-literal", params={"value": '"127.0.0.1"'}, into=IPv4Address)
+    ).data
+
+    assert path == Path("a/b")
+    assert numbers == deque([1, 2])
+    assert type(numbers) is deque
+    assert address == IPv4Address("127.0.0.1")
+
+
+def test_sync_get_decodes_types_msgspec_cannot_with_pydantic(
+    sync_client: SyncHTTPClient,
+) -> None:
+    path = sync_client.get("json-literal", params={"value": '"a/b"'}, into=Path).data
+    numbers = sync_client.get("json-literal", params={"value": "[1, 2]"}, into=deque[int]).data
+    address = sync_client.get(
+        "json-literal", params={"value": '"127.0.0.1"'}, into=IPv4Address
+    ).data
+
+    assert path == Path("a/b")
+    assert numbers == deque([1, 2])
+    assert type(numbers) is deque
+    assert address == IPv4Address("127.0.0.1")
+
+
+async def test_get_decodes_a_list_of_a_type_msgspec_cannot(client: HTTPClient) -> None:
+    paths = (await client.get("json-literal", params={"value": '["a"]'}, into=list[Path])).data
+
+    assert paths == [Path("a")]
+
+
+async def test_get_decodes_parametrized_dict_subclasses(client: HTTPClient) -> None:
+    ordered = (
+        await client.get("json-literal", params={"value": '{"a": 1}'}, into=OrderedDict[str, int])
+    ).data
+    counter = (
+        await client.get("json-literal", params={"value": '{"a": 1}'}, into=Counter[str])
+    ).data
+
+    assert type(ordered) is OrderedDict
+    assert ordered == {"a": 1}
+    assert type(counter) is Counter
+    assert counter == {"a": 1}
+
+
+def test_sync_get_decodes_parametrized_dict_subclasses(sync_client: SyncHTTPClient) -> None:
+    ordered = sync_client.get(
+        "json-literal", params={"value": '{"a": 1}'}, into=OrderedDict[str, int]
+    ).data
+    counter = sync_client.get("json-literal", params={"value": '{"a": 1}'}, into=Counter[str]).data
+
+    assert type(ordered) is OrderedDict
+    assert ordered == {"a": 1}
+    assert type(counter) is Counter
+    assert counter == {"a": 1}
+
+
+async def test_get_validates_a_parametrized_dict_subclass_values(client: HTTPClient) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        await client.get("json-literal", params={"value": '{"a": "b"}'}, into=OrderedDict[str, int])
+
+
+async def test_get_still_decodes_a_type_msgspec_supports_with_msgspec(client: HTTPClient) -> None:
+    # Which library's `ValidationError` a bad value raises is what shows who decoded it.
+    with pytest.raises(msgspec.ValidationError):
+        await client.get("json-literal", params={"value": '"not-a-date"'}, into=datetime)

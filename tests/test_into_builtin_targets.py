@@ -2,7 +2,9 @@
 library, so `task test-no-extras` runs it with both uninstalled."""
 
 import json
+import typing
 from collections import OrderedDict, defaultdict
+from collections.abc import Mapping
 from typing import Any, assert_type
 
 import pytest
@@ -274,3 +276,55 @@ async def test_stream_get_into_dict_still_skips_blank_crlf_lines(client: HTTPCli
     ]
 
     assert lines == [{"i": 0}, {"i": 1}]
+
+
+async def test_get_into_typing_dict_str_any_decodes_a_json_object(client: HTTPClient) -> None:
+    item = (await client.get("items/7", into=typing.Dict[str, Any])).data  # noqa: UP006
+
+    assert item == {"id": 7, "name": "item-7"}
+
+
+def test_sync_get_into_typing_dict_str_any_decodes_a_json_object(
+    sync_client: SyncHTTPClient,
+) -> None:
+    item = sync_client.get("items/7", into=typing.Dict[str, Any]).data  # noqa: UP006
+
+    assert item == {"id": 7, "name": "item-7"}
+
+
+async def test_get_into_mapping_str_any_decodes_a_json_object(client: HTTPClient) -> None:
+    item = (await client.get("items/7", into=Mapping[str, Any])).data
+
+    assert item == {"id": 7, "name": "item-7"}
+
+
+def test_sync_get_into_mapping_str_any_decodes_a_json_object(sync_client: SyncHTTPClient) -> None:
+    item = sync_client.get("items/7", into=Mapping[str, Any]).data
+
+    assert item == {"id": 7, "name": "item-7"}
+
+
+async def test_get_into_mapping_str_any_rejects_a_json_array(client: HTTPClient) -> None:
+    with pytest.raises(ValueError, match="Expected a JSON object"):
+        await client.get("json-array", into=Mapping[str, Any])
+
+
+def test_sync_sse_into_bytes_keeps_data_raw(sync_client: SyncHTTPClient) -> None:
+    events = list(sync_client.sse("events", params={"count": 1}, into=bytes))
+
+    assert_type(events[0].data, bytes)
+    assert events[0].data == b'{"msg": "hello 0", "now": 0}'
+
+
+async def test_sse_default_data_is_the_raw_text(client: HTTPClient) -> None:
+    events = [event async for event in client.sse("events", params={"count": 1})]
+
+    assert_type(events[0].data, str)
+    assert events[0].data == '{"msg": "hello 0", "now": 0}'
+
+
+def test_sync_sse_default_data_is_the_raw_text(sync_client: SyncHTTPClient) -> None:
+    events = list(sync_client.sse("events", params={"count": 1}))
+
+    assert_type(events[0].data, str)
+    assert events[0].data == '{"msg": "hello 0", "now": 0}'
