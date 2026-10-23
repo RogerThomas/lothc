@@ -2,6 +2,7 @@ import json
 from typing import Any, cast
 
 import pytest
+from _helpers import echoed_headers
 from msgspec import Struct
 from msgspec.json import Decoder
 from pydantic import BaseModel, TypeAdapter, ValidationError
@@ -55,11 +56,6 @@ async def test_get_decodes_msgspec_struct(client: HTTPClient) -> None:
     assert item == ItemStruct(id=7, name="item-7")
 
 
-async def test_get_decodes_plain_dict(client: HTTPClient) -> None:
-    item = (await client.get("items/7", into=dict)).data
-    assert item == {"id": 7, "name": "item-7"}
-
-
 async def test_get_with_raw_dict_params(client: HTTPClient) -> None:
     result = (await client.get("items", params={"q": "pikachu", "page": 2}, into=dict)).data
     assert result == {"q": "pikachu", "page": 2, "items": [{"id": 2, "name": "pikachu-match"}]}
@@ -87,24 +83,23 @@ async def test_get_with_scalar_query_params_still_works(client: HTTPClient) -> N
 
 async def test_get_with_pydantic_params_omits_none_fields(client: HTTPClient) -> None:
     result = (
-        await client.get("items", params=SearchParamsModel(q="pikachu", page=1), into=dict)
+        await client.get("echo-query", params=SearchParamsModel(q="pikachu", page=1), into=dict)
     ).data
-    assert result["q"] == "pikachu"
-    assert result["page"] == 1
+    assert result == {"query": {"q": ["pikachu"], "page": ["1"]}}
 
 
-async def test_get_with_msgspec_params(client: HTTPClient) -> None:
+async def test_get_with_msgspec_params_omits_none_fields(client: HTTPClient) -> None:
     result = (
-        await client.get("items", params=SearchParamsStruct(q="pikachu", page=1), into=dict)
+        await client.get("echo-query", params=SearchParamsStruct(q="pikachu", page=1), into=dict)
     ).data
-    assert result["q"] == "pikachu"
+    assert result == {"query": {"q": ["pikachu"], "page": ["1"]}}
 
 
 async def test_get_with_raw_headers(client: HTTPClient) -> None:
     result = (
         await client.get("echo-headers", headers={"x-custom": "header-value"}, into=dict)
     ).data
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     assert headers["x-custom"] == "header-value"
 
 
@@ -126,7 +121,7 @@ async def test_get_with_pydantic_headers_omits_none_fields(client: HTTPClient) -
             into=dict,
         )
     ).data
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     assert headers["x-custom"] == "header-value"
     assert "x-omitted" not in headers
 
@@ -139,7 +134,7 @@ async def test_get_with_msgspec_headers_omits_none_fields(client: HTTPClient) ->
             into=dict,
         )
     ).data
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     assert headers["x-custom"] == "header-value"
     assert "x-omitted" not in headers
 
@@ -148,7 +143,7 @@ async def test_default_headers_sent_on_every_request(base_url: str) -> None:
     async with HTTPClient(base_url=base_url, default_headers={"x-api-key": "secret"}) as client:
         result = (await client.get("echo-headers", into=dict)).data
 
-    headers = {h["name"].lower(): h["value"] for h in result["headers"]}
+    headers = echoed_headers(result)
     assert headers["x-api-key"] == "secret"
 
 

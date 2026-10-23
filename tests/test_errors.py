@@ -88,13 +88,6 @@ async def test_get_error_has_request_info(client: HTTPClient) -> None:
     assert exc_info.value.request.host == "127.0.0.1"
 
 
-async def test_response_get_error_has_request_info(client: HTTPClient) -> None:
-    with pytest.raises(HTTPResponseError) as exc_info:
-        await client.get("boom")
-    assert exc_info.value.request.method == "GET"
-    assert exc_info.value.request.path == "/boom"
-
-
 async def test_sse_error_has_request_info(client: HTTPClient) -> None:
     with pytest.raises(HTTPResponseError) as exc_info:
         async for _ in client.sse("boom"):
@@ -149,13 +142,6 @@ def test_sync_get_error_has_request_info(sync_client: SyncHTTPClient) -> None:
     assert exc_info.value.request.host == "127.0.0.1"
 
 
-def test_sync_get_result_error_has_request_info(sync_client: SyncHTTPClient) -> None:
-    with pytest.raises(HTTPResponseError) as exc_info:
-        sync_client.get("boom")
-    assert exc_info.value.request.method == "GET"
-    assert exc_info.value.request.path == "/boom"
-
-
 def test_sync_sse_error_has_request_info(sync_client: SyncHTTPClient) -> None:
     with pytest.raises(HTTPResponseError) as exc_info:
         for _ in sync_client.sse("boom"):
@@ -164,10 +150,12 @@ def test_sync_sse_error_has_request_info(sync_client: SyncHTTPClient) -> None:
     assert exc_info.value.request.path == "/boom"
 
 
-async def test_response_error_carries_the_error_responses_headers(base_url: str) -> None:
+async def test_response_error_carries_the_error_responses_headers(
+    base_url: str, server_key: str
+) -> None:
     async with HTTPClient(base_url=base_url, max_retries=0) as client:
         with pytest.raises(HTTPResponseError) as exc_info:
-            await client.get("retry-after", params={"key": "error-headers"})
+            await client.get("retry-after", params={"key": server_key})
 
     assert exc_info.value.status == 429
     assert exc_info.value.headers["Retry-After"] == "0"

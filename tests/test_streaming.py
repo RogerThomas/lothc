@@ -1,3 +1,4 @@
+import json
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, cast
 
@@ -90,7 +91,11 @@ async def test_stream_get_raw_bytes_mode_error_for_status_false_suppresses_raise
 ) -> None:
     chunks = [chunk async for chunk in client.stream_get("boom", error_for_status=False)]
 
-    assert b"".join(chunks) != b""
+    assert json.loads(b"".join(chunks)) == {
+        "type": "internal-server-error",
+        "title": "Internal server error",
+        "status": 500,
+    }
 
 
 async def test_stream_get_skips_blank_lines_between_ndjson_records(client: HTTPClient) -> None:
@@ -114,7 +119,7 @@ async def test_stream_get_into_not_a_type_raises_type_error(client: HTTPClient) 
         [line async for line in client.stream_get("ndjson", into=cast(TypeForm[Any], 1))]
 
 
-@pytest.mark.parametrize("interruptible", [False, True])
+@pytest.mark.parametrize("interruptible", [False, True], ids=["blocking", "interruptible"])
 def test_sync_stream_get_without_into_reconstructs_exact_bytes(
     sync_client: SyncHTTPClient, *, interruptible: bool
 ) -> None:
@@ -140,7 +145,11 @@ def test_sync_stream_get_raw_bytes_mode_error_for_status_false_suppresses_raise(
 ) -> None:
     chunks = list(sync_client.stream_get("boom", error_for_status=False))
 
-    assert b"".join(chunks) != b""
+    assert json.loads(b"".join(chunks)) == {
+        "type": "internal-server-error",
+        "title": "Internal server error",
+        "status": 500,
+    }
 
 
 def test_sync_stream_get_skips_blank_lines_between_ndjson_records(
@@ -151,7 +160,7 @@ def test_sync_stream_get_skips_blank_lines_between_ndjson_records(
     assert lines == [{"i": 0}, {"i": 1}, {"i": 2}]
 
 
-@pytest.mark.parametrize("interruptible", [False, True])
+@pytest.mark.parametrize("interruptible", [False, True], ids=["blocking", "interruptible"])
 def test_sync_stream_get_transport_error_mid_stream_raises_connection_error(
     sync_client: SyncHTTPClient, *, interruptible: bool
 ) -> None:

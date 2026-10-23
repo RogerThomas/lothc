@@ -4,19 +4,13 @@ from lothc import HTTPClient, SyncHTTPClient
 
 
 class EchoedHeaders(BaseModel):
-    x_custom: str | None = None
+    content_type: str
 
 
 async def test_delete_returns_raw_bytes_by_default(client: HTTPClient) -> None:
     body = (await client.delete("items/7")).data
 
     assert body == b'{"id": 7, "deleted": true}'
-
-
-async def test_delete_decodes_into(client: HTTPClient) -> None:
-    result = (await client.delete("items/7", into=dict)).data
-
-    assert result == {"id": 7, "deleted": True}
 
 
 async def test_response_delete_includes_status_and_data(client: HTTPClient) -> None:
@@ -29,7 +23,7 @@ async def test_response_delete_includes_status_and_data(client: HTTPClient) -> N
 async def test_response_delete_with_typed_headers(client: HTTPClient) -> None:
     result = await client.delete("items/7", into=dict, response_headers_type=EchoedHeaders)
 
-    assert result.typed_headers is not None
+    assert result.typed_headers == EchoedHeaders(content_type="application/json")
 
 
 def test_sync_delete_result_includes_status_and_data(sync_client: SyncHTTPClient) -> None:
@@ -53,12 +47,6 @@ async def test_head_returns_headers_only_result(client: HTTPClient) -> None:
     assert result.data is None
     assert result.status == 200
     assert result.headers["x-item-exists"] == "true"
-
-
-def test_sync_delete_decodes_into(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.delete("items/7", into=dict).data
-
-    assert result == {"id": 7, "deleted": True}
 
 
 def test_sync_head_returns_headers_only_result(sync_client: SyncHTTPClient) -> None:

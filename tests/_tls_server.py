@@ -11,12 +11,11 @@ import socket
 import ssl
 import sys
 from collections.abc import Generator
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
 
 import trustme
-from _server import TestAppHandler
+from _server import TestAppHandler, serve_in_background
 
 
 class _TLSServer(ThreadingHTTPServer):
@@ -72,11 +71,5 @@ def serve_tls(context: ssl.SSLContext) -> Generator[str]:
     `localhost`, not `127.0.0.1`, in the URL: that's the name the certificate is verified against
     here, so hostname verification is exercised too rather than only IP-SAN matching.
     """
-    with _TLSServer(context) as server, ThreadPoolExecutor(max_workers=1) as pool:
-        # `poll_interval=0.01` for the same reason as `conftest.py`'s plain server: the 0.5s
-        # default makes every `shutdown()` wait up to half a second.
-        pool.submit(server.serve_forever, 0.01)
-        try:
-            yield f"https://localhost:{server.server_port}/"
-        finally:
-            server.shutdown()
+    with serve_in_background(_TLSServer(context)) as server:
+        yield f"https://localhost:{server.server_port}/"

@@ -193,6 +193,7 @@ known-first-party = ["lothc"]
     "S105",   # hardcoded-password false positives on deliberate literal test values, e.g.
     # test_oauth.py asserting a cache file holds `"access_token": "token-1"`
     "S106",   # hardcoded-password false positives on deliberate literal test values
+    "S107",   # the same, as a default: `_oauth_server.py`'s `client_secret="client-secret"`
     "S603",   # subprocess call with a fixed, non-attacker-controlled argument list
     "S607",   # partial executable path — deliberately PATH-resolved, matching Taskfile invocations
 ]

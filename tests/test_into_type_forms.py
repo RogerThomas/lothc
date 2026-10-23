@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from ipaddress import IPv4Address
 from pathlib import Path
-from typing import Annotated, Any, NamedTuple, TypedDict
+from typing import Annotated, Any, Literal, NamedTuple, TypedDict
 
 import annotated_types
 import msgspec
@@ -300,6 +300,7 @@ def test_sync_sse_decodes_data_into_a_form(sync_client: SyncHTTPClient) -> None:
         list[Annotated[int, AfterValidator(_positive)]],
         PositiveInts,
     ],
+    ids=["pydantic-field", "annotated-types", "after-validator", "type-alias"],
 )
 async def test_get_enforces_pydantic_only_metadata_on_a_form_without_models(
     client: HTTPClient,
@@ -331,16 +332,22 @@ def test_sync_get_enforces_a_pydantic_dataclass_field_constraint(
         sync_client.get("json-literal", params={"value": '{"id": -1}'}, into=PositiveItem)
 
 
-async def test_get_keeps_plain_and_msgspec_metadata_on_msgspec(client: HTTPClient) -> None:
+@pytest.mark.parametrize(
+    ("value", "form"),
+    [
+        ("[-5]", list[Annotated[int, msgspec.Meta(gt=0)]]),
+        ('["a"]', list[Annotated[int, "doc"]]),
+    ],
+    ids=["msgspec-meta", "plain-metadata"],
+)
+async def test_get_keeps_plain_and_msgspec_metadata_on_msgspec(
+    client: HTTPClient,
+    value: str,
+    form: Any,  # noqa: ANN401 — the forms differ in type, which isn't what's under test
+) -> None:
     # msgspec's own error type shows which library decoded it.
     with pytest.raises(msgspec.ValidationError):
-        await client.get(
-            "json-literal", params={"value": "[-5]"}, into=list[Annotated[int, msgspec.Meta(gt=0)]]
-        )
-    with pytest.raises(msgspec.ValidationError):
-        await client.get(
-            "json-literal", params={"value": '["a"]'}, into=list[Annotated[int, "doc"]]
-        )
+        await client.get("json-literal", params={"value": value}, into=form)
 
 
 async def test_get_into_a_struct_with_pydantic_metadata_raises_type_error(
@@ -435,23 +442,33 @@ async def test_post_with_an_unusable_into_sends_nothing(
     assert lothc_mocker.get_call_count() == 0
 
 
-async def test_get_put_patch_delete_with_an_unusable_into_send_nothing(
-    client: HTTPClient, lothc_mocker: LOTHCMocker
+type MockedVerb = Literal["get", "put", "patch", "delete"]
+
+
+async def _send_with_unusable_into(client: HTTPClient, verb: MockedVerb) -> None:
+    into = ItemStruct | ItemModel
+    match verb:
+        case "get":
+            await client.get("items/7", into=into)
+        case "put":
+            await client.put("items/7", json={"id": 7}, into=into)
+        case "patch":
+            await client.patch("items/7", json={"id": 7}, into=into)
+        case "delete":
+            await client.delete("items/7", into=into)
+
+
+@pytest.mark.parametrize("verb", ["get", "put", "patch", "delete"])
+async def test_an_unusable_into_sends_nothing(
+    client: HTTPClient, lothc_mocker: LOTHCMocker, verb: MockedVerb
 ) -> None:
     lothc_mocker.add_get_response(path="/items/7", data={"id": 7})
     lothc_mocker.add_put_response(path="/items/7", data={"id": 7})
     lothc_mocker.add_patch_response(path="/items/7", data={"id": 7})
     lothc_mocker.add_delete_response(path="/items/7", data={"id": 7})
-    into = ItemStruct | ItemModel
 
     with pytest.raises(TypeError):
-        await client.get("items/7", into=into)
-    with pytest.raises(TypeError):
-        await client.put("items/7", json={"id": 7}, into=into)
-    with pytest.raises(TypeError):
-        await client.patch("items/7", json={"id": 7}, into=into)
-    with pytest.raises(TypeError):
-        await client.delete("items/7", into=into)
+        await _send_with_unusable_into(client, verb)
 
     assert lothc_mocker.get_call_count() == 0
 

@@ -1,10 +1,12 @@
 import ssl
 from collections.abc import AsyncGenerator, Generator
-from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import trustme
-from _server import make_server
+from _oauth_server import TokenServer
+from _server import make_server, serve_in_background
 from _tls_server import serve_tls, tls_server_context
 
 from lothc import HTTPClient, SyncHTTPClient
@@ -12,15 +14,18 @@ from lothc import HTTPClient, SyncHTTPClient
 
 @pytest.fixture(scope="session", name="base_url")
 def _base_url() -> Generator[str]:
-    with make_server() as server, ThreadPoolExecutor(max_workers=1) as pool:
-        # `poll_interval=0.01`, not the 0.5s default: `shutdown()` blocks until
-        # `serve_forever`'s loop next wakes up, so the default makes every teardown pay up
-        # to half a second of pure waiting (measured).
-        pool.submit(server.serve_forever, 0.01)
-        try:
-            yield f"http://127.0.0.1:{server.server_port}/"
-        finally:
-            server.shutdown()
+    with serve_in_background(make_server()) as server:
+        yield f"http://127.0.0.1:{server.server_port}/"
+
+
+@pytest.fixture(name="server_key")
+def _server_key() -> str:
+    """A fresh key for the test server's per-key state (hit counters, OAuth request logs).
+
+    The server lives for the whole session, so a hand-picked key collides silently when a test
+    is copy-pasted, and its state leaks into a re-run of the same test within the session.
+    """
+    return str(uuid4())
 
 
 @pytest.fixture(name="client")
@@ -33,6 +38,15 @@ async def _client(base_url: str) -> AsyncGenerator[HTTPClient]:
 def _sync_client(base_url: str) -> Generator[SyncHTTPClient]:
     with SyncHTTPClient(base_url=base_url) as client:
         yield client
+
+
+@pytest.fixture(name="token_server")
+def _token_server(
+    base_url: str, server_key: str, sync_client: SyncHTTPClient, tmp_path: Path
+) -> TokenServer:
+    cache_dir = tmp_path / "token-cache"
+    cache_dir.mkdir()
+    return TokenServer(base_url, server_key, sync_client, cache_dir)
 
 
 @pytest.fixture(scope="session", name="tls_ca")

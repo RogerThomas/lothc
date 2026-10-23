@@ -4,8 +4,7 @@ parameter decodes the body onto `.error`."""
 import pickle
 from collections.abc import AsyncGenerator, Generator
 from pathlib import Path
-from typing import Any, assert_type
-from uuid import uuid4
+from typing import Any, Literal, assert_type
 
 import pytest
 from msgspec import Struct, ValidationError
@@ -255,6 +254,7 @@ async def test_a_bound_type_parameter_overrides_its_default(client: HTTPClient) 
         (HTTPResponseError[NotFound], "must be HTTPResponseError or a subclass"),
         (MixedError, "mixes msgspec Structs and pydantic BaseModels"),
     ],
+    ids=["unbound", "not-a-subclass", "generic-alias", "mixed-libraries"],
 )
 def test_a_bad_raises_fails_at_construction(raises: Any, match: str) -> None:  # noqa: ANN401 — deliberately not a valid `raises=`
     with pytest.raises(TypeError, match=match):
@@ -263,37 +263,84 @@ def test_a_bad_raises_fails_at_construction(raises: Any, match: str) -> None:  #
         SyncHTTPClient(raises=raises)
 
 
+# The verbs each `raises=` validation test calls (the sync one uses `put` where async uses `post`).
+type Verb = Literal["get", "post", "head", "download", "stream_get", "stream_post", "sse"]
+type SyncVerb = Literal["get", "put", "head", "download", "stream_get", "stream_post", "sse"]
+
+
+async def _call_with_raises(
+    client: HTTPClient,
+    verb: Verb,
+    raises: Any,  # noqa: ANN401 — deliberately not a valid `raises=`
+    tmp_path: Path,
+) -> None:
+    match verb:
+        case "get":
+            await client.get("items/7", raises=raises)
+        case "post":
+            await client.post("items", json={"a": 1}, raises=raises)
+        case "head":
+            await client.head("items/7", raises=raises)
+        case "download":
+            await client.download("binary", tmp_path / "file", raises=raises)
+        case "stream_get":
+            async for _ in client.stream_get("binary", raises=raises):
+                pass
+        case "stream_post":
+            async for _ in client.stream_post("ndjson-echo", json={"n": 1}, raises=raises):
+                pass
+        case "sse":
+            async for _ in client.sse("events", raises=raises):
+                pass
+
+
+def _sync_call_with_raises(
+    sync_client: SyncHTTPClient,
+    verb: SyncVerb,
+    raises: Any,  # noqa: ANN401 — deliberately not a valid `raises=`
+    tmp_path: Path,
+) -> None:
+    match verb:
+        case "get":
+            sync_client.get("items/7", raises=raises)
+        case "put":
+            sync_client.put("items/7", json={"name": "name"}, raises=raises)
+        case "head":
+            sync_client.head("items/7", raises=raises)
+        case "download":
+            sync_client.download("binary", tmp_path / "file", raises=raises)
+        case "stream_get":
+            for _ in sync_client.stream_get("binary", raises=raises):
+                pass
+        case "stream_post":
+            for _ in sync_client.stream_post("ndjson-echo", json={"n": 1}, raises=raises):
+                pass
+        case "sse":
+            for _ in sync_client.sse("events", raises=raises):
+                pass
+
+
 @pytest.mark.parametrize(
     ("raises", "match"),
     [
         (GenericError, "leaves HTTPResponseError's error type unbound"),
         (int, "must be HTTPResponseError or a subclass"),
     ],
+    ids=["unbound", "not-a-subclass"],
+)
+@pytest.mark.parametrize(
+    "verb", ["get", "post", "head", "download", "stream_get", "stream_post", "sse"]
 )
 async def test_a_bad_per_call_raises_fails_even_on_a_200(
     client: HTTPClient,
     tmp_path: Path,
+    verb: Verb,
     raises: Any,  # noqa: ANN401 — deliberately not a valid `raises=`
     match: str,
 ) -> None:
     # Checked before sending, so it can't hide until a real 4xx/5xx and replace that error.
     with pytest.raises(TypeError, match=match):
-        await client.get("items/7", raises=raises)
-    with pytest.raises(TypeError, match=match):
-        await client.post("items", json={"a": 1}, raises=raises)
-    with pytest.raises(TypeError, match=match):
-        await client.head("items/7", raises=raises)
-    with pytest.raises(TypeError, match=match):
-        await client.download("binary", tmp_path / "file", raises=raises)
-    with pytest.raises(TypeError, match=match):
-        async for _ in client.stream_get("binary", raises=raises):
-            pass
-    with pytest.raises(TypeError, match=match):
-        async for _ in client.stream_post("ndjson-echo", json={"n": 1}, raises=raises):
-            pass
-    with pytest.raises(TypeError, match=match):
-        async for _ in client.sse("events", raises=raises):
-            pass
+        await _call_with_raises(client, verb, raises, tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -302,30 +349,20 @@ async def test_a_bad_per_call_raises_fails_even_on_a_200(
         (GenericError, "leaves HTTPResponseError's error type unbound"),
         (int, "must be HTTPResponseError or a subclass"),
     ],
+    ids=["unbound", "not-a-subclass"],
+)
+@pytest.mark.parametrize(
+    "verb", ["get", "put", "head", "download", "stream_get", "stream_post", "sse"]
 )
 def test_sync_a_bad_per_call_raises_fails_even_on_a_200(
     sync_client: SyncHTTPClient,
     tmp_path: Path,
+    verb: SyncVerb,
     raises: Any,  # noqa: ANN401 — deliberately not a valid `raises=`
     match: str,
 ) -> None:
     with pytest.raises(TypeError, match=match):
-        sync_client.get("items/7", raises=raises)
-    with pytest.raises(TypeError, match=match):
-        sync_client.put("items/7", json={"name": "name"}, raises=raises)
-    with pytest.raises(TypeError, match=match):
-        sync_client.head("items/7", raises=raises)
-    with pytest.raises(TypeError, match=match):
-        sync_client.download("binary", tmp_path / "file", raises=raises)
-    with pytest.raises(TypeError, match=match):
-        for _ in sync_client.stream_get("binary", raises=raises):
-            pass
-    with pytest.raises(TypeError, match=match):
-        for _ in sync_client.stream_post("ndjson-echo", json={"n": 1}, raises=raises):
-            pass
-    with pytest.raises(TypeError, match=match):
-        for _ in sync_client.sse("events", raises=raises):
-            pass
+        _sync_call_with_raises(sync_client, verb, raises, tmp_path)
 
 
 async def test_a_per_call_raises_mixing_struct_and_basemodel_raises_type_error(
@@ -444,12 +481,12 @@ def test_sync_head_raises_the_per_call_class(sync_client: SyncHTTPClient) -> Non
         sync_client.head("missing", raises=MyAPIError)
 
 
-async def test_retries_exhausted_raise_the_selected_class(base_url: str) -> None:
+async def test_retries_exhausted_raise_the_selected_class(base_url: str, server_key: str) -> None:
     async with HTTPClient(
         base_url=base_url, max_retries=1, backoff_base=0.001, raises=MyAPIError
     ) as client:
         with pytest.raises(MyAPIError) as exc_info:
-            await client.get("flaky", params={"key": str(uuid4()), "fail_times": 5})
+            await client.get("flaky", params={"key": server_key, "fail_times": 5})
 
     assert exc_info.value.status == 503
     assert exc_info.value.error == {
@@ -459,14 +496,14 @@ async def test_retries_exhausted_raise_the_selected_class(base_url: str) -> None
     }
 
 
-def test_sync_retries_exhausted_raise_the_selected_class(base_url: str) -> None:
+def test_sync_retries_exhausted_raise_the_selected_class(base_url: str, server_key: str) -> None:
     with (
         SyncHTTPClient(
             base_url=base_url, max_retries=1, backoff_base=0.001, raises=MyAPIError
         ) as client,
         pytest.raises(MyAPIError) as exc_info,
     ):
-        client.get("flaky", params={"key": str(uuid4()), "fail_times": 5})
+        client.get("flaky", params={"key": server_key, "fail_times": 5})
 
     assert exc_info.value.status == 503
 
