@@ -117,7 +117,7 @@ def _invalidated(token: _CachedToken | None, stale_access_token: str | None) -> 
     """`token` marked expired, unless it has already moved on from `stale_access_token`.
 
     Marked expired rather than dropped, so the next call renews through the refresh token when
-    there is one (falling back to a fresh mint on a 400, as any refresh does). Comparing against
+    there is one (falling back to a fresh mint on a 400/401, as any refresh does). Comparing against
     the token the rejected request carried is what stops two requests that both got a 401 from
     each discarding the *new* token the other just obtained.
 
@@ -457,6 +457,49 @@ def _persist_token(
         )
 
 
+def _rejected_access_token(
+    token: _CachedToken | None, stale_access_token: str | None
+) -> str | None:
+    """The access token an `invalidate()` is about: the one the rejected request carried, else
+    the current one (`None` if there's neither).
+
+    >>> token = _CachedToken("token-1", None, expires_at=9e9, expires_in=3600.0)
+    >>> _rejected_access_token(token, "token-0"), _rejected_access_token(token, None)
+    ('token-0', 'token-1')
+    >>> _rejected_access_token(None, None) is None
+    True
+    """
+    if stale_access_token is not None:
+        return stale_access_token
+    return None if token is None else token.access_token
+
+
+def _invalidate_token_cache(
+    path: Path, token_url: str, client_id: str, scope: str | None, rejected_access_token: str
+) -> None:
+    """Mark the cached token expired too, so the next process renews instead of reloading a token
+    the server has revoked (a POST's 401 is never retried, so a short-lived script would otherwise
+    fail on every run until the token expired naturally).
+
+    Marked expired rather than deleted, exactly as `_invalidated` does in memory, so a later
+    process can still renew through the cached refresh token. A file holding a different token
+    (another process has already renewed) is left alone, and an unusable one reads as "no cache",
+    so there's nothing to do. A failed write warns rather than raises, like `_persist_token`.
+    """
+    cached = _read_token_cache(path, token_url, client_id, scope)
+    if cached is None or cached.access_token != rejected_access_token:
+        return
+    try:
+        _write_token_cache(path, token_url, client_id, scope, replace(cached, expires_at=0.0))
+    except OSError as error:
+        warnings.warn(
+            f"Could not mark the OAuth token cache at {path} expired ({error}); the next process"
+            " may load the rejected token from it.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+
 def _validate_provider_config(
     token_request: TokenRequestTyping | None,
     token_refresh_request: TokenRefreshRequestTyping | None,
@@ -499,9 +542,9 @@ class OAuthProvider:
       compare, no lock, no HTTP. Inside that window it renews: a refresh
       (`grant_type=refresh_token`, or `token_refresh_request`) if the last response carried a
       `refresh_token` (carried forward if the refresh response omits one), falling back to a
-      fresh mint only if the refresh is rejected with a 400 or if there's no way to refresh.
-      Any failure to obtain a token — a non-400 rejection, a 5xx, a transport error, a decode
-      error, a malformed payload — is raised as `OAuthTokenError` from the API call that
+      fresh mint only if the refresh is rejected with a 400 or 401, or if there's no way to
+      refresh. Any failure to obtain a token — another rejection, a 5xx, a transport error, a
+      decode error, a malformed payload — is raised as `OAuthTokenError` from the API call that
       triggered the renewal, with the original as `__cause__`. Concurrent callers inside the
       window share one renewal via a lock.
     - `token_cache_dir` adds persistence only, it never changes *when* a token is renewed:
@@ -509,9 +552,10 @@ class OAuthProvider:
       mint/refresh and read back on construction. The file is named for the token URL's host,
       the client ID and a hash of `token_url` + `client_id` + `scope`
       (`auth.example.com-my-client-9b73c8cc1d16.json`), so providers can share one directory;
-      a corrupt/unreadable file is ignored. The directory must exist at construction. The write
-      is plain sync file IO inside the async `__call__` — a few hundred bytes, once per token
-      lifetime.
+      a corrupt/unreadable file is ignored. `invalidate()` (a 401) marks the file's token expired
+      too, keeping its refresh token, so a revoked token isn't reloaded by the next process. The
+      directory must exist at construction. The write is plain sync file IO inside the async
+      `__call__` — a few hundred bytes, once per token lifetime.
     - Every token request goes through a short-lived client from `client_factory` (default
       `HTTPClient`), called with no arguments — so `functools.partial(HTTPClient,
       timeout=5.0, proxy=...)` is how the token endpoint gets its own timeout/proxy/TLS config.
@@ -628,10 +672,12 @@ class OAuthProvider:
         try:
             refreshed = await self._refresh(current.refresh_token)
         except HTTPResponseError as error:
-            # Only a 400 (`invalid_grant`: the refresh token expired or was revoked) means "mint
-            # instead" — a 401/403/429 says something else is wrong and re-minting would just
-            # repeat it.
-            if error.status != 400:
+            # A 400 (RFC 6749's `invalid_grant`: the refresh token expired or was revoked) means
+            # "mint instead", and so does a 401, which some servers send for a revoked refresh
+            # token: with the disk cache, raising on it would wedge every new process on the same
+            # dead refresh token. A 403/429/5xx says something else is wrong, and re-minting would
+            # just repeat it.
+            if error.status not in {400, 401}:
                 raise
             return await self._mint_after_rejected_refresh(error)
         if refreshed is None:
@@ -644,8 +690,15 @@ class OAuthProvider:
         For a token revoked before it expires. `HTTPClient` calls this itself when a request gets
         a 401 (and retries it once, for idempotent verbs), so you rarely need to. Pass the token
         that was rejected to make it a no-op if a fresh one has already been obtained since.
+        With `token_cache_dir`, the cache file is marked expired too if it still holds that
+        token, so the next process doesn't reload it.
         """
+        rejected = _rejected_access_token(self._token, stale_access_token)
         self._token = _invalidated(self._token, stale_access_token)
+        if self._token_cache_path is not None and rejected is not None:
+            _invalidate_token_cache(
+                self._token_cache_path, self._token_url, self._client_id, self._scope, rejected
+            )
 
     async def __call__(self) -> str:
         fresh = _fresh_token(self._token, self._refresh_leeway, time.time())
@@ -765,10 +818,12 @@ class SyncOAuthProvider:
         try:
             refreshed = self._refresh(current.refresh_token)
         except HTTPResponseError as error:
-            # Only a 400 (`invalid_grant`: the refresh token expired or was revoked) means "mint
-            # instead" — a 401/403/429 says something else is wrong and re-minting would just
-            # repeat it.
-            if error.status != 400:
+            # A 400 (RFC 6749's `invalid_grant`: the refresh token expired or was revoked) means
+            # "mint instead", and so does a 401, which some servers send for a revoked refresh
+            # token: with the disk cache, raising on it would wedge every new process on the same
+            # dead refresh token. A 403/429/5xx says something else is wrong, and re-minting would
+            # just repeat it.
+            if error.status not in {400, 401}:
                 raise
             return self._mint_after_rejected_refresh(error)
         if refreshed is None:
@@ -781,8 +836,16 @@ class SyncOAuthProvider:
         For a token revoked before it expires. `HTTPClient` calls this itself when a request gets
         a 401 (and retries it once, for idempotent verbs), so you rarely need to. Pass the token
         that was rejected to make it a no-op if a fresh one has already been obtained since.
+        With `token_cache_dir`, the cache file is marked expired too if it still holds that
+        token, so the next process doesn't reload it.
         """
-        self._token = _invalidated(self._token, stale_access_token)
+        with self._lock:
+            rejected = _rejected_access_token(self._token, stale_access_token)
+            self._token = _invalidated(self._token, stale_access_token)
+            if self._token_cache_path is not None and rejected is not None:
+                _invalidate_token_cache(
+                    self._token_cache_path, self._token_url, self._client_id, self._scope, rejected
+                )
 
     def __call__(self) -> str:
         fresh = _fresh_token(self._token, self._refresh_leeway, time.time())
