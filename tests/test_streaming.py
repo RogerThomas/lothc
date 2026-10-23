@@ -5,6 +5,7 @@ import pytest
 from msgspec import Struct
 from msgspec.json import Decoder
 from pydantic import BaseModel, TypeAdapter
+from typing_extensions import TypeForm
 
 from lothc import HTTPClient, HTTPConnectionError, SyncHTTPClient
 
@@ -17,11 +18,7 @@ class LineModel(BaseModel):
     i: int
 
 
-class _Unsupported:
-    pass
-
-
-async def test_stream_get_without_response_data_type_reconstructs_exact_bytes(
+async def test_stream_get_without_into_reconstructs_exact_bytes(
     client: HTTPClient,
 ) -> None:
     chunks = [chunk async for chunk in client.stream_get("ndjson", params={"count": 3})]
@@ -31,61 +28,47 @@ async def test_stream_get_without_response_data_type_reconstructs_exact_bytes(
 
 async def test_stream_get_raw_mode_does_not_split_embedded_newlines(client: HTTPClient) -> None:
     # Binary content with embedded `\n` bytes must round-trip exactly — raw mode
-    # must not treat those bytes as line separators the way response_data_type does.
+    # must not treat those bytes as line separators the way into does.
     chunks = [chunk async for chunk in client.stream_get("binary")]
 
     assert b"".join(chunks) == b"AAA\nBBB\x00\nCCC"
 
 
-async def test_stream_get_decodes_response_data_type(client: HTTPClient) -> None:
-    lines = [
-        line
-        async for line in client.stream_get("ndjson", params={"count": 3}, response_data_type=dict)
-    ]
+async def test_stream_get_decodes_into(client: HTTPClient) -> None:
+    lines = [line async for line in client.stream_get("ndjson", params={"count": 3}, into=dict)]
 
     assert lines == [{"i": 0}, {"i": 1}, {"i": 2}]
 
 
 async def test_stream_post_decodes_typed_lines(client: HTTPClient) -> None:
     lines = [
-        line
-        async for line in client.stream_post(
-            "ndjson-echo", json={"n": 3}, response_data_type=Decoder(Line)
-        )
+        line async for line in client.stream_post("ndjson-echo", json={"n": 3}, into=Decoder(Line))
     ]
 
     assert lines == [Line(i=0), Line(i=1), Line(i=2)]
 
 
-def test_sync_stream_get_decodes_response_data_type(sync_client: SyncHTTPClient) -> None:
-    lines = list(sync_client.stream_get("ndjson", params={"count": 3}, response_data_type=dict))
+def test_sync_stream_get_decodes_into(sync_client: SyncHTTPClient) -> None:
+    lines = list(sync_client.stream_get("ndjson", params={"count": 3}, into=dict))
 
     assert lines == [{"i": 0}, {"i": 1}, {"i": 2}]
 
 
 def test_sync_stream_post_decodes_typed_lines(sync_client: SyncHTTPClient) -> None:
-    lines = list(
-        sync_client.stream_post("ndjson-echo", json={"n": 3}, response_data_type=Decoder(Line))
-    )
+    lines = list(sync_client.stream_post("ndjson-echo", json={"n": 3}, into=Decoder(Line)))
 
     assert lines == [Line(i=0), Line(i=1), Line(i=2)]
 
 
 async def test_stream_get_decodes_via_msgspec_struct_class(client: HTTPClient) -> None:
-    lines = [
-        line
-        async for line in client.stream_get("ndjson", params={"count": 3}, response_data_type=Line)
-    ]
+    lines = [line async for line in client.stream_get("ndjson", params={"count": 3}, into=Line)]
 
     assert lines == [Line(i=0), Line(i=1), Line(i=2)]
 
 
 async def test_stream_get_decodes_via_pydantic_model_class(client: HTTPClient) -> None:
     lines = [
-        line
-        async for line in client.stream_get(
-            "ndjson", params={"count": 3}, response_data_type=LineModel
-        )
+        line async for line in client.stream_get("ndjson", params={"count": 3}, into=LineModel)
     ]
 
     assert lines == [LineModel(i=0), LineModel(i=1), LineModel(i=2)]
@@ -95,7 +78,7 @@ async def test_stream_get_decodes_via_pydantic_type_adapter(client: HTTPClient) 
     lines = [
         line
         async for line in client.stream_get(
-            "ndjson", params={"count": 3}, response_data_type=TypeAdapter(LineModel)
+            "ndjson", params={"count": 3}, into=TypeAdapter(LineModel)
         )
     ]
 
@@ -113,9 +96,7 @@ async def test_stream_get_raw_bytes_mode_error_for_status_false_suppresses_raise
 async def test_stream_get_skips_blank_lines_between_ndjson_records(client: HTTPClient) -> None:
     lines = [
         line
-        async for line in client.stream_get(
-            "ndjson-blank-line", params={"count": 3}, response_data_type=dict
-        )
+        async for line in client.stream_get("ndjson-blank-line", params={"count": 3}, into=dict)
     ]
 
     assert lines == [{"i": 0}, {"i": 1}, {"i": 2}]
@@ -128,20 +109,13 @@ async def test_stream_get_transport_error_mid_stream_raises_connection_error(
         [chunk async for chunk in client.stream_get("truncated")]
 
 
-async def test_stream_get_unsupported_response_data_type_raises_type_error(
-    client: HTTPClient,
-) -> None:
-    with pytest.raises(TypeError, match="Unsupported response_data_type"):
-        [
-            line
-            async for line in client.stream_get(
-                "ndjson", params={"count": 1}, response_data_type=cast(Any, _Unsupported)
-            )
-        ]
+async def test_stream_get_into_not_a_type_raises_type_error(client: HTTPClient) -> None:
+    with pytest.raises(TypeError, match="Unsupported into: 1"):
+        [line async for line in client.stream_get("ndjson", into=cast(TypeForm[Any], 1))]
 
 
 @pytest.mark.parametrize("interruptible", [False, True])
-def test_sync_stream_get_without_response_data_type_reconstructs_exact_bytes(
+def test_sync_stream_get_without_into_reconstructs_exact_bytes(
     sync_client: SyncHTTPClient, *, interruptible: bool
 ) -> None:
     chunks = list(
@@ -154,7 +128,7 @@ def test_sync_stream_get_without_response_data_type_reconstructs_exact_bytes(
 def test_sync_stream_post_interruptible_decodes_typed_lines(sync_client: SyncHTTPClient) -> None:
     lines = list(
         sync_client.stream_post(
-            "ndjson-echo", json={"n": 3}, response_data_type=Decoder(Line), interruptible=True
+            "ndjson-echo", json={"n": 3}, into=Decoder(Line), interruptible=True
         )
     )
 
@@ -172,9 +146,7 @@ def test_sync_stream_get_raw_bytes_mode_error_for_status_false_suppresses_raise(
 def test_sync_stream_get_skips_blank_lines_between_ndjson_records(
     sync_client: SyncHTTPClient,
 ) -> None:
-    lines = list(
-        sync_client.stream_get("ndjson-blank-line", params={"count": 3}, response_data_type=dict)
-    )
+    lines = list(sync_client.stream_get("ndjson-blank-line", params={"count": 3}, into=dict))
 
     assert lines == [{"i": 0}, {"i": 1}, {"i": 2}]
 
@@ -205,7 +177,7 @@ async def test_stream_get_skips_blank_lines_in_a_crlf_ndjson_stream(client: HTTP
     lines = [
         line
         async for line in client.stream_get(
-            "ndjson-blank-line", params={"count": 3, "newline": "crlf"}, response_data_type=dict
+            "ndjson-blank-line", params={"count": 3, "newline": "crlf"}, into=dict
         )
     ]
 
@@ -217,7 +189,7 @@ def test_sync_stream_get_skips_blank_lines_in_a_crlf_ndjson_stream(
 ) -> None:
     lines = list(
         sync_client.stream_get(
-            "ndjson-blank-line", params={"count": 3, "newline": "crlf"}, response_data_type=dict
+            "ndjson-blank-line", params={"count": 3, "newline": "crlf"}, into=dict
         )
     )
 
@@ -229,9 +201,7 @@ async def test_stream_get_decodes_many_ndjson_lines_arriving_in_one_chunk(
 ) -> None:
     lines = [
         line
-        async for line in client.stream_get(
-            "ndjson-blank-line", params={"count": 5000}, response_data_type=dict
-        )
+        async for line in client.stream_get("ndjson-blank-line", params={"count": 5000}, into=dict)
     ]
 
     assert lines == [{"i": i} for i in range(5000)]

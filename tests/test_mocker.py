@@ -73,7 +73,7 @@ async def test_add_get_response_encodes_pydantic_model(
 ) -> None:
     lothc_mocker.add_get_response(path="/items/7", data=ItemModel(id=7, name="item-7"))
 
-    item = (await client.get("items/7", response_data_type=ItemModel)).data
+    item = (await client.get("items/7", into=ItemModel)).data
 
     assert item == ItemModel(id=7, name="item-7")
 
@@ -83,7 +83,7 @@ async def test_add_get_response_encodes_msgspec_struct(
 ) -> None:
     lothc_mocker.add_get_response(path="/items/7", data=ItemStruct(id=7, name="item-7"))
 
-    item = (await client.get("items/7", response_data_type=ItemStruct)).data
+    item = (await client.get("items/7", into=ItemStruct)).data
 
     assert item == ItemStruct(id=7, name="item-7")
 
@@ -93,7 +93,7 @@ async def test_add_post_response_encodes_dict(
 ) -> None:
     lothc_mocker.add_post_response(path="/items", data={"id": 7, "name": "item-7"})
 
-    item = (await client.post("items", response_data_type=dict)).data
+    item = (await client.post("items", into=dict)).data
 
     assert item == {"id": 7, "name": "item-7"}
 
@@ -132,7 +132,7 @@ async def test_add_get_response_with_data_and_headers_together(
         path="/items/7", data={"id": 7}, headers={"content-type": "text/plain"}
     )
 
-    result = await client.get("items/7", response_data_type=dict)
+    result = await client.get("items/7", into=dict)
 
     assert result.data == {"id": 7}
     assert result.headers["content-type"] == "text/plain"
@@ -146,7 +146,7 @@ async def test_add_get_response_matches_on_params(
         path="/items", params={"page": "1"}, data={"page": 1}
     )
 
-    item = (await client.get("items", params={"page": "2"}, response_data_type=dict)).data
+    item = (await client.get("items", params={"page": "2"}, into=dict)).data
 
     assert item == {"page": 2}
     matching.assert_called(count=1)
@@ -160,7 +160,7 @@ async def test_add_get_response_matches_on_bool_param(
     `str(True)` == `"True"` — confirmed live against a real `RequestBuilder.query()` call."""
     lothc_mocker.add_get_response(path="/items", params={"flag": True}, data={"ok": True})
 
-    item = (await client.get("items", params={"flag": True}, response_data_type=dict)).data
+    item = (await client.get("items", params={"flag": True}, into=dict)).data
 
     assert item == {"ok": True}
 
@@ -174,7 +174,7 @@ async def test_add_get_response_matches_on_a_repeated_query_param(
         path="/items", params={"tag": ["a", "b"]}, data={"ok": True}
     )
 
-    item = (await client.get("items", params={"tag": ["a", "b"]}, response_data_type=dict)).data
+    item = (await client.get("items", params={"tag": ["a", "b"]}, into=dict)).data
 
     assert item == {"ok": True}
     matching.assert_called(count=1)
@@ -187,7 +187,7 @@ async def test_add_get_response_matches_on_a_repeated_query_param_as_tuple(
     this key"."""
     lothc_mocker.add_get_response(path="/items", params={"tag": ("a", "b")}, data={"ok": True})
 
-    item = (await client.get("items", params={"tag": ("a", "b")}, response_data_type=dict)).data
+    item = (await client.get("items", params={"tag": ("a", "b")}, into=dict)).data
 
     assert item == {"ok": True}
 
@@ -293,7 +293,7 @@ async def test_strict_enabled_false_falls_through_to_the_real_call(
 ) -> None:
     lothc_mocker.strict(enabled=False)
 
-    item = (await client.get("items/7", response_data_type=dict)).data
+    item = (await client.get("items/7", into=dict)).data
 
     assert item == {"id": 7, "name": "item-7"}
 
@@ -302,7 +302,7 @@ async def test_strict_enabled_false_falls_through_to_the_real_call(
 async def test_lothc_mocker_marker_disables_strict(
     client: HTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
-    item = (await client.get("items/7", response_data_type=dict)).data
+    item = (await client.get("items/7", into=dict)).data
 
     assert item == {"id": 7, "name": "item-7"}
     assert lothc_mocker.get_call_count() == 0
@@ -312,7 +312,7 @@ async def test_lothc_mocker_marker_disables_strict(
 async def test_lothc_mocker_marker_disables_strict_positional(
     client: HTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
-    item = (await client.get("items/7", response_data_type=dict)).data
+    item = (await client.get("items/7", into=dict)).data
 
     assert item == {"id": 7, "name": "item-7"}
     assert lothc_mocker.get_call_count() == 0
@@ -361,7 +361,7 @@ def test_add_post_response_encodes_dict_sync(
 ) -> None:
     lothc_mocker.add_post_response(path="/items", data={"id": 7, "name": "item-7"})
 
-    item = sync_client.post("items", response_data_type=dict).data
+    item = sync_client.post("items", into=dict).data
 
     assert item == {"id": 7, "name": "item-7"}
 
@@ -398,7 +398,7 @@ async def test_match_request_with_response_computes_from_the_request(
 ) -> None:
     lothc_mocker.mock("GET").match_request_with_response(_handler_computes_item_from_path)
 
-    item = (await client.get("items/42", response_data_type=dict)).data
+    item = (await client.get("items/42", into=dict)).data
 
     assert item == {"id": 42}
 
@@ -412,7 +412,7 @@ def test_match_request_with_response_works_for_sync_client(
 ) -> None:
     lothc_mocker.mock("GET").match_request_with_response(_sync_handler_computes_item_from_path)
 
-    item = sync_client.get("items/42", response_data_type=dict).data
+    item = sync_client.get("items/42", into=dict).data
 
     assert item == {"id": 42}
 
@@ -430,7 +430,7 @@ async def test_match_request_with_response_accepts_an_async_callable_object(
     still dispatches through the async path instead of returning an un-awaited coroutine."""
     lothc_mocker.mock("GET").match_request_with_response(_AsyncCallableHandler())
 
-    item = (await client.get("items/42", response_data_type=dict)).data
+    item = (await client.get("items/42", into=dict)).data
 
     assert item == {"id": 42}
 
@@ -445,7 +445,7 @@ async def test_match_request_with_response_returning_none_falls_through(
     lothc_mocker.mock("GET", path="/items/7").match_request_with_response(_handler_declines)
     lothc_mocker.add_get_response(path="/items/7", data={"id": 7})
 
-    item = (await client.get("items/7", response_data_type=dict)).data
+    item = (await client.get("items/7", into=dict)).data
 
     assert item == {"id": 7}
 
@@ -502,7 +502,7 @@ async def test_match_query_and_match_body_json_narrow_a_mock(
     narrow.match_query({"page": "2"}).match_body_json({"any": "thing"})
     wide = lothc_mocker.add_get_response(path="/items", data={"matched": False})
 
-    item = (await client.get("items", params={"page": "2"}, response_data_type=dict)).data
+    item = (await client.get("items", params={"page": "2"}, into=dict)).data
 
     assert item == {"matched": False}  # match_body_json requires a body a GET never sends
     narrow.assert_called(count=0)
@@ -519,7 +519,7 @@ async def test_match_request_uses_a_custom_predicate(
     mock = lothc_mocker.add_get_response(path="/items/7", data={"ok": True})
     mock.match_request(_matches_flag_header)
 
-    item = (await client.get("items/7", headers={"x-flag": "1"}, response_data_type=dict)).data
+    item = (await client.get("items/7", headers={"x-flag": "1"}, into=dict)).data
 
     assert item == {"ok": True}
     mock.assert_called(count=1)
@@ -548,7 +548,7 @@ async def test_match_request_accepts_an_async_callable_object(
     mock = lothc_mocker.add_get_response(path="/items/7", data={"ok": True})
     mock.match_request(_MatchesFlagHeader())
 
-    item = (await client.get("items/7", headers={"x-flag": "1"}, response_data_type=dict)).data
+    item = (await client.get("items/7", headers={"x-flag": "1"}, into=dict)).data
 
     assert item == {"ok": True}
     mock.assert_called(count=1)
@@ -637,6 +637,6 @@ async def test_mock_response_data_encodes_aliases_like_a_real_request(
 ) -> None:
     lothc_mocker.add_get_response(path="/items/7", data=_AliasedMockBody(userId=7))
 
-    result = (await client.get("items/7", response_data_type=dict)).data
+    result = (await client.get("items/7", into=dict)).data
 
     assert result == {"userId": 7}

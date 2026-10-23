@@ -36,7 +36,7 @@ class Pokemon(BaseModel):
 
 
 async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
-    response = await client.get("pokemon/pikachu", response_data_type=Pokemon)
+    response = await client.get("pokemon/pikachu", into=Pokemon)
     print(response.status, response.data)  # 200 id=25 name='pikachu'
 ```
 
@@ -68,7 +68,7 @@ there's demand for an httpx/aiohttp/niquests backend, the author is happy to con
 ![HTTP client throughput race — lothc and pyreqwest finish in well under a fifth of a second, other libraries take much longer](https://raw.githubusercontent.com/RogerThomas/lothc/main/assets/perf-race.svg)
 
 Benchmarked with [`perf.py`](https://github.com/RogerThomas/lothc/blob/main/perf.py) against a tiny Rust-based static JSON server, 10,000 requests at
-concurrency 100 — including lothc's fully-typed decode targets (`response_data_type=` a msgspec
+concurrency 100 — including lothc's fully-typed decode targets (`into=` a msgspec
 `Struct` or a pydantic `BaseModel`), not just raw bytes or an untyped dict. The object handed back
 from those runs isn't just parsed JSON — it's a real, constructed, field-validated instance of
 your own type, and that validation cost is included in the numbers, not benchmarked around.
@@ -77,9 +77,9 @@ numbers: [docs/benchmarks.md](https://rogerthomas.github.io/lothc/benchmarks/).
 
 ## Highlights
 
-Pass `response_data_type` to any lothc call and get back a real, constructed, field-validated
+Pass `into` to any lothc call and get back a real, constructed, field-validated
 pydantic `BaseModel` or msgspec `Struct`, instead of the plain `dict` `.json()` leaves you to
-validate yourself. See [Benchmarks](https://rogerthomas.github.io/lothc/benchmarks/) for what that costs (usually nothing).
+validate yourself. Any type expression works, so `into=list[Pokemon]` decodes a top-level array. See [Benchmarks](https://rogerthomas.github.io/lothc/benchmarks/) for what that costs (usually nothing).
 
 | | |
 |---|---|
@@ -104,3 +104,9 @@ task deps-sync    # install
 task test         # run tests
 task check        # lint + format-check + typecheck (what CI runs)
 ```
+
+## License
+
+lothc is [MIT](https://github.com/RogerThomas/lothc/blob/main/LICENSE). It's built on
+[pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (Apache-2.0), which is built on the Rust
+crate [reqwest](https://github.com/seanmonstar/reqwest) (MIT or Apache-2.0). Thanks to both.

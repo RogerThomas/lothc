@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.13"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -1166,6 +1166,7 @@ name = "lothc"
 source = { editable = "." }
 dependencies = [
     { name = "pyreqwest" },
+    { name = "typing-extensions" },
 ]
 
 [package.optional-dependencies]
@@ -1218,6 +1219,7 @@ requires-dist = [
     { name = "pydantic", marker = "extra == 'pydantic'", specifier = ">=2.12.5" },
     { name = "pyreqwest", specifier = ">=0.13.0" },
     { name = "pytest", marker = "extra == 'testing'", specifier = ">=9.0.2" },
+    { name = "typing-extensions", specifier = ">=4.13.0" },
 ]
 provides-extras = ["msgspec", "pydantic", "testing"]
 

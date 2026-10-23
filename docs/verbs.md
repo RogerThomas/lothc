@@ -35,7 +35,7 @@ response = await client.get(
     "items/7",
     params={"q": "pikachu", "page": 2},
     headers={"x-custom": "header-value"},
-    response_data_type=ItemModel,
+    into=ItemModel,
 )
 response.data  # ItemModel(id=7, name="item-7")
 ```
@@ -65,11 +65,9 @@ class SearchStructParams(Struct):
     cursor: str | None = None  # same omission behavior, msgspec Struct instead of BaseModel
 
 
+response = await client.get("items", params=SearchParams(q="pikachu", page=1), into=SearchResult)
 response = await client.get(
-    "items", params=SearchParams(q="pikachu", page=1), response_data_type=SearchResult
-)
-response = await client.get(
-    "items", params=SearchStructParams(q="pikachu", page=1), response_data_type=SearchResult
+    "items", params=SearchStructParams(q="pikachu", page=1), into=SearchResult
 )
 ```
 
@@ -89,22 +87,71 @@ await client.get("items", params={"tag": ["ready", "pending"], "limit": 10})
 
 ### Top-level arrays and other shapes
 
-`response_data_type` also accepts a pydantic `TypeAdapter` or a msgspec `Decoder`, which is how a
-top-level JSON array (or any shape that isn't one model) gets a typed decode. Build them once and
-reuse them:
+`into` takes any type expression, not just a class, so a top-level JSON array (or a union, an
+`Optional`, a `type` alias) decodes with no wrapper:
+
+```python
+response = await client.get("items", into=list[ItemModel])
+response.data  # list[ItemModel]
+response = await client.get("items", into=list[ItemStruct])
+response.data  # list[ItemStruct]
+response = await client.get("items/7", into=ItemStruct | None)  # a `null` body gives None
+```
+
+The library is picked from the models inside the type, including the fields of a `TypedDict`,
+dataclass or `NamedTuple`: a `Struct` anywhere means msgspec, a `BaseModel` anywhere means
+pydantic, and mixing the two in one type raises `TypeError`. Validation only pydantic enforces
+also means pydantic, since msgspec would silently skip it: `Annotated` metadata from pydantic
+(`Field(gt=0)`, `AfterValidator(...)`) or `annotated_types` (`Gt(0)`), a pydantic dataclass, or a
+pydantic type such as `HttpUrl`. Without pydantic installed, such a type raises `TypeError` rather
+than decoding unvalidated. Plain metadata (`Annotated[int, "doc"]`, `msgspec.Meta(gt=0)`) doesn't
+count. A type with none of these (`list[int]`) uses msgspec if it's installed, else pydantic.
+
+lothc builds the decoder once per type and reuses it, so writing `into=list[ItemModel]` inline on
+every call costs nothing extra, and so does `Annotated[int, AfterValidator(check)]` with a
+module-level `check`. The exception is `Annotated` metadata that's only ever equal to itself,
+pydantic's `Field(...)` above all: written inline, each call makes a new, unequal type, so lothc
+rebuilds its decoder on every call rather than caching a new one per call forever. Hoist such a
+type into a module-level `type` alias to have it built once:
+
+```python
+from typing import Annotated
+
+from pydantic import Field
+
+type PositiveInts = list[Annotated[int, Field(gt=0)]]
+
+response = await client.get("counts", into=PositiveInts)  # built once, then reused
+```
+
+An inline `lambda` validator is likewise a new type per call: it decodes correctly but builds a
+new decoder every time. lothc stops caching new types once it holds 4096, so that can't grow
+memory without limit; use a module-level function (or a `type` alias) to have it built once.
+
+Without either extra only `bytes`, `str`, `dict`, `dict[str, Any]` and `dict` subclasses work;
+anything else raises a `TypeError` naming the extra to install.
+
+`into=str` means the raw text, never JSON-parsed, just as `into=bytes` means the raw bytes:
+`get(into=str)` gives the body decoded as UTF-8 (invalid UTF-8 raises `UnicodeDecodeError`, a
+`ValueError`), `sse(into=str)` gives each event's `data` as is (the same as the default),
+`stream_get`/`stream_post` with `into=str` give each line as text (split on `\n`, blank lines
+skipped, like the NDJSON decode), and a pinned `HTTPResponseError[str]` gets the error body's text
+on `.error`.
+
+A bare `dict` subclass (`OrderedDict`, `defaultdict`, your own) decodes a JSON object like
+`into=dict` and is built as that subclass (a `defaultdict` with no `default_factory`).
+
+A pre-built pydantic `TypeAdapter` or msgspec `Decoder` is still accepted, used as-is:
 
 ```python
 from msgspec.json import Decoder
 from pydantic import TypeAdapter
 
-items_adapter = TypeAdapter(list[ItemModel])
-response = await client.get("items", response_data_type=items_adapter)
-response.data  # list[ItemModel]
-response = await client.get("items", response_data_type=Decoder(list[ItemStruct]))
-response.data  # list[ItemStruct]
+response = await client.get("items", into=TypeAdapter(list[ItemModel]))
+response = await client.get("items", into=Decoder(list[ItemStruct]))
 ```
 
-`response_data_type=dict` is for a JSON *object*; decoding an array (or a string, number, `null`)
+`into=dict` is for a JSON *object*; decoding an array (or a string, number, `null`)
 into it raises a `ValueError` that says what the body actually was.
 
 ## The `Response`
@@ -112,7 +159,7 @@ into it raises a `ValueError` that says what the body actually was.
 `get`, `post`, `put`, `patch`, `delete` and `head` all return a `Response`:
 
 ```python
-response = await client.get("items/7", response_data_type=ItemModel)
+response = await client.get("items/7", into=ItemModel)
 response.data  # ItemModel(id=7, name="item-7")
 response.status  # 200
 response.headers  # {"content-type": "application/json", ...}
@@ -171,9 +218,7 @@ class ItemHeaders(BaseModel):
     content_type: str | None = None
 
 
-response = await client.get(
-    "items/7", response_data_type=ItemModel, response_headers_type=ItemHeaders
-)
+response = await client.get("items/7", into=ItemModel, response_headers_type=ItemHeaders)
 response.typed_headers.content_type  # "application/json"
 ```
 
@@ -218,7 +263,7 @@ await client.post("render", content="# Title", headers={"content-type": "text/ma
 Each returns a `Response` like `get`'s, including the same `response_headers_type` option:
 
 ```python
-response = await client.post("items", json={"name": "new-item"}, response_data_type=ItemModel)
+response = await client.post("items", json={"name": "new-item"}, into=ItemModel)
 response.data  # ItemModel(...)
 response.status  # 201
 ```
@@ -279,7 +324,7 @@ await client.post(
 ## DELETE
 
 ```python
-response = await client.delete("items/7", response_data_type=ItemModel)
+response = await client.delete("items/7", into=ItemModel)
 response.data  # ItemModel(...)
 ```
 
@@ -292,7 +337,7 @@ await client.delete("items", json={"ids": [7, 8]})
 
 ## HEAD
 
-Headers-only — no body is ever decoded, so there's no `response_data_type`:
+Headers-only — no body is ever decoded, so there's no `into`:
 
 ```python
 response = await client.head("items/7")
@@ -334,5 +379,5 @@ first and renamed into place on success, so a download that fails partway (a dro
 a cancelled task) never leaves a truncated file behind, and an existing file at `dest` is left
 exactly as it was. Writes happen on the calling thread even for the async client: each chunk
 write takes microseconds, and moving them to a thread measured 2.5-3.8x slower. `download()` only ever does a `GET`; there's no
-`json`/`data`/`form`/`content` body option and no `response_data_type` — the response is always raw
+`json`/`data`/`form`/`content` body option and no `into` — the response is always raw
 bytes, on disk or in memory. Same `params`/`headers`/`error_for_status` as every other verb.

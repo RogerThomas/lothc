@@ -224,32 +224,32 @@ class Stats(TypedDict):
 
 
 async def _fetch_one_lothc(client: HTTPClient, path: str) -> None:
-    data = (await client.get(path, response_data_type=dict)).data
+    data = (await client.get(path, into=dict)).data
     assert "status" in data
 
 
 async def _fetch_one_lothc_msgspec(client: HTTPClient, path: str) -> None:
-    data = (await client.get(path, response_data_type=MsgspecResponse)).data
+    data = (await client.get(path, into=MsgspecResponse)).data
     assert data.status == "success"
 
 
 async def _fetch_one_lothc_pydantic(client: HTTPClient, path: str) -> None:
-    data = (await client.get(path, response_data_type=PydanticResponse)).data
+    data = (await client.get(path, into=PydanticResponse)).data
     assert data.status == "success"
 
 
 def _fetch_one_lothc_sync(client: SyncHTTPClient, path: str) -> None:
-    data = client.get(path, response_data_type=dict).data
+    data = client.get(path, into=dict).data
     assert "status" in data
 
 
 def _fetch_one_lothc_msgspec_sync(client: SyncHTTPClient, path: str) -> None:
-    data = client.get(path, response_data_type=MsgspecResponse).data
+    data = client.get(path, into=MsgspecResponse).data
     assert data.status == "success"
 
 
 def _fetch_one_lothc_pydantic_sync(client: SyncHTTPClient, path: str) -> None:
-    data = client.get(path, response_data_type=PydanticResponse).data
+    data = client.get(path, into=PydanticResponse).data
     assert data.status == "success"
 
 

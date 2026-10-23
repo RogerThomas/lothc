@@ -74,12 +74,12 @@ class _BaseModelTokenResponseTyping(BaseModelTyping, _TokenFieldsTyping, Protoco
 
 # A union of two Protocols that each *also* inherit `_compat.py`'s structural `StructTyping`/
 # `BaseModelTyping` — rather than one flat Protocol with the three fields — so that a
-# `type[TokenResponseTyping]` is itself a valid `response_data_type=` (every member is a `Data`
-# member) and `_post_model` can hand it straight to `client.post(...)` with no local decoder and
-# no cast. Confirmed live on basedpyright, mypy, ty and zuban with the test suite's real pydantic
-# and msgspec models: `client.post(..., response_data_type=token_response)` reveals as this
-# union, a model declaring plain `expires_in: int` still satisfies the `int | None` property
-# covariantly, and a model with no `expires_in` at all is rejected at the call site.
+# `type[TokenResponseTyping]` is itself a valid `into=` type form and `_post_model` can hand it
+# straight to `client.post(...)` with no local decoder and no cast. Confirmed live on
+# basedpyright, mypy, ty and zuban with the test suite's real pydantic and msgspec models:
+# `client.post(..., into=token_response)` reveals as this union, a model declaring plain
+# `expires_in: int` still satisfies the `int | None` property covariantly, and a model with no
+# `expires_in` at all is rejected at the call site.
 type TokenResponseTyping = _StructTokenResponseTyping | _BaseModelTokenResponseTyping
 
 
@@ -92,7 +92,7 @@ class OAuthTokenError(Exception):
     This is the one place lothc wraps a decode library's error: the provider runs *inside* the
     user's unrelated verb call (`await client.get("items/7")`), so an unwrapped error there reads
     as a failure of that call — e.g. an `HTTPResponseError` whose `.status` is really the token
-    endpoint's, not the API's. A `response_data_type` decode error, by contrast, already belongs
+    endpoint's, not the API's. An `into` decode error, by contrast, already belongs
     to the call that raised it.
     """
 
@@ -581,9 +581,7 @@ class OAuthProvider:
     async def _post_rfc(self, body: dict[str, str]) -> _CachedToken:
         headers = _rfc_headers(self._client_id, self._client_secret, self._client_auth)
         async with self._client_factory() as client:
-            response = await client.post(
-                self._token_url, data=body, headers=headers, response_data_type=dict
-            )
+            response = await client.post(self._token_url, data=body, headers=headers, into=dict)
         payload = response.data
         return _token_from_rfc_payload(payload, self._default_expires_in, time.time())
 
@@ -591,9 +589,7 @@ class OAuthProvider:
         self, payload: JSONPayload, token_response: type[TokenResponseTyping]
     ) -> _CachedToken:
         async with self._client_factory() as client:
-            response = await client.post(
-                self._token_url, json=payload, response_data_type=token_response
-            )
+            response = await client.post(self._token_url, json=payload, into=token_response)
         decoded = response.data
         return _token_from_model(decoded, self._default_expires_in, time.time())
 
@@ -722,9 +718,7 @@ class SyncOAuthProvider:
     def _post_rfc(self, body: dict[str, str]) -> _CachedToken:
         headers = _rfc_headers(self._client_id, self._client_secret, self._client_auth)
         with self._client_factory() as client:
-            response = client.post(
-                self._token_url, data=body, headers=headers, response_data_type=dict
-            )
+            response = client.post(self._token_url, data=body, headers=headers, into=dict)
         payload = response.data
         return _token_from_rfc_payload(payload, self._default_expires_in, time.time())
 
@@ -732,7 +726,7 @@ class SyncOAuthProvider:
         self, payload: JSONPayload, token_response: type[TokenResponseTyping]
     ) -> _CachedToken:
         with self._client_factory() as client:
-            response = client.post(self._token_url, json=payload, response_data_type=token_response)
+            response = client.post(self._token_url, json=payload, into=token_response)
         decoded = response.data
         return _token_from_model(decoded, self._default_expires_in, time.time())
 

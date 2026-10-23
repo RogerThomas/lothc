@@ -36,6 +36,10 @@ class ErrorModel(BaseModel):
     message: str
 
 
+class ModelAPIError(HTTPResponseError[ErrorModel]):
+    pass
+
+
 class QueryModel(BaseModel):
     page: int
     per_page: int
@@ -53,7 +57,7 @@ ITEM_LIST_ADAPTER = TypeAdapter(list[ItemModel])
 
 
 @pytest.mark.parametrize(
-    "response_data_type",
+    "into",
     [bytes, dict, ItemModel, ItemStruct],
     ids=["bytes", "dict", "pydantic", "msgspec"],
 )
@@ -61,13 +65,13 @@ def test_sync_get_small(
     benchmark: Any,  # noqa: ANN401
     sync_client: SyncHTTPClient,
     lothc_mocker: LOTHCMocker,
-    response_data_type: type[Any],
+    into: type[Any],
 ) -> None:
     lothc_mocker.add_get_response(path="/items/7", data=ITEM)
 
     @benchmark
     def _() -> None:
-        sync_client.get("items/7", response_data_type=response_data_type)
+        sync_client.get("items/7", into=into)
 
 
 def test_sync_get_large_list_pydantic(
@@ -79,7 +83,7 @@ def test_sync_get_large_list_pydantic(
 
     @benchmark
     def _() -> None:
-        response = sync_client.get("items", response_data_type=ITEM_LIST_ADAPTER)
+        response = sync_client.get("items", into=ITEM_LIST_ADAPTER)
         assert len(response.data) == len(ITEMS)
 
 
@@ -96,7 +100,7 @@ def test_sync_get_with_params_and_headers(
 
     @benchmark
     def _() -> None:
-        response = sync_client.get("items", params=params, headers=headers, response_data_type=dict)
+        response = sync_client.get("items", params=params, headers=headers, into=dict)
         assert response.headers["X-Total-Count"] == "500"
 
 
@@ -115,7 +119,7 @@ def test_sync_post_json(
 
     @benchmark
     def _() -> None:
-        sync_client.post("items", json=payload, response_data_type=ItemModel)
+        sync_client.post("items", json=payload, into=ItemModel)
 
 
 def test_sync_post_form(
@@ -149,8 +153,8 @@ def test_sync_error_response(
 
     @benchmark
     def _() -> None:
-        with pytest.raises(HTTPResponseError):
-            sync_client.get("missing", error_type=ErrorModel)
+        with pytest.raises(ModelAPIError):
+            sync_client.get("missing", raises=ModelAPIError)
 
 
 def test_sync_stream_get_ndjson(
@@ -162,7 +166,7 @@ def test_sync_stream_get_ndjson(
 
     @benchmark
     def _() -> None:
-        count = sum(1 for _ in sync_client.stream_get("stream", response_data_type=ItemStruct))
+        count = sum(1 for _ in sync_client.stream_get("stream", into=ItemStruct))
         assert count == len(ITEMS)
 
 
@@ -177,7 +181,7 @@ def test_sync_sse(
 
     @benchmark
     def _() -> None:
-        count = sum(1 for _ in sync_client.sse("events", response_data_type=ItemModel))
+        count = sum(1 for _ in sync_client.sse("events", into=ItemModel))
         assert count == len(ITEMS)
 
 
@@ -195,7 +199,7 @@ def test_sync_download(
 
 
 @pytest.mark.parametrize(
-    "response_data_type",
+    "into",
     [bytes, ItemModel, ItemStruct],
     ids=["bytes", "pydantic", "msgspec"],
 )
@@ -204,13 +208,13 @@ def test_async_get_small(
     async_client: HTTPClient,
     event_loop_runner: asyncio.Runner,
     lothc_mocker: LOTHCMocker,
-    response_data_type: type[Any],
+    into: type[Any],
 ) -> None:
     lothc_mocker.add_get_response(path="/items/7", data=ITEM)
 
     @benchmark
     def _() -> None:
-        event_loop_runner.run(async_client.get("items/7", response_data_type=response_data_type))
+        event_loop_runner.run(async_client.get("items/7", into=into))
 
 
 def test_async_gather_get(
@@ -222,9 +226,7 @@ def test_async_gather_get(
     lothc_mocker.add_get_response(path="/items/7", data=ITEM)
 
     async def _many() -> None:
-        await asyncio.gather(
-            *(async_client.get("items/7", response_data_type=ItemStruct) for _ in range(50))
-        )
+        await asyncio.gather(*(async_client.get("items/7", into=ItemStruct) for _ in range(50)))
 
     @benchmark
     def _() -> None:
