@@ -747,6 +747,21 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+    def do_OPTIONS(self) -> None:
+        # A CORS preflight answer: 204 echoing the request's `Origin`, or 404 for `/missing`.
+        parsed = urlparse(self.path)
+        if parsed.path == "/flaky":
+            self._handle_flaky(parsed.query)
+            return
+        if parsed.path == "/missing":
+            self.send_response(404)
+        else:
+            self.send_response(204)
+            self.send_header("Access-Control-Allow-Origin", self.headers.get("Origin", "*"))
+            self.send_header("Access-Control-Allow-Methods", "GET, POST")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/items":
