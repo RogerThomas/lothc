@@ -7,6 +7,14 @@ messages; 0.0.17 to 0.0.19 were hand-written in the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. Releases up to and including
 0.0.16 predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/releases).
 
+## [0.2.2](https://github.com/RogerThomas/lothc/compare/0.2.1...0.2.2) (2026-11-05)
+
+
+### Features
+
+* add options() verb, retried by default ([72b069e](https://github.com/RogerThomas/lothc/commit/72b069e8804d604cb097c72b694e6ed6b8ebfc71))
+* add options() verb, retried by default ([347db40](https://github.com/RogerThomas/lothc/commit/347db4083365916b1dda3ef97bb8736897ac29c9))
+
 ## [0.2.1](https://github.com/RogerThomas/lothc/compare/0.2.0...0.2.1) (2026-10-23)
 
 
