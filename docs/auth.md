@@ -296,7 +296,7 @@ OAuthProvider(
 
 A token the server rejects with a `401` before it expires (revoked, rotated) is discarded
 automatically. The client calls `provider.invalidate()` and, for an idempotent verb
-(`GET`/`PUT`/`DELETE`/`HEAD`), retries the request once with a freshly obtained token. A `POST`
+(`GET`/`PUT`/`DELETE`/`HEAD`/`OPTIONS`), retries the request once with a freshly obtained token. A `POST`
 or `PATCH` is never replayed, since it may not be safe to repeat: it raises the `401`, and the
 next call gets a fresh token. A second `401` on the retry is raised as-is, so a request that
 genuinely lacks access fails after one extra token fetch rather than looping.

@@ -167,9 +167,9 @@ type SyncAuthProvider = Callable[[], str]
 
 @dataclass(slots=True)
 class RequestInfo:
-    """The request actually sent, attached to `Response.request`/`head`'s result and to
-    `HTTPResponseError.request` — the target you asked for, not necessarily the one a final
-    response came from if redirects were followed.
+    """The request actually sent, attached to `Response.request` (every non-streaming verb's
+    result) and to `HTTPResponseError.request` — the target you asked for, not necessarily the
+    one a final response came from if redirects were followed.
     """
 
     method: str
@@ -2366,7 +2366,7 @@ def _parse_typed_headers(
 
 @dataclass
 class Response[TData, THeaders: TypedHeaders | None = None]:
-    """What `get`/`post`/`put`/`patch`/`delete`/`head`/`download` return: the decoded body
+    """What `get`/`post`/`put`/`patch`/`delete`/`head`/`options`/`download` return: the decoded body
     (`.data`) alongside the status and headers.
 
     `.typed_headers` is `None` unless `response_headers_type` was passed to the call that
@@ -2561,7 +2561,13 @@ class HTTPClient:
     See `SyncHTTPClient` for the sync mirror — same methods, same overload shapes.
     """
 
-    _default_retry_methods: ClassVar[frozenset[str]] = frozenset({"GET", "PUT", "DELETE", "HEAD"})
+    _default_retry_methods: ClassVar[frozenset[str]] = frozenset({
+        "GET",
+        "PUT",
+        "DELETE",
+        "HEAD",
+        "OPTIONS",
+    })
     # The streaming verbs (`sse`, `stream_get`, `stream_post`, `download`) swap the client's total
     # `timeout` for this per-request one whenever the caller doesn't pass their own: pyreqwest has
     # no "no timeout" override, and a total timeout on a long-lived body kills every healthy
@@ -2629,12 +2635,13 @@ class HTTPClient:
         `bearer_token` is a static token; `bearer_auth` is an async callable resolved fresh on
         every request; `basic_auth` is a `(username, password)` pair — provide at most one of the
         three. `max_retries` enables a real retry middleware (backoff, `Retry-After`-aware); with
-        no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`) retry, and
-        `backoff_base` scales the wait between attempts (`backoff_base * 2 ** attempt`, so the
-        0.1 default waits 0.1s then 0.2s) — a `Retry-After` header on the response wins over the
-        computed delay, up to `max_retry_after` (60s by default): a server asking for a longer wait
-        ends retrying, and its 429/503 is raised as `HTTPResponseError` so you can schedule a retry
-        from `e.headers["Retry-After"]`. Pass `max_retry_after=None` to honour any wait.
+        no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`/`OPTIONS`)
+        retry, and `backoff_base` scales the wait between attempts (`backoff_base * 2 **
+        attempt`, so the 0.1 default waits 0.1s then 0.2s) — a `Retry-After` header on the
+        response wins over the computed delay, up to `max_retry_after` (60s by default): a server
+        asking for a longer wait ends retrying, and its 429/503 is raised as `HTTPResponseError`
+        so you can schedule a retry from `e.headers["Retry-After"]`. Pass `max_retry_after=None`
+        to honour any wait.
 
         `connect_timeout` bounds only the TCP connect phase (separate from `timeout`, which
         covers the whole request); `read_timeout` bounds the idle gap between two consecutive
@@ -4450,6 +4457,76 @@ class HTTPClient:
             elapsed,
         )
 
+    @overload
+    async def options(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[None]: ...
+    @overload
+    async def options[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[None, THeaders]: ...
+    async def options(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        response_headers_type: type[TypedHeaders] | None = None,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[None, Any]:
+        """OPTIONS `path` (e.g. a CORS preflight) — status and headers only, any body is discarded.
+        Pass `response_headers_type` to get the response headers parsed into `.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
+        """
+        _validate_raises(raises)
+        request_builder = await self._prepare_request(
+            self._client.request("OPTIONS", path), params, headers, timeout, skip_auth=skip_auth
+        )
+        started = time.monotonic()
+        raw_response, request_info = await _send(request_builder)
+        elapsed = time.monotonic() - started
+        if error_for_status:
+            await self._check_status(raw_response, raises, request_info)
+        response_headers = _LazyHeaders(raw_response.headers)
+        typed_headers = (
+            None
+            if response_headers_type is None
+            else _parse_typed_headers(response_headers, response_headers_type)
+        )
+        return Response(
+            None,
+            raw_response.status,
+            response_headers,
+            typed_headers,
+            request_info,
+            raw_response.version,
+            elapsed,
+        )
+
 
 class SyncHTTPClient:
     """Sync typed HTTP client: `with SyncHTTPClient(base_url=...) as client:`.
@@ -4457,7 +4534,13 @@ class SyncHTTPClient:
     See `HTTPClient` for the async mirror — same methods, same overload shapes.
     """
 
-    _default_retry_methods: ClassVar[frozenset[str]] = frozenset({"GET", "PUT", "DELETE", "HEAD"})
+    _default_retry_methods: ClassVar[frozenset[str]] = frozenset({
+        "GET",
+        "PUT",
+        "DELETE",
+        "HEAD",
+        "OPTIONS",
+    })
     # The streaming verbs (`sse`, `stream_get`, `stream_post`, `download`) swap the client's total
     # `timeout` for this per-request one whenever the caller doesn't pass their own: pyreqwest has
     # no "no timeout" override, and a total timeout on a long-lived body kills every healthy
@@ -4525,12 +4608,13 @@ class SyncHTTPClient:
         `bearer_token` is a static token; `bearer_auth` is a callable resolved fresh on every
         request; `basic_auth` is a `(username, password)` pair — provide at most one of the
         three. `max_retries` enables a real retry middleware (backoff, `Retry-After`-aware); with
-        no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`) retry, and
-        `backoff_base` scales the wait between attempts (`backoff_base * 2 ** attempt`, so the
-        0.1 default waits 0.1s then 0.2s) — a `Retry-After` header on the response wins over the
-        computed delay, up to `max_retry_after` (60s by default): a server asking for a longer wait
-        ends retrying, and its 429/503 is raised as `HTTPResponseError` so you can schedule a retry
-        from `e.headers["Retry-After"]`. Pass `max_retry_after=None` to honour any wait.
+        no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`/`OPTIONS`)
+        retry, and `backoff_base` scales the wait between attempts (`backoff_base * 2 **
+        attempt`, so the 0.1 default waits 0.1s then 0.2s) — a `Retry-After` header on the
+        response wins over the computed delay, up to `max_retry_after` (60s by default): a server
+        asking for a longer wait ends retrying, and its 429/503 is raised as `HTTPResponseError`
+        so you can schedule a retry from `e.headers["Retry-After"]`. Pass `max_retry_after=None`
+        to honour any wait.
 
         `connect_timeout` bounds only the TCP connect phase (separate from `timeout`, which
         covers the whole request); `read_timeout` bounds the idle gap between two consecutive
@@ -6369,6 +6453,76 @@ class SyncHTTPClient:
         _validate_raises(raises)
         request_builder = self._prepare_request(
             self._client.head(path), params, headers, timeout, skip_auth=skip_auth
+        )
+        started = time.monotonic()
+        raw_response, request_info = _send_sync(request_builder)
+        elapsed = time.monotonic() - started
+        if error_for_status:
+            self._check_status(raw_response, raises, request_info)
+        response_headers = _LazyHeaders(raw_response.headers)
+        typed_headers = (
+            None
+            if response_headers_type is None
+            else _parse_typed_headers(response_headers, response_headers_type)
+        )
+        return Response(
+            None,
+            raw_response.status,
+            response_headers,
+            typed_headers,
+            request_info,
+            raw_response.version,
+            elapsed,
+        )
+
+    @overload
+    def options(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[None]: ...
+    @overload
+    def options[THeaders: TypedHeaders](
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        response_headers_type: type[THeaders],
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[None, THeaders]: ...
+    def options(
+        self,
+        path: str,
+        *,
+        params: Params | None = None,
+        headers: Headers | None = None,
+        timeout: float | None = None,
+        skip_auth: bool = False,
+        response_headers_type: type[TypedHeaders] | None = None,
+        error_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]] | None = None,
+    ) -> Response[None, Any]:
+        """OPTIONS `path` (e.g. a CORS preflight) — status and headers only, any body is discarded.
+        Pass `response_headers_type` to get the response headers parsed into `.typed_headers`.
+
+        `timeout` overrides the client's own for this call only; `skip_auth` omits the
+        `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
+        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        this call.
+        """
+        _validate_raises(raises)
+        request_builder = self._prepare_request(
+            self._client.request("OPTIONS", path), params, headers, timeout, skip_auth=skip_auth
         )
         started = time.monotonic()
         raw_response, request_info = _send_sync(request_builder)

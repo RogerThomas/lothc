@@ -109,9 +109,9 @@ entries terse: a fact plus the *why*, not a narrative of how it was found.
 ## Roadmap
 
 Done: typed and raw query params/headers, per-verb `timeout=`, transport error wrapping
-(`HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError`), `put`/`patch`/`delete`/`head`,
-bodies on `delete`, SSE (`TypeAdapter`/`Decoder`, spec-compliant reconnect), `stream_get`/
-`stream_post` (raw chunks by default, NDJSON decode via `into`), `download`, the
+(`HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError`),
+`put`/`patch`/`delete`/`head`/`options`, bodies on `delete`, SSE (`TypeAdapter`/`Decoder`,
+spec-compliant reconnect), `stream_get`/`stream_post` (raw chunks by default, NDJSON decode via `into`), `download`, the
 `into=` decode targets (`bytes` default, `dict`, any type expression via PEP 747 `TypeForm`
 such as `list[Model]`, a pre-built `TypeAdapter`/`Decoder`), auth (`bearer_token` /
 `bearer_auth` callable / `basic_auth` pair, at most one; per-verb `skip_auth=True`), OAuth 2
@@ -130,7 +130,7 @@ plugin (`lothc[testing]`).
 Not done yet: `sse_post` (SSE over POST, deferred by the user).
 
 Maybe later, only if someone asks (they came from a code review, not a request): request/response
-hooks, a generic `request()`/OPTIONS, streaming uploads, status/headers on the streaming verbs,
+hooks, a generic `request()`, streaming uploads, status/headers on the streaming verbs,
 cookie-jar access.
 
 Deliberately not exposed: per-algorithm compression toggles, `interface`, `tcp_nodelay`,
@@ -163,8 +163,8 @@ Deliberately not exposed: per-algorithm compression toggles, `interface`, `tcp_n
       ...
   ```
 
-- **Verbs**: `get`, `post`, `put`, `patch`, `delete`, `head`, `download`, `sse`, `stream_get`,
-  `stream_post`. Each is a set of `@overload`s plus one real implementation. Everything except the
+- **Verbs**: `get`, `post`, `put`, `patch`, `delete`, `head`, `options`, `download`, `sse`,
+  `stream_get`, `stream_post`. Each is a set of `@overload`s plus one real implementation. Everything except the
   three streaming verbs returns a `Response` (body on `.data`; for `download(dest=...)`, the
   written `Path`).
 

@@ -66,3 +66,38 @@ def test_sync_head_error_for_status_false_suppresses_raise(sync_client: SyncHTTP
     result = sync_client.head("missing", error_for_status=False)
 
     assert result.status == 404
+
+
+async def test_options_returns_preflight_status_and_headers(client: HTTPClient) -> None:
+    result = await client.options(
+        "items", headers={"origin": "origin", "access-control-request-method": "GET"}
+    )
+
+    assert result.data is None
+    assert result.status == 204
+    assert result.headers["access-control-allow-origin"] == "origin"
+    assert result.headers["access-control-allow-methods"] == "GET, POST"
+    assert result.request.method == "OPTIONS"
+
+
+def test_sync_options_returns_preflight_status_and_headers(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.options("items", headers={"origin": "origin"})
+
+    assert result.data is None
+    assert result.status == 204
+    assert result.headers["access-control-allow-origin"] == "origin"
+    assert result.request.method == "OPTIONS"
+
+
+async def test_options_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
+    result = await client.options("missing", error_for_status=False)
+
+    assert result.status == 404
+
+
+def test_sync_options_error_for_status_false_suppresses_raise(
+    sync_client: SyncHTTPClient,
+) -> None:
+    result = sync_client.options("missing", error_for_status=False)
+
+    assert result.status == 404
