@@ -162,7 +162,7 @@ into it raises a `ValueError` that says what the body actually was.
 
 ## The `Response`
 
-`get`, `post`, `put`, `patch`, `delete` and `head` all return a `Response`:
+`get`, `post`, `put`, `patch`, `delete`, `head` and `options` all return a `Response`:
 
 ```python
 response = await client.get("items/7", into=ItemModel)
@@ -353,6 +353,21 @@ response.data  # always None
 ```
 
 It takes the same `response_headers_type` option as `get`, via `response.typed_headers`.
+
+## OPTIONS
+
+Same shape as `head`: status and headers only, any body is discarded. The usual use is a CORS
+preflight:
+
+```python
+response = await client.options(
+    "pools",
+    headers={"origin": "https://app.example.com", "access-control-request-method": "GET"},
+)
+response.status  # 204
+response.headers["access-control-allow-origin"]
+response.data  # always None
+```
 
 ## Downloading large bodies — `download`
 
