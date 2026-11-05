@@ -13,7 +13,7 @@ Implemented as a real pyreqwest `with_middleware` hook — retries on a transpor
 (including a body cut off partway) or a `429`/`500`/`502`/`503`/`504` response, with exponential
 backoff, honoring a `Retry-After` header when the server sends one.
 
-By default, only the idempotent verbs retry: `get`, `put`, `delete`, `head`. `post`/`patch` need
+By default, only the idempotent verbs retry: `get`, `put`, `delete`, `head`, `options`. `post`/`patch` need
 an explicit opt-in, since retrying a non-idempotent request can duplicate side effects:
 
 ```python

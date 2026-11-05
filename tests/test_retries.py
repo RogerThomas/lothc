@@ -36,6 +36,13 @@ async def test_retries_honors_retry_after_header(base_url: str, server_key: str)
     assert result == {"attempts": 2}
 
 
+async def test_retries_applied_to_options_by_default(base_url: str, server_key: str) -> None:
+    async with HTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
+        result = await client.options("flaky", params={"key": server_key, "fail_times": 2})
+
+    assert result.status == 200
+
+
 async def test_retries_not_applied_to_post_by_default(base_url: str, server_key: str) -> None:
     async with HTTPClient(base_url=base_url, max_retries=3) as client:
         with pytest.raises(HTTPResponseError):
@@ -115,6 +122,13 @@ async def test_retries_exhausted_via_transport_error_raises_transport_error(
     async with HTTPClient(base_url=base_url, max_retries=1, backoff_base=0.001) as client:
         with pytest.raises(HTTPConnectionError):
             await client.get("connection-flaky", params={"key": server_key, "fail_times": 5})
+
+
+def test_sync_retries_applied_to_options_by_default(base_url: str, server_key: str) -> None:
+    with SyncHTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
+        result = client.options("flaky", params={"key": server_key, "fail_times": 2})
+
+    assert result.status == 200
 
 
 def test_sync_retries_not_applied_to_post_by_default(base_url: str, server_key: str) -> None:
