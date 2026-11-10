@@ -747,6 +747,24 @@ async def test_data_repeats_a_key_per_sequence_element_and_encodes_bools(
     assert result["body"] == "tag=a&tag=b&enabled=true"
 
 
+async def test_data_writes_an_int_outside_64_bits_as_its_exact_digits(client: HTTPClient) -> None:
+    result = (
+        await client.post("echo-body", data={"over": 2**63, "under": -(2**63) - 1}, into=dict)
+    ).data
+
+    assert result["body"] == "over=9223372036854775808&under=-9223372036854775809"
+
+
+def test_sync_data_writes_an_int_outside_64_bits_as_its_exact_digits(
+    sync_client: SyncHTTPClient,
+) -> None:
+    result = sync_client.post(
+        "echo-body", data={"over": 2**63, "under": -(2**63) - 1}, into=dict
+    ).data
+
+    assert result["body"] == "over=9223372036854775808&under=-9223372036854775809"
+
+
 async def test_data_accepts_a_pydantic_model_encoded_by_alias(client: HTTPClient) -> None:
     result = (await client.post("echo-body", data=AliasedModel(userId=1), into=dict)).data
 

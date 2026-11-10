@@ -1,5 +1,6 @@
 import json
 import time
+from collections.abc import AsyncGenerator, Generator
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, cast
 
@@ -19,6 +20,18 @@ class Line(Struct):
 
 class LineModel(BaseModel):
     i: int
+
+
+@pytest.fixture(name="timeout_client")
+async def _timeout_client(base_url: str) -> AsyncGenerator[HTTPClient]:
+    async with HTTPClient(base_url=base_url, timeout=0.5) as client:
+        yield client
+
+
+@pytest.fixture(name="sync_timeout_client")
+def _sync_timeout_client(base_url: str) -> Generator[SyncHTTPClient]:
+    with SyncHTTPClient(base_url=base_url, timeout=0.5) as client:
+        yield client
 
 
 async def test_stream_get_without_into_reconstructs_exact_bytes(
@@ -219,59 +232,55 @@ async def test_stream_get_decodes_many_ndjson_lines_arriving_in_one_chunk(
 
 
 async def test_stream_get_hands_over_each_chunk_as_it_arrives(
-    base_url: str, server_key: str
+    server_key: str, timeout_client: HTTPClient
 ) -> None:
     # `/endless` writes 5 bytes every 5ms and never finishes. Held back until pyreqwest's 64KB
     # default read buffer filled, the first chunk would take over a minute; the 0.5s idle limit
     # turns that into a failure here rather than a hang.
-    async with HTTPClient(base_url=base_url, timeout=0.5) as client:
-        stream = client.stream_get("endless", params={"key": server_key})
-        started = time.monotonic()
-        first = await anext(stream)
-        elapsed = time.monotonic() - started
-        await stream.aclose()
+    stream = timeout_client.stream_get("endless", params={"key": server_key})
+    started = time.monotonic()
+    first = await anext(stream)
+    elapsed = time.monotonic() - started
+    await stream.aclose()
 
     assert first.startswith(b"chunk")
     assert elapsed < 0.4
 
 
 async def test_stream_post_hands_over_each_chunk_as_it_arrives(
-    base_url: str, server_key: str
+    server_key: str, timeout_client: HTTPClient
 ) -> None:
-    async with HTTPClient(base_url=base_url, timeout=0.5) as client:
-        stream = client.stream_post("endless", params={"key": server_key}, json={"a": 1})
-        started = time.monotonic()
-        first = await anext(stream)
-        elapsed = time.monotonic() - started
-        await stream.aclose()
+    stream = timeout_client.stream_post("endless", params={"key": server_key}, json={"a": 1})
+    started = time.monotonic()
+    first = await anext(stream)
+    elapsed = time.monotonic() - started
+    await stream.aclose()
 
     assert first.startswith(b"chunk")
     assert elapsed < 0.4
 
 
 def test_sync_stream_get_hands_over_each_chunk_as_it_arrives(
-    base_url: str, server_key: str
+    server_key: str, sync_timeout_client: SyncHTTPClient
 ) -> None:
-    with SyncHTTPClient(base_url=base_url, timeout=0.5) as client:
-        stream = client.stream_get("endless", params={"key": server_key})
-        started = time.monotonic()
-        first = next(stream)
-        elapsed = time.monotonic() - started
-        stream.close()
+    stream = sync_timeout_client.stream_get("endless", params={"key": server_key})
+    started = time.monotonic()
+    first = next(stream)
+    elapsed = time.monotonic() - started
+    stream.close()
 
     assert first.startswith(b"chunk")
     assert elapsed < 0.4
 
 
 def test_sync_stream_post_hands_over_each_chunk_as_it_arrives(
-    base_url: str, server_key: str
+    server_key: str, sync_timeout_client: SyncHTTPClient
 ) -> None:
-    with SyncHTTPClient(base_url=base_url, timeout=0.5) as client:
-        stream = client.stream_post("endless", params={"key": server_key}, json={"a": 1})
-        started = time.monotonic()
-        first = next(stream)
-        elapsed = time.monotonic() - started
-        stream.close()
+    stream = sync_timeout_client.stream_post("endless", params={"key": server_key}, json={"a": 1})
+    started = time.monotonic()
+    first = next(stream)
+    elapsed = time.monotonic() - started
+    stream.close()
 
     assert first.startswith(b"chunk")
     assert elapsed < 0.4

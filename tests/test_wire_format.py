@@ -266,20 +266,35 @@ def _wire_cases() -> list[_Case]:
             ),
         ),
         _Case(
-            "params-repeated-and-signed",
-            call={"params": {"t": ("a", "b"), "n": -3, "i64-max": 2**63 - 1, "f53": 2**53 + 1}},
+            "params-repeated-signed-and-past-64-bits",
+            call={
+                "params": {
+                    "t": ("a", "b"),
+                    "n": -3,
+                    "i64-max": 2**63 - 1,
+                    "f53": 2**53 + 1,
+                    "over": (2**63, 2**64),
+                    "under": -(2**63) - 1,
+                }
+            },
             expected=_Seen(
                 status=200,
                 request=RequestInfo(
                     method="GET",
-                    url="http://127.0.0.1:<port>/echo-request?t=a&t=b&n=-3&i64-max=9223372036854775807&f53=9007199254740993",
+                    url=(
+                        "http://127.0.0.1:<port>/echo-request?t=a&t=b&n=-3"
+                        "&i64-max=9223372036854775807&f53=9007199254740993"
+                        "&over=9223372036854775808&over=18446744073709551616"
+                        "&under=-9223372036854775809"
+                    ),
                     path="/echo-request",
                     host="127.0.0.1",
                 ),
                 wire=_Wire(
                     line=(
                         "GET /echo-request?t=a&t=b&n=-3&i64-max=9223372036854775807"
-                        "&f53=9007199254740993 HTTP/1.1"
+                        "&f53=9007199254740993&over=9223372036854775808"
+                        "&over=18446744073709551616&under=-9223372036854775809 HTTP/1.1"
                     ),
                     headers=[
                         ("Accept", "*/*"),
