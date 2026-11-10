@@ -12,6 +12,12 @@
 //! A connection through a proxy does the proxy's handshake (`proxy.rs`) on its socket first, on
 //! the same thread and under the same deadline.
 //!
+//! Sockets are set up as `connect.rs` says, and every wait is bounded by the request's `Limits`:
+//! its total timeout, `connect_timeout` while connecting (a TLS handshake included, which the
+//! first request drives) and `read_timeout`. A sync body is read only when the caller asks for a
+//! chunk, so `read_timeout`'s gap starts again with each read: unlike pyreqwest, whose reader
+//! reads ahead into a two-chunk buffer, a caller slower than `read_timeout` doesn't time out.
+//!
 //! A redirect to follow (`redirect.rs`) puts its connection back (hyper drains the unread response
 //! or closes it) and sends the hop's request the same way, under the same deadline, so a hop to the
 //! same origin takes that connection again.
@@ -24,9 +30,10 @@
 //! `close()` fails every request still running with the `RuntimeError` a request after it raises,
 //! as pyreqwest's does: it shuts down the sockets in `InFlight`, which wakes their threads' poll(2).
 //! A stream's body, once its head has arrived, outlives the client, as on pyreqwest.
+use std::cell::Cell;
 use std::future::{poll_fn, Future};
 use std::io;
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,6 +53,7 @@ use rustls::ClientConnection;
 use url::Url;
 
 use crate::body::RequestBody;
+use crate::connect::{ConnectOptions, ConnectSettings};
 use crate::cookie::Cookies;
 use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
@@ -119,6 +127,8 @@ struct SyncConn {
     sender: Sender,
     driver: Driver,
     closed: bool,
+    /// Its `connect_timeout` deadline, which still applies while its TLS handshake is under way.
+    connect_by: Option<Instant>,
 }
 
 impl SyncConn {
@@ -154,16 +164,69 @@ fn poll_timeout(deadline: Option<Instant>) -> Option<i32> {
     }
 }
 
-/// Wait for `fd` to be readable (or writable, if `writable`) until `deadline`; `Ok(false)` if it
-/// passed first.
-fn wait(fd: RawFd, ready: &PollReady, deadline: Option<Instant>) -> Result<bool, Failure> {
+/// The earlier of two deadlines, if either.
+fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// What bounds one request's waits: its total timeout's deadline, and reqwest's `read_timeout`,
+/// which until the response's head arrives is a fixed deadline from the request's start
+/// (`head_by`), then a limit on each gap while its body is read.
+#[derive(Clone, Copy)]
+struct Limits {
+    total: Option<Instant>,
+    read_timeout: Option<Duration>,
+    head_by: Option<Instant>,
+    clock: DeadlineClock,
+}
+
+impl Limits {
+    fn new(clock: DeadlineClock, started: Instant, timeout: Option<Duration>, read_timeout: Option<Duration>) -> Self {
+        let deadline = |timeout| clock.deadline(started, timeout);
+        Self { total: timeout.and_then(deadline), read_timeout, head_by: read_timeout.and_then(deadline), clock }
+    }
+
+    /// The deadline until the response's head arrives.
+    fn before_head(&self) -> Option<Instant> {
+        earliest(self.total, self.head_by)
+    }
+}
+
+/// One `drive`'s view of its request's `Limits`, as its connection makes progress.
+struct Waits<'a> {
+    limits: Limits,
+    /// When the final response's head arrived, set by the future being driven (or already, for a
+    /// body read): from then on `read_timeout` limits each gap, from it or the last read.
+    head: &'a Cell<Option<Instant>>,
+    last_read: Option<Instant>,
+    /// A new connection's `connect_timeout` deadline, while its TLS handshake is under way.
+    connect_by: Option<Instant>,
+}
+
+impl Waits<'_> {
+    fn deadline(&self, ready: &PollReady) -> Option<Instant> {
+        let read = match (self.limits.read_timeout, self.head.get()) {
+            (None, _) => None,
+            (Some(_), None) => self.limits.head_by,
+            (Some(timeout), Some(head)) => self.limits.clock.deadline(self.last_read.map_or(head, |read| read.max(head)), timeout),
+        };
+        earliest(earliest(self.limits.total, read), self.connect_by.filter(|_| ready.handshaking()))
+    }
+}
+
+/// Wait for `fd` to be readable (or writable, if a send is blocked) until `deadline`: `None` if
+/// it passed first, else whether it is readable.
+fn wait(fd: RawFd, ready: &PollReady, deadline: Option<Instant>) -> Result<Option<bool>, Failure> {
     loop {
-        let Some(timeout) = poll_timeout(deadline) else { return Ok(false) };
+        let Some(timeout) = poll_timeout(deadline) else { return Ok(None) };
         let events = if ready.wants_writable() { libc::POLLIN | libc::POLLOUT } else { libc::POLLIN };
         let mut pfd = libc::pollfd { fd, events, revents: 0 };
         // SAFETY: `pfd` is one valid, writable `pollfd` for the whole call, matching `nfds` = 1.
         match unsafe { libc::poll(&mut pfd, 1, timeout) } {
-            0 => return Ok(false),
+            0 => return Ok(None),
             n if n < 0 => {
                 let error = io::Error::last_os_error();
                 if error.kind() != io::ErrorKind::Interrupted {
@@ -172,13 +235,14 @@ fn wait(fd: RawFd, ready: &PollReady, deadline: Option<Instant>) -> Result<bool,
             }
             _ => {
                 let failed = pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
-                if failed || pfd.revents & libc::POLLIN != 0 {
+                let readable = failed || pfd.revents & libc::POLLIN != 0;
+                if readable {
                     ready.set_readable();
                 }
                 if failed || pfd.revents & libc::POLLOUT != 0 {
                     ready.set_writable();
                 }
-                return Ok(true);
+                return Ok(Some(readable));
             }
         }
     }
@@ -188,14 +252,14 @@ fn wait(fd: RawFd, ready: &PollReady, deadline: Option<Instant>) -> Result<bool,
 type Driver = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// Drive a connection's hyper driver and `fut` (which runs on that connection) until `fut`
-/// finishes, waiting for socket `fd` in poll(2) until `deadline`.
+/// finishes, waiting for socket `fd` in poll(2) until `waits` says to stop.
 fn drive<F: Future>(
     fd: RawFd,
     ready: &PollReady,
     driver: &mut Driver,
     closed: &mut bool,
     mut fut: Pin<&mut F>,
-    deadline: Option<Instant>,
+    waits: &mut Waits<'_>,
 ) -> Result<F::Output, Failure> {
     let flag = Arc::new(FlagWaker(AtomicBool::new(false)));
     let waker = Waker::from(flag.clone());
@@ -211,29 +275,32 @@ fn drive<F: Future>(
         if flag.0.load(Ordering::Relaxed) {
             continue;
         }
-        if !wait(fd, ready, deadline)? {
-            return Err(Failure::Timeout);
+        match wait(fd, ready, waits.deadline(ready))? {
+            None => return Err(Failure::Timeout),
+            Some(true) if waits.limits.read_timeout.is_some() => waits.last_read = Some(Instant::now()),
+            Some(_) => {}
         }
     }
 }
 
 /// Drive `conn`'s hyper driver and one request until the request finishes (or gets a redirect
 /// to follow, see `fetch`).
-fn run_on(
-    conn: &mut SyncConn,
-    request: Request<RequestBody>,
-    deadline: Option<Instant>,
-    redirect: Option<&mut Redirect>,
-    cookies: Option<&Cookies>,
-) -> Result<Fetched, Failure> {
-    let SyncConn { fd, ready, sender, driver, closed, .. } = conn;
-    drive(*fd, ready, driver, closed, std::pin::pin!(fetch(sender, request, redirect, cookies)), deadline)?
+fn run_on(conn: &mut SyncConn, request: Request<RequestBody>, limits: Limits, redirect: Option<&mut Redirect>, cookies: Option<&Cookies>) -> Result<Fetched, Failure> {
+    let SyncConn { fd, ready, sender, driver, closed, connect_by, .. } = conn;
+    let head = Cell::new(None);
+    let mut waits = Waits { limits, head: &head, last_read: None, connect_by: *connect_by };
+    let mark = limits.read_timeout.is_some().then_some(&head);
+    let fetched = drive(*fd, ready, driver, closed, std::pin::pin!(fetch(sender, request, redirect, cookies, mark)), &mut waits);
+    fetched?
 }
 
 /// Drive `conn`'s hyper driver and one request until its response's head arrives.
-fn send_on(conn: &mut SyncConn, request: Request<RequestBody>, deadline: Option<Instant>) -> Result<Response<Incoming>, Failure> {
-    let SyncConn { fd, ready, sender, driver, closed, .. } = conn;
-    drive(*fd, ready, driver, closed, std::pin::pin!(send(sender, request)), deadline)?
+fn send_on(conn: &mut SyncConn, request: Request<RequestBody>, limits: Limits) -> Result<Response<Incoming>, Failure> {
+    let SyncConn { fd, ready, sender, driver, closed, connect_by, .. } = conn;
+    let head = Cell::new(None);
+    let mut waits = Waits { limits, head: &head, last_read: None, connect_by: *connect_by };
+    let sent = drive(*fd, ready, driver, closed, std::pin::pin!(send(sender, request)), &mut waits);
+    sent?
 }
 
 /// Drive a new connection's proxy handshake on the calling thread until it finishes, or `deadline`
@@ -251,16 +318,10 @@ fn drive_handshake(handshake: Handshake, fd: RawFd, ready: &PollReady, deadline:
         if flag.0.load(Ordering::Relaxed) {
             continue;
         }
-        if !wait(fd, ready, deadline)? {
+        if wait(fd, ready, deadline)?.is_none() {
             return Err(Failure::Timeout);
         }
     }
-}
-
-/// reqwest's local resolution for a `socks5://` proxy: the first address, if there is one.
-fn resolve_for_socks(host: &str) -> Result<Option<IpAddr>, Failure> {
-    let mut addresses = (host, 0).to_socket_addrs().map_err(|e| Failure::Transport(format!("error resolving for socks proxy: {e}")))?;
-    Ok(addresses.next().map(|address| address.ip()))
 }
 
 /// Whether a pooled connection is still usable: nothing reads an idle socket here (no event
@@ -292,39 +353,6 @@ fn close_idle(conn: SyncConn) {
     drop(stream);
 }
 
-fn connect_error(error: &io::Error) -> Failure {
-    if error.kind() == io::ErrorKind::TimedOut {
-        Failure::Timeout
-    } else {
-        Failure::Transport(error_chain(error))
-    }
-}
-
-fn open_socket(host: &str, port: u16, deadline: Option<Instant>) -> Result<TcpStream, Failure> {
-    let addresses: Vec<SocketAddr> = (host, port).to_socket_addrs().map_err(|e| connect_error(&e))?.collect();
-    let mut last_error = None;
-    for address in addresses {
-        let attempt = match deadline {
-            Some(deadline) => {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    return Err(Failure::Timeout);
-                }
-                TcpStream::connect_timeout(&address, left.max(Duration::from_millis(1)))
-            }
-            None => TcpStream::connect(address),
-        };
-        match attempt {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(match last_error {
-        Some(error) => connect_error(&error),
-        None => Failure::Transport(format!("no addresses found for {host}")),
-    })
-}
-
 /// One origin's idle connections, (connection, when it went idle), oldest first; checkout takes
 /// from the end.
 type IdleConns = Vec<(SyncConn, Instant)>;
@@ -332,6 +360,7 @@ type IdleConns = Vec<(SyncConn, Instant)>;
 #[pyclass(frozen, module = "lothc._native")]
 pub(crate) struct SyncPool {
     config: ClientConfig,
+    connect: Arc<ConnectSettings>,
     tls: TlsSettings,
     tls_config: Mutex<Option<Arc<rustls::ClientConfig>>>,
     idle_policy: IdlePolicy,
@@ -374,14 +403,18 @@ impl SyncPool {
         lock(&self.in_flight).closed
     }
 
-    fn connect(&self, target: &Target, deadline: Option<Instant>) -> Result<SyncConn, Failure> {
+    /// A new connection for a request to `target`, under `limits` and `connect_timeout` (which
+    /// still applies to its TLS handshake, which the first request drives: `connect_by`).
+    fn connect(&self, target: &Target, limits: Limits) -> Result<SyncConn, Failure> {
         let transport = |e: io::Error| Failure::Transport(error_chain(&e));
+        let connect_by = self.connect.connect_timeout.and_then(|timeout| self.clock.deadline(Instant::now(), timeout));
+        let deadline = earliest(limits.before_head(), connect_by);
         // reqwest resolves a `socks5://` proxy's target before connecting to the proxy.
         let resolved = match &target.resolve {
-            Some(host) => resolve_for_socks(host)?,
+            Some(host) => self.connect.resolve_first(host)?,
             None => None,
         };
-        let stream = open_socket(&target.host, target.port, deadline)?;
+        let stream = self.connect.connect_blocking(&target.host, target.port, deadline)?;
         // Before anything waits on it, so `close()` can cut a proxy's or TLS's handshake short too.
         let busy = self.enter(stream.as_raw_fd())?;
         stream.set_nodelay(true).map_err(transport)?;
@@ -403,18 +436,18 @@ impl SyncPool {
         let driver: Driver = Box::pin(async move {
             let _ = driver.await;
         });
-        Ok(SyncConn { busy: Some(busy), _stream: stream, fd, ready, sender, driver, closed: false })
+        Ok(SyncConn { busy: Some(busy), _stream: stream, fd, ready, sender, driver, closed: false, connect_by })
     }
 
     /// A connection for a request to `target`, in `InFlight`: an idle one, or a new one. A failure
     /// after `close()` began is that close's doing.
-    fn checkout(&self, target: &Target, deadline: Option<Instant>) -> Result<SyncConn, Failure> {
+    fn checkout(&self, target: &Target, limits: Limits) -> Result<SyncConn, Failure> {
         let conn = match self.take_idle(&target.key) {
             Some(mut conn) => self.enter(conn.fd).map(|busy| {
                 conn.busy = Some(busy);
                 conn
             }),
-            None => self.connect(target, deadline),
+            None => self.connect(target, limits),
         };
         match conn {
             Err(_) if self.closing() => Err(Failure::Closed),
@@ -479,13 +512,13 @@ impl SyncPool {
         &self,
         target: &Target,
         mut request: Request<RequestBody>,
-        deadline: Option<Instant>,
+        limits: Limits,
         mut redirect: Option<&mut Redirect>,
         cookies: Option<&Cookies>,
     ) -> Result<Fetched, Failure> {
         for _ in 0..3 {
-            let mut conn = self.checkout(target, deadline)?;
-            let outcome = run_on(&mut conn, request, deadline, redirect.as_deref_mut(), cookies);
+            let mut conn = self.checkout(target, limits)?;
+            let outcome = run_on(&mut conn, request, limits, redirect.as_deref_mut(), cookies);
             if conn.leave() {
                 // `close()` shut its socket down: whatever came back doesn't count, not even a body
                 // that looks whole (one that ends with the connection reads as complete).
@@ -522,19 +555,19 @@ impl SyncPool {
     }
 
     /// `send_blocking`, following redirects (`redirect`, if the client does) under the same
-    /// `deadline`: the final response, or how it failed. `Err` for a hop that can't be made.
+    /// `limits`: the final response, or how it failed. `Err` for a hop that can't be made.
     fn send_following(
         &self,
         py: Python<'_>,
         mut target: Target,
         mut request: Request<RequestBody>,
-        deadline: Option<Instant>,
+        limits: Limits,
         mut redirect: Option<Box<Redirect>>,
         mut cookies: Option<Cookies>,
     ) -> PyResult<Result<Head, Failure>> {
         loop {
             let state = redirect.as_deref_mut();
-            let fetched = py.detach(|| self.send_blocking(&target, request, deadline, state, cookies.as_ref()));
+            let fetched = py.detach(|| self.send_blocking(&target, request, limits, state, cookies.as_ref()));
             match (fetched, redirect.as_deref()) {
                 (Ok(Fetched::Hop(hop)), Some(state)) => (target, request, cookies) = self.hop(py, state, hop)?,
                 (Ok(Fetched::Hop(_)), None) => return Ok(Err(Failure::Transport("internal error: a redirect lost its state".to_owned()))),
@@ -551,12 +584,12 @@ impl SyncPool {
         py: Python<'_>,
         mut target: Target,
         mut request: Request<RequestBody>,
-        deadline: Option<Instant>,
+        limits: Limits,
         mut redirect: Option<Box<Redirect>>,
         mut cookies: Option<Cookies>,
     ) -> PyResult<(Target, SyncConn, Response<Incoming>)> {
         loop {
-            let (conn, response) = py.detach(|| self.open_stream(&target, request, deadline)).map_err(|f| self.glue.failure(py, f))?;
+            let (conn, response) = py.detach(|| self.open_stream(&target, request, limits)).map_err(|f| self.glue.failure(py, f))?;
             if let Some(cookies) = &cookies {
                 cookies.store(response.headers());
             }
@@ -580,10 +613,10 @@ impl SyncPool {
 
     /// `send_blocking` for a streamed request: the connection it runs on (now busy until its body
     /// is read) and the response's head.
-    fn open_stream(&self, target: &Target, mut request: Request<RequestBody>, deadline: Option<Instant>) -> Result<(SyncConn, Response<Incoming>), Failure> {
+    fn open_stream(&self, target: &Target, mut request: Request<RequestBody>, limits: Limits) -> Result<(SyncConn, Response<Incoming>), Failure> {
         for _ in 0..3 {
-            let mut conn = self.checkout(target, deadline)?;
-            let outcome = send_on(&mut conn, request, deadline);
+            let mut conn = self.checkout(target, limits)?;
+            let outcome = send_on(&mut conn, request, limits);
             // Left even with the head in: its body outlives the client, as on pyreqwest.
             if conn.leave() {
                 return Err(Failure::Closed);
@@ -612,7 +645,7 @@ impl SyncPool {
 impl SyncPool {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (base_url, default_headers, user_agent, https_only, cookie_store, follow_redirects, max_redirects, root_certificates, identity_pem, min_tls_version, max_tls_version, danger_accept_invalid_certs, timeout, pool_idle_timeout, pool_max_idle_per_host, proxy, no_proxy, glue))]
+    #[pyo3(signature = (base_url, default_headers, user_agent, https_only, cookie_store, follow_redirects, max_redirects, root_certificates, identity_pem, min_tls_version, max_tls_version, danger_accept_invalid_certs, timeout, pool_idle_timeout, pool_max_idle_per_host, proxy, no_proxy, glue, connect))]
     fn new(
         py: Python<'_>,
         base_url: Option<&str>,
@@ -633,6 +666,7 @@ impl SyncPool {
         proxy: Option<&str>,
         no_proxy: Option<&str>,
         glue: &Bound<'_, PyAny>,
+        connect: &ConnectOptions,
     ) -> PyResult<Self> {
         // The client's `timeout` is only converted, so that a bad one fails on entry with pyo3's
         // own message, as on pyreqwest's builder: each request carries its own timeout.
@@ -642,6 +676,7 @@ impl SyncPool {
                 .with_proxies(Proxies::new(proxy, no_proxy)?)
                 .with_redirects(follow_redirects, max_redirects)
                 .with_cookies(cookie_store),
+            connect: connect.settings.clone(),
             tls: TlsSettings::new(
                 &root_certificates,
                 identity_pem.as_deref(),
@@ -697,8 +732,8 @@ impl SyncPool {
             Err(message) => return Err(self.glue.connection_error(py, message)),
         };
         let started = Instant::now();
-        let deadline = timeout.and_then(|timeout| self.clock.deadline(started, timeout));
-        let result = self.send_following(py, target, request, deadline, redirect, cookies)?;
+        let limits = Limits::new(self.clock, started, timeout, self.connect.read_timeout);
+        let result = self.send_following(py, target, request, limits, redirect, cookies)?;
         let exchange = Exchange {
             method: method.unbind(),
             url,
@@ -793,14 +828,18 @@ struct OpenStream {
     key: OriginKey,
     conn: SyncConn,
     body: BodyStream,
-    deadline: Option<Instant>,
+    limits: Limits,
 }
 
 impl OpenStream {
+    /// The body's next chunk, under its total deadline and, from now, `read_timeout`'s gap.
     fn next_chunk(&mut self) -> Result<Option<Bytes>, Failure> {
-        let Self { conn, body, deadline, .. } = self;
+        let Self { conn, body, limits, .. } = self;
         let SyncConn { fd, ready, driver, closed, .. } = conn;
-        drive(*fd, ready, driver, closed, std::pin::pin!(poll_fn(|cx| body.poll_chunk(cx))), *deadline)?
+        let head = Cell::new(limits.read_timeout.map(|_| Instant::now()));
+        let mut waits = Waits { limits: *limits, head: &head, last_read: None, connect_by: None };
+        let chunk = drive(*fd, ready, driver, closed, std::pin::pin!(poll_fn(|cx| body.poll_chunk(cx))), &mut waits);
+        chunk?
     }
 }
 
@@ -864,8 +903,8 @@ impl SyncStream {
                 return Err(pool.glue.connection_error(py, message));
             }
         };
-        let deadline = self.timeout.and_then(|timeout| pool.clock.deadline(Instant::now(), timeout));
-        let (target, conn, response) = match pool.open_following(py, target, request, deadline, redirect, cookies) {
+        let limits = Limits::new(pool.clock, Instant::now(), self.timeout, pool.connect.read_timeout);
+        let (target, conn, response) = match pool.open_following(py, target, request, limits, redirect, cookies) {
             Ok(opened) => opened,
             Err(error) => {
                 self.put(StreamState::Done);
@@ -876,7 +915,7 @@ impl SyncStream {
         let body = BodyStream::new(&mut parts.headers, incoming);
         match pool.glue.stream_head(py, parts.status.as_u16(), parts.version, parts.headers) {
             Ok(head) => {
-                self.put(StreamState::Open(Box::new(OpenStream { key: target.key, conn, body, deadline })));
+                self.put(StreamState::Open(Box::new(OpenStream { key: target.key, conn, body, limits })));
                 Ok(head)
             }
             Err(error) => {

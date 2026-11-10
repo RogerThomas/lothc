@@ -58,6 +58,7 @@ fn tls_error(error: rustls::Error) -> io::Error {
 
 impl<R: Readiness> TlsSocket<R> {
     pub(crate) fn new(fd: RawFd, ready: R, tls: ClientConnection) -> Self {
+        ready.set_handshaking(true);
         Self {
             fd,
             ready,
@@ -111,6 +112,9 @@ impl<R: Readiness> TlsSocket<R> {
                 return Poll::Ready(Err(tls_error(error)));
             }
             if records.is_empty() {
+                if !self.tls.is_handshaking() {
+                    self.ready.set_handshaking(false);
+                }
                 return Poll::Ready(Ok(n));
             }
         }

@@ -95,6 +95,29 @@ class SyncStream:
     def close(self) -> None: ...
 
 @final
+class ConnectOptions:
+    """A client's connection settings (`native/src/connect.rs`): `resolve` as (host, address)
+    pairs, `local_address`, `tcp_keepalive`'s idle time (reqwest's 15s if `None`),
+    `connect_timeout` and `read_timeout`. An address that isn't one raises `ValueError`, and so
+    does a negative duration, as on pyreqwest's builder."""
+
+    def __init__(
+        self,
+        resolve: Sequence[tuple[str, str]],
+        local_address: str | None,
+        tcp_keepalive: timedelta | None,
+        connect_timeout: timedelta | None,
+        read_timeout: timedelta | None,
+    ) -> None: ...
+    @property
+    def local_address(self) -> str | None:
+        """`local_address`, as Rust writes it."""
+
+    @property
+    def connect_timeout(self) -> float | None:
+        """`connect_timeout`, in seconds."""
+
+@final
 class Pool:
     """The async pool, bound to the event loop (and thread) it was created on; another thread's
     use is a `RuntimeError`."""
@@ -119,23 +142,25 @@ class Pool:
         proxy: str | None,
         no_proxy: str | None,
         glue: _Glue,
+        connect: ConnectOptions,
         event_loop: asyncio.AbstractEventLoop,
-        spawn_connect: Callable[[int, str, int, str | None], object],
+        spawn_connect: Callable[[int, str, int, str | None, list[str] | None], object],
         close_conn: Callable[[int], object],
     ) -> None:
-        """`spawn_connect(conn, host, port, resolve)` asks Python to connect a socket for
-        connection `conn` (to the origin or its proxy), resolving `resolve` first if it isn't
-        `None` (a `socks5://` proxy's target), then `connected` or `connect_failed`;
-        `close_conn(conn)` to unregister and close it. `timeout` is the client's, only converted
-        (a negative one raises `ValueError`, as pyreqwest's builder does); each request carries
-        its own. `pool_idle_timeout`/
-        `pool_max_idle_per_host` default to reqwest's 90s and no cap. `proxy`/`no_proxy` are
-        `proxy=` and `no_proxy=` (comma-separated); without `proxy`, the environment's proxies
-        apply, read now. A `proxy` that isn't a URL raises `ValueError`. With
-        `follow_redirects`, a request follows up to `max_redirects` (reqwest's 10 if `None`) as
-        reqwest does, within its one timeout; a negative `max_redirects` raises `OverflowError`
-        even without, as pyreqwest's builder does. With `cookie_store`, the pool keeps a cookie
-        jar, empty at first, as reqwest's `cookie_store(true)` does."""
+        """`spawn_connect(conn, host, port, resolve, addresses)` asks Python to connect a
+        socket for connection `conn` (to the origin or its proxy), at `addresses` (`resolve=`'s
+        for `host`) if given, resolving `resolve` first if it isn't `None` (a `socks5://` proxy's
+        target), then `connected` or `connect_failed`; `close_conn(conn)` to unregister and close
+        it, or to give up on its connect (`connect_timeout`). `timeout` is the client's, only
+        converted (a negative one raises `ValueError`, as pyreqwest's builder does); each request
+        carries its own. `pool_idle_timeout`/`pool_max_idle_per_host` default to reqwest's 90s
+        and no cap. `proxy`/`no_proxy` are `proxy=` and `no_proxy=` (comma-separated); without
+        `proxy`, the environment's proxies apply, read now. A `proxy` that isn't a URL raises
+        `ValueError`. With `follow_redirects`, a request follows up to `max_redirects` (reqwest's
+        10 if `None`) as reqwest does, within its one timeout; a negative `max_redirects` raises
+        `OverflowError` even without, as pyreqwest's builder does. With
+        `cookie_store`, the pool keeps a cookie jar, empty at first, as reqwest's
+        `cookie_store(true)` does."""
 
     def set_callbacks(
         self,
@@ -193,7 +218,9 @@ class Pool:
     def connected(self, conn: int, fd: int, resolved: str | None = None) -> None:
         """`conn`'s socket `fd` is connected; `resolved` is the first address of the host
         `spawn_connect` asked to resolve, if any."""
-    def connect_failed(self, conn: int, message: str) -> None: ...
+    def connect_failed(self, conn: int, message: str, timed_out: bool = False) -> None:
+        """Connecting `conn` failed with `message`; `timed_out` if by a timeout."""
+
     def on_readable(self, conn: int) -> None: ...
     def on_writable(self, conn: int) -> None: ...
     def cancel(self, fut: asyncio.Future[Response[Any, Any]]) -> None:
@@ -228,6 +255,7 @@ class SyncPool:
         proxy: str | None,
         no_proxy: str | None,
         glue: _Glue,
+        connect: ConnectOptions,
     ) -> None:
         """As `Pool`, but idle connections expire only when the pool is used: no reaper."""
     def request(

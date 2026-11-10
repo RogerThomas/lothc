@@ -1,5 +1,6 @@
 //! What a finished exchange becomes: exactly what lothc's pyreqwest path returns or raises, built
 //! in one pass from lothc's own classes and helpers (handed over as `glue`).
+use std::cell::Cell;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -56,11 +57,13 @@ pub(crate) enum Fetched {
 /// `redirect` (the request's redirect state, when the client follows redirects) says to follow it.
 /// The response's cookies go into the jar first (`cookies`, with `cookie_store=True`), a redirect's
 /// included.
+/// `head`, if given, is told when the final response's head arrived (for `read_timeout`).
 pub(crate) async fn fetch(
     sender: &mut Sender,
     request: http::Request<RequestBody>,
     redirect: Option<&mut Redirect>,
     cookies: Option<&Cookies>,
+    head: Option<&Cell<Option<Instant>>>,
 ) -> Result<Fetched, Failure> {
     let response = send(sender, request).await?;
     if let Some(cookies) = cookies {
@@ -70,6 +73,9 @@ pub(crate) async fn fetch(
         if let Some(hop) = redirect.next(response.status().as_u16(), response.headers())? {
             return Ok(Fetched::Hop(hop));
         }
+    }
+    if let Some(head) = head {
+        head.set(Some(Instant::now()));
     }
     let (mut parts, body) = response.into_parts();
     let body = match decompress::coding(&parts.headers) {
