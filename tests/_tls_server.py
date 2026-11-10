@@ -54,12 +54,15 @@ class _TLSServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-def tls_server_context(ca: trustme.CA) -> ssl.SSLContext:
-    """A server-side context presenting a cert for `localhost`/`127.0.0.1` issued by `ca`."""
+def tls_server_context(
+    ca: trustme.CA, names: tuple[str, ...] = ("localhost", "127.0.0.1")
+) -> ssl.SSLContext:
+    """A server-side context presenting a cert for `names` (`localhost`/`127.0.0.1` by default)
+    issued by `ca`."""
     context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     # Via a temp file rather than trustme's `configure_cert`, whose signature mentions pyOpenSSL
     # (not installed), so it types as partially unknown; stdlib only loads a cert chain from disk.
-    with ca.issue_cert("localhost", "127.0.0.1").private_key_and_cert_chain_pem.tempfile() as path:
+    with ca.issue_cert(*names).private_key_and_cert_chain_pem.tempfile() as path:
         context.load_cert_chain(path)
     return context
 

@@ -4,7 +4,7 @@
 this module is the one canonical server implementation for both. Endpoints: `/items`
 (GET/POST/PUT/PATCH/DELETE/HEAD), `/echo-headers`, `/echo-query`, `/slow`, `/events` (SSE),
 `/boom`, `/upload` (multipart), `/oauth/token*` (OAuth 2 token endpoints), plus
-cookie/redirect/retry/streaming scenarios used by their own tests.
+cookie/redirect/retry/streaming/connection-close scenarios used by their own tests.
 """
 
 import contextlib
@@ -564,6 +564,17 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_connection_close(self) -> None:
+        # Announces the close, so the client must open a new connection for its next request.
+        self.close_connection = True
+        self._write_json(200, {"closed": "announced"}, {"Connection": "close"})
+
+    def _handle_silent_close(self) -> None:
+        # Closes after responding without saying so, as a server dropping an idle keep-alive
+        # connection does: a client reusing that connection unchecked writes into a dead socket.
+        self._write_json(200, {"closed": "silently"})
+        self.close_connection = True
+
     def _handle_slow(self, query: str) -> None:
         # `seconds` lets each caller buy exactly the delay its own assertion needs, rather than
         # one shared number sized for the strictest case. A test that only needs the client to
@@ -722,6 +733,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/json-array": self._handle_json_array,
             "/deeply-nested-error": self._handle_deeply_nested_error,
             "/crlf-text": self._handle_crlf_text,
+            "/connection-close": self._handle_connection_close,
+            "/silent-close": self._handle_silent_close,
         }
         route = plain_routes.get(parsed.path)
         if route is None:
