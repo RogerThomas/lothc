@@ -267,6 +267,8 @@ so the payoff shrinks as the suite gets faster), **bypassing `uv run`** (~30ms),
   `mtls_base_url` (client cert required). The handshake runs on the handler thread, so a failed
   one never blocks `serve_forever`. Every negative control in `tests/test_tls.py` pins the rustls
   failure in `match=` (`UnknownIssuer`, `NotValidForName`, `CertificateRequired`, `UnknownCA`, `ProtocolVersion`).
+  A wrong host name reads differently per platform (bare `NotValidForName` on macOS, `certificate
+  not valid for name ...` on Linux), so its tests match both: check a new pin on Linux too.
   Certs load via stdlib `load_cert_chain` from a trustme tempfile, not `configure_cert`, whose
   pyOpenSSL-typed signature is partially unknown to basedpyright. `max_connections`/
   `pool_timeout` have a real test (one slot, two concurrent `/slow`); `connect_timeout` can't be

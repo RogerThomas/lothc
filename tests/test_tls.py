@@ -79,8 +79,10 @@ async def test_root_certificates_from_another_ca_is_still_untrusted(https_base_u
 async def test_cert_for_another_host_name_raises_connection_error(
     other_name_base_url: str, tls_ca_pem: bytes
 ) -> None:
+    # rustls names this `NotValidForName` where the OS verifier reports it bare (macOS) and
+    # `certificate not valid for name ...` where it reports the names involved (Linux).
     async with HTTPClient(base_url=other_name_base_url, root_certificates=[tls_ca_pem]) as client:
-        with pytest.raises(HTTPConnectionError, match="NotValidForName"):
+        with pytest.raises(HTTPConnectionError, match=r"NotValidForName|not valid for name"):
             await client.get("items/7")
 
 
@@ -89,7 +91,7 @@ def test_sync_cert_for_another_host_name_raises_connection_error(
 ) -> None:
     with (
         SyncHTTPClient(base_url=other_name_base_url, root_certificates=[tls_ca_pem]) as client,
-        pytest.raises(HTTPConnectionError, match="NotValidForName"),
+        pytest.raises(HTTPConnectionError, match=r"NotValidForName|not valid for name"),
     ):
         client.get("items/7")
 
