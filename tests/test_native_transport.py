@@ -179,16 +179,6 @@ def test_sync_native_transport_refuses_an_unported_setting(setting: str, value: 
         SyncHTTPClient(native=True, **settings)
 
 
-async def test_native_transport_refuses_a_multipart_form(native_client: HTTPClient) -> None:
-    with pytest.raises(NotImplementedError, match="form="):
-        await native_client.post("upload", form={"field": "value"})
-
-
-def test_sync_native_transport_refuses_a_multipart_form(sync_native_client: SyncHTTPClient) -> None:
-    with pytest.raises(NotImplementedError, match="form="):
-        sync_native_client.post("upload", form={"field": "value"})
-
-
 def _unported_proxies() -> list[tuple[str, str]]:
     return [
         ("https://127.0.0.1:1", "an https:// proxy"),

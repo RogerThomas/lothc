@@ -54,7 +54,6 @@ use bytes::Bytes;
 use futures_executor::{LocalPool, LocalSpawner};
 use futures_util::task::LocalSpawnExt;
 use http::Request;
-use http_body_util::Full;
 use http::{HeaderMap, Version};
 use hyper::client::conn::http1;
 use pyo3::exceptions::PyRuntimeError;
@@ -64,6 +63,7 @@ use pyo3::types::{PyBytes, PyString};
 use rustls::pki_types::ServerName;
 use rustls::ClientConnection;
 
+use crate::body::RequestBody;
 use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
 use crate::io::{shutdown, LoopReady, Stream};
@@ -119,7 +119,7 @@ impl<T> Drop for ThreadBound<T> {
 /// One request's state, in the slab while it waits or runs.
 struct Meta {
     /// Taken by `start`; put back if hyper hands it back unsent.
-    request: Option<Request<Full<Bytes>>>,
+    request: Option<Request<RequestBody>>,
     /// What a redirect is followed from (`None` if they aren't): taken by `start` with the
     /// request, and put back with it, or with the hop's request.
     redirect: Option<Box<Redirect>>,
@@ -676,7 +676,7 @@ impl PoolState {
 
     /// hyper handed `slot`'s request back unsent (`conn` was already closing): it goes to the
     /// front of its origin's queue again, unless it timed out or was given up on meanwhile.
-    fn requeue(&mut self, py: Python<'_>, conn: usize, slot: usize, sender: Sender, request: Request<Full<Bytes>>, redirect: Option<Box<Redirect>>) -> PyResult<()> {
+    fn requeue(&mut self, py: Python<'_>, conn: usize, slot: usize, sender: Sender, request: Request<RequestBody>, redirect: Option<Box<Redirect>>) -> PyResult<()> {
         let origin = self.conns[conn].origin;
         match self.meta(slot) {
             Some(meta) if !meta.timed_out && !meta.cancelled => {

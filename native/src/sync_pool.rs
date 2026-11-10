@@ -36,7 +36,6 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{Request, Response};
-use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::client::conn::http1;
 use pyo3::exceptions::PyRuntimeError;
@@ -46,6 +45,7 @@ use rustls::pki_types::ServerName;
 use rustls::ClientConnection;
 use url::Url;
 
+use crate::body::RequestBody;
 use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
 use crate::io::{shutdown, PollReady, Stream};
@@ -218,13 +218,13 @@ fn drive<F: Future>(
 
 /// Drive `conn`'s hyper driver and one request until the request finishes (or gets a redirect
 /// to follow, see `fetch`).
-fn run_on(conn: &mut SyncConn, request: Request<Full<Bytes>>, deadline: Option<Instant>, redirect: Option<&mut Redirect>) -> Result<Fetched, Failure> {
+fn run_on(conn: &mut SyncConn, request: Request<RequestBody>, deadline: Option<Instant>, redirect: Option<&mut Redirect>) -> Result<Fetched, Failure> {
     let SyncConn { fd, ready, sender, driver, closed, .. } = conn;
     drive(*fd, ready, driver, closed, std::pin::pin!(fetch(sender, request, redirect)), deadline)?
 }
 
 /// Drive `conn`'s hyper driver and one request until its response's head arrives.
-fn send_on(conn: &mut SyncConn, request: Request<Full<Bytes>>, deadline: Option<Instant>) -> Result<Response<Incoming>, Failure> {
+fn send_on(conn: &mut SyncConn, request: Request<RequestBody>, deadline: Option<Instant>) -> Result<Response<Incoming>, Failure> {
     let SyncConn { fd, ready, sender, driver, closed, .. } = conn;
     drive(*fd, ready, driver, closed, std::pin::pin!(send(sender, request)), deadline)?
 }
@@ -471,7 +471,7 @@ impl SyncPool {
     fn send_blocking(
         &self,
         target: &Target,
-        mut request: Request<Full<Bytes>>,
+        mut request: Request<RequestBody>,
         deadline: Option<Instant>,
         mut redirect: Option<&mut Redirect>,
     ) -> Result<Fetched, Failure> {
@@ -505,7 +505,7 @@ impl SyncPool {
 
     /// The hop a redirect leads to: its request and where it goes (`Err` the exception it fails
     /// with before any I/O).
-    fn hop(&self, py: Python<'_>, redirect: &Redirect, hop: crate::redirect::Hop) -> PyResult<(Target, Request<Full<Bytes>>)> {
+    fn hop(&self, py: Python<'_>, redirect: &Redirect, hop: crate::redirect::Hop) -> PyResult<(Target, Request<RequestBody>)> {
         let Prepared { request, url, route, .. } = self.config.hop(py, &self.glue, redirect, hop)?;
         match Self::target(&url, route) {
             Ok(target) => Ok((target, request)),
@@ -519,7 +519,7 @@ impl SyncPool {
         &self,
         py: Python<'_>,
         mut target: Target,
-        mut request: Request<Full<Bytes>>,
+        mut request: Request<RequestBody>,
         deadline: Option<Instant>,
         mut redirect: Option<Box<Redirect>>,
     ) -> PyResult<Result<Head, Failure>> {
@@ -541,7 +541,7 @@ impl SyncPool {
         &self,
         py: Python<'_>,
         mut target: Target,
-        mut request: Request<Full<Bytes>>,
+        mut request: Request<RequestBody>,
         deadline: Option<Instant>,
         mut redirect: Option<Box<Redirect>>,
     ) -> PyResult<(Target, SyncConn, Response<Incoming>)> {
@@ -567,7 +567,7 @@ impl SyncPool {
 
     /// `send_blocking` for a streamed request: the connection it runs on (now busy until its body
     /// is read) and the response's head.
-    fn open_stream(&self, target: &Target, mut request: Request<Full<Bytes>>, deadline: Option<Instant>) -> Result<(SyncConn, Response<Incoming>), Failure> {
+    fn open_stream(&self, target: &Target, mut request: Request<RequestBody>, deadline: Option<Instant>) -> Result<(SyncConn, Response<Incoming>), Failure> {
         for _ in 0..3 {
             let mut conn = self.checkout(target, deadline)?;
             let outcome = send_on(&mut conn, request, deadline);
@@ -757,7 +757,7 @@ impl SyncPool {
 /// A prepared stream's request and where it goes (`Err` the connection error it fails with).
 struct PreparedStream {
     target: Result<Target, String>,
-    request: Request<Full<Bytes>>,
+    request: Request<RequestBody>,
     redirect: Option<Box<Redirect>>,
 }
 

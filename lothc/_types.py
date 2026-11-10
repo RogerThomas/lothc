@@ -31,8 +31,8 @@ type TypedHeaders = BaseModelTyping | StructTyping
 type JSONPayload = dict[str, Any] | list[Any] | BaseModelTyping | StructTyping
 
 # A caller never constructs these three directly — they just write a plain tuple literal, and
-# _apply_form_value/_apply_sync_form_value tell them apart by exact arity + element type. Keep
-# them private; File (below) is the only name a caller-facing type hint ever needs.
+# _form_value_parts tells them apart by exact arity + element type. Keep them private; File
+# (below) is the only name a caller-facing type hint ever needs.
 type _FormFileNoContentType = tuple[str, bytes | Path | BufferedIOBase]
 type _FormFileWithContentType = tuple[str, bytes | Path | BufferedIOBase, str]
 type _FormFileFromPathOverrideContentType = tuple[Path, str]

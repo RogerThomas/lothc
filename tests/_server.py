@@ -842,6 +842,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
 
     # Per-key record of every request body `/status-then-ok` received, oldest first.
     _received_bodies: ClassVar[dict[str, list[str]]] = {}
+    # Per-key record of what `/partial-body` received, read back via `/partial-body-seen`.
+    _partial_requests: ClassVar[dict[str, dict[str, object]]] = {}
 
     def _drain_body(self) -> bytes:
         # Read any request body, so a kept-alive connection's next request isn't misread.
@@ -870,6 +872,40 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self._write_json(status, {"attempt": attempt})
         else:
             self._write_json(200, {"attempts": attempt, "bodies": self._received_bodies[key]})
+
+    def _handle_partial_body(self, query: str) -> None:
+        # The request line, its headers and as much of its body as arrived before its
+        # `Content-Length` or the client going away, whichever came first: for a request a client
+        # abandons partway through its body.
+        length = int(self.headers.get("Content-Length", "0"))
+        body = bytearray()
+        with contextlib.suppress(ConnectionError):
+            while len(body) < length and (chunk := self.rfile.read1(length - len(body))):
+                body += chunk
+        self._partial_requests[parse_qs(query)["key"][0]] = {
+            "line": self.requestline,
+            "headers": [[name, value] for name, value in self.headers.items()],
+            "body": body.decode("latin-1"),
+        }
+        self._write_json(200, {"received": len(body)})
+
+    def _handle_partial_body_seen(self, query: str) -> None:
+        # What `/partial-body` recorded for the key, or a 404 until it has.
+        seen = self._partial_requests.get(parse_qs(query)["key"][0])
+        if seen is None:
+            self._write_json(404, _not_found_body)
+        else:
+            self._write_json(200, seen)
+
+    def _handle_count_body(self) -> None:
+        # How many bytes the request body has, read in chunks and kept nowhere: for an upload too
+        # large to echo back.
+        remaining = int(self.headers.get("Content-Length", "0"))
+        received = 0
+        while remaining and (chunk := self.rfile.read1(min(remaining, 1 << 16))):
+            received += len(chunk)
+            remaining -= len(chunk)
+        self._write_json(200, {"received": received})
 
     def _handle_redirect_to(self, query: str) -> None:
         # A `status` redirect (302 by default) to `to`, which may be another host.
@@ -984,8 +1020,11 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/events-drops": self._write_sse_drops,
             "/events-then-status": self._write_sse_then_status,
             "/oauth/token-broken": self._handle_oauth_token_broken,
+            "/partial-body": self._handle_partial_body,
+            "/partial-body-seen": self._handle_partial_body_seen,
         }
         plain_routes = {
+            "/count-body": self._handle_count_body,
             "/echo-method": self._handle_echo_method,
             "/events-fields": self._write_sse_fields,
             "/events-echo-accept": self._write_sse_echo_accept,

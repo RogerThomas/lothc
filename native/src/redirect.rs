@@ -12,6 +12,10 @@
 //! and the `Referer` apply to the hop's own copy alone, so a later hop back to the first origin
 //! sends them again, as reqwest does. A redirect response being followed is dropped unread, so
 //! hyper drains a small body and keeps the connection, or closes it for a larger one, as there.
+//!
+//! A body tower-http can't copy (a multipart one, which reqwest streams) means a redirect that
+//! must resend it isn't followed: that 307/308, or 301/302 for anything but a POST (which
+//! becomes a bodyless GET), is the final response, as tower-http's `BodyRepr::None` makes it.
 use bytes::Bytes;
 use http::header::{
     AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE, LOCATION, PROXY_AUTHORIZATION, REFERER,
@@ -41,6 +45,7 @@ impl Policy {
 pub(crate) struct Hop {
     pub(crate) url: Url,
     pub(crate) headers: HeaderMap,
+    pub(crate) body: Bytes,
 }
 
 /// A request's redirect state (tower-http's `ResponseFuture` plus the policy's URL list), from
@@ -53,7 +58,9 @@ pub(crate) struct Redirect {
     pub(crate) uri: Uri,
     /// The headers every hop starts from: the first request's, before hyper-util's `Host`.
     headers: HeaderMap,
-    pub(crate) body: Bytes,
+    /// A copy of the current request's body for the next hop (tower-http's `BodyRepr`): `None`
+    /// when it couldn't be copied.
+    body: Option<Bytes>,
     /// Every URL redirected from so far (`TowerRedirectPolicy::urls`).
     urls: Vec<Url>,
 }
@@ -101,7 +108,7 @@ fn bad_scheme(url: &Url) -> String {
 }
 
 impl Redirect {
-    pub(crate) fn new(policy: Policy, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Self {
+    pub(crate) fn new(policy: Policy, method: Method, uri: Uri, headers: HeaderMap, body: Option<Bytes>) -> Self {
         Self { policy, method, uri, headers, body, urls: Vec::new() }
     }
 
@@ -121,7 +128,7 @@ impl Redirect {
             301 | 302 => {
                 if self.method == Method::POST {
                     self.method = Method::GET;
-                    self.body = Bytes::new();
+                    self.body = Some(Bytes::new());
                     self.drop_payload_headers();
                 }
             }
@@ -130,12 +137,13 @@ impl Redirect {
                 if self.method != Method::HEAD {
                     self.method = Method::GET;
                 }
-                self.body = Bytes::new();
+                self.body = Some(Bytes::new());
                 self.drop_payload_headers();
             }
             307 | 308 => {}
             _ => return Ok(None),
         }
+        let Some(body) = self.body.clone() else { return Ok(None) };
         let location = headers
             .get(LOCATION)
             .and_then(|location| resolve_uri(std::str::from_utf8(location.as_bytes()).ok()?, &self.uri));
@@ -161,6 +169,6 @@ impl Redirect {
         if let Some(referer) = self.urls.last().and_then(|previous| make_referer(&next, previous)) {
             hop_headers.insert(REFERER, referer);
         }
-        Ok(Some(Hop { url: next, headers: hop_headers }))
+        Ok(Some(Hop { url: next, headers: hop_headers, body }))
     }
 }

@@ -18,11 +18,13 @@
 //! - `proxy`: which proxy a request goes through, and the proxy handshakes, as reqwest's;
 //! - `redirect`: following redirects, as reqwest's default policy does;
 //! - `headers`: `RawHeaders`, a response's headers until `_LazyHeaders` reads them.
+mod body;
 mod decompress;
 mod error;
 mod headers;
 mod idle;
 mod io;
+mod multipart;
 mod pool;
 mod proxy;
 mod redirect;

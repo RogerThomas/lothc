@@ -1,12 +1,14 @@
 """The loop-native transport over `lothc._native` (hyper on the asyncio loop; poll(2) for sync)."""
 
 import asyncio
+import secrets
 import time
 from base64 import b64encode
 from collections.abc import (
     AsyncGenerator,
     Callable,
     Generator,
+    Iterator,
     Mapping,
 )
 from contextlib import AsyncExitStack, ExitStack
@@ -35,6 +37,7 @@ from ._errors import (
     _status_error,
     _validate_raises,
 )
+from ._form import _form_parts, _FormPart
 from ._headers import CaseInsensitiveDict, _LazyHeaders
 from ._native import ClientBuildError as _NativeClientBuildError
 from ._native import Pool as _NativePool
@@ -163,19 +166,53 @@ class _NativeBody(IntEnum):
     ENCODED_JSON = 1
     JSON = 2
     FORM = 3
+    MULTIPART = 4
+
+
+def _multipart_boundary() -> str:
+    """A multipart boundary in reqwest's format (`gen_boundary`): four random 64-bit numbers as
+    16 lowercase hex digits each, joined by dashes."""
+    digits = secrets.token_hex(32)
+    return "-".join(digits[start : start + 16] for start in range(0, 64, 16))
+
+
+@dataclass(slots=True)
+class _NativeForm:
+    """A `form=` body as the native side builds it (`native/src/multipart.rs`), each time its
+    request is prepared: `parts()` describes the parts afresh, and the boundary is drawn once per
+    call, so a replayed attempt (only an empty form is ever replayed, as on pyreqwest) carries the
+    same one, as a copy of pyreqwest's request does."""
+
+    boundary: str
+    form: Form
+    infer_mime_type_from_file_extension: bool
+
+    def parts(self) -> Iterator[_FormPart]:
+        return _form_parts(
+            self.form,
+            infer_mime_type_from_file_extension=self.infer_mime_type_from_file_extension,
+        )
 
 
 def _native_body(
-    json: JSONPayload | None, data: Params | None, form: Form | None, content: str | bytes | None
+    json: JSONPayload | None,
+    data: Params | None,
+    form: Form | None,
+    content: str | bytes | None,
+    *,
+    infer_mime_type_from_file_extension: bool,
 ) -> tuple[object, _NativeBody]:
     """`_attach_body` for the native transport: a model's or Struct's JSON encoded here exactly
     as `_attach_json_body` encodes it, a `dict`/`list` left for the native side to serialize as
-    pyreqwest's `body_json` does (sorted keys, serde_json's numbers), `data=` as pairs."""
+    pyreqwest's `body_json` does (sorted keys, serde_json's numbers), `data=` as pairs, and
+    `form=` described part by part only once the native side builds it, after the request's
+    headers, as pyreqwest builds its form after them."""
     provided_bodies = [body for body in (json, data, form, content) if body is not None]
     if len(provided_bodies) > 1:
         raise ValueError("Provide at most one of 'json', 'data', 'form' or 'content'")
     if form is not None:
-        raise _unported("form= (a multipart body)")
+        native_form = _NativeForm(_multipart_boundary(), form, infer_mime_type_from_file_extension)
+        return native_form, _NativeBody.MULTIPART
     if json is not None:
         if isinstance(json, BaseModel):
             return json.model_dump_json(
@@ -355,6 +392,9 @@ class _NativeCall:
     body: object
     body_kind: _NativeBody
     timeout: timedelta | None
+    # Whether it may be sent more than once: not with a multipart body that has parts, which
+    # pyreqwest can't copy (`_replayable_copy`), so neither a retry nor a 401 replays it.
+    replayable: bool = True
 
 
 def _response_retry_signal(response: Response[Any, Any]) -> tuple[int, str | None]:
@@ -388,7 +428,13 @@ def _native_stream_request(call: _StreamCall) -> _NativeStreamRequest:
     timeout = None if call.timeout is None else _native_call_timeout(call.timeout)
     if call.json is None and call.data is None and call.form is None and call.content is None:
         return _NativeStreamRequest(query, encoded_headers, None, _NativeBody.RAW, timeout)
-    body, body_kind = _native_body(call.json, call.data, call.form, call.content)
+    body, body_kind = _native_body(
+        call.json,
+        call.data,
+        call.form,
+        call.content,
+        infer_mime_type_from_file_extension=call.infer_mime_type_from_file_extension,
+    )
     return _NativeStreamRequest(query, encoded_headers, body, body_kind, timeout)
 
 
@@ -717,8 +763,8 @@ class _NativeTransport:
     followed natively, inside each exchange, as reqwest follows them inside `send()`; retries and
     re-authentication run here around the exchanges, as pyreqwest's middleware runs around
     `send()`. Anything not ported yet is a `NotImplementedError` naming it, never a silent
-    difference: unported client settings at construction (`_reject_unported_settings`) and
-    `form=`. See `_SyncNativeTransport` for the sync mirror.
+    difference: unported client settings at construction (`_reject_unported_settings`). See
+    `_SyncNativeTransport` for the sync mirror.
 
     `repr=False`: a generated repr would print the bearer token or basic-auth password.
     """
@@ -845,7 +891,7 @@ class _NativeTransport:
         if sent is None:
             return response
         reauth.invalidate(sent)
-        if call.method not in self._idempotent_methods:
+        if call.method not in self._idempotent_methods or not call.replayable:
             return response
         return await self._exchange(
             pool,
@@ -889,7 +935,7 @@ class _NativeTransport:
             auth = self._static_auth
         started = time.monotonic()
         attempt = partial(self._attempt, pool, call, auth, reauth, token)
-        if call.method in self._retried_methods and self._retry is not None:
+        if call.method in self._retried_methods and self._retry is not None and call.replayable:
             response = await _retried(
                 self._retry, attempt, _response_retry_signal, _native_retryable
             )
@@ -915,12 +961,14 @@ class _NativeTransport:
     ) -> _NativeStreamSource:
         error_for_status, raises = call.error_for_status, call.raises
         error_class = (raises if raises is not None else self._raises) if error_for_status else None
+        # A multipart body with parts is sent once (`_NativeCall.replayable`).
+        replayable = not call.form
         if call.skip_auth:
             auth = _NativeStreamAuth(None, None, None, retry=False)
         else:
-            retry = method in self._idempotent_methods
+            retry = method in self._idempotent_methods and replayable
             auth = _NativeStreamAuth(self._bearer_auth, self._static_auth, self._reauth, retry)
-        retry = self._retry if method in self._retried_methods else None
+        retry = self._retry if method in self._retried_methods and replayable else None
         return _NativeStreamSource(
             pool, method, path, call, auth, error_class, retry, accept, last_event_id
         )
@@ -998,7 +1046,7 @@ class _NativeTransport:
         response_headers_type: type[TypedHeaders] | None,
         *,
         skip_auth: bool,
-        infer_mime_type_from_file_extension: bool,  # noqa: ARG002 — multipart only, not ported — pylint: disable=unused-argument
+        infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[Any, Any]:
@@ -1024,14 +1072,20 @@ class _NativeTransport:
         if json is None and data is None and form is None and content is None:
             body, body_kind = None, _NativeBody.RAW
         else:
-            body, body_kind = _native_body(json, data, form, content)
+            body, body_kind = _native_body(
+                json,
+                data,
+                form,
+                content,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            )
         effective_timeout = (
             self._total_timeout if timeout is None else _native_call_timeout(timeout)
         )
         error_class = (raises if raises is not None else self._raises) if error_for_status else None
         if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
             call = _NativeCall(
-                method, path, query, encoded_headers, body, body_kind, effective_timeout
+                method, path, query, encoded_headers, body, body_kind, effective_timeout, not form
             )
             return await self._send_through_middleware(
                 pool,
@@ -1247,8 +1301,7 @@ class _SyncNativeTransport:
     implementation (`_streaming.py`, `_sse.py`), fed by `_SyncNativeStreamSource`. Redirects,
     retries and re-authentication as `_NativeTransport`. Anything not ported yet is a
     `NotImplementedError` naming it, never a silent difference: unported client settings at
-    construction (`_reject_unported_settings`) and `form=`. See `_NativeTransport` for the async
-    mirror.
+    construction (`_reject_unported_settings`). See `_NativeTransport` for the async mirror.
 
     `repr=False`: a generated repr would print the bearer token or basic-auth password.
     """
@@ -1369,7 +1422,7 @@ class _SyncNativeTransport:
         if sent is None:
             return response
         reauth.invalidate(sent)
-        if call.method not in self._idempotent_methods:
+        if call.method not in self._idempotent_methods or not call.replayable:
             return response
         return self._exchange(
             pool,
@@ -1413,7 +1466,7 @@ class _SyncNativeTransport:
             auth = self._static_auth
         started = time.monotonic()
         attempt = partial(self._attempt, pool, call, auth, reauth, token)
-        if call.method in self._retried_methods and self._retry is not None:
+        if call.method in self._retried_methods and self._retry is not None and call.replayable:
             response = _retried_sync(
                 self._retry, attempt, _response_retry_signal, _native_retryable
             )
@@ -1439,12 +1492,14 @@ class _SyncNativeTransport:
     ) -> _SyncNativeStreamSource:
         error_for_status, raises = call.error_for_status, call.raises
         error_class = (raises if raises is not None else self._raises) if error_for_status else None
+        # A multipart body with parts is sent once (`_NativeCall.replayable`).
+        replayable = not call.form
         if call.skip_auth:
             auth = _SyncNativeStreamAuth(None, None, None, retry=False)
         else:
-            retry = method in self._idempotent_methods
+            retry = method in self._idempotent_methods and replayable
             auth = _SyncNativeStreamAuth(self._bearer_auth, self._static_auth, self._reauth, retry)
-        retry = self._retry if method in self._retried_methods else None
+        retry = self._retry if method in self._retried_methods and replayable else None
         return _SyncNativeStreamSource(
             pool, method, path, call, auth, error_class, retry, accept, last_event_id
         )
@@ -1512,7 +1567,7 @@ class _SyncNativeTransport:
         response_headers_type: type[TypedHeaders] | None,
         *,
         skip_auth: bool,
-        infer_mime_type_from_file_extension: bool,  # noqa: ARG002 — multipart only, not ported — pylint: disable=unused-argument
+        infer_mime_type_from_file_extension: bool,
         error_for_status: bool,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[Any, Any]:
@@ -1537,14 +1592,20 @@ class _SyncNativeTransport:
         if json is None and data is None and form is None and content is None:
             body, body_kind = None, _NativeBody.RAW
         else:
-            body, body_kind = _native_body(json, data, form, content)
+            body, body_kind = _native_body(
+                json,
+                data,
+                form,
+                content,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            )
         effective_timeout = (
             self._total_timeout if timeout is None else _native_call_timeout(timeout)
         )
         error_class = (raises if raises is not None else self._raises) if error_for_status else None
         if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
             call = _NativeCall(
-                method, path, query, encoded_headers, body, body_kind, effective_timeout
+                method, path, query, encoded_headers, body, body_kind, effective_timeout, not form
             )
             return self._send_through_middleware(
                 pool,

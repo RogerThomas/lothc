@@ -1,7 +1,7 @@
 //! Why an exchange failed, before it becomes one of lothc's exceptions.
-use bytes::Bytes;
 use http::Request;
-use http_body_util::Full;
+
+use crate::body::RequestBody;
 
 pyo3::create_exception!(
     _native,
@@ -16,7 +16,7 @@ pyo3::create_exception!(
 pub(crate) enum Failure {
     /// hyper never sent it (the connection was already closing): safe to send again.
     /// Boxed: a request is far bigger than the other variants.
-    Unsent(Box<Request<Full<Bytes>>>),
+    Unsent(Box<Request<RequestBody>>),
     /// The connection failed (refused, reset, TLS, cut short): `HTTPConnectionError`.
     Transport(String),
     /// The request's total timeout elapsed: `HTTPTimeoutError`.

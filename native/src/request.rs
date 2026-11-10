@@ -7,8 +7,9 @@
 //!    `?` left empty), values written as serde_urlencoded writes them;
 //! 3. headers, in pyreqwest's two maps: the client's `default_headers` and the request's own.
 //!    Setting a header on the request (auth first, then `headers=`) removes it from the defaults,
-//!    and the request's headers are appended to reqwest's own (which only a `data=` body's
-//!    content type, or a URL's userinfo, puts there): `reqwest, then defaults, then the request`;
+//!    and the request's headers are appended to reqwest's own (which only a URL's userinfo, a
+//!    `data=` body's content type, or a `form=` body's content type and length put there):
+//!    `reqwest, then defaults, then the request`;
 //! 4. a `json=` dict/list's content type, then reqwest's client defaults (`accept`, `user-agent`)
 //!    where absent, then an HTTP proxy's `proxy-authorization` where absent (reqwest's
 //!    `proxy_auth`, for an `http://` target only), then `accept-encoding` where absent
@@ -26,19 +27,20 @@ use base64::write::EncoderWriter;
 use bytes::Bytes;
 use form_urlencoded::{Serializer, Target};
 use http::header::{
-    Entry, HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, HOST,
-    PROXY_AUTHORIZATION, USER_AGENT,
+    Entry, HeaderMap, HeaderName, HeaderValue, ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE,
+    HOST, PROXY_AUTHORIZATION, USER_AGENT,
 };
 use http::{Method, Request, Uri};
-use http_body_util::Full;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PySequence, PyString, PyTuple};
 use rustls::pki_types::ServerName;
 use url::{Host, Url};
 
+use crate::body::RequestBody;
 use crate::decompress;
 use crate::error::ClientBuildError;
+use crate::multipart::Form;
 use crate::proxy::{Proxies, Route};
 use crate::redirect::{Hop, Policy, Redirect};
 use crate::response::Glue;
@@ -51,6 +53,8 @@ pub(crate) const BODY_ENCODED_JSON: u8 = 1;
 pub(crate) const BODY_JSON: u8 = 2;
 /// `body` is `data=` (a `dict`, or `(name, value)` pairs) to urlencode (reqwest's `.form()`).
 pub(crate) const BODY_FORM: u8 = 3;
+/// `body` is `form=` as `_NativeForm` describes it, a multipart body (`multipart.rs`).
+pub(crate) const BODY_MULTIPART: u8 = 4;
 
 /// Far below `HeaderMap`'s own limit, which panics rather than erroring in `extend`.
 const MAX_HEADERS: usize = 8192;
@@ -146,7 +150,7 @@ impl VerbHeaders {
 }
 
 pub(crate) struct Prepared {
-    pub(crate) request: Request<Full<Bytes>>,
+    pub(crate) request: Request<RequestBody>,
     pub(crate) url: Url,
     /// How its connection is made: direct, or through which proxy.
     pub(crate) route: Route,
@@ -490,6 +494,13 @@ impl ClientConfig {
         url.map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
+    /// A body that's only bytes, and the copy reqwest's redirect layer keeps of it (made only
+    /// when the client follows redirects).
+    fn copyable(&self, bytes: Bytes) -> (RequestBody, Option<Bytes>) {
+        let copy = self.redirects.is_some().then(|| bytes.clone());
+        (RequestBody::full(bytes), copy)
+    }
+
     /// Everything about a request but the connection. Fails before any I/O: a `ValueError` for
     /// what pyreqwest rejects while building (an unparseable URL, an invalid header or query
     /// value), `HTTPTransportError` for what reqwest rejects when sending (a scheme other than
@@ -568,22 +579,24 @@ impl ClientConfig {
             replacement.insert(name, value);
             set_request_headers(&mut defaults, &mut own, replacement)?;
         }
-        let body = match body {
-            None => Bytes::new(),
+        // The body as sent, and a copy for a redirect's next hop: `None` for a multipart body
+        // with parts, which reqwest streams, so its redirect layer can't copy it.
+        let (body, copy) = match body {
+            None => self.copyable(Bytes::new()),
             Some(body) => match body_kind {
                 BODY_RAW => match body.cast::<PyBytes>() {
-                    Ok(bytes) => Bytes::copy_from_slice(bytes.as_bytes()),
-                    Err(_) => Bytes::from(body.extract::<String>()?),
+                    Ok(bytes) => self.copyable(Bytes::copy_from_slice(bytes.as_bytes())),
+                    Err(_) => self.copyable(Bytes::from(body.extract::<String>()?)),
                 },
                 BODY_ENCODED_JSON => {
                     let mut content_type = HeaderMap::with_capacity(1);
                     content_type.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                     set_request_headers(&mut defaults, &mut own, content_type)?;
-                    Bytes::copy_from_slice(body.cast::<PyBytes>()?.as_bytes())
+                    self.copyable(Bytes::copy_from_slice(body.cast::<PyBytes>()?.as_bytes()))
                 }
                 BODY_JSON => {
                     let value: serde_json::Value = pythonize::depythonize(body)?;
-                    Bytes::from(serde_json::to_vec(&value).map_err(|e| PyValueError::new_err(e.to_string()))?)
+                    self.copyable(Bytes::from(serde_json::to_vec(&value).map_err(|e| PyValueError::new_err(e.to_string()))?))
                 }
                 BODY_FORM => {
                     let mut serializer = Serializer::new(String::new());
@@ -595,8 +608,9 @@ impl ClientConfig {
                     if let Entry::Vacant(entry) = reqwest_headers.try_entry(CONTENT_TYPE).map_err(too_many_headers)? {
                         entry.insert(HeaderValue::from_static("application/x-www-form-urlencoded"));
                     }
-                    Bytes::from(serializer.finish())
+                    self.copyable(Bytes::from(serializer.finish()))
                 }
+                BODY_MULTIPART => multipart_body(body, &mut reqwest_headers)?,
                 other => return Err(PyValueError::new_err(format!("unknown body kind {other}"))),
             },
         };
@@ -640,7 +654,7 @@ impl ClientConfig {
         // What reqwest's redirect layer copies, between `Decompression` and hyper-util.
         let redirect = self
             .redirects
-            .map(|policy| Box::new(Redirect::new(policy, method.clone(), uri.clone(), headers.clone(), body.clone())));
+            .map(|policy| Box::new(Redirect::new(policy, method.clone(), uri.clone(), headers.clone(), copy)));
         let request = sendable(method, &uri, &route, headers, body, invalid_uri)?;
         Ok(Prepared { request, url, route, redirect })
     }
@@ -649,12 +663,27 @@ impl ClientConfig {
     /// `host` and target as hyper-util does any request, but not the proxy credentials reqwest
     /// adds only for a first request (`execute_request`), which the hop already carries if any.
     pub(crate) fn hop(&self, py: Python<'_>, glue: &Glue, redirect: &Redirect, hop: Hop) -> PyResult<Prepared> {
-        let Hop { url, headers } = hop;
+        let Hop { url, headers, body } = hop;
         let route = self.proxies.route(&redirect.uri)?;
         let invalid_uri = || glue.builder_error(py, format!("builder error for url ({url}): Parsed Url is not a valid Uri"));
-        let request = sendable(redirect.method.clone(), &redirect.uri, &route, headers, redirect.body.clone(), invalid_uri)?;
+        let request = sendable(redirect.method.clone(), &redirect.uri, &route, headers, RequestBody::full(body), invalid_uri)?;
         Ok(Prepared { request, url, route, redirect: None })
     }
+}
+
+/// reqwest's `RequestBuilder::multipart`: the form's parts built (`multipart.rs`), its
+/// `Content-Type`, then its `Content-Length` when every part's length is known, appended to
+/// reqwest's own headers; the body, and its copy for a redirect (an empty form's only).
+fn multipart_body(form: &Bound<'_, PyAny>, reqwest_headers: &mut HeaderMap) -> PyResult<(RequestBody, Option<Bytes>)> {
+    let form = Form::extract(form)?;
+    let copy = form.is_empty().then(Bytes::new);
+    let encoded = form.encode();
+    let content_type = HeaderValue::from_str(&encoded.content_type).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    reqwest_headers.try_append(CONTENT_TYPE, content_type).map_err(too_many_headers)?;
+    if let Some(length) = encoded.length {
+        reqwest_headers.try_append(CONTENT_LENGTH, HeaderValue::from(length)).map_err(too_many_headers)?;
+    }
+    Ok((encoded.body, copy))
 }
 
 /// hyper-util's last touches to a request for `uri` (absolute) along `route`: `host` where absent,
@@ -665,9 +694,9 @@ fn sendable(
     uri: &Uri,
     route: &Route,
     mut headers: HeaderMap,
-    body: Bytes,
+    body: RequestBody,
     invalid_uri: impl Fn() -> PyErr,
-) -> PyResult<Request<Full<Bytes>>> {
+) -> PyResult<Request<RequestBody>> {
     if let Entry::Vacant(entry) = headers.try_entry(HOST).map_err(too_many_headers)? {
         let host = uri.host().ok_or_else(&invalid_uri)?;
         let host = match non_default_port(uri) {
@@ -685,7 +714,7 @@ fn sendable(
         }
         _ => Uri::default(),
     };
-    let mut request = Request::new(Full::new(body));
+    let mut request = Request::new(body);
     *request.method_mut() = method;
     *request.uri_mut() = target;
     *request.headers_mut() = headers;

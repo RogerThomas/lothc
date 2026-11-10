@@ -43,6 +43,11 @@ compression-core = "=0.4.33"
 hyper-util = { version = "=0.1.21", default-features = false, features = ["client-proxy"] }
 # A CONNECT response, parsed as hyper-util's tunnel parses it.
 httparse = "=1.10.1"
+# `form=` part types as reqwest's multipart sets them: `mime` parses one (pyreqwest's `MimeType`),
+# `mime_guess` guesses a file's from its extension (`Part::file`), without the reverse mappings,
+# as reqwest depends on it.
+mime = "=0.3.17"
+mime_guess = { version = "=2.0.5", default-features = false }
 
 [build-dependencies]
 # `build.rs`: the macOS link args for a plain `cargo build`. Same version as pyo3.

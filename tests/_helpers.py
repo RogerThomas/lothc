@@ -1,8 +1,12 @@
 """Small helpers shared by several test modules."""
 
+import json
+import time
 from typing import Any
 
 import pytest
+
+from lothc import SyncHTTPClient
 
 
 def echoed_headers(result: dict[str, Any]) -> dict[str, str]:
@@ -34,3 +38,16 @@ def clear_proxy_variables(monkeypatch: pytest.MonkeyPatch) -> None:
         "REQUEST_METHOD",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+def partial_body_seen(base_url: str, key: str) -> dict[str, Any]:
+    """What `/partial-body` recorded for `key` (request line, headers, as much body as arrived),
+    once it has: it records only after the client hangs up, which may be just after the client's
+    own call raised."""
+    with SyncHTTPClient(base_url=base_url) as client:
+        for _ in range(200):
+            seen = client.get("partial-body-seen", params={"key": key}, error_for_status=False)
+            if seen.status == 200:
+                return json.loads(seen.data)
+            time.sleep(0.01)
+    raise AssertionError(f"/partial-body recorded nothing for {key}")

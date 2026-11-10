@@ -1,14 +1,17 @@
 import json
+import os
+import subprocess
+import sys
 from io import BytesIO
 from pathlib import Path
 from typing import Any, TypedDict, cast
 
 import pytest
-from _helpers import echoed_headers
+from _helpers import echoed_headers, partial_body_seen
 from msgspec import Struct
 from pydantic import BaseModel, ConfigDict, Field
 
-from lothc import HTTPClient, SyncHTTPClient
+from lothc import Form, HTTPClient, HTTPConnectionError, SyncHTTPClient
 
 
 class ItemModel(BaseModel):
@@ -64,6 +67,15 @@ class UploadResult(TypedDict):
     fields: dict[str, str]
     files: list[UploadedFile]
     parts: list[UploadedPart]
+
+
+class _BytearrayReader(BytesIO):
+    """A stream whose `read()` gives a `bytearray`, which pyreqwest accepts like `bytes`."""
+
+    def read(self, size: int | None = -1) -> bytes:
+        # Typed as Any: a `bytearray` breaks `read()`'s declared contract, which is the point.
+        data: Any = bytearray(super().read(size))
+        return data
 
 
 async def test_post_with_msgspec_json_body(client: HTTPClient) -> None:
@@ -138,6 +150,28 @@ async def test_post_with_form_buffered_value_without_a_name_attribute(
 
     assert result["fields"] == {"blob": "blob-content"}
     assert result["files"] == []
+
+
+async def test_post_with_form_buffered_value_whose_read_gives_a_bytearray(
+    client: HTTPClient,
+) -> None:
+    result = (
+        await client.post(
+            "upload", form={"blob": _BytearrayReader(b"blob-content")}, into=UploadResult
+        )
+    ).data
+
+    assert result["fields"] == {"blob": "blob-content"}
+
+
+def test_sync_post_with_form_buffered_value_whose_read_gives_a_bytearray(
+    sync_client: SyncHTTPClient,
+) -> None:
+    result = sync_client.post(
+        "upload", form={"blob": _BytearrayReader(b"blob-content")}, into=UploadResult
+    ).data
+
+    assert result["fields"] == {"blob": "blob-content"}
 
 
 async def test_post_with_form_file_mime_auto_inferred(client: HTTPClient) -> None:
@@ -886,3 +920,209 @@ def test_sync_data_omits_a_models_none_fields(
     result = sync_client.post("echo-body", data=data, into=dict).data
 
     assert result["body"] == "a=1"
+
+
+# --- form= parts that can't be built or sent ------------------------------------------------------
+# Raised where pyreqwest raises them: a file that can't be opened, a part type that isn't one, or a
+# name or value that isn't UTF-8 text, while the form is built, before anything is sent; a file
+# that opens but can't be read (a directory), while the body is being sent.
+
+
+_unbuildable_parts = pytest.mark.parametrize(
+    ("form", "error", "match"),
+    [
+        ({"f": ("n.txt", b"x", "not a type")}, ValueError, "mime parse error"),
+        ({cast(Any, 1): "v"}, TypeError, "'int' object"),
+        ({cast(Any, 1): b"v"}, TypeError, "'int' object"),
+        ({"\udc80": "v"}, UnicodeEncodeError, "surrogates not allowed"),
+        ({"n": "\udc80"}, UnicodeEncodeError, "surrogates not allowed"),
+        ({"n": ("\udc80.txt", b"x")}, UnicodeEncodeError, "surrogates not allowed"),
+        ({"n": ("n.txt", b"x", "\udc80")}, UnicodeEncodeError, "surrogates not allowed"),
+    ],
+    ids=[
+        "invalid-content-type",
+        "text-name-not-a-str",
+        "bytes-name-not-a-str",
+        "name-not-utf-8",
+        "value-not-utf-8",
+        "filename-not-utf-8",
+        "content-type-not-utf-8",
+    ],
+)
+
+
+@_unbuildable_parts
+async def test_a_form_part_that_cant_be_built_raises_before_anything_is_sent(
+    client: HTTPClient, server_key: str, form: Form, error: type[Exception], match: str
+) -> None:
+    with pytest.raises(error, match=match):
+        await client.post("status-then-ok", params={"key": server_key}, form=form)
+
+    assert (await client.get("hits", params={"key": server_key}, into=dict)).data == {"hits": 0}
+
+
+@_unbuildable_parts
+def test_sync_a_form_part_that_cant_be_built_raises_before_anything_is_sent(
+    sync_client: SyncHTTPClient, server_key: str, form: Form, error: type[Exception], match: str
+) -> None:
+    with pytest.raises(error, match=match):
+        sync_client.post("status-then-ok", params={"key": server_key}, form=form)
+
+    assert sync_client.get("hits", params={"key": server_key}, into=dict).data == {"hits": 0}
+
+
+async def test_a_missing_form_file_raises_before_anything_is_sent(
+    client: HTTPClient, server_key: str, tmp_path: Path
+) -> None:
+    with pytest.raises(FileNotFoundError):
+        await client.post(
+            "status-then-ok", params={"key": server_key}, form={"f": tmp_path / "missing.txt"}
+        )
+
+    assert (await client.get("hits", params={"key": server_key}, into=dict)).data == {"hits": 0}
+
+
+def test_sync_a_missing_form_file_raises_before_anything_is_sent(
+    sync_client: SyncHTTPClient, server_key: str, tmp_path: Path
+) -> None:
+    with pytest.raises(FileNotFoundError):
+        sync_client.post(
+            "status-then-ok",
+            params={"key": server_key},
+            form={"f": ("n.txt", tmp_path / "missing.txt")},
+        )
+
+    assert sync_client.get("hits", params={"key": server_key}, into=dict).data == {"hits": 0}
+
+
+# Root reads a file whatever its permissions say.
+_skip_as_root = pytest.mark.skipif(os.geteuid() == 0, reason="root can read an unreadable file")
+
+
+@_skip_as_root
+async def test_an_unreadable_form_file_raises_before_anything_is_sent(
+    client: HTTPClient, server_key: str, tmp_path: Path
+) -> None:
+    locked = tmp_path / "locked.txt"
+    locked.write_bytes(b"locked")
+    locked.chmod(0)
+
+    with pytest.raises(PermissionError):
+        await client.post("status-then-ok", params={"key": server_key}, form={"f": locked})
+
+    assert (await client.get("hits", params={"key": server_key}, into=dict)).data == {"hits": 0}
+
+
+@_skip_as_root
+def test_sync_an_unreadable_form_file_raises_before_anything_is_sent(
+    sync_client: SyncHTTPClient, server_key: str, tmp_path: Path
+) -> None:
+    locked = tmp_path / "locked.txt"
+    locked.write_bytes(b"locked")
+    locked.chmod(0)
+
+    with pytest.raises(PermissionError):
+        sync_client.post("status-then-ok", params={"key": server_key}, form={"f": locked})
+
+    assert sync_client.get("hits", params={"key": server_key}, into=dict).data == {"hits": 0}
+
+
+async def test_a_form_file_that_cant_be_read_fails_the_request_after_the_parts_before_it(
+    client: HTTPClient, base_url: str, server_key: str, tmp_path: Path
+) -> None:
+    (tmp_path / "directory").mkdir()
+
+    with pytest.raises(HTTPConnectionError):
+        await client.post(
+            "partial-body", params={"key": server_key}, form={"a": "b", "f": tmp_path / "directory"}
+        )
+
+    body = partial_body_seen(base_url, server_key)["body"]
+    assert 'name="a"\r\n\r\nb\r\n--' in body
+    assert body.endswith(
+        'name="f"; filename="directory"\r\nContent-Type: application/octet-stream\r\n\r\n'
+    )
+
+
+def test_sync_a_form_file_that_cant_be_read_fails_the_request_after_the_parts_before_it(
+    sync_client: SyncHTTPClient, base_url: str, server_key: str, tmp_path: Path
+) -> None:
+    (tmp_path / "directory").mkdir()
+
+    with pytest.raises(HTTPConnectionError):
+        sync_client.post(
+            "partial-body", params={"key": server_key}, form={"a": "b", "f": tmp_path / "directory"}
+        )
+
+    body = partial_body_seen(base_url, server_key)["body"]
+    assert 'name="a"\r\n\r\nb\r\n--' in body
+    assert body.endswith(
+        'name="f"; filename="directory"\r\nContent-Type: application/octet-stream\r\n\r\n'
+    )
+
+
+# A file part is read as it's sent, never held whole: uploading 32 MiB grows a fresh process's
+# peak memory by a small fraction of that. A fresh interpreter, since a peak only ever rises and
+# this one's already has. The file is sparse, so writing it is instant.
+def _upload_peak_growth_script(*, use_async: bool) -> str:
+    upload = (
+        "async def _upload():\n"
+        "    async with HTTPClient(base_url=base_url) as client:\n"
+        "        await client.post('count-body', form={'warm': 'up'})\n"
+        "        before = _peak()\n"
+        "        response = await client.post('count-body', form={'f': path}, into=dict)\n"
+        "    return response.data['received'], _peak() - before\n"
+        "received, growth = asyncio.run(_upload())\n"
+        if use_async
+        else "with SyncHTTPClient(base_url=base_url) as client:\n"
+        "    client.post('count-body', form={'warm': 'up'})\n"
+        "    before = _peak()\n"
+        "    response = client.post('count-body', form={'f': path}, into=dict)\n"
+        "received, growth = response.data['received'], _peak() - before\n"
+    )
+    return (
+        "import asyncio, resource, sys\n"
+        "from pathlib import Path\n"
+        "from lothc import HTTPClient, SyncHTTPClient\n"
+        "base_url, path = sys.argv[1], Path(sys.argv[2])\n"
+        "def _peak():\n"
+        "    # Bytes on macOS, kilobytes on Linux.\n"
+        "    scale = 1 if sys.platform == 'darwin' else 1024\n"
+        "    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale\n"
+        f"{upload}"
+        "print(received, growth)\n"
+    )
+
+
+def _upload_peak_growth(base_url: str, tmp_path: Path, *, use_async: bool) -> tuple[int, int]:
+    """How many bytes the server received for a 32 MiB file part, and how much the uploading
+    process's peak memory grew while it was sent."""
+    large = tmp_path / "large.bin"
+    with large.open("wb") as file:
+        file.truncate(32 << 20)
+    script = _upload_peak_growth_script(use_async=use_async)
+    result = subprocess.run(
+        [sys.executable, "-c", script, base_url, str(large)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    received, growth = result.stdout.split()
+    return int(received), int(growth)
+
+
+def test_a_large_form_file_is_streamed_not_held_in_memory(base_url: str, tmp_path: Path) -> None:
+    received, growth = _upload_peak_growth(base_url, tmp_path, use_async=True)
+
+    assert received > 32 << 20
+    assert growth < 8 << 20
+
+
+def test_sync_a_large_form_file_is_streamed_not_held_in_memory(
+    base_url: str, tmp_path: Path
+) -> None:
+    received, growth = _upload_peak_growth(base_url, tmp_path, use_async=False)
+
+    assert received > 32 << 20
+    assert growth < 8 << 20

@@ -7,22 +7,29 @@ Through a proxy, what's compared is what the proxy received (`_proxy_server.py` 
 absolute-form request to an HTTP proxy, the `CONNECT` before a tunnel, the SOCKS5 handshake. That
 is also how every hop of a followed redirect and every attempt of a retried request is compared:
 the proxy sees them all.
+
+A multipart `form=` body's boundary is random, so its cases mask each one (`_boundaries_masked`)
+and compare everything else byte for byte.
 """
 
+import io
 import json
+import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from functools import partial
-from typing import Any
+from pathlib import Path
+from typing import Any, cast
 from urllib.parse import urlsplit
 
 import pytest
-from _helpers import clear_proxy_variables
+from _helpers import clear_proxy_variables, partial_body_seen
 from _proxy_server import HTTPProxy, SocksProxy, serve_http_proxy, serve_socks5_proxy
 from msgspec import Struct
 from pydantic import BaseModel, Field
 
-from lothc import HTTPClient, RequestInfo, SyncHTTPClient
+from lothc import HTTPClient, HTTPConnectionError, RequestInfo, SyncHTTPClient
 
 
 class _QueryStruct(Struct):
@@ -1088,3 +1095,451 @@ def test_sync_native_transport_speaks_socks5_as_pyreqwest_does(
         actual = _sync_seen(native_client, _Case("socks"), origin), _taken_handshakes(proxy)
 
     assert actual == expected
+
+
+# --- form= ----------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class _FormFile:
+    """A file in `form_files`, put into a form when its case runs: its `Path`, or with `opened` the
+    file open for reading (a named `BufferedIOBase`)."""
+
+    name: str
+    opened: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Buffered:
+    """An unnamed in-memory stream (`io.BytesIO`), made afresh for each transport: one read
+    consumes it."""
+
+    content: bytes
+
+
+@dataclass(slots=True)
+class _FormCase:
+    id: str
+    # `_FormFile`s and `_Buffered`s become real when the case runs (`_resolved`).
+    form: dict[str, Any]
+    verb: str = "post"
+    path: str = "/echo-request"
+    call: dict[str, Any] = field(default_factory=dict[str, Any])
+    client: dict[str, Any] = field(default_factory=dict[str, Any])
+
+
+@pytest.fixture(name="form_files")
+def _form_files(tmp_path: Path) -> Path:
+    files = {
+        "a.txt": b"text-file",
+        "noext": b"no-ext",
+        "a.PNG": b"png",
+        "a.weirdext": b"weird",
+        "empty.json": b"",
+        'q"uo\\te ü.txt': b"quoted",
+    }
+    for name, content in files.items():
+        (tmp_path / name).write_bytes(content)
+    return tmp_path
+
+
+def _resolved(value: object, files: Path, stack: ExitStack) -> object:
+    """`value` with every `_FormFile`/`_Buffered` in it made real, files opened on `stack`."""
+    match value:
+        case _FormFile(name=name, opened=True):
+            return stack.enter_context((files / name).open("rb"))
+        case _FormFile(name=name):
+            return files / name
+        case _Buffered(content=content):
+            return io.BytesIO(content)
+        case tuple():
+            items = cast("tuple[object, ...]", value)
+            return tuple(_resolved(item, files, stack) for item in items)
+        case _:
+            return value
+
+
+def _form_call(case: _FormCase, files: Path, stack: ExitStack) -> _Case:
+    form = {name: _resolved(value, files, stack) for name, value in case.form.items()}
+    return _Case(case.id, case.verb, case.path, {**case.call, "form": form}, case.client)
+
+
+def _numbered_boundary(numbers: dict[str, str], match: re.Match[str]) -> str:
+    return numbers.setdefault(match[0], f"<boundary-{len(numbers)}>")
+
+
+def _boundaries_masked(text: str) -> str:
+    """`text` with each boundary in reqwest's format (four 16-digit hex numbers joined by dashes)
+    numbered by where it first appears, so two runs compare equal only if theirs are in the same
+    places."""
+    pattern = r"\b[0-9a-f]{16}(?:-[0-9a-f]{16}){3}\b"
+    return re.sub(pattern, partial(_numbered_boundary, {}), text)
+
+
+def _masked_seen(seen: _Seen) -> _Seen:
+    if isinstance(seen.wire, bytes):
+        return _Seen(seen.status, seen.request, _boundaries_masked(seen.wire.decode("latin-1")))
+    return _Seen(seen.status, seen.request, json.loads(_boundaries_masked(json.dumps(seen.wire))))
+
+
+def _form_parts_by_kind() -> dict[str, Any]:
+    return {
+        "file-tuple": ("n.txt", b"x"),
+        "file-tuple-with-type": ("n.bin", b"y", "Application/X-Foo; Charset=UTF-8"),
+        "file-tuple-without-extension": ("noext", b"z"),
+        "path-tuple": ("given.png", _FormFile("a.txt")),
+        "path-tuple-with-type": ("given.txt", _FormFile("a.txt"), "text/x-c"),
+        "path-with-type": (_FormFile("a.txt"), "image/gif"),
+        "path": _FormFile("a.txt"),
+        "path-without-extension": _FormFile("noext"),
+        "path-uppercase-extension": _FormFile("a.PNG"),
+        "path-unknown-extension": _FormFile("a.weirdext"),
+        "empty-path": _FormFile("empty.json"),
+        "named-stream": _FormFile("a.txt", opened=True),
+        "unnamed-stream": _Buffered(b"buffered"),
+    }
+
+
+def _form_cases() -> list[_FormCase]:
+    redirect = "/redirect-to?status={}&to=/echo-request"
+    return [
+        _FormCase("text-kinds", {"s": "v", "i": 7, "f": 1.5, "t": True, "e": ""}),
+        _FormCase("bytes", {"b": b"\x00\xff\r\n--", "empty": b""}),
+        _FormCase(
+            "json-parts",
+            {
+                "list": [1, "a", None],
+                "dict": {"b": 1, "a": [1.5]},
+                "struct": _ItemStruct(item_id=1),
+                "model": _AliasedModel(itemId=1),
+            },
+        ),
+        _FormCase("files", _form_parts_by_kind()),
+        _FormCase(
+            "files-without-type-inference",
+            _form_parts_by_kind(),
+            call={"infer_mime_type_from_file_extension": False},
+        ),
+        _FormCase(
+            "names-needing-encoding",
+            {
+                "a b": "1",
+                'q"t': "2",
+                "pc%": "3",
+                "ü中": "4",
+                "sl/ash": "5",
+                "ok-_.~!$&'()*+,;=:@": "6",
+                "": "7",
+                "c\r\nr": "8",
+                "#?{}<>`": "9",
+                "nul\x00": "10",
+            },
+        ),
+        _FormCase(
+            "filenames-needing-escapes",
+            {
+                "f": ('q"uote\\back\r\nnl ü.txt', b"x"),
+                "empty": ("", b"y"),
+                "path": _FormFile('q"uo\\te ü.txt'),
+            },
+        ),
+        _FormCase(
+            "repeated-names",
+            {
+                "text": ("a", "b", 3),
+                "bytes": (b"1", b"2"),
+                "files": (("a.txt", b"1"), ("b.txt", b"2", "text/x-b")),
+                "paths": (_FormFile("a.txt"), _FormFile("noext")),
+                "json": ([1], {"a": 1}),
+            },
+        ),
+        _FormCase("empty-form", {}),
+        _FormCase(
+            "auth-defaults-and-headers",
+            {"a": "b"},
+            call={"headers": {"X-1": "1", "Accept": "accept"}},
+            client={"bearer_token": "token", "default_headers": {"X-Default": "0"}},
+        ),
+        _FormCase(
+            "a-default-content-type-replaces-the-forms",
+            {"a": "b"},
+            client={"default_headers": {"Content-Type": "default", "X-Default": "0"}},
+        ),
+        _FormCase(
+            "a-content-type-header-replaces-the-forms",
+            {"a": "b"},
+            call={"headers": {"X-1": "1", "content-type": "own"}},
+        ),
+        _FormCase(
+            "userinfo-in-the-url",
+            {"a": "b"},
+            path="{base_url}echo-request".replace("http://", "http://user:pass@"),
+        ),
+        _FormCase("put", {"a": _FormFile("a.txt")}, verb="put"),
+        _FormCase("patch", {"a": "b"}, verb="patch"),
+        _FormCase("delete", {"a": "b"}, verb="delete"),
+        _FormCase("post-307-is-not-followed", {"a": "b"}, path=redirect.format(307)),
+        _FormCase("post-308-is-not-followed", {"a": _FormFile("a.txt")}, path=redirect.format(308)),
+        _FormCase("put-301-is-not-followed", {"a": "b"}, verb="put", path=redirect.format(301)),
+        _FormCase("put-302-is-not-followed", {"a": "b"}, verb="put", path=redirect.format(302)),
+        _FormCase("post-301-becomes-a-get", {"a": "b"}, path=redirect.format(301)),
+        _FormCase("post-302-becomes-a-get", {"a": _FormFile("a.txt")}, path=redirect.format(302)),
+        _FormCase("put-303-becomes-a-get", {"a": "b"}, verb="put", path=redirect.format(303)),
+        _FormCase("an-empty-form-follows-a-307", {}, path=redirect.format(307)),
+        _FormCase("an-empty-form-follows-a-put-302", {}, verb="put", path=redirect.format(302)),
+    ]
+
+
+@pytest.mark.parametrize("case", _form_cases(), ids=lambda case: case.id)
+async def test_native_transport_sends_a_form_as_pyreqwest_does(
+    base_url: str, form_files: Path, case: _FormCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = partial(HTTPClient, base_url=base_url, **case.client)
+    pyreqwest_client, native_client = _pair(factory, monkeypatch)
+
+    with ExitStack() as stack:
+        expected = await _async_seen(
+            pyreqwest_client, _form_call(case, form_files, stack), base_url
+        )
+        actual = await _async_seen(native_client, _form_call(case, form_files, stack), base_url)
+
+    assert _masked_seen(actual) == _masked_seen(expected)
+
+
+@pytest.mark.parametrize("case", _form_cases(), ids=lambda case: case.id)
+def test_sync_native_transport_sends_a_form_as_pyreqwest_does(
+    base_url: str, form_files: Path, case: _FormCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = partial(SyncHTTPClient, base_url=base_url, **case.client)
+    pyreqwest_client, native_client = _pair(factory, monkeypatch)
+
+    with ExitStack() as stack:
+        expected = _sync_seen(pyreqwest_client, _form_call(case, form_files, stack), base_url)
+        actual = _sync_seen(native_client, _form_call(case, form_files, stack), base_url)
+
+    assert _masked_seen(actual) == _masked_seen(expected)
+
+
+def _streamed_form_case() -> _FormCase:
+    return _FormCase("stream-post-form", {"a": "b", "f": _FormFile("a.txt")}, verb="stream_post")
+
+
+async def test_native_transport_streams_a_form_as_pyreqwest_does(
+    base_url: str, form_files: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pyreqwest_client, native_client = _pair(partial(HTTPClient, base_url=base_url), monkeypatch)
+    case = _streamed_form_case()
+
+    with ExitStack() as stack:
+        expected = await _async_streamed(
+            pyreqwest_client, _form_call(case, form_files, stack), base_url
+        )
+        actual = await _async_streamed(native_client, _form_call(case, form_files, stack), base_url)
+
+    assert _boundaries_masked(json.dumps(actual)) == _boundaries_masked(json.dumps(expected))
+
+
+def test_sync_native_transport_streams_a_form_as_pyreqwest_does(
+    base_url: str, form_files: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pyreqwest_client, native_client = _pair(partial(SyncHTTPClient, base_url=base_url), monkeypatch)
+    case = _streamed_form_case()
+
+    with ExitStack() as stack:
+        expected = _sync_streamed(pyreqwest_client, _form_call(case, form_files, stack), base_url)
+        actual = _sync_streamed(native_client, _form_call(case, form_files, stack), base_url)
+
+    assert _boundaries_masked(json.dumps(actual)) == _boundaries_masked(json.dumps(expected))
+
+
+# A file many times one read of it (64 KiB on the native transport), so it's read and sent in
+# several chunks, in plain HTTP and over TLS.
+def _large_file_case(files: Path) -> _FormCase:
+    (files / "large.bin").write_bytes(bytes(range(256)) * 4_096)
+    return _FormCase("large-file", {"a": "b", "f": _FormFile("large.bin"), "z": "y"})
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_native_transport_sends_a_large_file_as_pyreqwest_does(
+    server_url_fixture: str,
+    form_files: Path,
+    tls_ca_pem: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    factory = partial(HTTPClient, base_url=server_url, root_certificates=[tls_ca_pem])
+    pyreqwest_client, native_client = _pair(factory, monkeypatch)
+    case = _large_file_case(form_files)
+
+    with ExitStack() as stack:
+        expected = await _async_seen(
+            pyreqwest_client, _form_call(case, form_files, stack), server_url
+        )
+        actual = await _async_seen(native_client, _form_call(case, form_files, stack), server_url)
+
+    assert _masked_seen(actual) == _masked_seen(expected)
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_native_transport_sends_a_large_file_as_pyreqwest_does(
+    server_url_fixture: str,
+    form_files: Path,
+    tls_ca_pem: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    factory = partial(SyncHTTPClient, base_url=server_url, root_certificates=[tls_ca_pem])
+    pyreqwest_client, native_client = _pair(factory, monkeypatch)
+    case = _large_file_case(form_files)
+
+    with ExitStack() as stack:
+        expected = _sync_seen(pyreqwest_client, _form_call(case, form_files, stack), server_url)
+        actual = _sync_seen(native_client, _form_call(case, form_files, stack), server_url)
+
+    assert _masked_seen(actual) == _masked_seen(expected)
+
+
+def _retried_form_cases() -> list[_FormCase]:
+    """Through an HTTP proxy, which sees every attempt (`{key}` as in `_retried_cases`): a form
+    with parts is sent once, as pyreqwest can't copy it; an empty one is retried, its boundary
+    the same each time."""
+    retries: dict[str, Any] = {"max_retries": 1, "backoff_base": 0.001}
+    path = "/status-then-ok?key={key}&fail_times=1"
+    # The 503 a form sent once gets back is the response compared.
+    call = {"error_for_status": False}
+    return [
+        _FormCase("a-form-put-is-sent-once", {"a": "b"}, "put", path, call, retries),
+        _FormCase(
+            "a-form-post-is-sent-once",
+            {"f": _FormFile("a.txt")},
+            "post",
+            path,
+            call,
+            {**retries, "retry_methods": {"POST"}},
+        ),
+        _FormCase("an-empty-form-is-retried", {}, "put", path, call, retries),
+    ]
+
+
+def _masked_taken(taken: list[tuple[str, list[tuple[str, str]], bytes]]) -> str:
+    """`taken` as one text, so a boundary is numbered the same across every attempt."""
+    text = [(line, headers, body.decode("latin-1")) for line, headers, body in taken]
+    return _boundaries_masked(json.dumps(text))
+
+
+def _keyed_form_call(case: _FormCase, key: str, files: Path, stack: ExitStack) -> _Case:
+    keyed = _FormCase(
+        case.id, case.form, case.verb, case.path.replace("{key}", key), case.call, case.client
+    )
+    return _form_call(keyed, files, stack)
+
+
+@pytest.mark.parametrize("case", _retried_form_cases(), ids=lambda case: case.id)
+async def test_native_transport_retries_a_form_as_pyreqwest_does(
+    base_url: str,
+    server_key: str,
+    form_files: Path,
+    case: _FormCase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_proxy_variables(monkeypatch)
+    with serve_http_proxy(upstream_port=urlsplit(base_url).port) as proxy, ExitStack() as stack:
+        factory = partial(HTTPClient, base_url=base_url, proxy=proxy.url, **case.client)
+        pyreqwest_client, native_client = _pair(factory, monkeypatch)
+        keys = f"{server_key}-pyreqwest", f"{server_key}-native"
+
+        expected = (
+            await _async_attempts(
+                pyreqwest_client, _keyed_form_call(case, keys[0], form_files, stack), base_url
+            ),
+            _masked_taken(_taken_without_key(proxy, keys[0])),
+        )
+        actual = (
+            await _async_attempts(
+                native_client, _keyed_form_call(case, keys[1], form_files, stack), base_url
+            ),
+            _masked_taken(_taken_without_key(proxy, keys[1])),
+        )
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize("case", _retried_form_cases(), ids=lambda case: case.id)
+def test_sync_native_transport_retries_a_form_as_pyreqwest_does(
+    base_url: str,
+    server_key: str,
+    form_files: Path,
+    case: _FormCase,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_proxy_variables(monkeypatch)
+    with serve_http_proxy(upstream_port=urlsplit(base_url).port) as proxy, ExitStack() as stack:
+        factory = partial(SyncHTTPClient, base_url=base_url, proxy=proxy.url, **case.client)
+        pyreqwest_client, native_client = _pair(factory, monkeypatch)
+        keys = f"{server_key}-pyreqwest", f"{server_key}-native"
+
+        expected = (
+            _sync_attempts(
+                pyreqwest_client, _keyed_form_call(case, keys[0], form_files, stack), base_url
+            ),
+            _masked_taken(_taken_without_key(proxy, keys[0])),
+        )
+        actual = (
+            _sync_attempts(
+                native_client, _keyed_form_call(case, keys[1], form_files, stack), base_url
+            ),
+            _masked_taken(_taken_without_key(proxy, keys[1])),
+        )
+
+    assert actual == expected
+
+
+# A file that opens but can't be read (a directory) fails the request partway through its body:
+# what had gone out before it, with the head, is what the server received from either transport.
+def _unreadable_file_form(files: Path) -> dict[str, Any]:
+    (files / "directory").mkdir()
+    return {"a": "b", "f": files / "directory", "z": "y"}
+
+
+def _partial_seen(base_url: str, key: str) -> str:
+    seen = partial_body_seen(base_url, key)
+    return _boundaries_masked(json.dumps(seen).replace(key, "key"))
+
+
+async def _async_post_partial(client: HTTPClient, key: str, form: dict[str, Any]) -> None:
+    async with client:
+        with pytest.raises(HTTPConnectionError):
+            await client.post("partial-body", params={"key": key}, form=form)
+
+
+def _sync_post_partial(client: SyncHTTPClient, key: str, form: dict[str, Any]) -> None:
+    with client, pytest.raises(HTTPConnectionError):
+        client.post("partial-body", params={"key": key}, form=form)
+
+
+async def test_native_transport_sends_what_pyreqwest_sends_of_a_form_it_cant_finish(
+    base_url: str, server_key: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pyreqwest_client, native_client = _pair(partial(HTTPClient, base_url=base_url), monkeypatch)
+    form = _unreadable_file_form(tmp_path)
+    keys = f"{server_key}-pyreqwest", f"{server_key}-native"
+
+    await _async_post_partial(pyreqwest_client, keys[0], form)
+    await _async_post_partial(native_client, keys[1], form)
+
+    assert _partial_seen(base_url, keys[1]) == _partial_seen(base_url, keys[0])
+
+
+def test_sync_native_transport_sends_what_pyreqwest_sends_of_a_form_it_cant_finish(
+    base_url: str, server_key: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pyreqwest_client, native_client = _pair(partial(SyncHTTPClient, base_url=base_url), monkeypatch)
+    form = _unreadable_file_form(tmp_path)
+    keys = f"{server_key}-pyreqwest", f"{server_key}-native"
+
+    _sync_post_partial(pyreqwest_client, keys[0], form)
+    _sync_post_partial(native_client, keys[1], form)
+
+    assert _partial_seen(base_url, keys[1]) == _partial_seen(base_url, keys[0])

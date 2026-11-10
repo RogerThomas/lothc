@@ -162,10 +162,12 @@ class Pool:
 
         `query` (and a `data=` form `body`) is a `dict` (a `list`/`tuple` value repeats the key)
         or `(name, value)` pairs. `body_kind`: 0 raw `bytes`/`str`, 1 already-encoded JSON, 2 a
-        `dict`/`list` to serialize, 3 a form. `raises` is `None` for no status check. `timeout`
-        is the request's total timeout, as pyreqwest's builder takes it (a negative one raises
-        `ValueError`), its deadline rounded up to the end of a millisecond as tokio's timer rounds
-        reqwest's. Raises before any I/O for a request that can't be built (`ValueError`,
+        `dict`/`list` to serialize, 3 a form, 4 a multipart body as `_NativeForm` describes it
+        (its parts built in order as reqwest's are: a file opened here, its errors pyreqwest's
+        `OSError`s; a file part read as it's sent). `raises` is `None` for no status check.
+        `timeout` is the request's total timeout, as pyreqwest's builder takes it (a negative one
+        raises `ValueError`), its deadline rounded up to the end of a millisecond as tokio's timer
+        rounds reqwest's. Raises before any I/O for a request that can't be built (`ValueError`,
         `HTTPTransportError`).
         """
 

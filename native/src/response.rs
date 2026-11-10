@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use http::{HeaderMap, Response, Version};
-use http_body_util::{BodyExt, Full};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::client::conn::http1::SendRequest;
 use pyo3::exceptions::PyRuntimeError;
@@ -13,12 +13,13 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString, PyTuple};
 use url::Url;
 
+use crate::body::RequestBody;
 use crate::decompress;
 use crate::error::{error_chain, Failure};
 use crate::headers::RawHeaders;
 use crate::redirect::{Hop, Redirect};
 
-pub(crate) type Sender = SendRequest<Full<Bytes>>;
+pub(crate) type Sender = SendRequest<RequestBody>;
 
 /// The status line, headers and whole body of a response.
 pub(crate) struct Head {
@@ -30,7 +31,7 @@ pub(crate) struct Head {
 
 /// Send one request on a ready connection and wait for the response's head. A request hyper
 /// hands back unsent (the connection was already closing) comes back as `Failure::Unsent`.
-pub(crate) async fn send(sender: &mut Sender, request: http::Request<Full<Bytes>>) -> Result<Response<Incoming>, Failure> {
+pub(crate) async fn send(sender: &mut Sender, request: http::Request<RequestBody>) -> Result<Response<Incoming>, Failure> {
     if sender.ready().await.is_err() {
         return Err(Failure::Unsent(Box::new(request)));
     }
@@ -52,7 +53,7 @@ pub(crate) enum Fetched {
 
 /// Send one request on a ready connection and read the whole response (see `send`), unless
 /// `redirect` (the request's redirect state, when the client follows redirects) says to follow it.
-pub(crate) async fn fetch(sender: &mut Sender, request: http::Request<Full<Bytes>>, redirect: Option<&mut Redirect>) -> Result<Fetched, Failure> {
+pub(crate) async fn fetch(sender: &mut Sender, request: http::Request<RequestBody>, redirect: Option<&mut Redirect>) -> Result<Fetched, Failure> {
     let response = send(sender, request).await?;
     if let Some(redirect) = redirect {
         if let Some(hop) = redirect.next(response.status().as_u16(), response.headers())? {

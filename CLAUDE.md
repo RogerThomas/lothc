@@ -129,13 +129,14 @@ or editing Python here.
   only accepted difference is that a transport error's `str()` is a flat cause chain. Crate pins
   follow pyreqwest 0.15.0's lockfile, and each feature uses reqwest's own crates where they exist
   (hyper-util's proxy matcher, compression-codecs), never a hand port.
-- **Anything unported raises `NotImplementedError`**, never a silent difference: `form=`, HTTP/2,
+- **Anything unported raises `NotImplementedError`**, never a silent difference: HTTP/2,
   cookies, connect/read timeouts, `max_connections`/`pool_timeout`, `resolve`, `local_address`,
   `tcp_keepalive`, `https://` and SOCKS4 proxies, and `lothc.testing`'s mocker, which patches
   pyreqwest.
-- **Known differences that don't raise:** a sync client's expired idle connections stay open
-  until its next request (no thread to reap on), addresses are tried in order (no happy
-  eyeballs), a sync request doesn't take a connection another thread frees meanwhile (a strict
+- **Known differences that don't raise:** `form=` files are read on the loop thread in reads of up
+  to 64 KiB (pyreqwest reads them off it), so a slow filesystem stalls the loop; a sync client's
+  expired idle connections stay open until its next request (no thread to reap on), addresses
+  are tried in order (no happy eyeballs), a sync request doesn't take a connection another thread frees meanwhile (a strict
   `xfail`, until `max_connections` brings a waiting queue), and an async client is bound to the
   loop that opened it.
 - **Redirects run in Rust; retries and re-auth in Python.** A hop's headers must be reqwest's,
@@ -150,7 +151,7 @@ or editing Python here.
   used, so `http2=True` stays on pyreqwest.
 - **The mocker will run through native's own request code** (decided 2026-11-10), answering from
   Python handlers instead of the network, so mocked tests still see the exact request sent.
-- **Not built yet:** the sync waiting queue, `form=`, the mocker, and wheels.
+- **Not built yet:** the sync waiting queue, the mocker, and wheels.
 
 ## Decisions
 
