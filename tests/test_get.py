@@ -81,6 +81,28 @@ async def test_get_with_scalar_query_params_still_works(client: HTTPClient) -> N
     assert result == {"query": {"page": ["2"]}}
 
 
+async def test_get_writes_query_values_as_their_wire_strings(client: HTTPClient) -> None:
+    # Bools lowercase, numbers as written, and reserved/non-ASCII characters escaped so they
+    # round-trip (the server sees the decoded values).
+    result = (
+        await client.get(
+            "echo-query",
+            params={"on": True, "off": False, "count": 3, "ratio": 1.5, "text": "a b&c=ü"},
+            into=dict,
+        )
+    ).data
+
+    assert result == {
+        "query": {
+            "on": ["true"],
+            "off": ["false"],
+            "count": ["3"],
+            "ratio": ["1.5"],
+            "text": ["a b&c=ü"],
+        }
+    }
+
+
 async def test_get_with_pydantic_params_omits_none_fields(client: HTTPClient) -> None:
     result = (
         await client.get("echo-query", params=SearchParamsModel(q="pikachu", page=1), into=dict)
@@ -176,6 +198,24 @@ def test_sync_get_decodes_msgspec_struct(sync_client: SyncHTTPClient) -> None:
 def test_sync_get_decodes_plain_dict(sync_client: SyncHTTPClient) -> None:
     item = sync_client.get("items/7", into=dict).data
     assert item == {"id": 7, "name": "item-7"}
+
+
+def test_sync_get_writes_query_values_as_their_wire_strings(sync_client: SyncHTTPClient) -> None:
+    result = sync_client.get(
+        "echo-query",
+        params={"on": True, "off": False, "count": 3, "ratio": 1.5, "text": "a b&c=ü"},
+        into=dict,
+    ).data
+
+    assert result == {
+        "query": {
+            "on": ["true"],
+            "off": ["false"],
+            "count": ["3"],
+            "ratio": ["1.5"],
+            "text": ["a b&c=ü"],
+        }
+    }
 
 
 def test_sync_get_with_repeated_query_param(sync_client: SyncHTTPClient) -> None:

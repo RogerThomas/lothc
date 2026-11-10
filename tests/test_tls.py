@@ -33,6 +33,13 @@ def _tls13_only_base_url(tls_ca: trustme.CA) -> Generator[str]:
         yield url
 
 
+@pytest.fixture(scope="module", name="other_name_base_url")
+def _other_name_base_url(tls_ca: trustme.CA) -> Generator[str]:
+    """A trusted CA's cert, but for another host name than the `localhost` the URL connects to."""
+    with serve_tls(tls_server_context(tls_ca, ("other-name.test",))) as url:
+        yield url
+
+
 async def test_root_certificates_trusts_a_custom_ca(https_base_url: str, tls_ca_pem: bytes) -> None:
     async with HTTPClient(base_url=https_base_url, root_certificates=[tls_ca_pem]) as client:
         result = (await client.get("items/7", into=dict)).data
@@ -67,6 +74,26 @@ async def test_root_certificates_from_another_ca_is_still_untrusted(https_base_u
     async with HTTPClient(base_url=https_base_url, root_certificates=[other_ca_pem]) as client:
         with pytest.raises(HTTPConnectionError, match="UnknownIssuer"):
             await client.get("items/7")
+
+
+async def test_cert_for_another_host_name_raises_connection_error(
+    other_name_base_url: str, tls_ca_pem: bytes
+) -> None:
+    # rustls names this `NotValidForName` where the OS verifier reports it bare (macOS) and
+    # `certificate not valid for name ...` where it reports the names involved (Linux).
+    async with HTTPClient(base_url=other_name_base_url, root_certificates=[tls_ca_pem]) as client:
+        with pytest.raises(HTTPConnectionError, match=r"NotValidForName|not valid for name"):
+            await client.get("items/7")
+
+
+def test_sync_cert_for_another_host_name_raises_connection_error(
+    other_name_base_url: str, tls_ca_pem: bytes
+) -> None:
+    with (
+        SyncHTTPClient(base_url=other_name_base_url, root_certificates=[tls_ca_pem]) as client,
+        pytest.raises(HTTPConnectionError, match=r"NotValidForName|not valid for name"),
+    ):
+        client.get("items/7")
 
 
 async def test_danger_accept_invalid_certs_skips_verification(https_base_url: str) -> None:
