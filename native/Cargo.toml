@@ -1,0 +1,53 @@
+[package]
+name = "lothc-native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+# Same pins as pyreqwest 0.15.0 where it has them.
+[dependencies]
+pyo3 = { version = "=0.29.3", features = ["extension-module"] }
+hyper = { version = "=1.12.0", features = ["client", "http1"] }
+http = "=1.5.0"
+http-body-util = "=0.1.5"
+bytes = "=1.12.1"
+futures-executor = "=0.3.34"
+futures-util = "=0.3.34"
+libc = "0.2"
+form_urlencoded = "1"
+ryu = "1"
+itoa = "1"
+# TLS as reqwest 0.13's `rustls` feature: aws-lc-rs + the OS trust store.
+rustls = { version = "=0.23.45", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+rustls-platform-verifier = "=0.7.1"
+rustls-pki-types = "=1.15.1"
+# URL joining and serialization exactly as reqwest's (`Url::join`, `query_pairs_mut`).
+url = "=2.5.8"
+percent-encoding = "=2.3.2"
+# `json=` dicts/lists serialized the way pyreqwest's `body_json` does: pythonize's `depythonize`
+# into a `serde_json::Value` (sorted keys), then serde_json's own number formatting.
+pythonize = "=0.29.0"
+serde_json = "=1.0.152"
+# Basic auth from a URL's userinfo, encoded as reqwest does.
+base64 = "=0.23.1"
+# Response decompression with the codecs reqwest's gzip/deflate/brotli/zstd features use (through
+# tower-http and async-compression); their own dependencies are pinned in Cargo.lock to pyreqwest's.
+compression-codecs = { version = "=0.4.45", default-features = false, features = ["gzip", "zlib", "brotli", "zstd"] }
+compression-core = "=0.4.33"
+# Which proxy a request takes, as reqwest picks it: hyper-util's `Matcher` (the proxy environment
+# variables, NO_PROXY's rules, a proxy URL's credentials). `client-proxy` alone pulls in no tokio.
+hyper-util = { version = "=0.1.21", default-features = false, features = ["client-proxy"] }
+# A CONNECT response, parsed as hyper-util's tunnel parses it.
+httparse = "=1.10.1"
+
+[build-dependencies]
+# `build.rs`: the macOS link args for a plain `cargo build`. Same version as pyo3.
+pyo3-build-config = "=0.29.3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

@@ -6,8 +6,9 @@ pins the pytest version it's tested against.
 This is a thin, lothc-flavored adapter over pyreqwest's own `client_mocker` fixture
 (`pyreqwest.pytest_plugin`) rather than a separate interception mechanism — pyreqwest's plugin
 already monkeypatches `RequestBuilder.build`/`build_streamed` (exactly what `_send`/`_send_sync`
-and the streaming verbs call in `_client.py`), so it transparently intercepts every request a
-`HTTPClient`/`SyncHTTPClient` sends with no changes to how the client under test is built.
+and the streaming verbs call in `_transport_pyreqwest.py`), so it transparently intercepts every
+request a `HTTPClient`/`SyncHTTPClient` sends with no changes to how the client under test is
+built.
 
 **No pyreqwest type is ever part of this module's public API — not even re-exported.** A custom
 matcher/handler receives lothc's own `MockRequest` (a plain snapshot: `method`/`path`/
@@ -38,7 +39,7 @@ matcher support is dropped from these signatures accordingly.
 behaviour, all three encoding a value exactly as a real request would, so a mock always
 matches/responds the same way: `params=` accepts lothc's `Params`
 union (via `_encode_params`, shared with `_apply_params` — including a `list[...]`/`tuple[...]`
-value meaning a genuinely repeated query key, see `Params`'s own doc comment in `_client.py`) and
+value meaning a genuinely repeated query key, see `Params`'s own doc comment in `_types.py`) and
 is applied via a single `match_query(dict)` call — narrowing which requests an `add_*_response`
 rule matches, the same way a real call's `params=` would build the query string (each key's match
 value derived via `_query_param_match_values` from pyreqwest's own real encoder, not reimplemented
@@ -51,14 +52,11 @@ is byte-identical to the real request path's `_attach_json_body`); and `headers=
 (`Mapping[str, str] | BaseModel | Struct`, via `_encode_headers`, shared with `_apply_headers`).
 The same typed params/headers class used for a real request, or for a `response_headers_type=`
 decode on the read side, can be constructed once and passed straight into `add_*_response(...)`.
-The import below is the one deliberate `reportPrivateUsage` suppression in this module: these
-two encoding helpers, `_pydantic_by_alias` (so a mock encodes a model exactly as a real request
-would) and the `_QueryValue` type alias (`_query_param_match_values`'s own
-parameter type, kept as one import rather than an inline duplicate of `Params`'s value union so
-the two can't silently drift apart) keep this file's otherwise-universal
-`_`-prefix-for-module-private-functions convention rather than losing it to cross-module sharing,
-since basedpyright's module-boundary check has no way to express "private to the package, shared
-between two of its own files."
+The imports below share `_pydantic_by_alias` (so a mock encodes a model exactly as a real request
+would), the two encoding helpers and the `_QueryValue` type alias (`_query_param_match_values`'s
+own parameter type, imported rather than duplicated from `Params`'s value union so the two can't
+drift apart) with the real request path. They keep their `_` prefix: it marks them private to the
+package, and `pyproject.toml` turns basedpyright's `reportPrivateUsage` off inside `lothc/` only.
 """
 
 import functools
@@ -74,19 +72,21 @@ from pyreqwest.pytest_plugin.mock import ClientMocker
 from pyreqwest.request import Request
 from pyreqwest.response import Response, ResponseBuilder, SyncResponse
 
-from ._client import (
-    CaseInsensitiveDict,
+from ._compat import BaseModel, Struct, msgspec
+from ._encode import (
+    _encode_headers,
+    _encode_params,
+    _pydantic_by_alias,
+    _query_pairs,
+)
+from ._headers import CaseInsensitiveDict
+from ._types import (
     Data,
     Headers,
     JSONPayload,
     Params,
-    _encode_headers,  # pyright: ignore[reportPrivateUsage]
-    _encode_params,  # pyright: ignore[reportPrivateUsage]
-    _pydantic_by_alias,  # pyright: ignore[reportPrivateUsage]
-    _query_pairs,  # pyright: ignore[reportPrivateUsage]
-    _QueryValue,  # pyright: ignore[reportPrivateUsage]
+    _QueryValue,
 )
-from ._compat import BaseModel, Struct, msgspec
 
 __all__ = ["LOTHCMock", "LOTHCMocker", "MockRequest", "MockResponse"]
 
@@ -111,7 +111,7 @@ class MockRequest:
     let `.headers[...] = ...` mutate in place, and `hash(...)` still raised from deep inside
     dataclass machinery); a plain mutable dataclass is the honest shape, matching
     `hash(MockRequest(...))` raising a direct, expected `TypeError` instead. `headers` is a
-    `CaseInsensitiveDict`, matching `Response.headers` (see `_client.py`), so
+    `CaseInsensitiveDict`, matching `Response.headers` (see `_headers.py`), so
     `headers["Content-Type"]` and `headers["content-type"]` are one lookup and a repeated header
     keeps every value — indexing gives the first, `get_all` gives all of them. `query` is
     `query_string` already parsed into a single-value-per-key shape, via `_first_value_per_key` —
@@ -219,7 +219,7 @@ def _first_value_per_key(values: Mapping[str, str | list[str]]) -> dict[str, str
     `list[str]` for a genuinely repeated key) down to one value per key, first value wins.
 
     Note this is *not* what headers do any more: `MockRequest.headers`/`Response.headers` are a
-    `CaseInsensitiveDict` and keep every value of a repeated name (see `_client.py`). Query params
+    `CaseInsensitiveDict` and keep every value of a repeated name (see `_headers.py`). Query params
     still collapse, so a repeated key's extra values are genuinely dropped here — `query_string`
     stays alongside `query` for anyone who needs them."""
     return {name: value if isinstance(value, str) else value[0] for name, value in values.items()}
@@ -273,7 +273,7 @@ def _encode_json_payload(payload: JSONPayload) -> Any:  # noqa: ANN401
     """Turns any `JSONPayload` (`dict`, pydantic `BaseModel`, or msgspec `Struct`) into a plain
     JSON-able value, for a mock response's `.body_json()`.
 
-    Lives here, not in `_client.py`, because the real request path no longer uses it: `json=`
+    Lives here, not in the transports, because the real request path no longer uses it: `json=`
     bodies are now encoded straight to bytes by each library's own encoder (`_attach_json_body`),
     which produces byte-identical output, so a mock still responds exactly as a real server
     receiving the same value would be sent it."""
@@ -329,7 +329,7 @@ def _encode_response_data(mock: _MockTyping, data: Data) -> None:
 def _query_param_match_values(params: Mapping[str, _QueryValue]) -> dict[str, str | list[str]]:
     """The exact value(s) each `params` key matches against in `mock.match_query` (a `list[str]`
     for a key whose `Params` value was itself a list/tuple — i.e. a genuinely repeated query key,
-    see `Params`'s own doc comment in `_client.py` — a plain `str` otherwise), derived from
+    see `Params`'s own doc comment in `_types.py` — a plain `str` otherwise), derived from
     pyreqwest's own real URL/query encoder (`Url.parse_with_params` + `.query_dict_multi_value`)
     rather than a hand-reimplementation of it — reimplementing risked silently diverging from
     pyreqwest for any type it encodes differently from Python's own `str()` (confirmed live for

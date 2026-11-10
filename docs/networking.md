@@ -114,3 +114,15 @@ whole request, so it's useful for "fail fast on a dead host" without capping how
 chunks*, not the whole request. A body that keeps trickling never trips it; one that stalls does.
 That makes it the one timeout that's actually meaningful for an open-ended `sse()` stream, which
 the total `timeout` deliberately doesn't apply to — see [SSE → Timeouts](sse.md#timeouts).
+
+## Native transport (experimental)
+
+```python
+async with HTTPClient(base_url="https://api.example.com/", native=True) as client:
+    ...
+```
+
+`native=True` switches the client to lothc's experimental native transport, about twice as fast
+on `get(into=Struct)` in lothc's benchmarks. Not every setting is supported yet: an unsupported
+one raises `NotImplementedError` when the client is constructed. It isn't available on Windows,
+and `lothc.testing`'s mocker doesn't intercept its requests.

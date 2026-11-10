@@ -16,6 +16,7 @@ says. Through a tunnel, `/peer` names the proxy's connection to the server, one 
 """
 
 import asyncio
+import os
 import threading
 import time
 from collections.abc import AsyncGenerator, Generator
@@ -293,5 +294,34 @@ async def test_a_request_waiting_for_a_connection_takes_one_freed_meanwhile(
             await asyncio.wait([second], timeout=0.1)
             release.set()
             second_port = await second
+
+    assert second_port == first_port
+
+
+@pytest.mark.xfail(
+    os.environ.get("LOTHC_TRANSPORT") == "native",
+    reason="the native sync pool has no queue of waiting requests (it comes with max_connections)",
+    strict=True,
+)
+def test_sync_a_request_waiting_for_a_connection_takes_one_freed_meanwhile(
+    https_base_url: str, tls_ca_pem: bytes
+) -> None:
+    # The control for the test above: the same steps, pooling on.
+    release = threading.Event()
+    with (
+        serve_http_proxy(hold_later_tunnels=release) as proxy,
+        SyncHTTPClient(
+            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        ) as client,
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        first = pool.submit(_sync_port, client, 0.1)
+        _sync_tunnels_opened(proxy, 1)
+        second = pool.submit(_sync_port, client)
+        _sync_tunnels_opened(proxy, 2)
+        first_port = first.result()
+        wait([second], timeout=0.1)
+        release.set()
+        second_port = second.result()
 
     assert second_port == first_port

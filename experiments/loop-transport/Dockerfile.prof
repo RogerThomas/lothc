@@ -1,0 +1,2 @@
+FROM reqwest-floor-poc-bench:latest
+RUN apt-get update && apt-get install -y --no-install-recommends linux-perf && rm -rf /var/lib/apt/lists/*

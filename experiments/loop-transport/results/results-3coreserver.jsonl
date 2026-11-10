@@ -1,0 +1,40 @@
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":10,"run":0,"requests":20000,"rps":106233,"cpu_us_per_req":9.41,"p50_us":92.9,"p99_us":152.5,"max_us":260.8}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":10,"run":1,"requests":20000,"rps":102361,"cpu_us_per_req":9.76,"p50_us":95.3,"p99_us":171.0,"max_us":246.6}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":10,"run":2,"requests":20000,"rps":103459,"cpu_us_per_req":9.66,"p50_us":95.5,"p99_us":158.5,"max_us":273.0}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":10,"run":3,"requests":20000,"rps":102924,"cpu_us_per_req":9.71,"p50_us":96.2,"p99_us":160.9,"max_us":245.7}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":10,"run":4,"requests":20000,"rps":107178,"cpu_us_per_req":9.33,"p50_us":91.1,"p99_us":152.0,"max_us":284.9}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":0,"requests":20000,"rps":78873,"cpu_us_per_req":12.67,"p50_us":124.6,"p99_us":204.7,"max_us":310.2}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":1,"requests":20000,"rps":80821,"cpu_us_per_req":12.37,"p50_us":122.4,"p99_us":191.2,"max_us":304.1}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":2,"requests":20000,"rps":79429,"cpu_us_per_req":12.58,"p50_us":124.3,"p99_us":202.8,"max_us":413.3}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":3,"requests":20000,"rps":79310,"cpu_us_per_req":12.60,"p50_us":122.6,"p99_us":242.0,"max_us":394.3}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":4,"requests":20000,"rps":78037,"cpu_us_per_req":12.81,"p50_us":126.2,"p99_us":220.2,"max_us":323.0}
+{"impl": "pyreqwest-bytes", "concurrency": 10, "run": 0, "requests": 20000, "rps": 52703, "cpu_us_per_req": 18.97, "p50_us": 184.5, "p99_us": 370.7, "max_us": 665.9}
+{"impl": "pyreqwest-bytes", "concurrency": 10, "run": 1, "requests": 20000, "rps": 53493, "cpu_us_per_req": 18.69, "p50_us": 181.8, "p99_us": 339.3, "max_us": 638.0}
+{"impl": "pyreqwest-bytes", "concurrency": 10, "run": 2, "requests": 20000, "rps": 55351, "cpu_us_per_req": 18.07, "p50_us": 176.0, "p99_us": 331.5, "max_us": 924.6}
+{"impl": "pyreqwest-bytes", "concurrency": 10, "run": 3, "requests": 20000, "rps": 56785, "cpu_us_per_req": 17.61, "p50_us": 175.5, "p99_us": 276.9, "max_us": 488.0}
+{"impl": "pyreqwest-bytes", "concurrency": 10, "run": 4, "requests": 20000, "rps": 57018, "cpu_us_per_req": 17.53, "p50_us": 175.3, "p99_us": 276.2, "max_us": 476.2}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 0, "requests": 20000, "rps": 50084, "cpu_us_per_req": 19.96, "p50_us": 188.3, "p99_us": 333.3, "max_us": 588.2}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 1, "requests": 20000, "rps": 49818, "cpu_us_per_req": 20.07, "p50_us": 189.5, "p99_us": 340.5, "max_us": 773.6}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 2, "requests": 20000, "rps": 50728, "cpu_us_per_req": 19.7, "p50_us": 186.5, "p99_us": 330.3, "max_us": 622.6}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 3, "requests": 20000, "rps": 51303, "cpu_us_per_req": 19.47, "p50_us": 185.0, "p99_us": 324.0, "max_us": 868.7}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 4, "requests": 20000, "rps": 50077, "cpu_us_per_req": 19.95, "p50_us": 187.0, "p99_us": 338.7, "max_us": 2208.0}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":100,"run":0,"requests":20000,"rps":115776,"cpu_us_per_req":8.64,"p50_us":827.4,"p99_us":1515.2,"max_us":1873.7}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":100,"run":1,"requests":20000,"rps":119410,"cpu_us_per_req":8.38,"p50_us":817.1,"p99_us":1249.4,"max_us":1678.5}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":100,"run":2,"requests":20000,"rps":125309,"cpu_us_per_req":7.98,"p50_us":799.2,"p99_us":923.8,"max_us":1216.0}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":100,"run":3,"requests":20000,"rps":120299,"cpu_us_per_req":8.31,"p50_us":808.4,"p99_us":1245.9,"max_us":1587.2}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":100,"run":4,"requests":20000,"rps":123473,"cpu_us_per_req":8.10,"p50_us":808.6,"p99_us":941.2,"max_us":1232.8}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":0,"requests":20000,"rps":90764,"cpu_us_per_req":11.02,"p50_us":1075.8,"p99_us":1559.8,"max_us":1953.3}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":1,"requests":20000,"rps":91726,"cpu_us_per_req":10.90,"p50_us":1059.2,"p99_us":1392.3,"max_us":2255.5}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":2,"requests":20000,"rps":94123,"cpu_us_per_req":10.62,"p50_us":1046.9,"p99_us":1389.8,"max_us":2008.8}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":3,"requests":20000,"rps":97535,"cpu_us_per_req":10.25,"p50_us":1026.0,"p99_us":1162.6,"max_us":1320.9}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":4,"requests":20000,"rps":88280,"cpu_us_per_req":11.33,"p50_us":1090.0,"p99_us":1636.4,"max_us":2156.2}
+{"impl": "pyreqwest-bytes", "concurrency": 100, "run": 0, "requests": 20000, "rps": 59123, "cpu_us_per_req": 16.91, "p50_us": 1647.8, "p99_us": 3086.2, "max_us": 3594.5}
+{"impl": "pyreqwest-bytes", "concurrency": 100, "run": 1, "requests": 20000, "rps": 59685, "cpu_us_per_req": 16.75, "p50_us": 1647.7, "p99_us": 2934.5, "max_us": 3266.1}
+{"impl": "pyreqwest-bytes", "concurrency": 100, "run": 2, "requests": 20000, "rps": 60591, "cpu_us_per_req": 16.5, "p50_us": 1632.3, "p99_us": 2908.5, "max_us": 3340.4}
+{"impl": "pyreqwest-bytes", "concurrency": 100, "run": 3, "requests": 20000, "rps": 61138, "cpu_us_per_req": 16.36, "p50_us": 1603.1, "p99_us": 2847.8, "max_us": 3472.9}
+{"impl": "pyreqwest-bytes", "concurrency": 100, "run": 4, "requests": 20000, "rps": 58815, "cpu_us_per_req": 17.0, "p50_us": 1666.3, "p99_us": 3289.0, "max_us": 4532.7}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 0, "requests": 20000, "rps": 54054, "cpu_us_per_req": 18.5, "p50_us": 2002.9, "p99_us": 2911.5, "max_us": 3353.5}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 1, "requests": 20000, "rps": 54769, "cpu_us_per_req": 18.26, "p50_us": 2005.5, "p99_us": 2674.1, "max_us": 2872.2}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 2, "requests": 20000, "rps": 53334, "cpu_us_per_req": 18.75, "p50_us": 2031.7, "p99_us": 2906.1, "max_us": 4251.7}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 3, "requests": 20000, "rps": 53257, "cpu_us_per_req": 18.78, "p50_us": 2072.8, "p99_us": 2695.9, "max_us": 3185.9}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 4, "requests": 20000, "rps": 53277, "cpu_us_per_req": 18.77, "p50_us": 2053.1, "p99_us": 2651.8, "max_us": 3633.1}

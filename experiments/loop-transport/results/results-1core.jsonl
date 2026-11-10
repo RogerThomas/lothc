@@ -1,0 +1,180 @@
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":1,"run":0,"requests":20000,"rps":17494,"cpu_us_per_req":21.81,"p50_us":57.0,"p99_us":76.2,"max_us":277.2}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":1,"run":1,"requests":20000,"rps":18095,"cpu_us_per_req":23.19,"p50_us":53.3,"p99_us":149.2,"max_us":771.2}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":1,"run":2,"requests":20000,"rps":19349,"cpu_us_per_req":21.04,"p50_us":56.4,"p99_us":101.2,"max_us":1226.8}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":1,"run":3,"requests":20000,"rps":17904,"cpu_us_per_req":21.46,"p50_us":56.6,"p99_us":72.4,"max_us":212.8}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":1,"run":4,"requests":20000,"rps":18549,"cpu_us_per_req":21.38,"p50_us":56.5,"p99_us":93.2,"max_us":454.8}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":1,"run":0,"requests":20000,"rps":16512,"cpu_us_per_req":25.40,"p50_us":60.3,"p99_us":83.0,"max_us":531.8}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":1,"run":1,"requests":20000,"rps":17966,"cpu_us_per_req":23.88,"p50_us":59.2,"p99_us":101.5,"max_us":2164.1}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":1,"run":2,"requests":20000,"rps":16691,"cpu_us_per_req":25.33,"p50_us":59.5,"p99_us":107.4,"max_us":270.2}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":1,"run":3,"requests":20000,"rps":16153,"cpu_us_per_req":25.81,"p50_us":61.1,"p99_us":94.3,"max_us":4046.1}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":1,"run":4,"requests":20000,"rps":15675,"cpu_us_per_req":27.32,"p50_us":61.4,"p99_us":129.4,"max_us":353.1}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":1,"run":0,"requests":20000,"rps":17372,"cpu_us_per_req":22.41,"p50_us":56.7,"p99_us":81.2,"max_us":1011.9}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":1,"run":1,"requests":20000,"rps":17463,"cpu_us_per_req":22.47,"p50_us":56.9,"p99_us":70.9,"max_us":303.4}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":1,"run":2,"requests":20000,"rps":17188,"cpu_us_per_req":23.22,"p50_us":58.2,"p99_us":79.4,"max_us":6308.0}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":1,"run":3,"requests":20000,"rps":17219,"cpu_us_per_req":22.80,"p50_us":57.9,"p99_us":71.2,"max_us":165.2}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":1,"run":4,"requests":20000,"rps":17210,"cpu_us_per_req":22.90,"p50_us":57.8,"p99_us":76.3,"max_us":206.5}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":1,"run":0,"requests":20000,"rps":16706,"cpu_us_per_req":25.25,"p50_us":60.5,"p99_us":81.7,"max_us":2852.0}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":1,"run":1,"requests":20000,"rps":16508,"cpu_us_per_req":25.24,"p50_us":60.0,"p99_us":73.9,"max_us":314.0}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":1,"run":2,"requests":20000,"rps":16527,"cpu_us_per_req":25.30,"p50_us":59.9,"p99_us":74.5,"max_us":209.2}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":1,"run":3,"requests":20000,"rps":16457,"cpu_us_per_req":25.25,"p50_us":60.2,"p99_us":75.7,"max_us":218.0}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":1,"run":4,"requests":20000,"rps":16328,"cpu_us_per_req":25.73,"p50_us":60.8,"p99_us":77.8,"max_us":1914.3}
+{"impl": "pyreqwest-bytes", "concurrency": 1, "run": 0, "requests": 20000, "rps": 13050, "cpu_us_per_req": 41.74, "p50_us": 76.1, "p99_us": 91.0, "max_us": 222.8}
+{"impl": "pyreqwest-bytes", "concurrency": 1, "run": 1, "requests": 20000, "rps": 13033, "cpu_us_per_req": 41.72, "p50_us": 76.0, "p99_us": 94.0, "max_us": 248.5}
+{"impl": "pyreqwest-bytes", "concurrency": 1, "run": 2, "requests": 20000, "rps": 13710, "cpu_us_per_req": 40.18, "p50_us": 75.1, "p99_us": 97.4, "max_us": 12307.3}
+{"impl": "pyreqwest-bytes", "concurrency": 1, "run": 3, "requests": 20000, "rps": 13343, "cpu_us_per_req": 41.18, "p50_us": 75.3, "p99_us": 100.0, "max_us": 781.7}
+{"impl": "pyreqwest-bytes", "concurrency": 1, "run": 4, "requests": 20000, "rps": 13187, "cpu_us_per_req": 41.35, "p50_us": 75.3, "p99_us": 90.5, "max_us": 335.4}
+{"impl": "pyreqwest-json", "concurrency": 1, "run": 0, "requests": 20000, "rps": 12421, "cpu_us_per_req": 46.49, "p50_us": 79.6, "p99_us": 99.5, "max_us": 429.6}
+{"impl": "pyreqwest-json", "concurrency": 1, "run": 1, "requests": 20000, "rps": 12366, "cpu_us_per_req": 46.43, "p50_us": 79.7, "p99_us": 103.3, "max_us": 1078.9}
+{"impl": "pyreqwest-json", "concurrency": 1, "run": 2, "requests": 20000, "rps": 12527, "cpu_us_per_req": 45.34, "p50_us": 78.2, "p99_us": 105.0, "max_us": 354.3}
+{"impl": "pyreqwest-json", "concurrency": 1, "run": 3, "requests": 20000, "rps": 11903, "cpu_us_per_req": 49.09, "p50_us": 79.1, "p99_us": 133.2, "max_us": 1402.0}
+{"impl": "pyreqwest-json", "concurrency": 1, "run": 4, "requests": 20000, "rps": 12839, "cpu_us_per_req": 44.65, "p50_us": 77.6, "p99_us": 107.3, "max_us": 5086.2}
+{"impl": "lothc-bytes", "concurrency": 1, "run": 0, "requests": 20000, "rps": 12665, "cpu_us_per_req": 46.0, "p50_us": 78.5, "p99_us": 97.4, "max_us": 607.7}
+{"impl": "lothc-bytes", "concurrency": 1, "run": 1, "requests": 20000, "rps": 12117, "cpu_us_per_req": 47.8, "p50_us": 79.9, "p99_us": 111.5, "max_us": 7924.6}
+{"impl": "lothc-bytes", "concurrency": 1, "run": 2, "requests": 20000, "rps": 12710, "cpu_us_per_req": 46.07, "p50_us": 78.9, "p99_us": 101.2, "max_us": 185.9}
+{"impl": "lothc-bytes", "concurrency": 1, "run": 3, "requests": 20000, "rps": 12589, "cpu_us_per_req": 46.37, "p50_us": 78.4, "p99_us": 113.7, "max_us": 8887.8}
+{"impl": "lothc-bytes", "concurrency": 1, "run": 4, "requests": 20000, "rps": 12701, "cpu_us_per_req": 45.69, "p50_us": 77.6, "p99_us": 98.9, "max_us": 315.2}
+{"impl": "lothc-dict", "concurrency": 1, "run": 0, "requests": 20000, "rps": 11643, "cpu_us_per_req": 52.76, "p50_us": 85.3, "p99_us": 113.3, "max_us": 441.7}
+{"impl": "lothc-dict", "concurrency": 1, "run": 1, "requests": 20000, "rps": 11677, "cpu_us_per_req": 52.53, "p50_us": 85.1, "p99_us": 101.5, "max_us": 397.6}
+{"impl": "lothc-dict", "concurrency": 1, "run": 2, "requests": 20000, "rps": 11534, "cpu_us_per_req": 53.39, "p50_us": 85.5, "p99_us": 105.4, "max_us": 323.7}
+{"impl": "lothc-dict", "concurrency": 1, "run": 3, "requests": 20000, "rps": 11440, "cpu_us_per_req": 54.77, "p50_us": 87.8, "p99_us": 118.0, "max_us": 323.3}
+{"impl": "lothc-dict", "concurrency": 1, "run": 4, "requests": 20000, "rps": 11740, "cpu_us_per_req": 52.28, "p50_us": 84.5, "p99_us": 109.8, "max_us": 382.8}
+{"impl": "lothc-msgspec", "concurrency": 1, "run": 0, "requests": 20000, "rps": 12358, "cpu_us_per_req": 47.67, "p50_us": 80.6, "p99_us": 102.7, "max_us": 634.8}
+{"impl": "lothc-msgspec", "concurrency": 1, "run": 1, "requests": 20000, "rps": 12329, "cpu_us_per_req": 47.88, "p50_us": 80.2, "p99_us": 99.9, "max_us": 366.2}
+{"impl": "lothc-msgspec", "concurrency": 1, "run": 2, "requests": 20000, "rps": 12448, "cpu_us_per_req": 47.55, "p50_us": 80.2, "p99_us": 96.7, "max_us": 641.3}
+{"impl": "lothc-msgspec", "concurrency": 1, "run": 3, "requests": 20000, "rps": 12526, "cpu_us_per_req": 46.99, "p50_us": 79.0, "p99_us": 99.0, "max_us": 306.8}
+{"impl": "lothc-msgspec", "concurrency": 1, "run": 4, "requests": 20000, "rps": 11901, "cpu_us_per_req": 49.53, "p50_us": 82.2, "p99_us": 106.5, "max_us": 510.9}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":10,"run":0,"requests":20000,"rps":136243,"cpu_us_per_req":7.34,"p50_us":74.8,"p99_us":106.0,"max_us":262.0}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":10,"run":1,"requests":20000,"rps":139463,"cpu_us_per_req":7.17,"p50_us":72.5,"p99_us":100.0,"max_us":127.2}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":10,"run":2,"requests":20000,"rps":141174,"cpu_us_per_req":7.08,"p50_us":71.8,"p99_us":96.3,"max_us":198.8}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":10,"run":3,"requests":20000,"rps":141611,"cpu_us_per_req":7.06,"p50_us":75.4,"p99_us":91.2,"max_us":275.6}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":10,"run":4,"requests":20000,"rps":139722,"cpu_us_per_req":7.15,"p50_us":72.2,"p99_us":99.2,"max_us":195.1}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":0,"requests":20000,"rps":96332,"cpu_us_per_req":10.38,"p50_us":106.8,"p99_us":134.1,"max_us":194.0}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":1,"requests":20000,"rps":97974,"cpu_us_per_req":10.20,"p50_us":105.1,"p99_us":130.0,"max_us":205.8}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":2,"requests":20000,"rps":97975,"cpu_us_per_req":10.20,"p50_us":105.5,"p99_us":129.1,"max_us":271.2}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":3,"requests":20000,"rps":96459,"cpu_us_per_req":10.36,"p50_us":106.2,"p99_us":133.9,"max_us":429.5}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":4,"requests":20000,"rps":94925,"cpu_us_per_req":10.52,"p50_us":108.0,"p99_us":148.8,"max_us":343.6}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":10,"run":0,"requests":20000,"rps":133698,"cpu_us_per_req":7.48,"p50_us":82.7,"p99_us":118.3,"max_us":214.5}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":10,"run":1,"requests":20000,"rps":139252,"cpu_us_per_req":7.18,"p50_us":82.6,"p99_us":98.4,"max_us":194.0}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":10,"run":2,"requests":20000,"rps":140050,"cpu_us_per_req":7.14,"p50_us":77.5,"p99_us":97.4,"max_us":166.7}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":10,"run":3,"requests":20000,"rps":135781,"cpu_us_per_req":7.36,"p50_us":79.3,"p99_us":107.4,"max_us":286.0}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":10,"run":4,"requests":20000,"rps":135686,"cpu_us_per_req":7.37,"p50_us":79.8,"p99_us":102.7,"max_us":158.2}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":10,"run":0,"requests":20000,"rps":94708,"cpu_us_per_req":10.56,"p50_us":114.8,"p99_us":141.5,"max_us":217.0}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":10,"run":1,"requests":20000,"rps":96106,"cpu_us_per_req":10.41,"p50_us":113.8,"p99_us":133.0,"max_us":156.0}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":10,"run":2,"requests":20000,"rps":92244,"cpu_us_per_req":10.79,"p50_us":115.5,"p99_us":163.6,"max_us":816.5}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":10,"run":3,"requests":20000,"rps":94977,"cpu_us_per_req":10.53,"p50_us":114.9,"p99_us":135.9,"max_us":197.4}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":10,"run":4,"requests":20000,"rps":95113,"cpu_us_per_req":10.51,"p50_us":114.7,"p99_us":135.8,"max_us":210.2}
+{"impl": "pyreqwest-bytes", "concurrency": 10, "run": 0, "requests": 20000, "rps": 62124, "cpu_us_per_req": 16.09, "p50_us": 157.8, "p99_us": 253.5, "max_us": 375.2}
+{"impl": "pyreqwest-bytes", "concurrency": 10, "run": 1, "requests": 20000, "rps": 60686, "cpu_us_per_req": 16.48, "p50_us": 159.7, "p99_us": 256.8, "max_us": 1646.9}
+{"impl": "pyreqwest-bytes", "concurrency": 10, "run": 2, "requests": 20000, "rps": 59017, "cpu_us_per_req": 16.93, "p50_us": 164.0, "p99_us": 273.9, "max_us": 568.2}
+{"impl": "pyreqwest-bytes", "concurrency": 10, "run": 3, "requests": 20000, "rps": 60752, "cpu_us_per_req": 16.45, "p50_us": 160.6, "p99_us": 257.8, "max_us": 336.1}
+{"impl": "pyreqwest-bytes", "concurrency": 10, "run": 4, "requests": 20000, "rps": 60212, "cpu_us_per_req": 16.6, "p50_us": 162.1, "p99_us": 265.0, "max_us": 478.1}
+{"impl": "pyreqwest-json", "concurrency": 10, "run": 0, "requests": 20000, "rps": 52071, "cpu_us_per_req": 19.2, "p50_us": 185.7, "p99_us": 305.5, "max_us": 470.8}
+{"impl": "pyreqwest-json", "concurrency": 10, "run": 1, "requests": 20000, "rps": 51730, "cpu_us_per_req": 19.32, "p50_us": 186.6, "p99_us": 314.3, "max_us": 519.9}
+{"impl": "pyreqwest-json", "concurrency": 10, "run": 2, "requests": 20000, "rps": 51520, "cpu_us_per_req": 19.4, "p50_us": 186.7, "p99_us": 314.5, "max_us": 634.7}
+{"impl": "pyreqwest-json", "concurrency": 10, "run": 3, "requests": 20000, "rps": 37717, "cpu_us_per_req": 26.51, "p50_us": 219.7, "p99_us": 804.4, "max_us": 1339.3}
+{"impl": "pyreqwest-json", "concurrency": 10, "run": 4, "requests": 20000, "rps": 52676, "cpu_us_per_req": 18.98, "p50_us": 184.3, "p99_us": 293.5, "max_us": 381.4}
+{"impl": "lothc-bytes", "concurrency": 10, "run": 0, "requests": 20000, "rps": 51432, "cpu_us_per_req": 19.42, "p50_us": 184.6, "p99_us": 322.4, "max_us": 786.5}
+{"impl": "lothc-bytes", "concurrency": 10, "run": 1, "requests": 20000, "rps": 49495, "cpu_us_per_req": 20.2, "p50_us": 189.2, "p99_us": 381.8, "max_us": 1082.8}
+{"impl": "lothc-bytes", "concurrency": 10, "run": 2, "requests": 20000, "rps": 51819, "cpu_us_per_req": 19.3, "p50_us": 183.8, "p99_us": 315.8, "max_us": 375.0}
+{"impl": "lothc-bytes", "concurrency": 10, "run": 3, "requests": 20000, "rps": 52679, "cpu_us_per_req": 18.98, "p50_us": 181.2, "p99_us": 307.2, "max_us": 365.8}
+{"impl": "lothc-bytes", "concurrency": 10, "run": 4, "requests": 20000, "rps": 49362, "cpu_us_per_req": 20.24, "p50_us": 190.0, "p99_us": 363.4, "max_us": 711.0}
+{"impl": "lothc-dict", "concurrency": 10, "run": 0, "requests": 20000, "rps": 40978, "cpu_us_per_req": 24.4, "p50_us": 243.0, "p99_us": 374.5, "max_us": 568.0}
+{"impl": "lothc-dict", "concurrency": 10, "run": 1, "requests": 20000, "rps": 41607, "cpu_us_per_req": 24.03, "p50_us": 238.1, "p99_us": 366.6, "max_us": 424.8}
+{"impl": "lothc-dict", "concurrency": 10, "run": 2, "requests": 20000, "rps": 40536, "cpu_us_per_req": 24.67, "p50_us": 246.0, "p99_us": 379.0, "max_us": 574.8}
+{"impl": "lothc-dict", "concurrency": 10, "run": 3, "requests": 20000, "rps": 40790, "cpu_us_per_req": 24.51, "p50_us": 244.6, "p99_us": 371.5, "max_us": 653.5}
+{"impl": "lothc-dict", "concurrency": 10, "run": 4, "requests": 20000, "rps": 40613, "cpu_us_per_req": 24.62, "p50_us": 241.5, "p99_us": 393.0, "max_us": 777.4}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 0, "requests": 20000, "rps": 51403, "cpu_us_per_req": 19.44, "p50_us": 187.0, "p99_us": 312.9, "max_us": 572.6}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 1, "requests": 20000, "rps": 51474, "cpu_us_per_req": 19.41, "p50_us": 186.5, "p99_us": 311.0, "max_us": 568.9}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 2, "requests": 20000, "rps": 49320, "cpu_us_per_req": 20.24, "p50_us": 192.4, "p99_us": 335.7, "max_us": 816.2}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 3, "requests": 20000, "rps": 49392, "cpu_us_per_req": 20.22, "p50_us": 191.9, "p99_us": 335.5, "max_us": 1042.4}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 4, "requests": 20000, "rps": 49815, "cpu_us_per_req": 20.06, "p50_us": 190.9, "p99_us": 332.9, "max_us": 621.2}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":50,"run":0,"requests":20000,"rps":132993,"cpu_us_per_req":7.52,"p50_us":381.2,"p99_us":624.0,"max_us":1027.5}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":50,"run":1,"requests":20000,"rps":123199,"cpu_us_per_req":8.11,"p50_us":398.6,"p99_us":757.1,"max_us":1186.9}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":50,"run":2,"requests":20000,"rps":118341,"cpu_us_per_req":8.44,"p50_us":396.2,"p99_us":860.4,"max_us":1212.2}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":50,"run":3,"requests":20000,"rps":128322,"cpu_us_per_req":7.79,"p50_us":384.9,"p99_us":726.8,"max_us":892.2}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":50,"run":4,"requests":20000,"rps":123283,"cpu_us_per_req":8.11,"p50_us":395.3,"p99_us":743.9,"max_us":1007.4}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":50,"run":0,"requests":20000,"rps":86679,"cpu_us_per_req":11.54,"p50_us":555.4,"p99_us":1010.2,"max_us":1272.8}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":50,"run":1,"requests":20000,"rps":94184,"cpu_us_per_req":10.62,"p50_us":520.8,"p99_us":911.5,"max_us":1197.0}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":50,"run":2,"requests":20000,"rps":102362,"cpu_us_per_req":9.77,"p50_us":490.2,"p99_us":633.7,"max_us":1022.5}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":50,"run":3,"requests":20000,"rps":92447,"cpu_us_per_req":10.82,"p50_us":521.0,"p99_us":1015.3,"max_us":1371.1}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":50,"run":4,"requests":20000,"rps":85821,"cpu_us_per_req":11.65,"p50_us":556.6,"p99_us":1115.4,"max_us":1529.3}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":50,"run":0,"requests":20000,"rps":106952,"cpu_us_per_req":9.34,"p50_us":459.4,"p99_us":951.4,"max_us":1302.9}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":50,"run":1,"requests":20000,"rps":116936,"cpu_us_per_req":8.55,"p50_us":412.3,"p99_us":836.0,"max_us":1059.8}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":50,"run":2,"requests":20000,"rps":115462,"cpu_us_per_req":8.66,"p50_us":411.2,"p99_us":840.8,"max_us":1221.5}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":50,"run":3,"requests":20000,"rps":125542,"cpu_us_per_req":7.96,"p50_us":389.4,"p99_us":736.7,"max_us":1134.8}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":50,"run":4,"requests":20000,"rps":126065,"cpu_us_per_req":7.93,"p50_us":390.1,"p99_us":687.2,"max_us":971.0}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":50,"run":0,"requests":20000,"rps":80295,"cpu_us_per_req":12.45,"p50_us":612.4,"p99_us":1167.0,"max_us":1425.4}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":50,"run":1,"requests":20000,"rps":89062,"cpu_us_per_req":11.23,"p50_us":571.0,"p99_us":732.9,"max_us":923.5}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":50,"run":2,"requests":20000,"rps":83933,"cpu_us_per_req":11.91,"p50_us":592.5,"p99_us":916.5,"max_us":1273.4}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":50,"run":3,"requests":20000,"rps":92925,"cpu_us_per_req":10.76,"p50_us":549.9,"p99_us":631.8,"max_us":863.5}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":50,"run":4,"requests":20000,"rps":87359,"cpu_us_per_req":11.45,"p50_us":575.3,"p99_us":857.6,"max_us":1015.5}
+{"impl": "pyreqwest-bytes", "concurrency": 50, "run": 0, "requests": 20000, "rps": 66911, "cpu_us_per_req": 14.94, "p50_us": 715.0, "p99_us": 1267.9, "max_us": 1939.0}
+{"impl": "pyreqwest-bytes", "concurrency": 50, "run": 1, "requests": 20000, "rps": 63109, "cpu_us_per_req": 15.84, "p50_us": 749.9, "p99_us": 1433.7, "max_us": 2369.9}
+{"impl": "pyreqwest-bytes", "concurrency": 50, "run": 2, "requests": 20000, "rps": 58424, "cpu_us_per_req": 17.11, "p50_us": 816.8, "p99_us": 1654.5, "max_us": 1947.2}
+{"impl": "pyreqwest-bytes", "concurrency": 50, "run": 3, "requests": 20000, "rps": 57838, "cpu_us_per_req": 17.29, "p50_us": 819.3, "p99_us": 1586.5, "max_us": 2384.2}
+{"impl": "pyreqwest-bytes", "concurrency": 50, "run": 4, "requests": 20000, "rps": 54624, "cpu_us_per_req": 18.3, "p50_us": 853.3, "p99_us": 1996.5, "max_us": 2719.7}
+{"impl": "pyreqwest-json", "concurrency": 50, "run": 0, "requests": 20000, "rps": 61536, "cpu_us_per_req": 16.25, "p50_us": 794.1, "p99_us": 1147.0, "max_us": 1405.2}
+{"impl": "pyreqwest-json", "concurrency": 50, "run": 1, "requests": 20000, "rps": 60319, "cpu_us_per_req": 16.58, "p50_us": 793.7, "p99_us": 1279.3, "max_us": 1855.8}
+{"impl": "pyreqwest-json", "concurrency": 50, "run": 2, "requests": 20000, "rps": 59119, "cpu_us_per_req": 16.91, "p50_us": 813.4, "p99_us": 1247.1, "max_us": 1717.4}
+{"impl": "pyreqwest-json", "concurrency": 50, "run": 3, "requests": 20000, "rps": 62310, "cpu_us_per_req": 16.05, "p50_us": 778.1, "p99_us": 1138.9, "max_us": 1362.8}
+{"impl": "pyreqwest-json", "concurrency": 50, "run": 4, "requests": 20000, "rps": 55572, "cpu_us_per_req": 17.99, "p50_us": 846.3, "p99_us": 1669.1, "max_us": 3434.2}
+{"impl": "lothc-bytes", "concurrency": 50, "run": 0, "requests": 20000, "rps": 59031, "cpu_us_per_req": 16.94, "p50_us": 842.5, "p99_us": 1333.2, "max_us": 1821.2}
+{"impl": "lothc-bytes", "concurrency": 50, "run": 1, "requests": 20000, "rps": 59733, "cpu_us_per_req": 16.74, "p50_us": 832.1, "p99_us": 1322.5, "max_us": 1949.3}
+{"impl": "lothc-bytes", "concurrency": 50, "run": 2, "requests": 20000, "rps": 60943, "cpu_us_per_req": 16.41, "p50_us": 819.3, "p99_us": 1191.3, "max_us": 1707.0}
+{"impl": "lothc-bytes", "concurrency": 50, "run": 3, "requests": 20000, "rps": 60909, "cpu_us_per_req": 16.42, "p50_us": 815.6, "p99_us": 1185.2, "max_us": 1498.5}
+{"impl": "lothc-bytes", "concurrency": 50, "run": 4, "requests": 20000, "rps": 61466, "cpu_us_per_req": 16.27, "p50_us": 806.0, "p99_us": 1180.7, "max_us": 1826.1}
+{"impl": "lothc-dict", "concurrency": 50, "run": 0, "requests": 20000, "rps": 47579, "cpu_us_per_req": 21.02, "p50_us": 1072.7, "p99_us": 1526.4, "max_us": 1803.5}
+{"impl": "lothc-dict", "concurrency": 50, "run": 1, "requests": 20000, "rps": 46353, "cpu_us_per_req": 21.57, "p50_us": 1090.3, "p99_us": 1577.8, "max_us": 2276.0}
+{"impl": "lothc-dict", "concurrency": 50, "run": 2, "requests": 20000, "rps": 47476, "cpu_us_per_req": 21.06, "p50_us": 1071.5, "p99_us": 1491.6, "max_us": 1767.7}
+{"impl": "lothc-dict", "concurrency": 50, "run": 3, "requests": 20000, "rps": 46381, "cpu_us_per_req": 21.56, "p50_us": 1083.2, "p99_us": 1605.5, "max_us": 2006.0}
+{"impl": "lothc-dict", "concurrency": 50, "run": 4, "requests": 20000, "rps": 46872, "cpu_us_per_req": 21.34, "p50_us": 1073.3, "p99_us": 1607.9, "max_us": 1812.2}
+{"impl": "lothc-msgspec", "concurrency": 50, "run": 0, "requests": 20000, "rps": 59714, "cpu_us_per_req": 16.75, "p50_us": 840.3, "p99_us": 1166.0, "max_us": 1349.8}
+{"impl": "lothc-msgspec", "concurrency": 50, "run": 1, "requests": 20000, "rps": 59541, "cpu_us_per_req": 16.79, "p50_us": 841.5, "p99_us": 1167.9, "max_us": 1291.2}
+{"impl": "lothc-msgspec", "concurrency": 50, "run": 2, "requests": 20000, "rps": 56668, "cpu_us_per_req": 17.65, "p50_us": 867.5, "p99_us": 1555.8, "max_us": 3845.5}
+{"impl": "lothc-msgspec", "concurrency": 50, "run": 3, "requests": 20000, "rps": 59213, "cpu_us_per_req": 16.89, "p50_us": 852.1, "p99_us": 1185.5, "max_us": 1480.2}
+{"impl": "lothc-msgspec", "concurrency": 50, "run": 4, "requests": 20000, "rps": 59273, "cpu_us_per_req": 16.87, "p50_us": 847.8, "p99_us": 1176.7, "max_us": 1709.6}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":100,"run":0,"requests":20000,"rps":130645,"cpu_us_per_req":7.66,"p50_us":763.5,"p99_us":889.2,"max_us":1272.5}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":100,"run":1,"requests":20000,"rps":132078,"cpu_us_per_req":7.57,"p50_us":758.0,"p99_us":852.3,"max_us":1228.4}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":100,"run":2,"requests":20000,"rps":134158,"cpu_us_per_req":7.45,"p50_us":749.4,"p99_us":824.2,"max_us":1117.2}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":100,"run":3,"requests":20000,"rps":134128,"cpu_us_per_req":7.46,"p50_us":747.4,"p99_us":867.0,"max_us":1052.5}
+{"impl":"reqwest","runtime":"current","body":"bytes","concurrency":100,"run":4,"requests":20000,"rps":130241,"cpu_us_per_req":7.68,"p50_us":748.8,"p99_us":1299.5,"max_us":1768.8}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":0,"requests":20000,"rps":98147,"cpu_us_per_req":10.19,"p50_us":1004.5,"p99_us":1470.7,"max_us":1695.3}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":1,"requests":20000,"rps":101189,"cpu_us_per_req":9.88,"p50_us":993.3,"p99_us":1096.1,"max_us":1317.4}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":2,"requests":20000,"rps":101342,"cpu_us_per_req":9.87,"p50_us":994.4,"p99_us":1066.4,"max_us":1279.9}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":3,"requests":20000,"rps":96594,"cpu_us_per_req":10.35,"p50_us":1013.9,"p99_us":1402.0,"max_us":2104.9}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":4,"requests":20000,"rps":100715,"cpu_us_per_req":9.93,"p50_us":996.8,"p99_us":1134.1,"max_us":1471.3}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":100,"run":0,"requests":20000,"rps":110701,"cpu_us_per_req":9.03,"p50_us":849.3,"p99_us":1986.4,"max_us":2542.6}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":100,"run":1,"requests":20000,"rps":126399,"cpu_us_per_req":7.91,"p50_us":788.4,"p99_us":965.3,"max_us":1046.3}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":100,"run":2,"requests":20000,"rps":120956,"cpu_us_per_req":8.27,"p50_us":805.0,"p99_us":1204.9,"max_us":1319.4}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":100,"run":3,"requests":20000,"rps":112233,"cpu_us_per_req":8.91,"p50_us":837.1,"p99_us":1826.4,"max_us":2152.3}
+{"impl":"reqwest","runtime":"multi","body":"bytes","concurrency":100,"run":4,"requests":20000,"rps":117810,"cpu_us_per_req":8.49,"p50_us":811.6,"p99_us":1689.6,"max_us":2081.5}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":100,"run":0,"requests":20000,"rps":81724,"cpu_us_per_req":12.24,"p50_us":1189.7,"p99_us":2031.6,"max_us":2486.2}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":100,"run":1,"requests":20000,"rps":85144,"cpu_us_per_req":11.74,"p50_us":1144.5,"p99_us":1644.2,"max_us":1784.3}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":100,"run":2,"requests":20000,"rps":75569,"cpu_us_per_req":13.23,"p50_us":1254.2,"p99_us":2385.1,"max_us":2659.5}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":100,"run":3,"requests":20000,"rps":80851,"cpu_us_per_req":12.37,"p50_us":1205.1,"p99_us":2259.0,"max_us":2619.3}
+{"impl":"reqwest","runtime":"multi","body":"json","concurrency":100,"run":4,"requests":20000,"rps":88063,"cpu_us_per_req":11.35,"p50_us":1144.5,"p99_us":1309.3,"max_us":1401.0}
+{"impl": "pyreqwest-bytes", "concurrency": 100, "run": 0, "requests": 20000, "rps": 66056, "cpu_us_per_req": 15.14, "p50_us": 1482.9, "p99_us": 2594.5, "max_us": 3706.0}
+{"impl": "pyreqwest-bytes", "concurrency": 100, "run": 1, "requests": 20000, "rps": 67290, "cpu_us_per_req": 14.86, "p50_us": 1437.3, "p99_us": 2463.7, "max_us": 3302.7}
+{"impl": "pyreqwest-bytes", "concurrency": 100, "run": 2, "requests": 20000, "rps": 68160, "cpu_us_per_req": 14.67, "p50_us": 1428.3, "p99_us": 2418.9, "max_us": 2668.3}
+{"impl": "pyreqwest-bytes", "concurrency": 100, "run": 3, "requests": 20000, "rps": 64589, "cpu_us_per_req": 15.48, "p50_us": 1480.8, "p99_us": 2884.4, "max_us": 3886.7}
+{"impl": "pyreqwest-bytes", "concurrency": 100, "run": 4, "requests": 20000, "rps": 66153, "cpu_us_per_req": 15.12, "p50_us": 1459.6, "p99_us": 2658.5, "max_us": 3045.8}
+{"impl": "pyreqwest-json", "concurrency": 100, "run": 0, "requests": 20000, "rps": 60004, "cpu_us_per_req": 16.67, "p50_us": 1711.8, "p99_us": 2508.2, "max_us": 6681.0}
+{"impl": "pyreqwest-json", "concurrency": 100, "run": 1, "requests": 20000, "rps": 59913, "cpu_us_per_req": 16.69, "p50_us": 1708.5, "p99_us": 2499.0, "max_us": 2776.8}
+{"impl": "pyreqwest-json", "concurrency": 100, "run": 2, "requests": 20000, "rps": 61547, "cpu_us_per_req": 16.25, "p50_us": 1700.7, "p99_us": 2283.0, "max_us": 2645.3}
+{"impl": "pyreqwest-json", "concurrency": 100, "run": 3, "requests": 20000, "rps": 61078, "cpu_us_per_req": 16.37, "p50_us": 1666.2, "p99_us": 2529.2, "max_us": 4014.9}
+{"impl": "pyreqwest-json", "concurrency": 100, "run": 4, "requests": 20000, "rps": 61431, "cpu_us_per_req": 16.28, "p50_us": 1699.5, "p99_us": 2297.6, "max_us": 2620.7}
+{"impl": "lothc-bytes", "concurrency": 100, "run": 0, "requests": 20000, "rps": 60878, "cpu_us_per_req": 16.43, "p50_us": 1762.6, "p99_us": 2420.0, "max_us": 2781.9}
+{"impl": "lothc-bytes", "concurrency": 100, "run": 1, "requests": 20000, "rps": 59456, "cpu_us_per_req": 16.82, "p50_us": 1796.7, "p99_us": 2588.8, "max_us": 3325.4}
+{"impl": "lothc-bytes", "concurrency": 100, "run": 2, "requests": 20000, "rps": 56168, "cpu_us_per_req": 17.81, "p50_us": 1877.9, "p99_us": 3151.6, "max_us": 4381.3}
+{"impl": "lothc-bytes", "concurrency": 100, "run": 3, "requests": 20000, "rps": 44672, "cpu_us_per_req": 22.38, "p50_us": 2182.4, "p99_us": 5632.2, "max_us": 7574.7}
+{"impl": "lothc-bytes", "concurrency": 100, "run": 4, "requests": 20000, "rps": 56684, "cpu_us_per_req": 17.64, "p50_us": 1853.8, "p99_us": 3045.0, "max_us": 3805.4}
+{"impl": "lothc-dict", "concurrency": 100, "run": 0, "requests": 20000, "rps": 39410, "cpu_us_per_req": 25.23, "p50_us": 2358.7, "p99_us": 5097.7, "max_us": 6545.3}
+{"impl": "lothc-dict", "concurrency": 100, "run": 1, "requests": 20000, "rps": 45196, "cpu_us_per_req": 22.13, "p50_us": 2139.2, "p99_us": 3656.6, "max_us": 4615.6}
+{"impl": "lothc-dict", "concurrency": 100, "run": 2, "requests": 20000, "rps": 46254, "cpu_us_per_req": 21.62, "p50_us": 2155.1, "p99_us": 3231.4, "max_us": 4620.3}
+{"impl": "lothc-dict", "concurrency": 100, "run": 3, "requests": 20000, "rps": 47767, "cpu_us_per_req": 20.93, "p50_us": 2108.9, "p99_us": 2979.0, "max_us": 3283.3}
+{"impl": "lothc-dict", "concurrency": 100, "run": 4, "requests": 20000, "rps": 47019, "cpu_us_per_req": 21.27, "p50_us": 2117.0, "p99_us": 3075.0, "max_us": 4336.1}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 0, "requests": 20000, "rps": 58488, "cpu_us_per_req": 17.1, "p50_us": 1815.8, "p99_us": 2547.4, "max_us": 2761.4}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 1, "requests": 20000, "rps": 48271, "cpu_us_per_req": 20.71, "p50_us": 2053.5, "p99_us": 3905.7, "max_us": 4997.8}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 2, "requests": 20000, "rps": 47267, "cpu_us_per_req": 21.15, "p50_us": 2132.5, "p99_us": 4059.6, "max_us": 6699.5}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 3, "requests": 20000, "rps": 49434, "cpu_us_per_req": 20.23, "p50_us": 2087.9, "p99_us": 3624.0, "max_us": 5593.3}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 4, "requests": 20000, "rps": 48487, "cpu_us_per_req": 20.62, "p50_us": 2107.5, "p99_us": 3788.5, "max_us": 6254.4}

@@ -7,6 +7,11 @@ __pycache__/
 coverage.xml
 htmlcov/
 dist/
+
+# The Rust extension: cargo's build output, and the module an editable install puts in lothc/
+/native/target/
+/lothc/_native.*.so
+/lothc/_native.*.pyd
 *.egg-info/
 .DS_Store
 
@@ -35,3 +40,4 @@ tmp.json
 
 # Agent git worktrees (each carries its own .venv) — scratch, never committed
 .claude/worktrees/
+/benchmarks/json_server/target/

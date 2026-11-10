@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 from collections.abc import AsyncGenerator, Generator
 from concurrent.futures import ThreadPoolExecutor
@@ -183,6 +184,69 @@ async def test_a_request_in_flight_when_the_client_closes_raises_runtime_error(
 
     with pytest.raises(RuntimeError, match="client is closed"):
         await request
+
+
+@pytest.mark.parametrize(
+    "path", ["stall-after-first-chunk", "stall-unframed"], ids=["chunked", "ends-with-connection"]
+)
+async def test_a_request_whose_body_is_still_arriving_when_the_client_closes_raises_runtime_error(
+    base_url: str, path: str
+) -> None:
+    # Promptly, and not with the part that arrived: an unframed body would even look complete.
+    client = HTTPClient(base_url=base_url)
+    await client.__aenter__()
+    request = asyncio.create_task(client.get(path, params={"seconds": 1.0}))
+    await asyncio.sleep(0.1)
+    await client.__aexit__(None, None, None)
+    closed_at = time.monotonic()
+
+    with pytest.raises(RuntimeError, match="client is closed"):
+        await request
+    assert time.monotonic() - closed_at < 0.5
+
+
+async def _first_chunk(client: HTTPClient, path: str, params: dict[str, Any]) -> bytes:
+    stream = client.stream_get(path, params=params)
+    try:
+        return await anext(stream)
+    finally:
+        await stream.aclose()
+
+
+async def test_a_stream_still_waiting_for_its_head_when_the_client_closes_raises_runtime_error(
+    base_url: str,
+) -> None:
+    client = HTTPClient(base_url=base_url)
+    await client.__aenter__()
+    request = asyncio.create_task(_first_chunk(client, "slow", {"seconds": 1.0}))
+    await asyncio.sleep(0.1)
+    await client.__aexit__(None, None, None)
+    closed_at = time.monotonic()
+
+    with pytest.raises(RuntimeError, match="client is closed"):
+        await request
+    assert time.monotonic() - closed_at < 0.5
+
+
+@pytest.mark.xfail(
+    os.environ.get("LOTHC_TRANSPORT") == "native",
+    reason="the native async pool fails a stream's reads when its client closes",
+    strict=True,
+)
+async def test_a_stream_whose_head_has_arrived_reads_on_after_the_client_closes(
+    base_url: str, server_key: str
+) -> None:
+    client = HTTPClient(base_url=base_url)
+    await client.__aenter__()
+    stream = client.stream_get("large", params={"key": server_key, "size": 2**20})
+    try:
+        received = len(await anext(stream))
+        await client.__aexit__(None, None, None)
+        received += sum([len(chunk) async for chunk in stream])
+    finally:
+        await stream.aclose()
+
+    assert received == 2**20
 
 
 async def test_exiting_a_client_that_is_not_open_is_harmless(base_url: str) -> None:
@@ -392,6 +456,7 @@ def _open_and_close_sync(client: SyncHTTPClient) -> None:
         {"identity_pem": b"identity-pem"},
         {"max_tls_version": "TLSv1.1"},
         {"min_tls_version": "TLSv1.3", "max_tls_version": "TLSv1.2"},
+        {"timeout": float("nan")},
     ],
     ids=[
         "local_address",
@@ -403,6 +468,7 @@ def _open_and_close_sync(client: SyncHTTPClient) -> None:
         "identity_pem",
         "max_tls_version",
         "min_above_max_tls_version",
+        "nan",
     ],
 )
 async def test_unusable_settings_raise_value_error_by_the_time_the_client_opens(
@@ -427,6 +493,7 @@ async def test_unusable_settings_raise_value_error_by_the_time_the_client_opens(
         {"identity_pem": b"identity-pem"},
         {"max_tls_version": "TLSv1.1"},
         {"min_tls_version": "TLSv1.3", "max_tls_version": "TLSv1.2"},
+        {"timeout": float("nan")},
     ],
     ids=[
         "local_address",
@@ -438,6 +505,7 @@ async def test_unusable_settings_raise_value_error_by_the_time_the_client_opens(
         "identity_pem",
         "max_tls_version",
         "min_above_max_tls_version",
+        "nan",
     ],
 )
 def test_sync_unusable_settings_raise_value_error_by_the_time_the_client_opens(
@@ -447,6 +515,18 @@ def test_sync_unusable_settings_raise_value_error_by_the_time_the_client_opens(
         _open_and_close_sync(SyncHTTPClient(**settings))
 
     assert not type(exc_info.value).__module__.startswith("pyreqwest")
+
+
+@pytest.mark.parametrize("timeout", [float("inf"), 1e20], ids=["infinite", "huge"])
+async def test_a_timeout_too_large_to_represent_raises_overflow_error(timeout: float) -> None:
+    with pytest.raises(OverflowError):
+        await _open_and_close(HTTPClient(timeout=timeout))
+
+
+@pytest.mark.parametrize("timeout", [float("inf"), 1e20], ids=["infinite", "huge"])
+def test_sync_a_timeout_too_large_to_represent_raises_overflow_error(timeout: float) -> None:
+    with pytest.raises(OverflowError):
+        _open_and_close_sync(SyncHTTPClient(timeout=timeout))
 
 
 # pyreqwest's `BuilderError` from building the client is re-raised as a plain `ValueError` with
@@ -516,3 +596,62 @@ def test_sync_a_request_in_flight_when_the_client_closes_raises_runtime_error(
 
         with pytest.raises(RuntimeError, match="client is closed"):
             request.result()
+
+
+@pytest.mark.parametrize(
+    "path", ["stall-after-first-chunk", "stall-unframed"], ids=["chunked", "ends-with-connection"]
+)
+def test_sync_a_request_whose_body_is_still_arriving_when_the_client_closes_raises_runtime_error(
+    base_url: str, path: str
+) -> None:
+    client = SyncHTTPClient(base_url=base_url)
+    client.__enter__()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        request = pool.submit(client.get, path, params={"seconds": 1.0})
+        time.sleep(0.1)
+        client.__exit__(None, None, None)
+        closed_at = time.monotonic()
+
+        with pytest.raises(RuntimeError, match="client is closed"):
+            request.result()
+        assert time.monotonic() - closed_at < 0.5
+
+
+def _sync_first_chunk(client: SyncHTTPClient, path: str, params: dict[str, Any]) -> bytes:
+    stream = client.stream_get(path, params=params)
+    try:
+        return next(stream)
+    finally:
+        stream.close()
+
+
+def test_sync_a_stream_still_waiting_for_its_head_when_the_client_closes_raises_runtime_error(
+    base_url: str,
+) -> None:
+    client = SyncHTTPClient(base_url=base_url)
+    client.__enter__()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        request = pool.submit(_sync_first_chunk, client, "slow", {"seconds": 1.0})
+        time.sleep(0.1)
+        client.__exit__(None, None, None)
+        closed_at = time.monotonic()
+
+        with pytest.raises(RuntimeError, match="client is closed"):
+            request.result()
+        assert time.monotonic() - closed_at < 0.5
+
+
+def test_sync_a_stream_whose_head_has_arrived_reads_on_after_the_client_closes(
+    base_url: str, server_key: str
+) -> None:
+    client = SyncHTTPClient(base_url=base_url)
+    client.__enter__()
+    stream = client.stream_get("large", params={"key": server_key, "size": 2**20})
+    try:
+        received = len(next(stream))
+        client.__exit__(None, None, None)
+        received += sum(len(chunk) for chunk in stream)
+    finally:
+        stream.close()
+
+    assert received == 2**20

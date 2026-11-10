@@ -1,25 +1,11 @@
-from ._client import (
-    AuthProvider,
-    CaseInsensitiveDict,
-    Data,
-    File,
-    Form,
-    Headers,
-    HTTPClient,
+from ._client import HTTPClient
+from ._errors import (
     HTTPConnectionError,
     HTTPResponseError,
     HTTPTimeoutError,
     HTTPTransportError,
-    JSONPayload,
-    Params,
-    RequestInfo,
-    Response,
-    SSEEvent,
-    SyncAuthProvider,
-    SyncHTTPClient,
-    TlsVersion,
-    TypedHeaders,
 )
+from ._headers import CaseInsensitiveDict
 from ._oauth import (
     OAuthProvider,
     OAuthTokenError,
@@ -27,6 +13,24 @@ from ._oauth import (
     TokenRefreshRequestTyping,
     TokenRequestTyping,
     TokenResponseTyping,
+)
+from ._response import (
+    RequestInfo,
+    Response,
+)
+from ._settings import TlsVersion
+from ._sse import SSEEvent
+from ._sync_client import SyncHTTPClient
+from ._types import (
+    AuthProvider,
+    Data,
+    File,
+    Form,
+    Headers,
+    JSONPayload,
+    Params,
+    SyncAuthProvider,
+    TypedHeaders,
 )
 
 __all__ = [

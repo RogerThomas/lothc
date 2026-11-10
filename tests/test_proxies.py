@@ -6,9 +6,12 @@ the caller's afterwards, so none leaks into another test. `test_wire_format.py` 
 bytes a proxy receives.
 """
 
+import asyncio
 import socket
+import time
 from base64 import b64encode
 from collections.abc import AsyncGenerator, Generator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -583,6 +586,45 @@ def test_sync_a_stalled_connect_is_bound_by_the_request_timeout(
         pytest.raises(HTTPTimeoutError),
     ):
         client.get("items/7")
+
+
+async def test_a_connect_still_waiting_on_its_proxy_when_the_client_closes_raises_runtime_error(
+    https_base_url: str, tls_ca_pem: bytes
+) -> None:
+    with serve_http_proxy(behaviour=ProxyBehaviour.SILENT) as proxy:
+        client = HTTPClient(
+            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        )
+        await client.__aenter__()
+        request = asyncio.create_task(client.get("items/7"))
+        await asyncio.sleep(0.1)
+        await client.__aexit__(None, None, None)
+        closed_at = time.monotonic()
+
+        with pytest.raises(RuntimeError, match="client is closed"):
+            await request
+        assert time.monotonic() - closed_at < 0.5
+
+
+def test_sync_a_connect_still_waiting_on_its_proxy_when_the_client_closes_raises_runtime_error(
+    https_base_url: str, tls_ca_pem: bytes
+) -> None:
+    with (
+        serve_http_proxy(behaviour=ProxyBehaviour.SILENT) as proxy,
+        ThreadPoolExecutor(max_workers=1) as pool,
+    ):
+        client = SyncHTTPClient(
+            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        )
+        client.__enter__()
+        request = pool.submit(client.get, "items/7")
+        time.sleep(0.1)
+        client.__exit__(None, None, None)
+        closed_at = time.monotonic()
+
+        with pytest.raises(RuntimeError, match="client is closed"):
+            request.result()
+        assert time.monotonic() - closed_at < 0.5
 
 
 # --- The proxy environment variables ----------------------------------------------------------

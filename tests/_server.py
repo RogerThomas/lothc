@@ -130,6 +130,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
     _closed_peers: ClassVar[dict[str, list[int]]] = {}
     # The key this connection's last `/peer?key=` request gave (a handler serves one connection).
     _peer_key: str | None = None
+    # Per-key `Authorization` of every request `/rejects-first-token-then-flaky` got, in order.
+    _seen_authorizations: ClassVar[dict[str, list[str]]] = {}
 
     def _client_port(self) -> int:
         _, port = self.client_address
@@ -267,6 +269,23 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: a\r\n\r\n")
         self.wfile.write(b"data: b\n\n")
         self.wfile.write(b"id\ndata: c\n\n")
+        self.wfile.flush()
+
+    def _write_sse_echo_request(self, query: str) -> None:
+        # `/echo-request` (request line and headers) as an SSE event, for comparing what two
+        # transports send for `sse()`. The first connection (per `key`) then dies mid-stream, so
+        # the client reconnects with `Last-Event-ID`, which is echoed too before a clean close.
+        attempt = self._bump_counter(parse_qs(query)["key"][0])
+        headers = [[name, value] for name, value in self.headers.items()]
+        record = (
+            f"id: {attempt}\ndata: {json.dumps({'line': self.requestline, 'headers': headers})}\n\n"
+        )
+        if attempt == 1:
+            self._start_sse_response(chunked=True)
+            self._write_sse_chunk(record)
+            return
+        self._start_sse_response()
+        self.wfile.write(record.encode())
         self.wfile.flush()
 
     def _handle_read_item(self, item_id: str) -> None:
@@ -522,6 +541,19 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
         time.sleep(seconds)
 
+    def _handle_stall_unframed(self, query: str) -> None:
+        # `_handle_stall_after_first_chunk` with no Content-Length and no chunking, so the body
+        # ends where the connection does: a client that sees its socket closed during the
+        # silence has what looks like a whole body, and must not take it for one.
+        seconds = float(parse_qs(query).get("seconds", ["1"])[0])
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.end_headers()
+        self.wfile.write(b"first")
+        self.wfile.flush()
+        time.sleep(seconds)
+
     def _handle_endless(self, query: str) -> None:
         # Streams chunks until the client hangs up, then counts the hang-up (per `key`), so a
         # test can assert that closing a stream early really releases its connection.
@@ -538,6 +570,63 @@ class TestAppHandler(BaseHTTPRequestHandler):
                 time.sleep(0.005)
         except ConnectionError:
             self._bump_counter(f"{key}-hangups")
+
+    def _handle_large(self, query: str) -> None:
+        # `size` bytes in 64KB writes, counting how many it has written so far (per `key`, read
+        # back from `/hits` as `<key>-written`): a client reading slower than this holds it back
+        # once the socket buffers fill, rather than reading the body into memory ahead of its
+        # caller. Ends when the client hangs up.
+        params = parse_qs(query)
+        written = f"{params['key'][0]}-written"
+        size = int(params["size"][0])
+        block = bytes(64 * 1024)
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        self._counters[written] = 0
+        with contextlib.suppress(ConnectionError):
+            for _ in range(size // len(block)):
+                self.wfile.write(block)
+                self._counters[written] += len(block)
+
+    def _handle_counted_redirect(self, query: str) -> None:
+        # A 302 to `to`, counting every request it gets (per `key`, read back via `/hits`), so a
+        # test can tell how many times the whole chain was started over.
+        params = parse_qs(query)
+        self._bump_counter(params["key"][0])
+        self._write_bodyless(302, {"Location": params["to"][0]})
+
+    def _handle_slow_redirect(self, query: str) -> None:
+        # `/redirect-to`'s 302 to `to`, sent `seconds` late: a hop that takes time of its own.
+        params = parse_qs(query)
+        sleep(float(params["seconds"][0]))
+        self._write_bodyless(302, {"Location": params["to"][0]})
+
+    def _handle_rejects_first_token_then_flaky(self, query: str) -> None:
+        # `/rejects-first-token`'s 401 for `token-1`; any other token gets a 503 for the key's
+        # first `fail_times` requests, then a 200 with every `Authorization` the key has seen.
+        params = parse_qs(query)
+        key = params["key"][0]
+        seen = self._seen_authorizations.setdefault(key, [])
+        seen.append(self.headers.get("Authorization", ""))
+        if seen[-1] == "Bearer token-1":
+            self._write_json(401, {"error": "invalid_token"})
+        elif self._bump_counter(key) <= int(params["fail_times"][0]):
+            self._write_json(503, {"authorizations": seen})
+        else:
+            self._write_json(200, {"authorizations": seen})
+
+    def _handle_compressed_zeros(self, query: str) -> None:
+        # `size` zero bytes, gzipped: a body that compresses so well that decoding a frame of it
+        # in one go would hold all of it at once, where a stream takes it in 4KB pieces.
+        body = gzip.compress(bytes(int(parse_qs(query)["size"][0])), mtime=0)
+        self.send_response(200)
+        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_hits(self, query: str) -> None:
         # Reads back any per-key counter, for routes whose own response can't carry it.
@@ -1019,6 +1108,13 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/always-unauthorized": self._handle_always_unauthorized,
             "/json-literal": self._handle_json_literal,
             "/stall-after-first-chunk": self._handle_stall_after_first_chunk,
+            "/stall-unframed": self._handle_stall_unframed,
+            "/echo-request-sse": self._write_sse_echo_request,
+            "/large": self._handle_large,
+            "/compressed-zeros": self._handle_compressed_zeros,
+            "/redirect-counted": self._handle_counted_redirect,
+            "/slow-redirect": self._handle_slow_redirect,
+            "/rejects-first-token-then-flaky": self._handle_rejects_first_token_then_flaky,
         }
         if parsed.path in query_routes:
             query_routes[parsed.path](parsed.query)

@@ -1,0 +1,324 @@
+//! Sockets for hyper: raw non-blocking `recv`/`send` on a file descriptor Python (async) or Rust
+//! (sync) owns, with readiness coming from wherever the pool waits: the asyncio loop's reader and
+//! writer callbacks (`LoopReady`) or `poll(2)` on the calling thread (`PollReady`).
+use std::cell::Cell;
+use std::io;
+use std::os::fd::RawFd;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
+
+use crate::tls::TlsSocket;
+
+/// `recv(2)` into an initialised buffer, retrying on `EINTR`.
+pub(crate) fn recv(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
+    loop {
+        // SAFETY: `buf` is a live, writable slice of exactly `buf.len()` bytes for the whole call,
+        // and recv(2) writes at most that many bytes into it.
+        let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+        if let Ok(n) = usize::try_from(n) {
+            return Ok(n);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// `send(2)`, retrying on `EINTR`. `MSG_NOSIGNAL` so a peer that has gone away is an `EPIPE`
+/// error rather than a `SIGPIPE` (Python ignores it anyway, embedders might not).
+pub(crate) fn send(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
+    loop {
+        // SAFETY: `buf` is a live, readable slice of exactly `buf.len()` bytes for the whole call,
+        // and send(2) only reads from it.
+        let n = unsafe { libc::send(fd, buf.as_ptr().cast(), buf.len(), libc::MSG_NOSIGNAL) };
+        if let Ok(n) = usize::try_from(n) {
+            return Ok(n);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Shut both directions of a socket down, failing whatever hyper is waiting on (EOF/EPIPE) while
+/// leaving the descriptor itself for its owner to close.
+pub(crate) fn shutdown(fd: RawFd) {
+    if fd >= 0 {
+        // SAFETY: shutdown(2) takes no pointers; on a descriptor that is already shut down or
+        // closed it only returns an error, which there is nothing to do about here.
+        unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
+    }
+}
+
+/// Where a socket's readiness comes from. Both pools' sockets go through this, so the plain and
+/// TLS streams are written once.
+pub(crate) trait Readiness: Unpin {
+    /// Whether a `recv` may find data. When it can't, `cx`'s waker is kept for when it may.
+    fn poll_readable(&self, cx: &mut Context<'_>) -> bool;
+    /// A short read emptied the socket, so the next read waits instead of hitting `EAGAIN`.
+    fn mark_drained(&self);
+    /// `recv` said `EAGAIN`: wait (with `cx`'s waker) until the socket is readable again.
+    fn wait_readable(&self, cx: &mut Context<'_>);
+    /// `send` said `EAGAIN`: wait (with `cx`'s waker) until the socket is writable again.
+    fn wait_writable(&self, cx: &mut Context<'_>);
+}
+
+/// One loop-driven socket's readiness. `Cell`s, not `RefCell`s: nothing here can be borrowed
+/// twice, so there is no borrow to fail.
+#[derive(Default)]
+struct LoopFlags {
+    readable: Cell<bool>,
+    read_waker: Cell<Option<Waker>>,
+    write_waker: Cell<Option<Waker>>,
+    /// Whether the pool has been asked to `loop.add_writer` this socket and hasn't heard back.
+    writer_requested: Cell<bool>,
+    /// Whether the pool stopped watching the socket (`loop.remove_reader`) because nothing was
+    /// reading it: a streamed body whose consumer is behind, with data waiting unread.
+    paused: Cell<bool>,
+}
+
+/// Readiness from the asyncio loop: `loop.add_reader` is registered (level-triggered) except
+/// while paused, and `loop.add_writer` only while a send is blocked, both requested through
+/// `readers`/`writers` because only the pool can call into Python.
+///
+/// A paused socket stays marked readable, so the next read goes straight to `recv`; only once that
+/// would block is watching it again requested (`resume`). Without the pause a level-triggered
+/// reader fires on every loop iteration for data hyper won't read yet (its body channel is full),
+/// a busy loop for as long as a streamed body's consumer is slow.
+#[derive(Clone)]
+pub(crate) struct LoopReady {
+    conn: usize,
+    flags: Rc<LoopFlags>,
+    writers: Rc<Cell<Vec<usize>>>,
+    readers: Rc<Cell<Vec<usize>>>,
+}
+
+impl LoopReady {
+    pub(crate) fn new(conn: usize, writers: Rc<Cell<Vec<usize>>>, readers: Rc<Cell<Vec<usize>>>) -> Self {
+        Self { conn, flags: Rc::new(LoopFlags::default()), writers, readers }
+    }
+
+    /// The pool stopped watching the socket (nothing was waiting to read it).
+    pub(crate) fn pause(&self) {
+        self.flags.paused.set(true);
+    }
+
+    /// A read is about to wait: if the socket isn't watched, ask the pool to watch it again.
+    fn resume(&self) {
+        if self.flags.paused.replace(false) {
+            let mut readers = self.readers.take();
+            readers.push(self.conn);
+            self.readers.set(readers);
+        }
+    }
+
+    /// The loop says the socket is readable: the waiting read, if any, should run.
+    pub(crate) fn set_readable(&self) -> Option<Waker> {
+        self.flags.readable.set(true);
+        self.flags.read_waker.take()
+    }
+
+    /// The loop says the socket is writable (its one-shot writer was removed by the pool).
+    pub(crate) fn set_writable(&self) -> Option<Waker> {
+        self.flags.writer_requested.set(false);
+        self.flags.write_waker.take()
+    }
+}
+
+impl Readiness for LoopReady {
+    fn poll_readable(&self, cx: &mut Context<'_>) -> bool {
+        if self.flags.readable.get() {
+            return true;
+        }
+        self.flags.read_waker.set(Some(cx.waker().clone()));
+        self.resume();
+        false
+    }
+
+    fn mark_drained(&self) {
+        self.flags.readable.set(false);
+    }
+
+    fn wait_readable(&self, cx: &mut Context<'_>) {
+        self.flags.readable.set(false);
+        self.flags.read_waker.set(Some(cx.waker().clone()));
+        self.resume();
+    }
+
+    fn wait_writable(&self, cx: &mut Context<'_>) {
+        self.flags.write_waker.set(Some(cx.waker().clone()));
+        if !self.flags.writer_requested.replace(true) {
+            let mut writers = self.writers.take();
+            writers.push(self.conn);
+            self.writers.set(writers);
+        }
+    }
+}
+
+/// Readiness from `poll(2)` on the calling thread: the sync pool's request loop polls the socket
+/// whenever every future is stalled, then re-polls them all, so no waker is needed here.
+#[derive(Clone)]
+pub(crate) struct PollReady(Arc<PollFlags>);
+
+struct PollFlags {
+    readable: AtomicBool,
+    writable: AtomicBool,
+}
+
+impl PollReady {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(PollFlags { readable: AtomicBool::new(false), writable: AtomicBool::new(true) }))
+    }
+
+    pub(crate) fn set_readable(&self) {
+        self.0.readable.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_writable(&self) {
+        self.0.writable.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether a send is blocked, so the next `poll(2)` should also wait for `POLLOUT`.
+    pub(crate) fn wants_writable(&self) -> bool {
+        !self.0.writable.load(Ordering::Relaxed)
+    }
+}
+
+impl Readiness for PollReady {
+    fn poll_readable(&self, _cx: &mut Context<'_>) -> bool {
+        self.0.readable.load(Ordering::Relaxed)
+    }
+
+    fn mark_drained(&self) {
+        self.0.readable.store(false, Ordering::Relaxed);
+    }
+
+    fn wait_readable(&self, _cx: &mut Context<'_>) {
+        self.0.readable.store(false, Ordering::Relaxed);
+    }
+
+    fn wait_writable(&self, _cx: &mut Context<'_>) {
+        self.0.writable.store(false, Ordering::Relaxed);
+    }
+}
+
+/// A plain TCP socket for hyper.
+pub(crate) struct PlainSocket<R> {
+    fd: RawFd,
+    ready: R,
+}
+
+impl<R: Readiness> hyper::rt::Read for PlainSocket<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        mut buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        if !self.ready.poll_readable(cx) {
+            return Poll::Pending;
+        }
+        let (n, capacity) = loop {
+            // SAFETY: only the uninitialised tail is handed to recv(2), which writes into it and
+            // never reads it; `advance(n)` below then marks exactly the `n` bytes it wrote.
+            let dst = unsafe { buf.as_mut() };
+            let capacity = dst.len();
+            // SAFETY: `dst` is a live, writable region of `capacity` bytes for the whole call.
+            let n = unsafe { libc::recv(self.fd, dst.as_mut_ptr().cast(), capacity, 0) };
+            if let Ok(n) = usize::try_from(n) {
+                break (n, capacity);
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => {}
+                io::ErrorKind::WouldBlock => {
+                    self.ready.wait_readable(cx);
+                    return Poll::Pending;
+                }
+                _ => return Poll::Ready(Err(error)),
+            }
+        };
+        // A short read drained the socket: skip the recv that would only say EAGAIN. Readiness
+        // is level-triggered, so data that arrives later re-arms it.
+        if n > 0 && n < capacity {
+            self.ready.mark_drained();
+        }
+        // SAFETY: recv(2) initialised exactly `n` bytes at the start of the region above.
+        unsafe { buf.advance(n) };
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<R: Readiness> hyper::rt::Write for PlainSocket<R> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        match send(self.fd, buf) {
+            Ok(n) => Poll::Ready(Ok(n)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                self.ready.wait_writable(cx);
+                Poll::Pending
+            }
+            Err(error) => Poll::Ready(Err(error)),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// What hyper's connection runs over: one type for plain and TLS, so both pools hold a single
+/// `SendRequest`/`Connection` type.
+pub(crate) enum Stream<R> {
+    Plain(PlainSocket<R>),
+    Tls(Box<TlsSocket<R>>),
+}
+
+impl<R: Readiness> Stream<R> {
+    pub(crate) fn plain(fd: RawFd, ready: R) -> Self {
+        Self::Plain(PlainSocket { fd, ready })
+    }
+}
+
+impl<R: Readiness> hyper::rt::Read for Stream<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(socket) => Pin::new(socket).poll_read(cx, buf),
+            Self::Tls(socket) => Pin::new(socket.as_mut()).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<R: Readiness> hyper::rt::Write for Stream<R> {
+    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(socket) => Pin::new(socket).poll_write(cx, buf),
+            Self::Tls(socket) => Pin::new(socket.as_mut()).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(socket) => Pin::new(socket).poll_flush(cx),
+            Self::Tls(socket) => Pin::new(socket.as_mut()).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(socket) => Pin::new(socket).poll_shutdown(cx),
+            Self::Tls(socket) => Pin::new(socket.as_mut()).poll_shutdown(cx),
+        }
+    }
+}
