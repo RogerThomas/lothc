@@ -374,8 +374,22 @@ def _open_and_close_sync(client: SyncHTTPClient) -> None:
         {"max_connections": 0},
         {"default_headers": {"bad name": "value"}},
         {"timeout": -1.0},
+        {"user_agent": "a\nb"},
+        {"identity_pem": b"identity-pem"},
+        {"max_tls_version": "TLSv1.1"},
+        {"min_tls_version": "TLSv1.3", "max_tls_version": "TLSv1.2"},
     ],
-    ids=["local_address", "resolve", "max_connections", "default_headers", "timeout"],
+    ids=[
+        "local_address",
+        "resolve",
+        "max_connections",
+        "default_headers",
+        "timeout",
+        "user_agent",
+        "identity_pem",
+        "max_tls_version",
+        "min_above_max_tls_version",
+    ],
 )
 async def test_unusable_settings_raise_value_error_by_the_time_the_client_opens(
     settings: dict[str, Any],
@@ -395,8 +409,22 @@ async def test_unusable_settings_raise_value_error_by_the_time_the_client_opens(
         {"max_connections": 0},
         {"default_headers": {"bad name": "value"}},
         {"timeout": -1.0},
+        {"user_agent": "a\nb"},
+        {"identity_pem": b"identity-pem"},
+        {"max_tls_version": "TLSv1.1"},
+        {"min_tls_version": "TLSv1.3", "max_tls_version": "TLSv1.2"},
     ],
-    ids=["local_address", "resolve", "max_connections", "default_headers", "timeout"],
+    ids=[
+        "local_address",
+        "resolve",
+        "max_connections",
+        "default_headers",
+        "timeout",
+        "user_agent",
+        "identity_pem",
+        "max_tls_version",
+        "min_above_max_tls_version",
+    ],
 )
 def test_sync_unusable_settings_raise_value_error_by_the_time_the_client_opens(
     settings: dict[str, Any],
@@ -405,6 +433,46 @@ def test_sync_unusable_settings_raise_value_error_by_the_time_the_client_opens(
         _open_and_close_sync(SyncHTTPClient(**settings))
 
     assert not type(exc_info.value).__module__.startswith("pyreqwest")
+
+
+# pyreqwest's `BuilderError` from building the client is re-raised as a plain `ValueError` with
+# its message and causes in one line, chained to the original.
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        ({"max_tls_version": "TLSv1.1"}, "builder error: empty supported tls versions"),
+        ({"user_agent": "a\nb"}, "builder error: failed to parse header value"),
+    ],
+    ids=["max_tls_version", "user_agent"],
+)
+async def test_a_client_build_error_is_a_plain_value_error_with_pyreqwests_message(
+    settings: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValueError, match="builder error") as exc_info:
+        await _open_and_close(HTTPClient(**settings))
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == message
+    assert exc_info.value.__cause__ is not None
+
+
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        ({"max_tls_version": "TLSv1.1"}, "builder error: empty supported tls versions"),
+        ({"user_agent": "a\nb"}, "builder error: failed to parse header value"),
+    ],
+    ids=["max_tls_version", "user_agent"],
+)
+def test_sync_a_client_build_error_is_a_plain_value_error_with_pyreqwests_message(
+    settings: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValueError, match="builder error") as exc_info:
+        _open_and_close_sync(SyncHTTPClient(**settings))
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == message
+    assert exc_info.value.__cause__ is not None
 
 
 def test_sync_local_address_is_the_address_connections_come_from(base_url: str) -> None:

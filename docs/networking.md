@@ -72,6 +72,11 @@ in production.
 Like `timeout`, these are all client-level only — set once on the client, no per-call override,
 since a TLS/connection identity belongs to the underlying connection, not a single request.
 
+lothc uses rustls, which has no TLS 1.0 or 1.1. As a minimum they allow everything it has; as a
+maximum (or a minimum above the maximum) they leave no version at all, so opening the client
+raises `ValueError("builder error: empty supported tls versions")`. An unusable `identity_pem`
+or a `user_agent` that isn't a valid header value fails the same way, as a plain `ValueError`.
+
 ## DNS overrides, source address and keepalive
 
 ```python

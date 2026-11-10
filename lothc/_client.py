@@ -287,6 +287,19 @@ def _translate_transport_error(
     return HTTPTransportError(str(error))
 
 
+def _client_build_error(error: PyreqwestBuilderError) -> ValueError:
+    """pyreqwest's `BuilderError` from building a client (a TLS version range rustls can't
+    satisfy, an unusable `identity_pem`, a `user_agent` that isn't a valid header value) as a
+    plain `ValueError`, so no pyreqwest type reaches the caller.
+
+    The message is pyreqwest's own, with its causes after it on one line
+    (`builder error: empty supported tls versions`), which is also what the native transport
+    raises. `BuilderError` already subclasses `ValueError`, so `except ValueError` still works.
+    """
+    causes = [cause["message"] for cause in error.details["causes"] or []]
+    return ValueError(": ".join([error.message, *(c for c in causes if c != error.message)]))
+
+
 @contextmanager
 def _atomic_download_file(dest: Path) -> Generator[BufferedWriter]:
     """A file to stream a download into that only becomes `dest` once the body is complete.
@@ -554,6 +567,21 @@ def _bearer_token_sent(request: Request) -> str | None:
     return sent.removeprefix("Bearer ")
 
 
+def _replayable_copy(request: Request) -> Request | None:
+    """A copy of `request` to send while the original is kept for a replay, or `None` when its
+    body can't be copied: a multipart `form=` body, which reqwest streams (`Body::try_clone` has
+    nothing to clone), so pyreqwest's `copy()` raises `RuntimeError: Failed to clone request`.
+
+    `None` means "send the original once": reqwest's own retry policy skips a request whose body
+    it can't clone the same way, and failing the whole call, before anything is sent, only
+    because a retry *might* be needed made `form=` unusable on any client with retries.
+    """
+    try:
+        return request.copy()
+    except RuntimeError:
+        return None
+
+
 @dataclass
 class _ReauthMiddleware:
     """On a 401, discard the token that was rejected; for an idempotent verb, also get a fresh one
@@ -573,12 +601,13 @@ class _ReauthMiddleware:
         sent = _bearer_token_sent(request)
         if sent is None:
             return await next.run(request)
-        retryable = request.method in self.retry_methods
-        response = await next.run(request.copy() if retryable else request)
+        # `None` (not replayed) for a non-idempotent verb, or a body that can't be copied.
+        replay = _replayable_copy(request) if request.method in self.retry_methods else None
+        response = await next.run(request if replay is None else replay)
         if response.status != 401:
             return response
         self.auth.invalidate(sent)
-        if not retryable:
+        if replay is None:
             return response
         request.headers["authorization"] = f"Bearer {await self.auth()}"
         return await next.run(request)
@@ -595,12 +624,13 @@ class _SyncReauthMiddleware:
         sent = _bearer_token_sent(request)
         if sent is None:
             return next.run(request)
-        retryable = request.method in self.retry_methods
-        response = next.run(request.copy() if retryable else request)
+        # `None` (not replayed) for a non-idempotent verb, or a body that can't be copied.
+        replay = _replayable_copy(request) if request.method in self.retry_methods else None
+        response = next.run(request if replay is None else replay)
         if response.status != 401:
             return response
         self.auth.invalidate(sent)
-        if not retryable:
+        if replay is None:
             return response
         request.headers["authorization"] = f"Bearer {self.auth()}"
         return next.run(request)
@@ -620,8 +650,12 @@ class _RetryMiddleware:
         if request.method not in self.retry_methods:
             return await next.run(request)
         for attempt in range(self.max_retries + 1):
+            # Only the first attempt can find the body uncopyable: a later one means it copied.
+            attempt_request = _replayable_copy(request)
+            if attempt_request is None:
+                return await next.run(request)
             try:
-                response = await next.run(request.copy())
+                response = await next.run(attempt_request)
             except PyreqwestRequestError as error:
                 if attempt == self.max_retries or not _is_retryable_send_error(error):
                     raise
@@ -651,8 +685,12 @@ class _SyncRetryMiddleware:
         if request.method not in self.retry_methods:
             return next.run(request)
         for attempt in range(self.max_retries + 1):
+            # Only the first attempt can find the body uncopyable: a later one means it copied.
+            attempt_request = _replayable_copy(request)
+            if attempt_request is None:
+                return next.run(request)
             try:
-                response = next.run(request.copy())
+                response = next.run(attempt_request)
             except PyreqwestRequestError as error:
                 if attempt == self.max_retries or not _is_retryable_send_error(error):
                     raise
@@ -1604,6 +1642,22 @@ def _encode_params(params: Params) -> Mapping[str, _QueryValue]:
             return cast("Mapping[str, _QueryValue]", params)
 
 
+def _exact_query_value(
+    value: str | int | float | bool,  # noqa: FBT001 — a query value, not a flag
+) -> str | int | float | bool:
+    """`value` as pyreqwest's query/form encoder must get it to send it exactly: an `int` outside
+    the signed 64-bit range as its own digits (pyreqwest turns one into a float, so `2**63` went
+    out as `9.223372036854776e18`), anything else unchanged. A `bool` is an `int` in range, so it
+    still goes out as `true`/`false`.
+
+    >>> [_exact_query_value(v) for v in (2**63, -(2**63) - 1, 2**63 - 1, True, 1.5, "a")]
+    ['9223372036854775808', '-9223372036854775809', 9223372036854775807, True, 1.5, 'a']
+    """
+    if isinstance(value, int) and not -(2**63) <= value < 2**63:
+        return str(value)
+    return value
+
+
 def _query_pairs(params: Mapping[str, _QueryValue]) -> list[tuple[str, str | int | float | bool]]:
     """Expands an `_encode_params`-normalized `Params` mapping into the flat list-of-pairs shape
     pyreqwest's `RequestBuilder.query()` actually needs to produce a repeated query key on the
@@ -1614,13 +1668,16 @@ def _query_pairs(params: Mapping[str, _QueryValue]) -> list[tuple[str, str | int
     inconsistency between the two pyreqwest APIs, not something to build on. A flat
     `Sequence[tuple[str, QueryPrimitive]]` works for `.query()`, so that's the shape used here. A
     `list`/`tuple` value means "repeat this query param once per element" — see `Params`'s own
-    doc comment above."""
+    doc comment above. Every value goes through `_exact_query_value`, so an `int` too big for
+    64 bits isn't sent as a float. Shared by `params=`, `data=` and `lothc.testing`'s `params=`
+    matching, so all three agree on every value's wire string."""
     pairs: list[tuple[str, str | int | float | bool]] = []
     for name, value in params.items():
-        if isinstance(value, list | tuple):
-            pairs.extend((name, item) for item in value)
+        # A tuple of types, not `list | tuple`: ~100ns faster per value, on every request's params.
+        if isinstance(value, (list, tuple)):
+            pairs.extend((name, _exact_query_value(item)) for item in value)
         else:
-            pairs.append((name, value))
+            pairs.append((name, _exact_query_value(value)))
     return pairs
 
 
@@ -2729,8 +2786,12 @@ class HTTPClient:
             builder = builder.with_middleware(
                 _ReauthMiddleware(self._bearer_auth, self._default_retry_methods)
             )
+        try:
+            pyreqwest_client = builder.build()
+        except PyreqwestBuilderError as error:
+            raise _client_build_error(error) from error
         stack = AsyncExitStack()
-        self._pyreqwest_client = await stack.enter_async_context(builder.build())
+        self._pyreqwest_client = await stack.enter_async_context(pyreqwest_client)
         self._exit_stack = stack
         return self
 
@@ -3846,7 +3907,10 @@ class HTTPClient:
                 request_builder, params, headers, effective_timeout, skip_auth=skip_auth
             )
             if state.last_event_id:
-                request_builder = request_builder.header("last-event-id", state.last_event_id)
+                # `.headers()` replaces a same-named value where `.header()` appends one, so a
+                # caller's own `Last-Event-ID` (sent as-is until this stream has seen an id)
+                # gives way to the tracked one instead of going out beside it.
+                request_builder = request_builder.headers({"last-event-id": state.last_event_id})
             connection = self._sse_connection(
                 request_builder,
                 state,
@@ -4702,8 +4766,12 @@ class SyncHTTPClient:
             builder = builder.with_middleware(
                 _SyncReauthMiddleware(self._bearer_auth, self._default_retry_methods)
             )
+        try:
+            pyreqwest_client = builder.build()
+        except PyreqwestBuilderError as error:
+            raise _client_build_error(error) from error
         stack = ExitStack()
-        self._pyreqwest_client = stack.enter_context(builder.build())
+        self._pyreqwest_client = stack.enter_context(pyreqwest_client)
         self._exit_stack = stack
         return self
 
@@ -5814,7 +5882,10 @@ class SyncHTTPClient:
                 request_builder, params, headers, effective_timeout, skip_auth=skip_auth
             )
             if state.last_event_id:
-                request_builder = request_builder.header("last-event-id", state.last_event_id)
+                # `.headers()` replaces a same-named value where `.header()` appends one, so a
+                # caller's own `Last-Event-ID` (sent as-is until this stream has seen an id)
+                # gives way to the tracked one instead of going out beside it.
+                request_builder = request_builder.headers({"last-event-id": state.last_event_id})
             connection = self._sse_connection(
                 request_builder,
                 state,

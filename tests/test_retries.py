@@ -707,6 +707,54 @@ def test_sync_a_retried_put_resends_the_same_raw_body(base_url: str, server_key:
     assert result == {"attempts": 2, "bodies": ["content", "content"]}
 
 
+# A multipart `form=` body is streamed, so it can't be replayed: on a retried verb it is sent once,
+# the way reqwest's own retry policy treats a body it can't clone, rather than failing to send.
+async def test_a_form_put_on_a_client_with_retries_is_sent(base_url: str, server_key: str) -> None:
+    async with HTTPClient(base_url=base_url, max_retries=1, backoff_base=0.001) as client:
+        result = (
+            await client.put(
+                "status-then-ok", params={"key": server_key}, form={"a": "b"}, into=dict
+            )
+        ).data
+
+    assert result["attempts"] == 1
+    assert 'name="a"' in result["bodies"][0]
+
+
+def test_sync_a_form_put_on_a_client_with_retries_is_sent(base_url: str, server_key: str) -> None:
+    with SyncHTTPClient(base_url=base_url, max_retries=1, backoff_base=0.001) as client:
+        result = client.put(
+            "status-then-ok", params={"key": server_key}, form={"a": "b"}, into=dict
+        ).data
+
+    assert result["attempts"] == 1
+    assert 'name="a"' in result["bodies"][0]
+
+
+async def test_a_form_put_is_not_retried(base_url: str, server_key: str) -> None:
+    async with HTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
+        with pytest.raises(HTTPResponseError) as exc_info:
+            await client.put(
+                "status-then-ok", params={"key": server_key, "fail_times": 1}, form={"a": "b"}
+            )
+        hits = (await client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert exc_info.value.status == 503
+    assert hits == {"hits": 1}
+
+
+def test_sync_a_form_put_is_not_retried(base_url: str, server_key: str) -> None:
+    with SyncHTTPClient(base_url=base_url, max_retries=2, backoff_base=0.001) as client:
+        with pytest.raises(HTTPResponseError) as exc_info:
+            client.put(
+                "status-then-ok", params={"key": server_key, "fail_times": 1}, form={"a": "b"}
+            )
+        hits = client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert exc_info.value.status == 503
+    assert hits == {"hits": 1}
+
+
 async def test_a_timed_out_attempt_is_retried_with_its_own_timeout(base_url: str) -> None:
     # Three attempts of 0.05s each: the floor proves the timeouts were retried, the ceiling that
     # each attempt got its own `timeout` rather than one shared across the call. The server

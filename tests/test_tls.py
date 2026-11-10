@@ -330,7 +330,8 @@ def test_sync_identity_pem_works_with_danger_accept_invalid_certs(
 
 
 # Checked when the client is opened, not on the first HTTPS request, so a plain-HTTP client fails
-# too. Any `ValueError` will do: the message is pyreqwest's, not part of lothc's contract.
+# too. Any message will do (it is pyreqwest's), but the type is a plain `ValueError`, never
+# pyreqwest's own `BuilderError`.
 @pytest.mark.parametrize(
     "case", ["no-pem", "cert-only", "key-only", "other-key", "public-key-section"]
 )
@@ -339,9 +340,11 @@ async def test_unusable_identity_pem_raises_value_error_on_entry(
 ) -> None:
     client = HTTPClient(base_url=base_url, identity_pem=_unusable_identity_pem(case, tls_ca))
 
-    with pytest.raises(ValueError):  # noqa: PT011
+    with pytest.raises(ValueError) as exc_info:  # noqa: PT011
         async with client:
             pass
+
+    assert type(exc_info.value) is ValueError
 
 
 @pytest.mark.parametrize(
@@ -352,8 +355,10 @@ def test_sync_unusable_identity_pem_raises_value_error_on_entry(
 ) -> None:
     client = SyncHTTPClient(base_url=base_url, identity_pem=_unusable_identity_pem(case, tls_ca))
 
-    with pytest.raises(ValueError), client:  # noqa: PT011
+    with pytest.raises(ValueError) as exc_info, client:  # noqa: PT011
         pass
+
+    assert type(exc_info.value) is ValueError
 
 
 async def test_min_tls_version_above_the_server_max_raises_connection_error(
@@ -496,8 +501,8 @@ def test_sync_min_tls_version_below_what_rustls_supports_allows_every_version(
 
 
 # A range leaving rustls no version (a TLS 1.0/1.1 maximum, or a minimum above the maximum) fails
-# before any request, even on a plain-HTTP client: when it is built or, at the latest, opened.
-# Any `ValueError` will do, as above.
+# before any request, even on a plain-HTTP client, when it is opened: a plain `ValueError` with
+# pyreqwest's message, never pyreqwest's own `BuilderError`.
 @pytest.mark.parametrize(
     ("min_tls_version", "max_tls_version"),
     [(None, "TLSv1.0"), (None, "TLSv1.1"), ("TLSv1.0", "TLSv1.1"), ("TLSv1.3", "TLSv1.2")],
@@ -505,11 +510,13 @@ def test_sync_min_tls_version_below_what_rustls_supports_allows_every_version(
 async def test_tls_versions_rustls_cannot_satisfy_raise_value_error(
     base_url: str, min_tls_version: TlsVersion | None, max_tls_version: TlsVersion
 ) -> None:
-    with pytest.raises(ValueError):  # noqa: PT011
+    with pytest.raises(ValueError, match=r"^builder error: empty supported tls versions$") as exc:
         async with HTTPClient(
             base_url=base_url, min_tls_version=min_tls_version, max_tls_version=max_tls_version
         ):
             pass
+
+    assert type(exc.value) is ValueError
 
 
 @pytest.mark.parametrize(
@@ -520,12 +527,14 @@ def test_sync_tls_versions_rustls_cannot_satisfy_raise_value_error(
     base_url: str, min_tls_version: TlsVersion | None, max_tls_version: TlsVersion
 ) -> None:
     with (
-        pytest.raises(ValueError),  # noqa: PT011
+        pytest.raises(ValueError, match=r"^builder error: empty supported tls versions$") as exc,
         SyncHTTPClient(
             base_url=base_url, min_tls_version=min_tls_version, max_tls_version=max_tls_version
         ),
     ):
         pass
+
+    assert type(exc.value) is ValueError
 
 
 async def test_https_only_allows_an_https_request(https_base_url: str, tls_ca_pem: bytes) -> None:

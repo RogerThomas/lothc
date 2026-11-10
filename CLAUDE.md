@@ -416,6 +416,12 @@ directional only.
   Both spellings work, since `Params` has no other meaning for a list to protect. pyreqwest's
   `.query()` rejects a mapping with a list value (`BuilderError: unsupported value`) despite its
   stub allowing it, so `_query_pairs` flattens to pairs first.
+- **An `int` outside the signed 64-bit range goes out as `str(n)`** (`_exact_query_value`, in
+  `_query_pairs`). pyreqwest's `.query()`/`.form()`/`Url.parse_with_params` turn one into a
+  float, so `2**64 - 1` (a `uint64` id) went out as `1.8446744073709552e19`. `lothc.testing`'s
+  `params=` matching runs through `_query_pairs` too, or a mock would expect the float (and match
+  `2**64 + 1` against `2**64`). Only the out-of-range case is rewritten: every other value, `bool`
+  included, keeps pyreqwest's own wire string.
 - **A `Form` repeat tuple must be homogeneous.** `tuple[_FormValue, ...]` admitted
   `(b"...", "image/png")`, which reads as a file plus its content type but has no filename, and
   went out as a binary part *plus* a text part. `_FormRepeat` is a union of four homogeneous
@@ -611,6 +617,12 @@ directional only.
   `BuilderError` (from `.build()`/`.build_streamed()`) aren't `TransportError` subclasses but are
   caught alongside it and mapped to plain `HTTPTransportError`. `_send`/`_send_sync` take the
   unbuilt builder and call `.build()` inside their own `try`.
+- **A client build's `BuilderError` is a plain `ValueError`** (`_client_build_error`, around
+  `builder.build()` in `__aenter__`/`__enter__`): a TLS 1.0/1.1 maximum or a minimum above the
+  maximum (rustls has neither version), some unusable `identity_pem`s, a `user_agent` with a
+  newline. A settings mistake, not a transport failure, so not `HTTPTransportError`. The message
+  is pyreqwest's plus its causes (`builder error: empty supported tls versions`), matching the
+  native transport's; `__cause__` is the original.
 - **Status errors are separate from transport errors.** `HTTPResponseError` (a 4xx/5xx with a
   `body_start` snippet) and `HTTPTransportError` (no response at all) are different failure
   classes; don't unify them.
@@ -627,6 +639,15 @@ directional only.
   "error reading a body from connection" (truncation always has it, corrupt gzip/br/deflate/zstd
   never do). When testing: a "corrupt" gzip body under gzip's 10-byte header comes back as a
   `ReadError`.
+- **A multipart `form=` request is sent once, never retried or re-authenticated.** reqwest streams
+  a multipart body, so pyreqwest's `request.copy()` raises `RuntimeError: Failed to clone
+  request`, and both middlewares copied before every attempt: any `form=` call on a retried verb
+  failed before sending, even when the first attempt would have succeeded. `_replayable_copy`
+  returns `None` for that, and the middleware then sends the original once, as reqwest's own
+  retry policy skips a body it can't clone. Rejected: encoding the multipart body to bytes in
+  lothc (a second implementation of reqwest's multipart writer, buffering a `Path` upload in
+  memory). `request.body` is `None` for a multipart body (and for `data=`), so attempting the copy
+  is the only way to tell.
 
 ### Streaming, SSE and downloads
 
@@ -660,7 +681,9 @@ directional only.
 - **`sse()` reconnects per the WHATWG EventSource model**, in `_sse_stream` itself (the retry
   middleware wraps `send()`, which returns once headers arrive). On a transport error it reconnects
   with `Last-Event-ID` until `max_reconnects` *consecutive* reconnects yield no event (reset on
-  every event; `None` unlimited, `0` fail fast). A clean close returns unless
+  every event; `None` unlimited, `0` fail fast). The tracked id is set with `.headers()`, which
+  replaces a caller's own `Last-Event-ID` (`.header()` appended, sending the stale one first);
+  until an id is seen, the caller's goes out as is. A clean close returns unless
   `reconnect_on_close=True`; a 204 always returns. `id:` persists until an explicit empty `id:`;
   `retry:` overrides the delay mid-stream; all three line terminators work across chunk splits; a
   leading BOM is stripped once per connection; a non-204 2xx with the wrong Content-Type raises
