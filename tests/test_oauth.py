@@ -1,19 +1,24 @@
 import asyncio
 import base64
 import json
+import re
+import socket
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote
 
 import msgspec
 import pytest
 from _helpers import echoed_headers
 from _oauth_server import TokenEndpoint, TokenServer
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from lothc import (
     HTTPClient,
+    HTTPConnectionError,
     HTTPResponseError,
     OAuthProvider,
     OAuthTokenError,
@@ -1445,3 +1450,178 @@ async def test_failing_to_mark_the_token_cache_expired_warns_rather_than_raises(
         token_server.cache_dir.chmod(0o700)
 
     assert await provider() == "token-2"
+
+
+def _closed_port_token_url() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"http://127.0.0.1:{port}/oauth/token"
+
+
+async def test_an_unreachable_token_endpoint_is_an_oauth_token_error(base_url: str) -> None:
+    token_url = _closed_port_token_url()
+    provider = OAuthProvider(
+        token_url=token_url, client_id="client-id", client_secret="client-secret"
+    )
+
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        with pytest.raises(OAuthTokenError) as error_info:
+            await _bearer(api)
+
+    assert error_info.value.token_url == token_url
+    assert isinstance(error_info.value.__cause__, HTTPConnectionError)
+
+
+def test_sync_an_unreachable_token_endpoint_is_an_oauth_token_error(base_url: str) -> None:
+    token_url = _closed_port_token_url()
+    provider = SyncOAuthProvider(
+        token_url=token_url, client_id="client-id", client_secret="client-secret"
+    )
+
+    with (
+        SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api,
+        pytest.raises(OAuthTokenError) as error_info,
+    ):
+        _sync_bearer(api)
+
+    assert error_info.value.token_url == token_url
+    assert isinstance(error_info.value.__cause__, HTTPConnectionError)
+
+
+@pytest.mark.parametrize("broken", ["not-json", "no-access-token"])
+async def test_a_200_without_a_usable_token_is_an_oauth_token_error(
+    base_url: str, token_server: TokenServer, broken: Literal["not-json", "no-access-token"]
+) -> None:
+    endpoint = TokenEndpoint(path="oauth/token-broken", broken=broken)
+    provider = token_server.provider(endpoint)
+
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        with pytest.raises(OAuthTokenError) as error_info:
+            await _bearer(api)
+
+    assert error_info.value.token_url == token_server.url(endpoint)
+    assert error_info.value.__cause__ is not None
+
+
+@pytest.mark.parametrize("broken", ["not-json", "no-access-token"])
+def test_sync_a_200_without_a_usable_token_is_an_oauth_token_error(
+    base_url: str, token_server: TokenServer, broken: Literal["not-json", "no-access-token"]
+) -> None:
+    endpoint = TokenEndpoint(path="oauth/token-broken", broken=broken)
+    provider = token_server.sync_provider(endpoint)
+
+    with (
+        SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api,
+        pytest.raises(OAuthTokenError) as error_info,
+    ):
+        _sync_bearer(api)
+
+    assert error_info.value.token_url == token_server.url(endpoint)
+    assert error_info.value.__cause__ is not None
+
+
+async def test_a_custom_token_response_model_rejecting_the_body_is_an_oauth_token_error(
+    base_url: str, token_server: TokenServer
+) -> None:
+    # A JSON body with no `accessToken`, so `_TokenResponse` can't validate it.
+    endpoint = TokenEndpoint(path="oauth/token-broken", broken="no-access-token")
+    provider = OAuthProvider(
+        token_url=token_server.url(endpoint),
+        client_id="client-id",
+        client_secret="client-secret",
+        token_request=_TokenRequest,
+        token_response=_TokenResponse,
+    )
+
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        with pytest.raises(OAuthTokenError) as error_info:
+            await _bearer(api)
+
+    assert isinstance(error_info.value.__cause__, ValidationError)
+
+
+def _cache_file_expected(token_url: str) -> dict[str, object]:
+    return {
+        "token_url": token_url,
+        "client_id": "client-id",
+        "scope": "scope",
+        "access_token": "token-1",
+        "refresh_token": "refresh-1",
+        "expires_in": 3600,
+    }
+
+
+async def test_the_cache_file_records_the_token_and_a_whole_second_utc_expiry(
+    base_url: str, token_server: TokenServer
+) -> None:
+    endpoint = TokenEndpoint(expires_in=3600, with_refresh=True)
+    provider = token_server.provider(endpoint, cached=True, scope="scope")
+    before = datetime.now(UTC).replace(microsecond=0)
+
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        await _bearer(api)
+
+    cached = json.loads(_cache_file(token_server.cache_dir).read_text())
+    expires_at = cached.pop("expires_at")
+    assert cached == _cache_file_expected(token_server.url(endpoint))
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", expires_at)
+    expiry = datetime.fromisoformat(expires_at) - before
+    assert timedelta(seconds=3599) <= expiry <= timedelta(seconds=3610)
+
+
+def test_sync_the_cache_file_records_the_token_and_a_whole_second_utc_expiry(
+    base_url: str, token_server: TokenServer
+) -> None:
+    endpoint = TokenEndpoint(expires_in=3600, with_refresh=True)
+    provider = token_server.sync_provider(endpoint, cached=True, scope="scope")
+    before = datetime.now(UTC).replace(microsecond=0)
+
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        _sync_bearer(api)
+
+    cached = json.loads(_cache_file(token_server.cache_dir).read_text())
+    expires_at = cached.pop("expires_at")
+    assert cached == _cache_file_expected(token_server.url(endpoint))
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", expires_at)
+    expiry = datetime.fromisoformat(expires_at) - before
+    assert timedelta(seconds=3599) <= expiry <= timedelta(seconds=3610)
+
+
+def _make_cached_expiry_naive(cache_file: Path) -> None:
+    cached = json.loads(cache_file.read_text())
+    cached["expires_at"] = cached["expires_at"].removesuffix("Z")
+    cache_file.write_text(json.dumps(cached))
+
+
+async def test_a_cached_expiry_without_a_utc_offset_is_ignored(
+    base_url: str, token_server: TokenServer
+) -> None:
+    # A naive timestamp could be read in any time zone, so the file reads as "no cache".
+    endpoint = TokenEndpoint(expires_in=3600)
+    first_provider = token_server.provider(endpoint, cached=True)
+    async with HTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
+        await _bearer(api)
+    _make_cached_expiry_naive(_cache_file(token_server.cache_dir))
+
+    second_provider = token_server.provider(endpoint, cached=True)
+    async with HTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
+        bearer = await _bearer(api)
+
+    assert bearer == "Bearer token-2"
+
+
+def test_sync_a_cached_expiry_without_a_utc_offset_is_ignored(
+    base_url: str, token_server: TokenServer
+) -> None:
+    endpoint = TokenEndpoint(expires_in=3600)
+    first_provider = token_server.sync_provider(endpoint, cached=True)
+    with SyncHTTPClient(base_url=base_url, bearer_auth=first_provider) as api:
+        _sync_bearer(api)
+    _make_cached_expiry_naive(_cache_file(token_server.cache_dir))
+
+    second_provider = token_server.sync_provider(endpoint, cached=True)
+    with SyncHTTPClient(base_url=base_url, bearer_auth=second_provider) as api:
+        bearer = _sync_bearer(api)
+
+    assert bearer == "Bearer token-2"

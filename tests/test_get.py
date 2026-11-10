@@ -278,3 +278,31 @@ def test_sync_get_decodes_a_top_level_array_with_a_type_adapter(
     items = sync_client.get("json-array", into=TypeAdapter(list[ItemModel])).data
 
     assert [item.id for item in items] == [1, 2]
+
+
+@pytest.mark.parametrize(
+    "headers", [{"bad name": "value"}, {"x-name": "bad\nvalue"}], ids=["name", "value"]
+)
+async def test_an_invalid_header_raises_value_error_before_anything_is_sent(
+    client: HTTPClient, server_key: str, headers: dict[str, str]
+) -> None:
+    with pytest.raises(ValueError, match="header") as exc_info:
+        await client.get("status-then-ok", params={"key": server_key}, headers=headers)
+    hits = (await client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert not type(exc_info.value).__module__.startswith("pyreqwest")
+    assert hits == {"hits": 0}
+
+
+@pytest.mark.parametrize(
+    "headers", [{"bad name": "value"}, {"x-name": "bad\nvalue"}], ids=["name", "value"]
+)
+def test_sync_an_invalid_header_raises_value_error_before_anything_is_sent(
+    sync_client: SyncHTTPClient, server_key: str, headers: dict[str, str]
+) -> None:
+    with pytest.raises(ValueError, match="header") as exc_info:
+        sync_client.get("status-then-ok", params={"key": server_key}, headers=headers)
+    hits = sync_client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert not type(exc_info.value).__module__.startswith("pyreqwest")
+    assert hits == {"hits": 0}

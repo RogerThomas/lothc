@@ -2,17 +2,21 @@
 
 `examples/server.py` (used for manual smoke-testing) reuses this same handler on a fixed port —
 this module is the one canonical server implementation for both. Endpoints: `/items`
-(GET/POST/PUT/PATCH/DELETE/HEAD), `/echo-headers`, `/echo-query`, `/slow`, `/events` (SSE),
+(GET/POST/PUT/PATCH/DELETE/HEAD), `/echo-headers`, `/echo-query`, `/echo-request` (the whole
+request as it arrived, any verb with a body), `/slow`, `/peer` (which connection served it),
+`/events` (SSE),
 `/boom`, `/upload` (multipart), `/oauth/token*` (OAuth 2 token endpoints), plus
 cookie/redirect/retry/streaming/connection-close scenarios used by their own tests.
 """
 
 import contextlib
 import email.policy
+import gzip
 import json
 import socket
 import sys
 import time
+import zlib
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -37,6 +41,76 @@ _server_error_body = {
     "title": "Internal server error",
     "status": 500,
 }
+# `/compressed`'s br and zstd bodies, precomputed (no brotli in the stdlib, and
+# `compression.zstd` is 3.14+): `compressed_payload(name)` for each, then two zstd frames.
+_precompressed = {
+    "br-large": b"b\x8c\x13\x83#\xc1\x8e\xb5X\xc7\xe0\xc81B\xa5\xb7\x08\x88\xd8\xded\xd1\xe9"
+    b"\xab\x169p\xc8\x01\xfb\x81Z\x10I@\x89S\xb5@D_\xd80\x02\x94\xdc\xc1UY-\xb0\xd1\xe5'\x01`\x03",
+    "zstd-large": b'(\xb5/\xfd`v\xc2u\x01\x00$\x02{"encoding": "zstd-large", "text"}\x02\x00C\xc3'
+    b"\x16\x1d \xe5\xf9\x04",
+    "br": b"\x1bm\x00\xf8\x1d\x07v,<\xc6\xe2p\xd6\xa8E\xc4\xe4\xf6&\x8bN_\x80\xc0\x06\x1c"
+    b"\xb8\x04\x14\x04\x08\x03\xd3\xcd\xc0\x034\x00\xa3[\x864\x84Gh",
+    "zstd": b'(\xb5/\xfd \xc0E\x01\x00\xe0{"encoding": "zstd", "text"}\x03\x00\x95\x1d\xc1M'
+    b"\x0b\x1cb\x8e\x01",
+    "zstd-frames": b"(\xb5/\xfd \x079\x00\x00frame-1(\xb5/\xfd \x079\x00\x00frame-2",
+}
+
+
+def compressed_payload(codec: str) -> bytes:
+    """What `/compressed?codec=` decompresses to: 40-65KB for a `-large` codec, many times what
+    a decoder writes per read, a few hundred bytes for the others."""
+    repeat = 5000 if codec.endswith("-large") else 40
+    return json.dumps({"encoding": codec, "text": codec * repeat}).encode()
+
+
+def _with_gzip_flags(member: bytes, flags: int, fields: bytes) -> bytes:
+    # A gzip member's 10-byte header given `flags`, followed by the fields they announce.
+    return member[:3] + bytes([flags]) + member[4:10] + fields + member[10:]
+
+
+def _compressed_body(codec: str) -> bytes:
+    payload = compressed_payload(codec)
+    match codec:
+        case "gzip" | "gzip-large":
+            return gzip.compress(payload, mtime=0)
+        case "gzip-named":
+            # FEXTRA, FNAME and FCOMMENT.
+            fields = b"\x05\x00extra" + b"name\x00" + b"comment\x00"
+            return _with_gzip_flags(gzip.compress(payload, mtime=0), 0x1C, fields)
+        case "deflate" | "deflate-large":
+            return zlib.compress(payload)
+        case "deflate-raw":
+            # Deflate without zlib's 2-byte header and 4-byte checksum.
+            return zlib.compress(payload)[2:-4]
+        case _:
+            return _precompressed[codec]
+
+
+def _flip(body: bytes, index: int) -> bytes:
+    return body[:index] + bytes([body[index] ^ 1]) + body[index + 1 :]
+
+
+def _compressed_shape(complete: bytes, shape: str) -> tuple[list[bytes], int | None]:
+    # The writes `/compressed` makes for `shape=`, and its Content-Length (None: chunked).
+    match shape:
+        case "empty":
+            return [], 0
+        case "trailing":
+            return [complete + b"trailing"], len(complete) + 8
+        case "trailing-later":
+            return [complete, b"trailing"], len(complete) + 8
+        case "truncated":
+            return [complete[:-4]], len(complete) - 4
+        case "cut-off":
+            return [complete[:-4]], len(complete)
+        case "bad-crc":
+            return [_flip(complete, len(complete) - 8)], len(complete)
+        case "bad-length":
+            return [_flip(complete, len(complete) - 4)], len(complete)
+        case "byte-chunks":
+            return [b"1\r\n%c\r\n" % byte for byte in complete] + [b"0\r\n\r\n"], None
+        case _:
+            return [complete], len(complete)
 
 
 class TestAppHandler(BaseHTTPRequestHandler):
@@ -50,6 +124,16 @@ class TestAppHandler(BaseHTTPRequestHandler):
     # assert the wire shape of a token request through a public endpoint, never via provider
     # internals.
     _token_requests: ClassVar[dict[str, list[dict[str, object]]]] = {}
+    # Per-key client ports of the `/peer?key=` connections that have since closed, recorded when
+    # a connection's request loop ends (`handle`) and read back via GET /peer-closed, so a test
+    # can see a client close an idle connection without sending anything on it.
+    _closed_peers: ClassVar[dict[str, list[int]]] = {}
+    # The key this connection's last `/peer?key=` request gave (a handler serves one connection).
+    _peer_key: str | None = None
+
+    def _client_port(self) -> int:
+        _, port = self.client_address
+        return port
 
     def _write_json(
         self, status: int, payload: object, extra_headers: dict[str, str] | None = None
@@ -564,6 +648,41 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_compressed(self, query: str) -> None:
+        # A `codec=` body (see `_compressed_body`) sent as `Content-Encoding: <coding>` (default
+        # the codec up to its first `-`; a repeated `coding=` sends one header each), shaped by
+        # `shape=` (see `_compressed_shape`): `trailing`
+        # adds bytes after the stream in the same write, `trailing-later` in a later one,
+        # `truncated` cuts the stream short with an exact Content-Length, `cut-off` closes the
+        # connection short of it, `byte-chunks` sends one byte per chunk. `extra=1` sends two
+        # more headers after Content-Length.
+        params = parse_qs(query)
+        codec = params.get("codec", ["gzip"])[0]
+        status = int(params.get("status", ["200"])[0])
+        writes, length = _compressed_shape(
+            _compressed_body(codec), params.get("shape", ["complete"])[0]
+        )
+        self.close_connection = params.get("shape") == ["cut-off"]
+        self.send_response(status)
+        for coding in params.get("coding", [codec.split("-")[0]]):
+            self.send_header("Content-Encoding", coding)
+        if length is None:
+            self.send_header("Transfer-Encoding", "chunked")
+        elif status != 204:
+            self.send_header("Content-Length", str(length))
+        if "extra" in params:
+            self.send_header("X-1", "1")
+            self.send_header("X-2", "2")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        for write in writes:
+            self.wfile.write(write)
+            self.wfile.flush()
+            if len(writes) == 2:
+                # `trailing-later`: the trailing bytes arrive in a later read.
+                sleep(0.02)
+
     def _handle_connection_close(self) -> None:
         # Announces the close, so the client must open a new connection for its next request.
         self.close_connection = True
@@ -584,6 +703,19 @@ class TestAppHandler(BaseHTTPRequestHandler):
         sleep(float(parse_qs(query).get("seconds", ["0.5"])[0]))
         self._write_json(200, {"finally": True})
 
+    def _handle_peer(self, query: str) -> None:
+        # Which TCP connection served this request (its client port), for the connection-reuse
+        # tests. `seconds` holds the answer back, so concurrent requests finish in a known order.
+        params = parse_qs(query)
+        sleep(float(params.get("seconds", ["0"])[0]))
+        if "key" in params:
+            self._peer_key = params["key"][0]
+        self._write_json(200, {"port": self._client_port()})
+
+    def _handle_peer_closed(self, query: str) -> None:
+        key = parse_qs(query)["key"][0]
+        self._write_json(200, {"ports": self._closed_peers.get(key, [])})
+
     def _handle_echo_headers(self) -> None:
         headers = [{"name": name, "value": value} for name, value in self.headers.items()]
         self._write_json(200, {"headers": headers})
@@ -592,6 +724,20 @@ class TestAppHandler(BaseHTTPRequestHandler):
         # parse_qs already returns every value as a list (even a single-value key), so a
         # genuinely repeated key round-trips as a multi-element list with no extra handling.
         self._write_json(200, {"query": parse_qs(query)})
+
+    def _handle_echo_request(self) -> None:
+        # The request as it arrived, for the wire-format tests: the raw request line, every
+        # header in arrival order with its casing, and the body as latin-1 (one character per
+        # byte, so any body round-trips through JSON unchanged).
+        length = int(self.headers.get("Content-Length", "0"))
+        self._write_json(
+            200,
+            {
+                "line": self.requestline,
+                "headers": [[name, value] for name, value in self.headers.items()],
+                "body": self.rfile.read(length).decode("latin-1"),
+            },
+        )
 
     def _handle_boom(self) -> None:
         self._write_json(500, _server_error_body)
@@ -602,6 +748,168 @@ class TestAppHandler(BaseHTTPRequestHandler):
     def _handle_boom_large(self) -> None:
         # Longer than `HTTPResponseError.body_start`'s 100 bytes, with a header worth quoting.
         self._write_json(500, {"detail": "x" * 300}, {"X-Request-Id": "request-id"})
+
+    # Routes for the behaviour-contract tests (retry statuses and methods, redirect rules, SSE
+    # field parsing, ...). Each one answers whichever method it's called with, through
+    # `_handle_contract_route` at the top of every `do_*` below.
+
+    # Per-key record of every request body `/status-then-ok` received, oldest first.
+    _received_bodies: ClassVar[dict[str, list[str]]] = {}
+
+    def _drain_body(self) -> bytes:
+        # Read any request body, so a kept-alive connection's next request isn't misread.
+        return self.rfile.read(int(self.headers.get("Content-Length", "0")))
+
+    def _write_bodyless(self, status: int, extra_headers: dict[str, str] | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        for name, value in (extra_headers or {}).items():
+            self.send_header(name, value)
+        self.end_headers()
+
+    def _handle_status_then_ok(self, query: str) -> None:
+        # The key's first `fail_times` requests get `status` (503 by default), later ones a 200
+        # with the attempt number and every body received for the key so far. A HEAD answer has
+        # no body, so a HEAD test reads the attempt count back through `/hits`.
+        params = parse_qs(query)
+        key = params["key"][0]
+        self._received_bodies.setdefault(key, []).append(self._drain_body().decode())
+        attempt = self._bump_counter(key)
+        failed = attempt <= int(params.get("fail_times", ["0"])[0])
+        status = int(params.get("status", ["503"])[0]) if failed else 200
+        if self.command == "HEAD":
+            self._write_bodyless(status)
+        elif failed:
+            self._write_json(status, {"attempt": attempt})
+        else:
+            self._write_json(200, {"attempts": attempt, "bodies": self._received_bodies[key]})
+
+    def _handle_redirect_to(self, query: str) -> None:
+        # A `status` redirect (302 by default) to `to`, which may be another host.
+        # `cookie=name=value` also sets that cookie on the redirect response itself.
+        params = parse_qs(query)
+        self._drain_body()
+        headers = {"Location": params["to"][0]}
+        if "cookie" in params:
+            headers["Set-Cookie"] = f"{params['cookie'][0]}; Path=/"
+        self._write_bodyless(int(params.get("status", ["302"])[0]), headers)
+
+    def _handle_redirect_chain(self, query: str) -> None:
+        # `hops` redirects in a row, then a 200.
+        hops = int(parse_qs(query)["hops"][0])
+        if hops == 0:
+            self._write_json(200, {"hops": "done"})
+        else:
+            self._write_bodyless(302, {"Location": f"/redirect-chain?hops={hops - 1}"})
+
+    def _handle_counted_redirect_loop(self, query: str) -> None:
+        # `/redirect-loop`, counting every request it gets (per `key`, read back via `/hits`).
+        self._bump_counter(parse_qs(query)["key"][0])
+        self._write_bodyless(302, {"Location": f"/redirect-loop-counted?{query}"})
+
+    def _handle_echo_method(self) -> None:
+        # What arrived, so a redirect test can see whether the method and body survived a hop.
+        body = self._drain_body()
+        self._write_json(
+            200,
+            {
+                "method": self.command,
+                "body": body.decode(),
+                "content_type": self.headers.get("Content-Type"),
+            },
+        )
+
+    def _write_sse_fields(self) -> None:
+        # The field rules a naive event-stream parser gets wrong, one record each: a multi-line
+        # `data`, no space and two spaces after the colon, a bare `data` line, a non-numeric
+        # `retry`, an `id` containing NUL, an id-only record, and a final record with no blank
+        # line after it, which the spec discards at EOF.
+        self._start_sse_response()
+        self.wfile.write(
+            b"data: line-1\ndata: line-2\n\n"
+            b"data:no-space\n\n"
+            b"data:  two-spaces\n\n"
+            b"data\n\n"
+            b"retry: soon\ndata: bad-retry\n\n"
+            b"id: a\x00b\ndata: nul-id\n\n"
+            b"id: 5\n\n"
+            b"data: after-id\n\n"
+            b"data: unterminated\n"
+        )
+        self.wfile.flush()
+
+    def _write_sse_echo_accept(self) -> None:
+        # One event whose data is every `Accept` header value the request carried.
+        self._start_sse_response()
+        self.wfile.write(f"data: {json.dumps(self.headers.get_all('Accept') or [])}\n\n".encode())
+        self.wfile.flush()
+
+    def _write_sse_drops(self, query: str) -> None:
+        # The key's first `drops` connections break mid-stream (a chunked body never terminated),
+        # each after one event if `with_event=1`, else after only a comment; the next connection
+        # sends `done` and ends cleanly.
+        params = parse_qs(query)
+        attempt = self._bump_counter(params["key"][0])
+        self._start_sse_response(chunked=True)
+        if attempt > int(params["drops"][0]):
+            self._write_sse_chunk("data: done\n\n")
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        elif params.get("with_event", ["0"])[0] == "1":
+            self._write_sse_chunk(f"id: {attempt}\ndata: dropped-{attempt}\n\n")
+        else:
+            self._write_sse_chunk(": dropped\n\n")
+
+    def _write_sse_then_status(self, query: str) -> None:
+        # The key's first connection: one event, then the connection breaks. Every later one is
+        # refused with `status`.
+        params = parse_qs(query)
+        if self._bump_counter(params["key"][0]) == 1:
+            self._start_sse_response(chunked=True)
+            self._write_sse_chunk("id: 1\ndata: first\n\n")
+        else:
+            self._write_json(int(params["status"][0]), {"refused": True})
+
+    def _handle_oauth_token_broken(self, query: str) -> None:
+        # A token endpoint answering 200 with something that isn't a usable token: `shape=not-json`
+        # (an HTML page) or `shape=no-access-token` (JSON without `access_token`).
+        params = parse_qs(query)
+        self._drain_body()
+        self._record_token_request(params["key"][0], None)
+        if params["shape"][0] == "no-access-token":
+            self._write_json(200, {"token_type": "Bearer", "expires_in": 3600})
+            return
+        body = b"<html>not a token</html>"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_contract_route(self) -> bool:
+        """Serve one of the routes above, whatever the method; `False` if it isn't one of them."""
+        parsed = urlparse(self.path)
+        query_routes = {
+            "/status-then-ok": self._handle_status_then_ok,
+            "/redirect-to": self._handle_redirect_to,
+            "/redirect-chain": self._handle_redirect_chain,
+            "/redirect-loop-counted": self._handle_counted_redirect_loop,
+            "/events-drops": self._write_sse_drops,
+            "/events-then-status": self._write_sse_then_status,
+            "/oauth/token-broken": self._handle_oauth_token_broken,
+        }
+        plain_routes = {
+            "/echo-method": self._handle_echo_method,
+            "/events-fields": self._write_sse_fields,
+            "/events-echo-accept": self._write_sse_echo_accept,
+        }
+        if parsed.path in query_routes:
+            query_routes[parsed.path](parsed.query)
+            return True
+        if parsed.path in plain_routes:
+            plain_routes[parsed.path]()
+            return True
+        return False
 
     def _record_token_request(self, key: str, body: object) -> None:
         self._token_requests.setdefault(key, []).append({
@@ -673,7 +981,16 @@ class TestAppHandler(BaseHTTPRequestHandler):
         key = parse_qs(query)["key"][0]
         self._write_json(200, {"requests": self._token_requests.get(key, [])})
 
+    def handle(self) -> None:
+        try:
+            super().handle()
+        finally:
+            if self._peer_key is not None:
+                self._closed_peers.setdefault(self._peer_key, []).append(self._client_port())
+
     def do_GET(self) -> None:
+        if self._handle_contract_route():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/items":
             self._handle_search_items(parsed.query)
@@ -694,10 +1011,13 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/oauth/token-requests": self._handle_oauth_token_requests,
             "/echo-query": self._handle_echo_query,
             "/slow": self._handle_slow,
+            "/peer": self._handle_peer,
+            "/peer-closed": self._handle_peer_closed,
             "/endless": self._handle_endless,
             "/hits": self._handle_hits,
             "/body-flaky": self._handle_body_flaky,
             "/corrupt-gzip": self._handle_corrupt_gzip,
+            "/compressed": self._handle_compressed,
             "/always-unauthorized": self._handle_always_unauthorized,
             "/json-literal": self._handle_json_literal,
             "/stall-after-first-chunk": self._handle_stall_after_first_chunk,
@@ -707,6 +1027,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             return
         plain_routes = {
             "/echo-headers": self._handle_echo_headers,
+            "/echo-request": self._handle_echo_request,
             "/events-weird": self._write_sse_weird,
             "/events-byte-by-byte": self._write_sse_byte_by_byte,
             "/events-lenient": self._write_sse_lenient_cases,
@@ -743,12 +1064,16 @@ class TestAppHandler(BaseHTTPRequestHandler):
             route()
 
     def do_HEAD(self) -> None:
+        if self._handle_contract_route():
+            return
         parsed = urlparse(self.path)
         if parsed.path.startswith("/items/"):
             self.send_response(200)
             self.send_header("X-Item-Exists", "true")
             self.send_header("Content-Length", "0")
             self.end_headers()
+        elif parsed.path == "/compressed":
+            self._handle_compressed(parsed.query)
         elif parsed.path == "/slow":
             # GET's `/slow` delay with no body, so HEAD's own `.elapsed` can be bracketed too.
             sleep(float(parse_qs(parsed.query).get("seconds", ["0.5"])[0]))
@@ -761,6 +1086,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_OPTIONS(self) -> None:
+        if self._handle_contract_route():
+            return
         # A CORS preflight answer: 204 echoing the request's `Origin`, or 404 for `/missing`.
         parsed = urlparse(self.path)
         if parsed.path == "/flaky":
@@ -776,6 +1103,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:
+        if self._handle_contract_route():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/items":
             self._write_json(200, self._read_json_body())
@@ -792,6 +1121,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self._handle_upload()
         elif parsed.path == "/echo-body":
             self._handle_echo_body()
+        elif parsed.path == "/echo-request":
+            self._handle_echo_request()
         elif parsed.path == "/rejects-first-token":
             self._handle_rejects_first_token()
         elif parsed.path == "/oauth/token":
@@ -804,7 +1135,11 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self._write_json(404, _not_found_body)
 
     def do_PUT(self) -> None:
-        if self.path.startswith("/items/"):
+        if self._handle_contract_route():
+            return
+        if urlparse(self.path).path == "/echo-request":
+            self._handle_echo_request()
+        elif self.path.startswith("/items/"):
             item_id = int(self.path.removeprefix("/items/"))
             body = self._read_json_body()
             self._write_json(200, {"id": item_id, "name": body["name"]})
@@ -812,7 +1147,11 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self._write_json(404, _not_found_body)
 
     def do_PATCH(self) -> None:
-        if self.path.startswith("/items/"):
+        if self._handle_contract_route():
+            return
+        if urlparse(self.path).path == "/echo-request":
+            self._handle_echo_request()
+        elif self.path.startswith("/items/"):
             item_id = int(self.path.removeprefix("/items/"))
             body = self._read_json_body()
             self._write_json(200, {"id": item_id, "name": body["name"]})
@@ -820,11 +1159,15 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self._write_json(404, _not_found_body)
 
     def do_DELETE(self) -> None:
+        if self._handle_contract_route():
+            return
         if self.path.startswith("/items/"):
             item_id = int(self.path.removeprefix("/items/"))
             self._write_json(200, {"id": item_id, "deleted": True})
         elif self.path == "/echo-body":
             self._handle_echo_body()
+        elif urlparse(self.path).path == "/echo-request":
+            self._handle_echo_request()
         else:
             self._write_json(404, _not_found_body)
 

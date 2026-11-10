@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -200,3 +201,53 @@ def test_sync_download_to_file_response_carries_status_and_headers(
 
     assert response.status == 200
     assert response.headers["Content-Length"] == "12"
+
+
+def test_sync_failed_download_leaves_no_partial_file(
+    sync_client: SyncHTTPClient, tmp_path: Path
+) -> None:
+    with pytest.raises(HTTPConnectionError):
+        sync_client.download("truncated-after-first-chunk", dest=tmp_path / "dest")
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_sync_successful_download_replaces_an_existing_file(
+    sync_client: SyncHTTPClient, tmp_path: Path
+) -> None:
+    dest = tmp_path / "dest"
+    dest.write_bytes(b"previous-content")
+
+    sync_client.download("binary", dest=dest)
+
+    assert dest.read_bytes() == b"AAA\nBBB\x00\nCCC"
+    assert list(tmp_path.iterdir()) == [dest]
+
+
+async def test_a_cancelled_download_leaves_no_partial_file(
+    client: HTTPClient, tmp_path: Path
+) -> None:
+    # A one-second stream, cancelled 0.05s in while bytes are still arriving.
+    download = asyncio.create_task(
+        client.download("events", dest=tmp_path / "dest", params={"count": 50, "interval": 0.02})
+    )
+    await asyncio.sleep(0.05)
+    download.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await download
+
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_download_elapsed_covers_the_whole_body(client: HTTPClient) -> None:
+    # Three records 0.02s apart: the headers arrive at once, the body takes about 0.06s.
+    response = await client.download("events", params={"count": 3, "interval": 0.02})
+
+    assert response.elapsed >= 0.04
+
+
+def test_sync_download_elapsed_covers_the_whole_body(sync_client: SyncHTTPClient) -> None:
+    response = sync_client.download("events", params={"count": 3, "interval": 0.02})
+
+    assert response.elapsed >= 0.04

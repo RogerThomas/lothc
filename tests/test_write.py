@@ -475,12 +475,14 @@ async def test_post_with_string_content(client: HTTPClient) -> None:
     result = (await client.post("echo-body", content="hello", into=dict)).data
 
     assert result["body"] == "hello"
+    assert result["content_types"] == []  # unlike httpx, no default text/plain
 
 
 async def test_post_with_bytes_content(client: HTTPClient) -> None:
     result = (await client.post("echo-body", content=b"hello-bytes", into=dict)).data
 
     assert result["body"] == "hello-bytes"
+    assert result["content_types"] == []  # unlike httpx, no default text/plain
 
 
 async def test_post_with_more_than_one_body_kind_raises_value_error(client: HTTPClient) -> None:
@@ -492,12 +494,14 @@ def test_sync_post_with_string_content(sync_client: SyncHTTPClient) -> None:
     result = sync_client.post("echo-body", content="hello", into=dict).data
 
     assert result["body"] == "hello"
+    assert result["content_types"] == []  # unlike httpx, no default text/plain
 
 
 def test_sync_post_with_bytes_content(sync_client: SyncHTTPClient) -> None:
     result = sync_client.post("echo-body", content=b"hello-bytes", into=dict).data
 
     assert result["body"] == "hello-bytes"
+    assert result["content_types"] == []  # unlike httpx, no default text/plain
 
 
 def test_sync_post_with_msgspec_json_body(sync_client: SyncHTTPClient) -> None:
@@ -806,3 +810,61 @@ def test_sync_response_delete_can_send_a_raw_body(sync_client: SyncHTTPClient) -
     result = sync_client.delete("echo-body", content="raw", into=dict)
 
     assert result.data["body"] == "raw"
+
+
+@pytest.mark.parametrize("content", ["# Title", b"# Title"], ids=["str", "bytes"])
+async def test_content_is_sent_with_exactly_the_callers_content_type(
+    client: HTTPClient, content: str | bytes
+) -> None:
+    result = (
+        await client.post(
+            "echo-body", content=content, headers={"content-type": "text/markdown"}, into=dict
+        )
+    ).data
+
+    assert result["body"] == "# Title"
+    assert result["content_types"] == ["text/markdown"]
+
+
+@pytest.mark.parametrize("content", ["# Title", b"# Title"], ids=["str", "bytes"])
+def test_sync_content_is_sent_with_exactly_the_callers_content_type(
+    sync_client: SyncHTTPClient, content: str | bytes
+) -> None:
+    result = sync_client.post(
+        "echo-body", content=content, headers={"content-type": "text/markdown"}, into=dict
+    ).data
+
+    assert result["body"] == "# Title"
+    assert result["content_types"] == ["text/markdown"]
+
+
+class _OptionalFieldModel(BaseModel):
+    a: int
+    b: str | None = None
+
+
+class _OptionalFieldStruct(Struct):
+    a: int
+    b: str | None = None
+
+
+@pytest.mark.parametrize(
+    "data", [_OptionalFieldModel(a=1), _OptionalFieldStruct(a=1)], ids=["pydantic", "msgspec"]
+)
+async def test_data_omits_a_models_none_fields(
+    client: HTTPClient, data: _OptionalFieldModel | _OptionalFieldStruct
+) -> None:
+    result = (await client.post("echo-body", data=data, into=dict)).data
+
+    assert result["body"] == "a=1"
+
+
+@pytest.mark.parametrize(
+    "data", [_OptionalFieldModel(a=1), _OptionalFieldStruct(a=1)], ids=["pydantic", "msgspec"]
+)
+def test_sync_data_omits_a_models_none_fields(
+    sync_client: SyncHTTPClient, data: _OptionalFieldModel | _OptionalFieldStruct
+) -> None:
+    result = sync_client.post("echo-body", data=data, into=dict).data
+
+    assert result["body"] == "a=1"

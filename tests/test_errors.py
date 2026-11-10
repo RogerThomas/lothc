@@ -231,3 +231,32 @@ async def test_a_non_object_json_body_decoded_as_dict_names_what_it_got(
 ) -> None:
     with pytest.raises(ValueError, match=f"got a JSON {kind}"):
         await client.get("json-literal", params={"value": value}, into=dict)
+
+
+async def test_response_error_message_quotes_the_status_and_a_short_body_whole(
+    client: HTTPClient,
+) -> None:
+    with pytest.raises(HTTPResponseError) as exc_info:
+        await client.get("boom")
+
+    body = exc_info.value.body.decode()
+    assert len(body) <= 100
+    assert str(exc_info.value) == f"Request failed with status 500: {body}"
+
+
+async def test_response_error_message_cuts_a_long_body_at_100_bytes(client: HTTPClient) -> None:
+    with pytest.raises(HTTPResponseError) as exc_info:
+        await client.get("boom-large")
+
+    first_100 = exc_info.value.body[:100].decode()
+    assert str(exc_info.value) == f"Request failed with status 500: {first_100}…"
+
+
+def test_sync_response_error_message_cuts_a_long_body_at_100_bytes(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(HTTPResponseError) as exc_info:
+        sync_client.get("boom-large")
+
+    first_100 = exc_info.value.body[:100].decode()
+    assert str(exc_info.value) == f"Request failed with status 500: {first_100}…"

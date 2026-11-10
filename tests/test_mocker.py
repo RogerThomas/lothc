@@ -1,3 +1,4 @@
+import re
 from typing import Any, cast
 
 import pytest
@@ -5,7 +6,7 @@ from msgspec import Struct
 from pydantic import BaseModel, Field
 from pyreqwest.pytest_plugin.mock import ClientMocker
 
-from lothc import CaseInsensitiveDict, HTTPClient, HTTPResponseError, SyncHTTPClient
+from lothc import CaseInsensitiveDict, HTTPClient, HTTPResponseError, SSEEvent, SyncHTTPClient
 from lothc.testing import LOTHCMocker, MockRequest, MockResponse
 
 
@@ -637,3 +638,134 @@ async def test_mock_response_data_encodes_aliases_like_a_real_request(
     result = (await client.get("items/7", into=dict)).data
 
     assert result == {"userId": 7}
+
+
+async def test_add_put_response_returns_its_data(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_put_response(path="/items/7", data={"id": 7, "name": "put"})
+
+    response = await client.put("items/7", json={"name": "put"}, into=dict)
+
+    assert response.data == {"id": 7, "name": "put"}
+
+
+async def test_add_patch_response_returns_its_data(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_patch_response(path="/items/7", data={"id": 7, "name": "patch"})
+
+    response = await client.patch("items/7", json={"name": "patch"}, into=dict)
+
+    assert response.data == {"id": 7, "name": "patch"}
+
+
+async def test_add_delete_response_returns_its_status(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_delete_response(path="/items/7", status=404)
+
+    with pytest.raises(HTTPResponseError) as exc_info:
+        await client.delete("items/7")
+
+    assert exc_info.value.status == 404
+
+
+def test_sync_add_put_patch_and_delete_responses(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_put_response(path="/items/7", data={"verb": "put"})
+    lothc_mocker.add_patch_response(path="/items/7", data={"verb": "patch"})
+    lothc_mocker.add_delete_response(path="/items/7", data={"verb": "delete"})
+
+    assert sync_client.put("items/7", into=dict).data == {"verb": "put"}
+    assert sync_client.patch("items/7", into=dict).data == {"verb": "patch"}
+    assert sync_client.delete("items/7", into=dict).data == {"verb": "delete"}
+
+
+async def test_url_matches_the_whole_url_exactly(
+    base_url: str, client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(url=f"{base_url}items/7", data={"matched": True})
+
+    response = await client.get("items/7", into=dict)
+    with pytest.raises(AssertionError):  # strict, and another path doesn't match
+        await client.get("items/8")
+
+    assert response.data == {"matched": True}
+
+
+async def test_url_matches_a_regular_expression(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(url=re.compile(r"/items/\d+$"), data={"matched": True})
+
+    response = await client.get("items/8", into=dict)
+
+    assert response.data == {"matched": True}
+
+
+async def test_mock_request_body_is_the_bytes_that_were_sent(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_post_response(path="/items")
+
+    await client.post("items", json={"a": 1})
+
+    [seen] = mock.get_requests()
+    assert seen.body == b'{"a":1}'
+
+
+async def test_get_requests_shows_no_body_for_a_bodyless_request(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items/7")
+
+    await client.get("items/7")
+
+    [seen] = mock.get_requests()
+    assert seen.body is None
+
+
+async def test_a_mocked_response_can_be_streamed(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/ndjson", data=b'{"i": 0}\n{"i": 1}\n')
+
+    lines = [line async for line in client.stream_get("ndjson", into=dict)]
+
+    assert lines == [{"i": 0}, {"i": 1}]
+
+
+async def test_a_mocked_response_can_be_downloaded(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/binary", data=b"content")
+
+    response = await client.download("binary")
+
+    assert response.data == b"content"
+
+
+async def test_a_mocked_event_stream_can_be_read_with_sse(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(
+        path="/events",
+        data=b"id: 1\ndata: first\n\n",
+        headers={"content-type": "text/event-stream"},
+    )
+
+    events = [event async for event in client.sse("events", max_reconnects=0)]
+
+    assert events == [SSEEvent(id="1", event="message", data="first")]
+
+
+def test_sync_a_mocked_response_can_be_streamed(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/ndjson", data=b'{"i": 0}\n{"i": 1}\n')
+
+    lines = list(sync_client.stream_get("ndjson", into=dict))
+
+    assert lines == [{"i": 0}, {"i": 1}]
