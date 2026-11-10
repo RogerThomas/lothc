@@ -43,6 +43,12 @@
 //! whole body. A body read to its end returns the connection to the pool; closing a stream early
 //! shuts its socket down and retires it, so the server sees the hang-up.
 //!
+//! With `max_connections` (`limit.rs`), a request first takes one of the client's slots, or waits
+//! for one outside any origin's queue (so no connection is opened for it), until its
+//! `pool_timeout` (`Permits`, armed on the shared timer) or its own deadline. A slot comes back
+//! when the request's slab slot is released, or a stream's body ends; whatever gives one back
+//! leaves `run` to grant it to the next request waiting.
+//!
 //! `close()` fails every request still pending with the `RuntimeError` a request after it raises,
 //! as pyreqwest's does, except a stream whose head has arrived: its body outlives the client, as
 //! on pyreqwest, under its deadline, and its connection is closed (never pooled) once the body
@@ -77,6 +83,7 @@ use crate::cookie::Cookies;
 use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
 use crate::io::{shutdown, LoopReady, Stream};
+use crate::limit::{checked_max_connections, Permits};
 use crate::proxy::{Proxies, Route};
 use crate::redirect::{Hop, Redirect};
 use crate::request::{connect_address, ClientConfig, DeadlineClock, OriginKey, VerbHeaders};
@@ -143,6 +150,8 @@ struct Meta {
     timed_out: bool,
     /// The caller gave up on it: cancelled, or its stream closed.
     cancelled: bool,
+    /// It holds one of `max_connections`' slots.
+    permit: bool,
     /// `Some` for a streamed request; boxed, so a buffered one stays small.
     stream: Option<Box<StreamMeta>>,
     /// With `read_timeout`: when the final response's head arrived (set by its `fetch`, or for a
@@ -298,6 +307,8 @@ struct PoolState {
     idle_policy: IdlePolicy,
     /// When the idle reaper next runs; `None` while it isn't running (no idle connections).
     reap_at: Option<Instant>,
+    /// `max_connections`' slots, and the requests waiting for one; `None` without it.
+    permits: Option<Permits>,
     origins: Vec<Origin>,
     conns: Vec<Conn>,
     slots: Vec<Slot>,
@@ -362,12 +373,67 @@ impl PoolState {
         (slot, entry.generation)
     }
 
+    /// Free `slot`, giving back the request's `max_connections` slot if it holds one (`run`
+    /// grants it to the next request waiting).
     fn release(&mut self, slot: usize) -> Option<Meta> {
         let entry = self.slots.get_mut(slot)?;
         let meta = entry.meta.take()?;
         entry.generation = entry.generation.wrapping_add(1);
         self.free.push(slot);
+        if meta.permit {
+            self.give_back_permit();
+        }
         Some(meta)
+    }
+
+    fn give_back_permit(&mut self) {
+        if let Some(permits) = self.permits.as_mut() {
+            permits.give_back();
+        }
+    }
+
+    /// Arm a request's read deadline, `read_timeout` from `now`, when it starts: a wait for a
+    /// `max_connections` slot isn't reading.
+    fn arm_read(&mut self, py: Python<'_>, slot: usize, generation: u32, now: Instant) -> PyResult<()> {
+        if let Some(head_by) = self.connect.read_timeout.and_then(|timeout| self.clock.deadline(now, timeout)) {
+            self.deadlines.push(Reverse((head_by, Timer::Read(slot, generation))));
+            self.arm(py, head_by)?;
+        }
+        Ok(())
+    }
+
+    /// Start the requests waiting for a `max_connections` slot, oldest first, while slots are
+    /// free: whether any was.
+    fn grant_permits(&mut self, py: Python<'_>) -> PyResult<bool> {
+        if self.is_closed {
+            return Ok(false);
+        }
+        let mut granted = false;
+        while let Some((slot, generation)) = self.permits.as_mut().and_then(Permits::grant) {
+            let Some(meta) = self.slots.get_mut(slot).filter(|entry| entry.generation == generation).and_then(|entry| entry.meta.as_mut()) else {
+                // Not waiting any more (it can't happen: whatever ends a waiting request takes
+                // it out of the queue); the slot goes back.
+                self.give_back_permit();
+                continue;
+            };
+            meta.permit = true;
+            let origin = meta.origin;
+            let now = Instant::now();
+            self.arm_read(py, slot, generation, now)?;
+            self.place(py, slot, origin, now)?;
+            granted = true;
+        }
+        Ok(granted)
+    }
+
+    /// After a request that may have held a `max_connections` slot was given up outside `run`:
+    /// `run`, which grants the slot to the next request waiting.
+    fn regrant(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.permits.is_some() {
+            self.run(py)
+        } else {
+            Ok(())
+        }
     }
 
     fn is_live(&self, slot: usize, generation: u32) -> bool {
@@ -477,17 +543,27 @@ impl PoolState {
         }
     }
 
-    /// `place` a new request; with a `deadline`, the shared timer covers it, and its read
-    /// deadline (`read_timeout` from `now`) too.
+    /// `place` a new request, once it has a `max_connections` slot (it waits for one otherwise);
+    /// with a `deadline`, the shared timer covers it, waiting included, and its read deadline
+    /// (`read_timeout` from when it has its slot) too.
     fn enqueue(&mut self, py: Python<'_>, slot: usize, generation: u32, origin: usize, now: Instant, deadline: Option<Instant>) -> PyResult<()> {
         if let Some(deadline) = deadline {
             self.deadlines.push(Reverse((deadline, Timer::Total(slot, generation))));
             self.arm(py, deadline)?;
         }
-        if let Some(head_by) = self.connect.read_timeout.and_then(|timeout| self.clock.deadline(now, timeout)) {
-            self.deadlines.push(Reverse((head_by, Timer::Read(slot, generation))));
-            self.arm(py, head_by)?;
+        let clock = self.clock;
+        if let Some(permits) = self.permits.as_mut() {
+            if let Err(until) = permits.take(slot, generation, now, clock) {
+                return match until {
+                    Some(until) => self.arm(py, until),
+                    None => Ok(()),
+                };
+            }
+            if let Some(meta) = self.meta(slot) {
+                meta.permit = true;
+            }
         }
+        self.arm_read(py, slot, generation, now)?;
         if self.place(py, slot, origin, now)? {
             self.run(py)
         } else {
@@ -811,7 +887,7 @@ impl PoolState {
     fn stream_end(&mut self, py: Python<'_>, conn: usize, slot: usize, sender: Sender, result: Result<(), Failure>) -> PyResult<()> {
         let Some(c) = self.conns.get_mut(conn) else { return Ok(()) };
         c.current = None;
-        let (healthy, closed) = match self.meta(slot) {
+        let (healthy, closed, permit) = match self.meta(slot) {
             Some(meta) => {
                 let healthy = result.is_ok() && !meta.timed_out && !meta.cancelled;
                 let closed = meta.cancelled;
@@ -819,10 +895,15 @@ impl PoolState {
                     stream.end = Some(result);
                     stream.done = true;
                 }
-                (healthy, closed)
+                // Its body has been read: the request is done with its `max_connections` slot,
+                // though Python has yet to close the stream.
+                (healthy, closed, std::mem::take(&mut meta.permit))
             }
-            None => (false, false),
+            None => (false, false, false),
         };
+        if permit {
+            self.give_back_permit();
+        }
         if closed {
             self.release(slot);
         } else {
@@ -846,6 +927,11 @@ impl PoolState {
             let handshaken = self.handshaken.take();
             let stream_events = self.stream_events.take();
             if closed.is_empty() && finished.is_empty() && handshaken.is_empty() && stream_events.is_empty() {
+                // Slots given back by what ran start the requests waiting for them, which may
+                // have more to run.
+                if self.grant_permits(py)? {
+                    continue;
+                }
                 return Ok(());
             }
             for (conn, generation, result) in handshaken {
@@ -990,7 +1076,10 @@ impl PoolState {
                 self.establish(py, conn, fd, ready)?;
                 return self.run(py);
             }
-            Err(message) => return self.abandon(py, conn, Failure::Transport(message)),
+            Err(message) => {
+                self.abandon(py, conn, Failure::Transport(message))?;
+                return self.regrant(py);
+            }
         };
         let c = &mut self.conns[conn];
         c.fd = fd;
@@ -1027,12 +1116,14 @@ impl PoolState {
         c.state = State::Dead;
         c.generation = c.generation.wrapping_add(1);
         self.origins[origin].connecting = self.origins[origin].connecting.saturating_sub(1);
-        self.fail_waiting(py, origin, if timed_out { Failure::Timeout } else { Failure::Transport(message) })
+        self.fail_waiting(py, origin, if timed_out { Failure::Timeout } else { Failure::Transport(message) })?;
+        self.regrant(py)
     }
 
     /// `conn`'s `connect_timeout` passed: if it is still connecting (Python's connect, a proxy's
     /// handshake, or TLS's, which its first request drives), it is given up, timing out the
-    /// request counting on it.
+    /// request counting on it. Only `on_deadline` calls it, whose `run` regrants any
+    /// `max_connections` slot that gives back.
     fn connect_expired(&mut self, py: Python<'_>, conn: usize, generation: u32) -> PyResult<()> {
         let Some(c) = self.conns.get(conn).filter(|c| c.generation == generation) else { return Ok(()) };
         match c.state {
@@ -1053,7 +1144,8 @@ impl PoolState {
     }
 
     /// Time a request out: one in flight has its socket shut down, which fails hyper's I/O and
-    /// is reported as the timeout; one still waiting for a connection fails here.
+    /// is reported as the timeout; one still waiting for a connection, or for a
+    /// `max_connections` slot before that, fails here.
     fn time_out(&mut self, py: Python<'_>, slot: usize) -> PyResult<()> {
         if let Some(conn) = self.running(slot) {
             if let Some(meta) = self.meta(slot) {
@@ -1061,8 +1153,11 @@ impl PoolState {
             }
             shutdown(self.conns[conn].fd);
         } else if let Some(origin) = self.meta(slot).map(|meta| meta.origin) {
-            if let Some(pos) = self.origins[origin].waiting.iter().position(|s| *s == slot) {
-                self.origins[origin].waiting.remove(pos);
+            let waiting = match self.origins[origin].waiting.iter().position(|s| *s == slot) {
+                Some(pos) => self.origins[origin].waiting.remove(pos).is_some(),
+                None => self.permits.as_mut().and_then(|permits| permits.remove_where(|s| s == slot)).is_some(),
+            };
+            if waiting {
                 if let Some(meta) = self.release(slot) {
                     self.deliver(py, &meta, Err(Failure::Timeout))?;
                 }
@@ -1128,12 +1223,20 @@ impl PoolState {
 
     fn cancel(&mut self, py: Python<'_>, fut: &Bound<'_, PyAny>) -> PyResult<()> {
         let is_fut = |slots: &[Slot], slot: usize| slots[slot].meta.as_ref().is_some_and(|m| m.fut.is(fut));
+        // Waiting for a `max_connections` slot: it leaves the queue, holding none.
+        let slots = &self.slots;
+        if let Some(permits) = self.permits.as_mut() {
+            if let Some(slot) = permits.remove_where(|slot| is_fut(slots, slot)) {
+                self.release(slot);
+                return Ok(());
+            }
+        }
         for origin in 0..self.origins.len() {
             if let Some(pos) = self.origins[origin].waiting.iter().position(|s| is_fut(&self.slots, *s)) {
                 if let Some(slot) = self.origins[origin].waiting.remove(pos) {
                     self.release(slot);
                 }
-                return Ok(());
+                return self.regrant(py);
             }
         }
         let found = self.conns.iter().find_map(|c| c.current.filter(|s| is_fut(&self.slots, *s)));
@@ -1170,11 +1273,21 @@ impl PoolState {
                 Timer::Total(..) | Timer::Read(..) => {}
             }
         }
+        // Requests whose `pool_timeout` ran out waiting for a `max_connections` slot.
+        while let Some((slot, generation)) = self.permits.as_mut().and_then(|permits| permits.expired(now)) {
+            if self.is_live(slot, generation) {
+                if let Some(meta) = self.release(slot) {
+                    self.deliver(py, &meta, Err(Failure::Timeout))?;
+                }
+            }
+        }
         if self.reap_at.is_some_and(|at| at <= now) {
             self.reap(py, now)?;
         }
-        // One timer for whichever comes first, the next request deadline or the reaper's turn.
-        if let Some(at) = next.into_iter().chain(self.reap_at).min() {
+        // One timer for whichever comes first: the next request deadline, the next `pool_timeout`
+        // or the reaper's turn.
+        let pool_timeout = self.permits.as_ref().and_then(Permits::next_deadline);
+        if let Some(at) = next.into_iter().chain(self.reap_at).chain(pool_timeout).min() {
             self.arm(py, at)?;
         }
         self.run(py)
@@ -1223,6 +1336,7 @@ impl PoolState {
             origin,
             timed_out: false,
             cancelled: false,
+            permit: false,
             stream: None,
             head_at: self.connect.read_timeout.map(|_| Rc::default()),
         };
@@ -1271,6 +1385,7 @@ impl PoolState {
             origin,
             timed_out: false,
             cancelled: false,
+            permit: false,
             stream: Some(Box::new(StreamMeta {
                 channel: Rc::default(),
                 read: None,
@@ -1334,15 +1449,20 @@ impl PoolState {
             return Ok(());
         }
         let Some(origin) = self.meta(slot).map(|meta| meta.origin) else { return Ok(()) };
+        if self.permits.as_mut().and_then(|permits| permits.remove_where(|s| s == slot)).is_some() {
+            // Still waiting for a `max_connections` slot: it holds none.
+            self.release(slot);
+            return Ok(());
+        }
         if let Some(pos) = self.origins[origin].waiting.iter().position(|s| *s == slot) {
             self.origins[origin].waiting.remove(pos);
             self.release(slot);
-            return Ok(());
+            return self.regrant(py);
         }
         let Some(conn) = self.running(slot) else {
             // Never opened, or its body is done.
             self.release(slot);
-            return Ok(());
+            return self.regrant(py);
         };
         if let Some(meta) = self.meta(slot) {
             meta.cancelled = true;
@@ -1409,6 +1529,9 @@ impl PoolState {
             origin.waiting.clear();
             origin.connecting = 0;
         }
+        if let Some(permits) = self.permits.as_mut() {
+            permits.clear();
+        }
         // What their tasks reported goes with them; the streams that read on keep theirs.
         drop((self.done.take(), self.handshaken.take()));
         let events = self.stream_events.take();
@@ -1450,7 +1573,7 @@ pub(crate) struct Pool {
 impl Pool {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (base_url, default_headers, user_agent, https_only, cookie_store, follow_redirects, max_redirects, root_certificates, identity_pem, min_tls_version, max_tls_version, danger_accept_invalid_certs, timeout, pool_idle_timeout, pool_max_idle_per_host, proxy, no_proxy, glue, connect, event_loop, spawn_connect, close_conn))]
+    #[pyo3(signature = (base_url, default_headers, user_agent, https_only, cookie_store, follow_redirects, max_redirects, root_certificates, identity_pem, min_tls_version, max_tls_version, danger_accept_invalid_certs, timeout, pool_idle_timeout, pool_max_idle_per_host, max_connections, pool_timeout, proxy, no_proxy, glue, connect, event_loop, spawn_connect, close_conn))]
     fn new(
         py: Python<'_>,
         base_url: Option<&str>,
@@ -1468,6 +1591,8 @@ impl Pool {
         timeout: Option<Duration>,
         pool_idle_timeout: Option<Duration>,
         pool_max_idle_per_host: Option<usize>,
+        max_connections: Option<usize>,
+        pool_timeout: Option<Duration>,
         proxy: Option<&str>,
         no_proxy: Option<&str>,
         glue: &Bound<'_, PyAny>,
@@ -1479,6 +1604,7 @@ impl Pool {
         // The client's `timeout` is only converted, so that a bad one fails on entry with pyo3's
         // own message, as on pyreqwest's builder: each request carries its own timeout.
         let _ = timeout;
+        let max_connections = checked_max_connections(max_connections)?;
         let exec = LocalPool::new();
         let spawner = exec.spawner();
         let state = PoolState {
@@ -1499,6 +1625,7 @@ impl Pool {
             tls_config: None,
             idle_policy: IdlePolicy::new(pool_idle_timeout, pool_max_idle_per_host),
             reap_at: None,
+            permits: Permits::new(max_connections, pool_timeout),
             origins: Vec::new(),
             conns: Vec::new(),
             slots: Vec::new(),

@@ -130,15 +130,20 @@ or editing Python here.
   follow pyreqwest 0.15.0's lockfile, and each feature uses reqwest's own crates where they exist
   (hyper-util's proxy matcher, compression-codecs), never a hand port.
 - **Anything unported raises `NotImplementedError`**, never a silent difference: HTTP/2,
-  cookies, connect/read timeouts, `max_connections`/`pool_timeout`, `resolve`, `local_address`,
-  `tcp_keepalive`, `https://` and SOCKS4 proxies, and `lothc.testing`'s mocker, which patches
-  pyreqwest.
-- **Known differences that don't raise:** `form=` files are read on the loop thread in reads of up
-  to 64 KiB (pyreqwest reads them off it), so a slow filesystem stalls the loop; a sync client's
-  expired idle connections stay open until its next request (no thread to reap on), addresses
-  are tried in order (no happy eyeballs), a sync request doesn't take a connection another thread frees meanwhile (a strict
-  `xfail`, until `max_connections` brings a waiting queue), and an async client is bound to the
-  loop that opened it.
+  `https://` and SOCKS4 proxies, and `lothc.testing`'s mocker, which patches pyreqwest.
+- **Known differences that don't raise:**
+  - `form=` files are read on the loop thread in reads of up to 64 KiB (pyreqwest reads them off
+    it), so a slow filesystem stalls the loop.
+  - A sync client's expired idle connections stay open until its next request (no thread to
+    reap on), and its DNS lookup isn't bounded by `connect_timeout`.
+  - A sync stream never times out a slow consumer under `read_timeout`: it reads only when
+    asked, where pyreqwest's read-ahead fills and then times out.
+  - A sync request in a blocking TCP connect sees a connection another thread freed only once
+    its connect returns.
+  - A request cancelled while waiting for a `max_connections` slot leaves the queue and is never
+    sent; pyreqwest still sends it.
+  - Addresses are tried in order (no happy eyeballs), and an async client is bound to the loop
+    that opened it.
 - **Redirects run in Rust; retries and re-auth in Python.** A hop's headers must be reqwest's,
   in reqwest's order, which only the same Rust calls produce. Retries wrap the whole redirect
   chain, as pyreqwest's middleware does.
@@ -151,7 +156,7 @@ or editing Python here.
   used, so `http2=True` stays on pyreqwest.
 - **The mocker will run through native's own request code** (decided 2026-11-10), answering from
   Python handlers instead of the network, so mocked tests still see the exact request sent.
-- **Not built yet:** the sync waiting queue, the mocker, and wheels.
+- **Not built yet:** the mocker, SOCKS4 and `https://` proxies, and wheels.
 
 ## Decisions
 

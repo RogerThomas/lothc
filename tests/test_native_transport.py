@@ -156,7 +156,6 @@ def test_sync_pyreqwest_still_works_on_windows(
 def _unported_settings() -> list[tuple[str, Any]]:
     return [
         ("http2", True),
-        ("max_connections", 1),
     ]
 
 

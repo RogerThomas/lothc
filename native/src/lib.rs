@@ -17,6 +17,7 @@
 //! - `stream`: a streamed response body, read (and decoded) as it arrives;
 //! - `pool`/`sync_pool`: connection pooling, timeouts and cancellation;
 //! - `idle`: when an idle connection may be reused, as reqwest's pool decides it;
+//! - `limit`: `max_connections`/`pool_timeout`, the slots pyreqwest gives a client's requests;
 //! - `proxy`: which proxy a request goes through, and the proxy handshakes, as reqwest's;
 //! - `redirect`: following redirects, as reqwest's default policy does;
 //! - `cookie`: `cookie_store=True`'s cookie jar, as reqwest's;
@@ -29,6 +30,7 @@ mod error;
 mod headers;
 mod idle;
 mod io;
+mod limit;
 mod multipart;
 mod pool;
 mod proxy;

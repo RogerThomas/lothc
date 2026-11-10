@@ -18,6 +18,22 @@
 //! chunk, so `read_timeout`'s gap starts again with each read: unlike pyreqwest, whose reader
 //! reads ahead into a two-chunk buffer, a caller slower than `read_timeout` doesn't time out.
 //!
+//! A request that finds no idle connection waits in its origin's queue while it opens one of its
+//! own, as hyper-util's checkout races its connect: a connection another thread frees meanwhile
+//! is handed to the oldest request waiting, rather than pooled. One mid proxy handshake is woken
+//! for it (its poll(2) also watches a `WakePipe`); one still in its blocking TCP connect takes it
+//! once the connect returns. The connection it was opening is finished anyway and pooled, as
+//! hyper-util's is in the background: right there if nothing is left but setup without I/O, else
+//! on a thread of its own for the rest of the proxy handshake (under its `connect_timeout` only,
+//! as hyper-util's has no deadline of its own; closing the pool cuts it off, as it is in
+//! `InFlight`).
+//!
+//! With `max_connections` (`limit.rs`), a request takes one of the client's slots before it
+//! looks for a connection, waiting for one with the GIL released, and gives it back once its
+//! body has been read (a stream's once it is read to its end, fails or is closed). The wait
+//! counts towards its total timeout but not towards `read_timeout`, which starts once it has
+//! its slot.
+//!
 //! A redirect to follow (`redirect.rs`) puts its connection back (hyper drains the unread response
 //! or closes it) and sends the hop's request the same way, under the same deadline, so a hop to the
 //! same origin takes that connection again.
@@ -28,17 +44,20 @@
 //! pool; a stream closed or dropped early closes it, so the server sees the hang-up.
 //!
 //! `close()` fails every request still running with the `RuntimeError` a request after it raises,
-//! as pyreqwest's does: it shuts down the sockets in `InFlight`, which wakes their threads' poll(2).
+//! as pyreqwest's does: it shuts down the sockets in `InFlight`, which wakes their threads' poll(2),
+//! and wakes every thread waiting for a `max_connections` slot.
 //! A stream's body, once its head has arrived, outlives the client, as on pyreqwest.
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::future::{poll_fn, Future};
 use std::io;
-use std::net::TcpStream;
-use std::os::fd::{AsRawFd, RawFd};
+use std::net::{IpAddr, TcpStream};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -58,7 +77,8 @@ use crate::cookie::Cookies;
 use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
 use crate::io::{shutdown, PollReady, Stream};
-use crate::proxy::{Handshake, Proxies, Route};
+use crate::limit::{checked_max_connections, SyncLimiter, SyncPermit};
+use crate::proxy::{Proxies, Route};
 use crate::redirect::Redirect;
 use crate::request::{connect_address, ClientConfig, DeadlineClock, OriginKey, Prepared, VerbHeaders};
 use crate::response::{fetch, send, Exchange, Fetched, Glue, Head, Sender};
@@ -189,6 +209,13 @@ impl Limits {
         Self { total: timeout.and_then(deadline), read_timeout, head_by: read_timeout.and_then(deadline), clock }
     }
 
+    /// These limits with `read_timeout`'s deadline for the head from `now`, once a wait for a
+    /// `max_connections` slot is over: that wait counts towards the total timeout, but isn't
+    /// reading.
+    fn reading_from(self, now: Instant) -> Self {
+        Self { head_by: self.read_timeout.and_then(|timeout| self.clock.deadline(now, timeout)), ..self }
+    }
+
     /// The deadline until the response's head arrives.
     fn before_head(&self) -> Option<Instant> {
         earliest(self.total, self.head_by)
@@ -248,8 +275,100 @@ fn wait(fd: RawFd, ready: &PollReady, deadline: Option<Instant>) -> Result<Optio
     }
 }
 
+/// What `wait_or_woken` saw first.
+enum Woke {
+    Socket,
+    /// The `WakePipe`: another thread handed the request a connection.
+    Pipe,
+    TimedOut,
+}
+
+/// `wait`, also watching `wake` (a `WakePipe`'s read end, drained once it fires), which wins
+/// over the socket when both are ready, as hyper-util's checkout is polled before its connect.
+fn wait_or_woken(fd: RawFd, ready: &PollReady, wake: Option<&WakePipe>, deadline: Option<Instant>) -> Result<Woke, Failure> {
+    let Some(wake) = wake else {
+        return wait(fd, ready, deadline).map(|ready| if ready.is_some() { Woke::Socket } else { Woke::TimedOut });
+    };
+    loop {
+        let Some(timeout) = poll_timeout(deadline) else { return Ok(Woke::TimedOut) };
+        let events = if ready.wants_writable() { libc::POLLIN | libc::POLLOUT } else { libc::POLLIN };
+        let mut pfds = [libc::pollfd { fd, events, revents: 0 }, libc::pollfd { fd: wake.read.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+        // SAFETY: `pfds` is two valid, writable `pollfd`s for the whole call, matching `nfds` = 2.
+        match unsafe { libc::poll(pfds.as_mut_ptr(), 2, timeout) } {
+            0 => return Ok(Woke::TimedOut),
+            n if n < 0 => {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(Failure::Transport(error_chain(&error)));
+                }
+            }
+            _ => {
+                let revents = pfds[0].revents;
+                let failed = revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+                if failed || revents & libc::POLLIN != 0 {
+                    ready.set_readable();
+                }
+                if failed || revents & libc::POLLOUT != 0 {
+                    ready.set_writable();
+                }
+                if pfds[1].revents != 0 {
+                    wake.drain();
+                    return Ok(Woke::Pipe);
+                }
+                return Ok(Woke::Socket);
+            }
+        }
+    }
+}
+
+/// A pipe a thread waiting in poll(2) watches too, so another thread can wake it: a request mid
+/// proxy handshake that is handed a connection meanwhile.
+struct WakePipe {
+    read: OwnedFd,
+    write: OwnedFd,
+}
+
+impl WakePipe {
+    fn new() -> io::Result<Self> {
+        let mut fds = [0; 2];
+        // SAFETY: `fds` is a writable array of the two descriptors pipe(2) fills in.
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: pipe(2) just opened both descriptors, and nothing else owns them.
+        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        for fd in [&read, &write] {
+            // SAFETY: fcntl(2) on a descriptor this owns, with integer arguments only.
+            let set = unsafe {
+                libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) == 0
+                    && libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) == 0
+            };
+            if !set {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(Self { read, write })
+    }
+
+    fn wake(&self) {
+        let byte = 1u8;
+        // SAFETY: writes one byte from a live local; a full pipe (EAGAIN) is already awake.
+        unsafe { libc::write(self.write.as_raw_fd(), (&raw const byte).cast(), 1) };
+    }
+
+    fn drain(&self) {
+        let mut buf = [0u8; 16];
+        // SAFETY: reads into a live, writable local buffer of exactly `buf.len()` bytes.
+        while unsafe { libc::read(self.read.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+    }
+}
+
 /// A connection's hyper driver, `()` once the connection has closed.
 type Driver = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// A proxy's handshake on a new connection, boxed so that a request handed another connection
+/// mid handshake can leave it to finish on a thread of its own. `Err` is the connection error.
+type HandshakeFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 
 /// Drive a connection's hyper driver and `fut` (which runs on that connection) until `fut`
 /// finishes, waiting for socket `fd` in poll(2) until `waits` says to stop.
@@ -303,23 +422,25 @@ fn send_on(conn: &mut SyncConn, request: Request<RequestBody>, limits: Limits) -
     sent?
 }
 
-/// Drive a new connection's proxy handshake on the calling thread until it finishes, or `deadline`
-/// passes first.
-fn drive_handshake(handshake: Handshake, fd: RawFd, ready: &PollReady, deadline: Option<Instant>) -> Result<(), Failure> {
+/// Drive a new connection's proxy handshake on the calling thread until it finishes (`Ok(true)`),
+/// `deadline` passes first, or `wake` fires (`Ok(false)`): another thread handed the request a
+/// connection, and the handshake, unfinished, can go on elsewhere.
+fn drive_handshake(handshake: &mut HandshakeFuture, fd: RawFd, ready: &PollReady, deadline: Option<Instant>, wake: Option<&WakePipe>) -> Result<bool, Failure> {
     let flag = Arc::new(FlagWaker(AtomicBool::new(false)));
     let waker = Waker::from(flag.clone());
     let mut cx = Context::from_waker(&waker);
-    let mut fut = std::pin::pin!(handshake.run(fd, ready.clone()));
     loop {
         flag.0.store(false, Ordering::Relaxed);
-        if let Poll::Ready(result) = fut.as_mut().poll(&mut cx) {
-            return result.map_err(Failure::Transport);
+        if let Poll::Ready(result) = handshake.as_mut().poll(&mut cx) {
+            return result.map(|()| true).map_err(Failure::Transport);
         }
         if flag.0.load(Ordering::Relaxed) {
             continue;
         }
-        if wait(fd, ready, deadline)?.is_none() {
-            return Err(Failure::Timeout);
+        match wait_or_woken(fd, ready, wake, deadline)? {
+            Woke::Socket => {}
+            Woke::Pipe => return Ok(false),
+            Woke::TimedOut => return Err(Failure::Timeout),
         }
     }
 }
@@ -357,16 +478,247 @@ fn close_idle(conn: SyncConn) {
 /// from the end.
 type IdleConns = Vec<(SyncConn, Instant)>;
 
+/// A request in its origin's queue, opening a connection of its own.
+struct Waiting {
+    id: u64,
+    /// Wakes it, once it waits in poll(2) for a proxy handshake.
+    wake: Option<Arc<WakePipe>>,
+    /// The connection another thread freed for it, until it takes it.
+    handed: Option<SyncConn>,
+}
+
+/// One origin's idle connections and the requests waiting for one.
+struct SyncOrigin {
+    key: OriginKey,
+    idle: IdleConns,
+    /// Oldest first, each handed the first connection freed after it arrived.
+    waiting: VecDeque<Waiting>,
+}
+
+#[derive(Default)]
+struct Origins {
+    list: Vec<SyncOrigin>,
+    /// The next `Waiting::id`.
+    next: u64,
+}
+
+impl Origins {
+    fn find(&mut self, key: &OriginKey) -> Option<&mut SyncOrigin> {
+        self.list.iter_mut().find(|origin| &origin.key == key)
+    }
+
+    /// Queue a request for a connection to `key`: its id.
+    fn wait(&mut self, key: &OriginKey) -> u64 {
+        let id = self.next;
+        self.next += 1;
+        let waiting = Waiting { id, wake: None, handed: None };
+        match self.find(key) {
+            Some(origin) => origin.waiting.push_back(waiting),
+            None => self.list.push(SyncOrigin { key: key.clone(), idle: Vec::new(), waiting: VecDeque::from([waiting]) }),
+        }
+        id
+    }
+
+    /// Take request `id` out of `key`'s queue, if it is still there (and `only_handed` doesn't
+    /// keep it there for want of a connection handed to it): what it was handed, if anything.
+    fn leave(&mut self, key: &OriginKey, id: u64, only_handed: bool) -> Option<SyncConn> {
+        let origin = self.find(key)?;
+        let at = origin.waiting.iter().position(|waiting| waiting.id == id && (!only_handed || waiting.handed.is_some()))?;
+        origin.waiting.remove(at)?.handed
+    }
+}
+
+/// What a `SyncPool` shares with the threads that finish a connection for it in the background.
+struct Shared {
+    idle_policy: IdlePolicy,
+    origins: Mutex<Origins>,
+    closed: AtomicBool,
+}
+
+impl Shared {
+    /// The most recently idled connection to `key` that is still fresh and open, closing the
+    /// expired ones it passes (hyper-util's checkout). Without one, the request queues for one
+    /// while it opens its own (`Ticket`), if connections are pooled at all.
+    fn take_idle<'a>(&'a self, key: &'a OriginKey) -> Result<SyncConn, Option<Ticket<'a>>> {
+        let now = Instant::now();
+        loop {
+            let (mut conn, idle_at) = {
+                let mut origins = lock(&self.origins);
+                match origins.find(key).and_then(|origin| origin.idle.pop()) {
+                    Some(idle) => idle,
+                    None => {
+                        let ticket = self.idle_policy.pools().then(|| Ticket { shared: self, key, id: origins.wait(key) });
+                        return Err(ticket);
+                    }
+                }
+            };
+            if self.idle_policy.expired(idle_at, now) {
+                close_idle(conn);
+            } else if still_open(&mut conn) {
+                return Ok(conn);
+            }
+        }
+    }
+
+    /// Hand a finished connection to the oldest request waiting for one to its origin, else pool
+    /// it, unless its origin already holds as many idle ones as allowed (the ones already idle
+    /// stay, as in hyper-util, which offers a waiting request one however many are idle); first
+    /// take every origin's expired ones out. Each origin's list is oldest first, so its expired
+    /// ones are a prefix.
+    fn put_idle(&self, key: &OriginKey, conn: SyncConn) {
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut expired = Vec::new();
+        let mut woken = None;
+        let rejected = {
+            let mut origins = lock(&self.origins);
+            let now = Instant::now();
+            for origin in &mut origins.list {
+                let stale = origin.idle.iter().take_while(|(_, idle_at)| self.idle_policy.expired(*idle_at, now)).count();
+                expired.extend(origin.idle.drain(..stale).map(|(conn, _)| conn));
+            }
+            origins.list.retain(|origin| !origin.idle.is_empty() || !origin.waiting.is_empty() || &origin.key == key);
+            match origins.find(key) {
+                Some(origin) => match origin.waiting.iter_mut().find(|waiting| waiting.handed.is_none()) {
+                    Some(waiting) => {
+                        woken = waiting.wake.clone();
+                        waiting.handed = Some(conn);
+                        None
+                    }
+                    None if !self.idle_policy.has_room(origin.idle.len()) => Some(conn),
+                    None => {
+                        origin.idle.push((conn, now));
+                        None
+                    }
+                },
+                None if !self.idle_policy.has_room(0) => Some(conn),
+                None => {
+                    origins.list.push(SyncOrigin { key: key.clone(), idle: vec![(conn, now)], waiting: VecDeque::new() });
+                    None
+                }
+            }
+        };
+        // Woken and closed outside the lock: shutting a connection down may write to its socket.
+        if let Some(wake) = woken {
+            wake.wake();
+        }
+        expired.into_iter().chain(rejected).for_each(close_idle);
+    }
+
+    /// A connection finished for nobody's request in particular: pooled (or handed on), unless
+    /// the pool closed first.
+    fn put_back(&self, key: &OriginKey, mut conn: SyncConn) {
+        if !conn.leave() && !conn.closed {
+            self.put_idle(key, conn);
+        }
+    }
+}
+
+/// A request's place in its origin's queue while it opens a connection of its own. Dropped, it
+/// leaves the queue, and a connection handed to it too late goes on to the next request waiting,
+/// or the pool.
+struct Ticket<'a> {
+    shared: &'a Shared,
+    key: &'a OriginKey,
+    id: u64,
+}
+
+impl Ticket<'_> {
+    /// The connection another thread freed for this request, if one has been (it leaves the
+    /// queue then).
+    fn handed(&self) -> Option<SyncConn> {
+        lock(&self.shared.origins).leave(self.key, self.id, true)
+    }
+
+    /// A pipe that wakes this request's poll(2) when a connection is handed to it; `None` if no
+    /// pipe can be opened (it then only notices once its own connection is made).
+    fn wake(&self) -> Option<Arc<WakePipe>> {
+        let wake = Arc::new(WakePipe::new().ok()?);
+        let mut origins = lock(&self.shared.origins);
+        let waiting = origins.find(self.key)?.waiting.iter_mut().find(|waiting| waiting.id == self.id)?;
+        waiting.wake = Some(wake.clone());
+        Some(wake)
+    }
+}
+
+impl Drop for Ticket<'_> {
+    fn drop(&mut self) {
+        let late = lock(&self.shared.origins).leave(self.key, self.id, false);
+        if let Some(conn) = late {
+            self.shared.put_idle(self.key, conn);
+        }
+    }
+}
+
+/// A new connection's socket, connected (to the origin or its proxy) and in `InFlight`, with the
+/// proxy's handshake, if any, still to run before TLS and hyper.
+struct Opening {
+    /// First, so a connection given up leaves `InFlight` before its descriptor closes.
+    busy: Busy,
+    stream: TcpStream,
+    fd: RawFd,
+    ready: PollReady,
+    handshake: Option<HandshakeFuture>,
+    /// Its `connect_timeout` deadline, which bounds its proxy's handshake and, later, its TLS one.
+    connect_by: Option<Instant>,
+}
+
+/// What an https connection's TLS is set up with, or `None` for plain http.
+type TlsSetup = Option<(Arc<rustls::ClientConfig>, ServerName<'static>)>;
+
+impl Opening {
+    /// Set up TLS (for https) and hyper's connection over the socket, once its proxy's handshake
+    /// is done: neither does any I/O yet (TLS's handshake runs with the first request).
+    fn establish(self, tls: TlsSetup) -> Result<SyncConn, Failure> {
+        let Self { busy, stream, fd, ready, connect_by, .. } = self;
+        let io = match tls {
+            None => Stream::plain(fd, ready.clone()),
+            Some((config, name)) => {
+                let tls = ClientConnection::new(config, name).map_err(|e| Failure::Transport(error_chain(&e)))?;
+                Stream::Tls(Box::new(TlsSocket::new(fd, ready.clone(), tls)))
+            }
+        };
+        let (sender, driver) = futures_executor::block_on(http1::Builder::new().title_case_headers(true).handshake(io))
+            .map_err(|e| Failure::Transport(error_chain(&e)))?;
+        let driver: Driver = Box::pin(async move {
+            let _ = driver.await;
+        });
+        Ok(SyncConn { busy: Some(busy), _stream: stream, fd, ready, sender, driver, closed: false, connect_by })
+    }
+
+    /// Finish the connection for the pool, now that the request it was for took another: what
+    /// is left of its proxy's handshake runs on a thread of its own, under its `connect_timeout`
+    /// only (closing the pool shuts its socket down); without one, it is finished right here.
+    fn finish_elsewhere(mut self, shared: &Arc<Shared>, key: &OriginKey, tls: TlsSetup) {
+        let Some(mut handshake) = self.handshake.take() else {
+            if let Ok(conn) = self.establish(tls) {
+                shared.put_back(key, conn);
+            }
+            return;
+        };
+        let (shared, key) = (shared.clone(), key.clone());
+        // If no thread can be started, the connection is closed with the closure.
+        let _ = thread::Builder::new().name("lothc-connect".to_owned()).spawn(move || {
+            if matches!(drive_handshake(&mut handshake, self.fd, &self.ready, self.connect_by, None), Ok(true)) {
+                if let Ok(conn) = self.establish(tls) {
+                    shared.put_back(&key, conn);
+                }
+            }
+        });
+    }
+}
+
 #[pyclass(frozen, module = "lothc._native")]
 pub(crate) struct SyncPool {
     config: ClientConfig,
     connect: Arc<ConnectSettings>,
     tls: TlsSettings,
     tls_config: Mutex<Option<Arc<rustls::ClientConfig>>>,
-    idle_policy: IdlePolicy,
-    idle: Mutex<Vec<(OriginKey, IdleConns)>>,
+    shared: Arc<Shared>,
+    /// `max_connections`' slots; `None` without it.
+    limiter: Option<Arc<SyncLimiter>>,
     in_flight: Arc<Mutex<InFlight>>,
-    closed: AtomicBool,
     glue: Glue,
     clock: DeadlineClock,
 }
@@ -403,107 +755,96 @@ impl SyncPool {
         lock(&self.in_flight).closed
     }
 
-    /// A new connection for a request to `target`, under `limits` and `connect_timeout` (which
-    /// still applies to its TLS handshake, which the first request drives: `connect_by`).
-    fn connect(&self, target: &Target, limits: Limits) -> Result<SyncConn, Failure> {
+    /// The TLS an https `target`'s connection is set up with.
+    fn tls_setup(&self, target: &Target) -> Result<TlsSetup, Failure> {
+        target.server_name.as_ref().map(|name| Ok((self.tls_config()?, name.clone()))).transpose()
+    }
+
+    /// A newly connected socket, entered into `InFlight` before anything waits on it, so
+    /// `close()` can cut a proxy's or TLS's handshake short too, with its proxy's handshake ready
+    /// and its `connect_timeout` deadline (`connect_by`).
+    fn opening(&self, target: &Target, stream: TcpStream, resolved: Option<IpAddr>, connect_by: Option<Instant>) -> Result<Opening, Failure> {
         let transport = |e: io::Error| Failure::Transport(error_chain(&e));
-        let connect_by = self.connect.connect_timeout.and_then(|timeout| self.clock.deadline(Instant::now(), timeout));
-        let deadline = earliest(limits.before_head(), connect_by);
-        // reqwest resolves a `socks5://` proxy's target before connecting to the proxy.
-        let resolved = match &target.resolve {
-            Some(host) => self.connect.resolve_first(host)?,
-            None => None,
-        };
-        let stream = self.connect.connect_blocking(&target.host, target.port, deadline)?;
-        // Before anything waits on it, so `close()` can cut a proxy's or TLS's handshake short too.
         let busy = self.enter(stream.as_raw_fd())?;
         stream.set_nodelay(true).map_err(transport)?;
         stream.set_nonblocking(true).map_err(transport)?;
         let fd = stream.as_raw_fd();
         let ready = PollReady::new();
-        if let Some(handshake) = target.route.handshake(&target.key.host, target.key.port, self.config.user_agent(), resolved).map_err(Failure::Transport)? {
-            drive_handshake(handshake, fd, &ready, deadline)?;
-        }
-        let io = match &target.server_name {
-            None => Stream::plain(fd, ready.clone()),
-            Some(name) => {
-                let tls = ClientConnection::new(self.tls_config()?, name.clone()).map_err(|e| Failure::Transport(error_chain(&e)))?;
-                Stream::Tls(Box::new(TlsSocket::new(fd, ready.clone(), tls)))
-            }
-        };
-        let (sender, driver) = futures_executor::block_on(http1::Builder::new().title_case_headers(true).handshake(io))
-            .map_err(|e| Failure::Transport(error_chain(&e)))?;
-        let driver: Driver = Box::pin(async move {
-            let _ = driver.await;
-        });
-        Ok(SyncConn { busy: Some(busy), _stream: stream, fd, ready, sender, driver, closed: false, connect_by })
+        let handshake = target.route.handshake(&target.key.host, target.key.port, self.config.user_agent(), resolved).map_err(Failure::Transport)?;
+        let handshake = handshake.map(|handshake| -> HandshakeFuture { Box::pin(handshake.run(fd, ready.clone())) });
+        Ok(Opening { busy, stream, fd, ready, handshake, connect_by })
     }
 
-    /// A connection for a request to `target`, in `InFlight`: an idle one, or a new one. A failure
-    /// after `close()` began is that close's doing.
+    /// A request takes `conn`, handed over while it was opening a connection of its own
+    /// (`opening`, if it got as far as a socket), which is finished for the pool elsewhere.
+    fn take_handed(&self, target: &Target, conn: SyncConn, opening: Option<Opening>) -> Result<SyncConn, Failure> {
+        if let Some(opening) = opening {
+            if let Ok(tls) = self.tls_setup(target) {
+                opening.finish_elsewhere(&self.shared, &target.key, tls);
+            }
+        }
+        self.enter_conn(conn)
+    }
+
+    /// A new connection for a request to `target`, in `InFlight`, under `limits` and
+    /// `connect_timeout` (which still applies to its TLS handshake, which the first request
+    /// drives: `connect_by`). Until it is made, a connection another thread frees for the
+    /// request (`ticket`) wins, as hyper-util's checkout wins over its connect, unless the
+    /// request's own deadline passed first.
+    fn connect(&self, target: &Target, limits: Limits, ticket: Option<&Ticket<'_>>) -> Result<SyncConn, Failure> {
+        let connect_by = self.connect.connect_timeout.and_then(|timeout| self.clock.deadline(Instant::now(), timeout));
+        let deadline = earliest(limits.before_head(), connect_by);
+        // reqwest resolves a `socks5://` proxy's target before connecting to the proxy.
+        let connected = match &target.resolve {
+            Some(host) => self.connect.resolve_first(host),
+            None => Ok(None),
+        }
+        .and_then(|resolved| Ok((self.connect.connect_blocking(&target.host, target.port, deadline)?, resolved)));
+        // A blocking connect can't be woken: a connection handed over meanwhile is taken now,
+        // even if `connect_timeout` ran out, as long as the request's own deadline hasn't.
+        let expired = matches!(connected, Err(Failure::Timeout)) && limits.before_head().is_some_and(|until| until <= Instant::now());
+        let handed = ticket.filter(|_| !expired).and_then(Ticket::handed);
+        if let Some(handed) = handed {
+            let opening = connected.ok().and_then(|(stream, resolved)| self.opening(target, stream, resolved, connect_by).ok());
+            return self.take_handed(target, handed, opening);
+        }
+        let (stream, resolved) = connected?;
+        let mut opening = self.opening(target, stream, resolved, connect_by)?;
+        if let Some(mut handshake) = opening.handshake.take() {
+            let wake = ticket.and_then(Ticket::wake);
+            loop {
+                // Checked before each wait, as a connection handed over before the pipe was
+                // attached didn't write to it.
+                if let Some(handed) = ticket.and_then(Ticket::handed) {
+                    opening.handshake = Some(handshake);
+                    return self.take_handed(target, handed, Some(opening));
+                }
+                if drive_handshake(&mut handshake, opening.fd, &opening.ready, deadline, wake.as_deref())? {
+                    break;
+                }
+            }
+        }
+        opening.establish(self.tls_setup(target)?)
+    }
+
+    /// `conn`, entered into `InFlight` for a request.
+    fn enter_conn(&self, mut conn: SyncConn) -> Result<SyncConn, Failure> {
+        conn.busy = Some(self.enter(conn.fd)?);
+        Ok(conn)
+    }
+
+    /// A connection for a request to `target`, in `InFlight`: an idle one, or a new one (or one
+    /// freed for it while it connected). A failure after `close()` began is that close's doing.
     fn checkout(&self, target: &Target, limits: Limits) -> Result<SyncConn, Failure> {
-        let conn = match self.take_idle(&target.key) {
-            Some(mut conn) => self.enter(conn.fd).map(|busy| {
-                conn.busy = Some(busy);
-                conn
-            }),
-            None => self.connect(target, limits),
+        let conn = match self.shared.take_idle(&target.key) {
+            Ok(conn) => self.enter_conn(conn),
+            // Its place in the queue is given up as soon as it has a connection.
+            Err(ticket) => self.connect(target, limits, ticket.as_ref()),
         };
         match conn {
             Err(_) if self.closing() => Err(Failure::Closed),
             conn => conn,
         }
-    }
-
-    /// The most recently idled connection to `key` that is still fresh and open, closing the
-    /// expired ones it passes (hyper-util's checkout).
-    fn take_idle(&self, key: &OriginKey) -> Option<SyncConn> {
-        let now = Instant::now();
-        loop {
-            let (mut conn, idle_at) = {
-                let mut idle = lock(&self.idle);
-                let (_, conns) = idle.iter_mut().find(|(k, _)| k == key)?;
-                conns.pop()?
-            };
-            if self.idle_policy.expired(idle_at, now) {
-                close_idle(conn);
-            } else if still_open(&mut conn) {
-                return Some(conn);
-            }
-        }
-    }
-
-    /// Pool a finished connection, unless its origin already holds as many idle ones as allowed
-    /// (the ones already idle stay, as in hyper-util); first take every origin's expired ones out.
-    /// Each origin's list is oldest first, so its expired ones are a prefix.
-    fn put_idle(&self, key: &OriginKey, conn: SyncConn) {
-        if self.closed.load(Ordering::Relaxed) {
-            return;
-        }
-        let mut expired = Vec::new();
-        let rejected = {
-            let mut idle = lock(&self.idle);
-            let now = Instant::now();
-            for (_, conns) in idle.iter_mut() {
-                let stale = conns.iter().take_while(|(_, idle_at)| self.idle_policy.expired(*idle_at, now)).count();
-                expired.extend(conns.drain(..stale).map(|(conn, _)| conn));
-            }
-            idle.retain(|(k, conns)| !conns.is_empty() || k == key);
-            match idle.iter_mut().find(|(k, _)| k == key) {
-                Some((_, conns)) if !self.idle_policy.has_room(conns.len()) => Some(conn),
-                Some((_, conns)) => {
-                    conns.push((conn, now));
-                    None
-                }
-                None if !self.idle_policy.has_room(0) => Some(conn),
-                None => {
-                    idle.push((key.clone(), vec![(conn, now)]));
-                    None
-                }
-            }
-        };
-        // Closed outside the lock: shutting a connection down may write to its socket.
-        expired.into_iter().chain(rejected).for_each(close_idle);
     }
 
     /// Take an idle connection (or open one), run the request, put the connection back if it
@@ -527,7 +868,7 @@ impl SyncPool {
             match outcome {
                 Ok(fetched) => {
                     if !conn.closed {
-                        self.put_idle(&target.key, conn);
+                        self.shared.put_idle(&target.key, conn);
                     }
                     return Ok(fetched);
                 }
@@ -535,7 +876,7 @@ impl SyncPool {
                 Err(other) => {
                     // A redirect that can't be followed only dropped its response.
                     if other.keeps_connection() && !conn.closed {
-                        self.put_idle(&target.key, conn);
+                        self.shared.put_idle(&target.key, conn);
                     }
                     return Err(other);
                 }
@@ -601,7 +942,7 @@ impl SyncPool {
             // A redirect followed or refused goes unread, and its connection back to the pool.
             drop(response);
             if !conn.closed {
-                self.put_idle(&target.key, conn);
+                self.shared.put_idle(&target.key, conn);
             }
             match next {
                 Ok(Some(hop)) => (target, request, cookies) = self.hop(py, state, hop)?,
@@ -645,7 +986,7 @@ impl SyncPool {
 impl SyncPool {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (base_url, default_headers, user_agent, https_only, cookie_store, follow_redirects, max_redirects, root_certificates, identity_pem, min_tls_version, max_tls_version, danger_accept_invalid_certs, timeout, pool_idle_timeout, pool_max_idle_per_host, proxy, no_proxy, glue, connect))]
+    #[pyo3(signature = (base_url, default_headers, user_agent, https_only, cookie_store, follow_redirects, max_redirects, root_certificates, identity_pem, min_tls_version, max_tls_version, danger_accept_invalid_certs, timeout, pool_idle_timeout, pool_max_idle_per_host, max_connections, pool_timeout, proxy, no_proxy, glue, connect))]
     fn new(
         py: Python<'_>,
         base_url: Option<&str>,
@@ -663,6 +1004,8 @@ impl SyncPool {
         timeout: Option<Duration>,
         pool_idle_timeout: Option<Duration>,
         pool_max_idle_per_host: Option<usize>,
+        max_connections: Option<usize>,
+        pool_timeout: Option<Duration>,
         proxy: Option<&str>,
         no_proxy: Option<&str>,
         glue: &Bound<'_, PyAny>,
@@ -671,6 +1014,7 @@ impl SyncPool {
         // The client's `timeout` is only converted, so that a bad one fails on entry with pyo3's
         // own message, as on pyreqwest's builder: each request carries its own timeout.
         let _ = timeout;
+        let max_connections = checked_max_connections(max_connections)?;
         Ok(Self {
             config: ClientConfig::new(base_url, default_headers, user_agent, https_only)?
                 .with_proxies(Proxies::new(proxy, no_proxy)?)
@@ -685,10 +1029,13 @@ impl SyncPool {
                 danger_accept_invalid_certs,
             )?,
             tls_config: Mutex::new(None),
-            idle_policy: IdlePolicy::new(pool_idle_timeout, pool_max_idle_per_host),
-            idle: Mutex::new(Vec::new()),
+            shared: Arc::new(Shared {
+                idle_policy: IdlePolicy::new(pool_idle_timeout, pool_max_idle_per_host),
+                origins: Mutex::default(),
+                closed: AtomicBool::new(false),
+            }),
+            limiter: SyncLimiter::new(max_connections, pool_timeout),
             in_flight: Arc::default(),
-            closed: AtomicBool::new(false),
             glue: Glue::new(py, glue)?,
             clock: DeadlineClock::new(),
         })
@@ -713,7 +1060,7 @@ impl SyncPool {
         typed_headers: Option<Py<PyAny>>,
         headers_only: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if self.closed.load(Ordering::Relaxed) {
+        if self.shared.closed.load(Ordering::Relaxed) {
             return Err(Glue::closed_error());
         }
         let Prepared { request, url, route, redirect, cookies } = self.config.prepare(
@@ -733,7 +1080,14 @@ impl SyncPool {
         };
         let started = Instant::now();
         let limits = Limits::new(self.clock, started, timeout, self.connect.read_timeout);
-        let result = self.send_following(py, target, request, limits, redirect, cookies)?;
+        let result = match &self.limiter {
+            None => self.send_following(py, target, request, limits, redirect, cookies)?,
+            Some(limiter) => match py.detach(|| limiter.acquire(started, self.clock, limits.total)) {
+                // Given back once the body has been read, before it is decoded.
+                Ok(_permit) => self.send_following(py, target, request, limits.reading_from(Instant::now()), redirect, cookies)?,
+                Err(failure) => Err(failure),
+            },
+        };
         let exchange = Exchange {
             method: method.unbind(),
             url,
@@ -764,7 +1118,7 @@ impl SyncPool {
         last_event_id: Option<&str>,
     ) -> PyResult<SyncStream> {
         let pool = slf.get();
-        if pool.closed.load(Ordering::Relaxed) {
+        if pool.shared.closed.load(Ordering::Relaxed) {
             return Err(Glue::closed_error());
         }
         let verb_headers = VerbHeaders::sse(accept, last_event_id)?;
@@ -785,9 +1139,13 @@ impl SyncPool {
         Ok(SyncStream { pool: slf.clone().unbind(), request_info, timeout, state: Mutex::new(StreamState::Prepared(prepared)) })
     }
 
-    /// Fail every request still running (see the module's doc) and drop every idle connection.
+    /// Fail every request still running or waiting (see the module's doc) and drop every idle
+    /// connection.
     fn close(&self) {
-        self.closed.store(true, Ordering::Relaxed);
+        self.shared.closed.store(true, Ordering::Relaxed);
+        if let Some(limiter) = &self.limiter {
+            limiter.close();
+        }
         {
             let mut in_flight = lock(&self.in_flight);
             in_flight.closed = true;
@@ -796,7 +1154,7 @@ impl SyncPool {
                 shutdown(*fd);
             }
         }
-        lock(&self.idle).clear();
+        lock(&self.shared.origins).list.clear();
     }
 
     fn __repr__(&self) -> &'static str {
@@ -829,6 +1187,9 @@ struct OpenStream {
     conn: SyncConn,
     body: BodyStream,
     limits: Limits,
+    /// Its `max_connections` slot, given back once the body is read to its end, fails or the
+    /// stream is closed.
+    _permit: Option<SyncPermit>,
 }
 
 impl OpenStream {
@@ -903,7 +1264,21 @@ impl SyncStream {
                 return Err(pool.glue.connection_error(py, message));
             }
         };
-        let limits = Limits::new(pool.clock, Instant::now(), self.timeout, pool.connect.read_timeout);
+        let started = Instant::now();
+        let mut limits = Limits::new(pool.clock, started, self.timeout, pool.connect.read_timeout);
+        let permit = match &pool.limiter {
+            None => None,
+            Some(limiter) => match py.detach(|| limiter.acquire(started, pool.clock, limits.total)) {
+                Ok(permit) => {
+                    limits = limits.reading_from(Instant::now());
+                    Some(permit)
+                }
+                Err(failure) => {
+                    self.put(StreamState::Done);
+                    return Err(pool.glue.failure(py, failure));
+                }
+            },
+        };
         let (target, conn, response) = match pool.open_following(py, target, request, limits, redirect, cookies) {
             Ok(opened) => opened,
             Err(error) => {
@@ -915,7 +1290,7 @@ impl SyncStream {
         let body = BodyStream::new(&mut parts.headers, incoming);
         match pool.glue.stream_head(py, parts.status.as_u16(), parts.version, parts.headers) {
             Ok(head) => {
-                self.put(StreamState::Open(Box::new(OpenStream { key: target.key, conn, body, limits })));
+                self.put(StreamState::Open(Box::new(OpenStream { key: target.key, conn, body, limits, _permit: permit })));
                 Ok(head)
             }
             Err(error) => {
@@ -947,7 +1322,7 @@ impl SyncStream {
             Ok(None) => {
                 let OpenStream { key, conn, .. } = *open;
                 if !conn.closed {
-                    pool.put_idle(&key, conn);
+                    pool.shared.put_idle(&key, conn);
                 }
                 self.put(StreamState::Done);
                 Ok(None)
