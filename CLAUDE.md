@@ -178,3 +178,36 @@ or editing Python here.
 - **Matching shares the real request path's encoding**, so a mock matches what a real request
   sends.
 - **Strict by default**, unlike pyreqwest's plugin.
+
+## Pitfalls
+
+Each of these was a real bug or a lost hour once.
+
+- **In the `form=` `match`, `case list()` comes before the `File` patterns**: a sequence pattern
+  matches a list too, so `["a.png", b"..."]` was read as a file.
+- **`_LazyHeaders` holds pyreqwest's `HeaderMap`, not the response**: a read response caches its
+  body (40 held 10MB responses: ~470MB).
+- **`.to_bytes()`, never `bytes(x.bytes())`**, and don't convert at all when the decoder takes a
+  buffer (msgspec does; pydantic needs `bytes`).
+- **Keep `_send_method` one async layer deep**: each extra layer is a frame on every resume.
+- **The async idle limit wraps each chunk read, never a `yield`**, or a slow consumer looks like
+  a stalled server.
+- **The mocker validates before registering** (pyreqwest registers a mock as soon as the call
+  returns) **and applies `data=` before `headers=`** (`.body_json()` appends a Content-Type).
+- **OAuth:** aliased pydantic token models need `ConfigDict(validate_by_name=True)`, and the
+  token-request types are `Callable[..., JSONPayload]` because a `Protocol` fails 3 of 4
+  checkers.
+- **`msgspec_installed`/`pydantic_installed` are `bool`s**, not `msgspec is not None`, which strict
+  basedpyright flags as unnecessary.
+- **A test about `raises=` binds `__cause__` to a local first**: basedpyright narrows
+  `isinstance(x, HTTPResponseError)` to `HTTPResponseError[Unknown]`.
+- **`/events`' default interval is load-bearing** for the test that SSE events arrive
+  incrementally.
+- **asv:** run the large-body server as a separate process (a thread skews `peakmem`), keep
+  `build_command` on `python -m build --wheel`, and store only static data from `setup_cache()`
+  (it's pickled).
+- **`bench-check` measures `peakmem` on the first call only** (repeats fragment the allocator);
+  treat sub-millisecond `time` deltas as directional.
+- **`test-no-extras` runs `uv run --no-sync`**, or a plain `uv run` reinstalls the extras.
+- **release-please needs "Allow GitHub Actions to create and approve pull requests"** (Settings →
+  Actions → General).
