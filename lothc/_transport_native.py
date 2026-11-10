@@ -82,8 +82,6 @@ def _reject_unported_settings(settings: _TransportSettings) -> None:
         "resolve": settings.resolve is not None,
         "local_address": settings.local_address is not None,
         "tcp_keepalive": settings.tcp_keepalive is not None,
-        "max_connections": settings.max_connections is not None,
-        "pool_timeout": settings.pool_timeout is not None,
     }
     for name, used in unported.items():
         if used:
@@ -117,6 +115,15 @@ def _native_idle_timeout(settings: _TransportSettings) -> timedelta | None:
     if settings.pool_idle_timeout is None:
         return None
     return timedelta(seconds=settings.pool_idle_timeout)
+
+
+def _native_pool_timeout(settings: _TransportSettings) -> timedelta | None:
+    """`pool_timeout` as the pyreqwest transport hands it over, a `timedelta`, so a bad value fails
+    on entry with the same error as there (as `_native_idle_timeout`). It only bounds a wait for
+    one of `max_connections`' slots, so without that it does nothing, as on pyreqwest."""
+    if settings.pool_timeout is None:
+        return None
+    return timedelta(seconds=settings.pool_timeout)
 
 
 def _unported(feature: str) -> NotImplementedError:
@@ -1007,6 +1014,8 @@ class _NativeTransport:
                 total_timeout,
                 _native_idle_timeout(settings),
                 settings.pool_max_idle_per_host,
+                settings.max_connections,
+                _native_pool_timeout(settings),
                 settings.proxy,
                 _native_no_proxy(settings),
                 _native_glue(),
@@ -1538,6 +1547,8 @@ class _SyncNativeTransport:
                 total_timeout,
                 _native_idle_timeout(settings),
                 settings.pool_max_idle_per_host,
+                settings.max_connections,
+                _native_pool_timeout(settings),
                 settings.proxy,
                 _native_no_proxy(settings),
                 _native_glue(),

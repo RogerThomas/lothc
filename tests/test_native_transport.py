@@ -159,7 +159,6 @@ def _unported_settings() -> list[tuple[str, Any]]:
         ("connect_timeout", 1.0),
         ("read_timeout", 1.0),
         ("http2", True),
-        ("max_connections", 1),
     ]
 
 

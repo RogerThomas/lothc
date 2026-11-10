@@ -16,7 +16,6 @@ says. Through a tunnel, `/peer` names the proxy's connection to the server, one 
 """
 
 import asyncio
-import os
 import threading
 import time
 from collections.abc import AsyncGenerator, Generator
@@ -298,11 +297,6 @@ async def test_a_request_waiting_for_a_connection_takes_one_freed_meanwhile(
     assert second_port == first_port
 
 
-@pytest.mark.xfail(
-    os.environ.get("LOTHC_TRANSPORT") == "native",
-    reason="the native sync pool has no queue of waiting requests (it comes with max_connections)",
-    strict=True,
-)
 def test_sync_a_request_waiting_for_a_connection_takes_one_freed_meanwhile(
     https_base_url: str, tls_ca_pem: bytes
 ) -> None:
@@ -325,3 +319,176 @@ def test_sync_a_request_waiting_for_a_connection_takes_one_freed_meanwhile(
         second_port = second.result()
 
     assert second_port == first_port
+
+
+async def test_the_connection_a_request_was_opening_when_it_took_a_freed_one_is_still_pooled(
+    https_base_url: str, tls_ca_pem: bytes
+) -> None:
+    # The second request takes the first's connection without waiting for its own, which is
+    # finished anyway once its tunnel is let through, and pooled: the next two requests at once
+    # reuse both, opening no third tunnel.
+    release = threading.Event()
+    with serve_http_proxy(hold_later_tunnels=release) as proxy:
+        async with HTTPClient(
+            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        ) as client:
+            first = asyncio.create_task(_port(client, seconds=0.1))
+            await _tunnels_opened(proxy, 1)
+            second = asyncio.create_task(_port(client))
+            await _tunnels_opened(proxy, 2)
+            first_port = await first
+            await asyncio.wait([second], timeout=0.5)
+            finished_before_release = second.done()
+            release.set()
+            await asyncio.sleep(0.05)
+            ports = set(
+                await asyncio.gather(_port(client, seconds=0.05), _port(client, seconds=0.05))
+            )
+            tunnels = len(proxy.requests)
+
+    assert finished_before_release
+    assert len(ports) == 2
+    assert first_port in ports
+    assert tunnels == 2
+
+
+def test_sync_the_connection_a_request_was_opening_when_it_took_a_freed_one_is_still_pooled(
+    https_base_url: str, tls_ca_pem: bytes
+) -> None:
+    release = threading.Event()
+    with (
+        serve_http_proxy(hold_later_tunnels=release) as proxy,
+        SyncHTTPClient(
+            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        ) as client,
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        first = pool.submit(_sync_port, client, 0.1)
+        _sync_tunnels_opened(proxy, 1)
+        second = pool.submit(_sync_port, client)
+        _sync_tunnels_opened(proxy, 2)
+        first_port = first.result()
+        wait([second], timeout=0.5)
+        finished_before_release = second.done()
+        release.set()
+        time.sleep(0.05)
+        pair = [pool.submit(_sync_port, client, 0.05) for _ in range(2)]
+        ports = {future.result() for future in pair}
+        tunnels = len(proxy.requests)
+
+    assert finished_before_release
+    assert len(ports) == 2
+    assert first_port in ports
+    assert tunnels == 2
+
+
+async def _port_at(client: HTTPClient, url: str) -> int:
+    return int((await client.get(url, into=dict)).data["port"])
+
+
+def _sync_port_at(client: SyncHTTPClient, url: str) -> int:
+    return int(client.get(url, into=dict).data["port"])
+
+
+async def test_a_connection_freed_meanwhile_goes_only_to_a_request_for_its_own_origin(
+    https_base_url: str, tls_ca_pem: bytes
+) -> None:
+    other_origin = https_base_url.replace("localhost", "127.0.0.1")
+    release = threading.Event()
+    with serve_http_proxy(hold_later_tunnels=release) as proxy:
+        async with HTTPClient(
+            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        ) as client:
+            first = asyncio.create_task(_port(client, seconds=0.1))
+            await _tunnels_opened(proxy, 1)
+            second = asyncio.create_task(_port_at(client, f"{other_origin}peer"))
+            await _tunnels_opened(proxy, 2)
+            first_port = await first
+            await asyncio.wait([second], timeout=0.1)
+            finished_before_release = second.done()
+            release.set()
+            second_port = await second
+
+    assert not finished_before_release
+    assert second_port != first_port
+
+
+def test_sync_a_connection_freed_meanwhile_goes_only_to_a_request_for_its_own_origin(
+    https_base_url: str, tls_ca_pem: bytes
+) -> None:
+    other_origin = https_base_url.replace("localhost", "127.0.0.1")
+    release = threading.Event()
+    with (
+        serve_http_proxy(hold_later_tunnels=release) as proxy,
+        SyncHTTPClient(
+            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        ) as client,
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        first = pool.submit(_sync_port, client, 0.1)
+        _sync_tunnels_opened(proxy, 1)
+        second = pool.submit(_sync_port_at, client, f"{other_origin}peer")
+        _sync_tunnels_opened(proxy, 2)
+        first_port = first.result()
+        wait([second], timeout=0.1)
+        finished_before_release = second.done()
+        release.set()
+        second_port = second.result()
+
+    assert not finished_before_release
+    assert second_port != first_port
+
+
+async def test_a_request_waiting_for_a_connection_when_the_client_closes_raises_runtime_error(
+    https_base_url: str, tls_ca_pem: bytes
+) -> None:
+    release = threading.Event()
+    with serve_http_proxy(hold_later_tunnels=release) as proxy:
+        client = HTTPClient(
+            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        )
+        await client.__aenter__()
+        try:
+            first = asyncio.create_task(_port(client, seconds=0.5))
+            await _tunnels_opened(proxy, 1)
+            waiting = asyncio.create_task(_port(client))
+            await _tunnels_opened(proxy, 2)
+            await client.__aexit__(None, None, None)
+            closed_at = time.monotonic()
+
+            with pytest.raises(RuntimeError, match="client is closed"):
+                await waiting
+            assert time.monotonic() - closed_at < 0.5
+            with pytest.raises(RuntimeError, match="client is closed"):
+                await first
+        finally:
+            release.set()
+
+
+def test_sync_a_request_waiting_for_a_connection_when_the_client_closes_raises_runtime_error(
+    https_base_url: str, tls_ca_pem: bytes
+) -> None:
+    release = threading.Event()
+    with (
+        serve_http_proxy(hold_later_tunnels=release) as proxy,
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        client = SyncHTTPClient(
+            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        )
+        client.__enter__()
+        try:
+            first = pool.submit(_sync_port, client, 0.5)
+            _sync_tunnels_opened(proxy, 1)
+            waiting = pool.submit(_sync_port, client)
+            _sync_tunnels_opened(proxy, 2)
+            client.__exit__(None, None, None)
+            closed_at = time.monotonic()
+
+            with pytest.raises(RuntimeError, match="client is closed"):
+                waiting.result(timeout=2.0)
+            assert time.monotonic() - closed_at < 0.5
+            with pytest.raises(RuntimeError, match="client is closed"):
+                first.result(timeout=2.0)
+        finally:
+            release.set()

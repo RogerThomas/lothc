@@ -115,6 +115,8 @@ class Pool:
         timeout: timedelta | None,
         pool_idle_timeout: timedelta | None,
         pool_max_idle_per_host: int | None,
+        max_connections: int | None,
+        pool_timeout: timedelta | None,
         proxy: str | None,
         no_proxy: str | None,
         glue: _Glue,
@@ -128,7 +130,10 @@ class Pool:
         `close_conn(conn)` to unregister and close it. `timeout` is the client's, only converted
         (a negative one raises `ValueError`, as pyreqwest's builder does); each request carries
         its own. `pool_idle_timeout`/
-        `pool_max_idle_per_host` default to reqwest's 90s and no cap. `proxy`/`no_proxy` are
+        `pool_max_idle_per_host` default to reqwest's 90s and no cap. `max_connections` caps the
+        requests in flight at once, all origins together, as pyreqwest does (0 raises
+        `ValueError`); one beyond it waits its turn, for at most `pool_timeout` and never past its
+        own timeout, then raises `HTTPTimeoutError`. `proxy`/`no_proxy` are
         `proxy=` and `no_proxy=` (comma-separated); without `proxy`, the environment's proxies
         apply, read now. A `proxy` that isn't a URL raises `ValueError`. With
         `follow_redirects`, a request follows up to `max_redirects` (reqwest's 10 if `None`) as
@@ -222,6 +227,8 @@ class SyncPool:
         timeout: timedelta | None,
         pool_idle_timeout: timedelta | None,
         pool_max_idle_per_host: int | None,
+        max_connections: int | None,
+        pool_timeout: timedelta | None,
         proxy: str | None,
         no_proxy: str | None,
         glue: _Glue,
