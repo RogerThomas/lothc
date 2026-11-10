@@ -90,12 +90,21 @@ def _reject_unported_settings(settings: _TransportSettings) -> None:
 
 
 def _native_total_timeout(settings: _TransportSettings) -> timedelta | None:
-    """The client's `timeout` as the pyreqwest transport hands its builder it, a `timedelta`, only
-    so that a bad one fails on entry with the same error as there (as `_native_idle_timeout`);
-    each request still carries its own timeout."""
+    """The client's `timeout` as the pyreqwest transport hands its builder it, a `timedelta`, so
+    that a bad one fails on entry with the same error as there (as `_native_idle_timeout`). Each
+    request carries it, unless the call passes its own, converted the same way
+    (`_native_call_timeout`)."""
     if settings.timeout is None:
         return None
     return timedelta(seconds=settings.timeout)
+
+
+def _native_call_timeout(timeout: float) -> timedelta:
+    """A per-call `timeout` as the pyreqwest transport hands its request builder it
+    (`_apply_timeout`): a `timedelta`, so it rounds to the microsecond the same way and a NaN, an
+    infinite or an out-of-range one raises the same error, here, and a negative one the same
+    `ValueError`, from the native side's conversion as from pyreqwest's."""
+    return timedelta(seconds=timeout)
 
 
 def _native_idle_timeout(settings: _TransportSettings) -> timedelta | None:
@@ -345,7 +354,7 @@ class _NativeCall:
     headers: dict[str, str] | None
     body: object
     body_kind: _NativeBody
-    timeout: float | None
+    timeout: timedelta | None
 
 
 def _response_retry_signal(response: Response[Any, Any]) -> tuple[int, str | None]:
@@ -356,12 +365,14 @@ def _response_retry_signal(response: Response[Any, Any]) -> tuple[int, str | Non
 @dataclass(slots=True)
 class _NativeStreamRequest:
     """A native stream's request as the pool takes it: `query`/`headers` encoded (a plain `dict`
-    as is, as `send` passes it), the body as `_native_body` makes it."""
+    as is, as `send` passes it), the body as `_native_body` makes it, the per-call `timeout` as
+    `_native_call_timeout` does."""
 
     query: object
     headers: dict[str, str] | None
     body: object
     body_kind: _NativeBody
+    timeout: timedelta | None
 
 
 def _native_stream_request(call: _StreamCall) -> _NativeStreamRequest:
@@ -374,10 +385,11 @@ def _native_stream_request(call: _StreamCall) -> _NativeStreamRequest:
     encoded_headers = (
         headers if headers is None or isinstance(headers, dict) else _encode_headers(headers)
     )
+    timeout = None if call.timeout is None else _native_call_timeout(call.timeout)
     if call.json is None and call.data is None and call.form is None and call.content is None:
-        return _NativeStreamRequest(query, encoded_headers, None, _NativeBody.RAW)
+        return _NativeStreamRequest(query, encoded_headers, None, _NativeBody.RAW, timeout)
     body, body_kind = _native_body(call.json, call.data, call.form, call.content)
-    return _NativeStreamRequest(query, encoded_headers, body, body_kind)
+    return _NativeStreamRequest(query, encoded_headers, body, body_kind, timeout)
 
 
 @dataclass(slots=True)
@@ -448,7 +460,7 @@ class _NativeStreamSource:
             auth,
             request.body,
             request.body_kind,
-            self._call.timeout,
+            request.timeout,
             self._accept,
             self._last_event_id,
         )
@@ -593,7 +605,7 @@ class _SyncNativeStreamSource:
             auth,
             request.body,
             request.body_kind,
-            self._call.timeout,
+            request.timeout,
             self._accept,
             self._last_event_id,
         )
@@ -728,6 +740,9 @@ class _NativeTransport:
     # The longest gap `stream_get`/`stream_post`/`download` tolerate between chunks: the client's
     # `timeout` (see `_PyreqwestTransport`; `read_timeout` isn't ported). Not applied to `sse`.
     _stream_idle_timeout: float | None = _dataclass_field(init=False)
+    # The client's `timeout`, converted on entry (`_native_total_timeout`): each request's, unless
+    # the call passes its own.
+    _total_timeout: timedelta | None = _dataclass_field(default=None, init=False)
     # `into` -> the callable the native side decodes a body with, for the forms `_decoders`
     # caches; anything else is resolved per call, as `_decoder_for` rebuilds it per call.
     _decode_cache: dict[object, _DecodeFn | None] = _dataclass_field(init=False)
@@ -771,7 +786,7 @@ class _NativeTransport:
         auth: str | None,
         body: object,
         body_kind: _NativeBody,
-        timeout: float | None,
+        timeout: timedelta | None,
         decode: _DecodeFn | None,
         error_class: type[HTTPResponseError[Any]] | None,
         response_headers_type: type[TypedHeaders] | None,
@@ -924,6 +939,7 @@ class _NativeTransport:
         settings = self._settings
         event_loop = asyncio.get_running_loop()
         connections = _LoopConnections(event_loop)
+        total_timeout = _native_total_timeout(settings)
         # A plain `ValueError` from the native one, as `_client_build_error` makes pyreqwest's.
         try:
             pool = _NativePool(
@@ -940,7 +956,7 @@ class _NativeTransport:
                 settings.min_tls_version,
                 settings.max_tls_version,
                 settings.danger_accept_invalid_certs,
-                _native_total_timeout(settings),
+                total_timeout,
                 _native_idle_timeout(settings),
                 settings.pool_max_idle_per_host,
                 settings.proxy,
@@ -956,6 +972,7 @@ class _NativeTransport:
         connections.attach(pool)
         self._native_pool = pool
         self._connections = connections
+        self._total_timeout = total_timeout
 
     async def close(self) -> None:
         pool, connections = self._native_pool, self._connections
@@ -964,7 +981,7 @@ class _NativeTransport:
         if pool is not None:
             pool.close()
         if connections is not None:
-            connections.close_all()
+            connections.stop()
 
     async def send(
         self,
@@ -1008,7 +1025,9 @@ class _NativeTransport:
             body, body_kind = None, _NativeBody.RAW
         else:
             body, body_kind = _native_body(json, data, form, content)
-        effective_timeout = timeout if timeout is not None else self._settings.timeout
+        effective_timeout = (
+            self._total_timeout if timeout is None else _native_call_timeout(timeout)
+        )
         error_class = (raises if raises is not None else self._raises) if error_for_status else None
         if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
             call = _NativeCall(
@@ -1075,7 +1094,9 @@ class _NativeTransport:
         encoded_headers = (
             headers if headers is None or isinstance(headers, dict) else _encode_headers(headers)
         )
-        effective_timeout = timeout if timeout is not None else self._settings.timeout
+        effective_timeout = (
+            self._total_timeout if timeout is None else _native_call_timeout(timeout)
+        )
         error_class = (raises if raises is not None else self._raises) if error_for_status else None
         if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
             call = _NativeCall(
@@ -1249,6 +1270,9 @@ class _SyncNativeTransport:
     # The longest gap `stream_get`/`stream_post`/`download` tolerate between chunks: the client's
     # `timeout` (see `_PyreqwestTransport`; `read_timeout` isn't ported). Not applied to `sse`.
     _stream_idle_timeout: float | None = _dataclass_field(init=False)
+    # The client's `timeout`, converted on entry (`_native_total_timeout`): each request's, unless
+    # the call passes its own.
+    _total_timeout: timedelta | None = _dataclass_field(default=None, init=False)
     # `into` -> the callable the native side decodes a body with, for the forms `_decoders`
     # caches; anything else is resolved per call, as `_decoder_for` rebuilds it per call.
     _decode_cache: dict[object, _DecodeFn | None] = _dataclass_field(init=False)
@@ -1291,7 +1315,7 @@ class _SyncNativeTransport:
         auth: str | None,
         body: object,
         body_kind: _NativeBody,
-        timeout: float | None,
+        timeout: timedelta | None,
         decode: _DecodeFn | None,
         error_class: type[HTTPResponseError[Any]] | None,
         response_headers_type: type[TypedHeaders] | None,
@@ -1439,6 +1463,7 @@ class _SyncNativeTransport:
         if self._native_pool is not None:
             raise RuntimeError("This SyncHTTPClient is already open; enter it once at a time.")
         settings = self._settings
+        total_timeout = _native_total_timeout(settings)
         # A plain `ValueError` from the native one, as `_client_build_error` makes pyreqwest's.
         try:
             self._native_pool = _NativeSyncPool(
@@ -1455,7 +1480,7 @@ class _SyncNativeTransport:
                 settings.min_tls_version,
                 settings.max_tls_version,
                 settings.danger_accept_invalid_certs,
-                _native_total_timeout(settings),
+                total_timeout,
                 _native_idle_timeout(settings),
                 settings.pool_max_idle_per_host,
                 settings.proxy,
@@ -1464,6 +1489,7 @@ class _SyncNativeTransport:
             )
         except _NativeClientBuildError as error:
             raise ValueError(str(error)) from error
+        self._total_timeout = total_timeout
 
     def close(self) -> None:
         pool = self._native_pool
@@ -1512,7 +1538,9 @@ class _SyncNativeTransport:
             body, body_kind = None, _NativeBody.RAW
         else:
             body, body_kind = _native_body(json, data, form, content)
-        effective_timeout = timeout if timeout is not None else self._settings.timeout
+        effective_timeout = (
+            self._total_timeout if timeout is None else _native_call_timeout(timeout)
+        )
         error_class = (raises if raises is not None else self._raises) if error_for_status else None
         if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
             call = _NativeCall(
@@ -1574,7 +1602,9 @@ class _SyncNativeTransport:
         encoded_headers = (
             headers if headers is None or isinstance(headers, dict) else _encode_headers(headers)
         )
-        effective_timeout = timeout if timeout is not None else self._settings.timeout
+        effective_timeout = (
+            self._total_timeout if timeout is None else _native_call_timeout(timeout)
+        )
         error_class = (raises if raises is not None else self._raises) if error_for_status else None
         if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
             call = _NativeCall(

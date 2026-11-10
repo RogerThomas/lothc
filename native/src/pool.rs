@@ -35,6 +35,11 @@
 //! the body ends, so it is never idle (or reaped) mid-stream, and its deadline, if any, covers the
 //! whole body. A body read to its end returns the connection to the pool; closing a stream early
 //! shuts its socket down and retires it, so the server sees the hang-up.
+//!
+//! `close()` fails every request still pending with the `RuntimeError` a request after it raises,
+//! as pyreqwest's does, except a stream whose head has arrived: its body outlives the client, as
+//! on pyreqwest, under its deadline, and its connection is closed (never pooled) once the body
+//! ends or the stream is closed.
 use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
@@ -52,7 +57,7 @@ use http::Request;
 use http_body_util::Full;
 use http::{HeaderMap, Version};
 use hyper::client::conn::http1;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
@@ -64,7 +69,7 @@ use crate::idle::IdlePolicy;
 use crate::io::{shutdown, LoopReady, Stream};
 use crate::proxy::{Proxies, Route};
 use crate::redirect::{Hop, Redirect};
-use crate::request::{connect_address, total_timeout, ClientConfig, OriginKey, VerbHeaders};
+use crate::request::{connect_address, ClientConfig, DeadlineClock, OriginKey, VerbHeaders};
 use crate::response::{fetch, send, Exchange, Fetched, Glue, Head, Sender};
 use crate::stream::{BodyStream, Channel};
 use crate::tls::{TlsSettings, TlsSocket};
@@ -129,6 +134,14 @@ struct Meta {
     stream: Option<Box<StreamMeta>>,
 }
 
+impl Meta {
+    /// A stream whose head has arrived, not given up on: as on pyreqwest, its body outlives the
+    /// client.
+    fn reads_on(&self) -> bool {
+        !self.cancelled && self.stream.as_ref().is_some_and(|stream| stream.head)
+    }
+}
+
 /// A streamed request's state, from `stream` until Python closes it.
 struct StreamMeta {
     /// The body's chunks read ahead, shared with its pump task.
@@ -140,6 +153,8 @@ struct StreamMeta {
     /// The body has ended (its end reported or not).
     done: bool,
     opened: bool,
+    /// Its head has arrived, resolving the open Future.
+    head: bool,
     /// The total timeout, from `open`.
     timeout: Option<Duration>,
 }
@@ -260,6 +275,9 @@ struct PoolState {
     stream_events: Rc<Cell<Vec<StreamEvent>>>,
     event_loop: LoopGlue,
     glue: Glue,
+    clock: DeadlineClock,
+    /// Set by `close`: nothing new is sent, and only streams that read on (`Meta::reads_on`)
+    /// still have a connection, closed once their body ends.
     is_closed: bool,
 }
 
@@ -270,13 +288,6 @@ fn push<T>(cell: &Cell<Vec<T>>, item: T) {
     let mut items = cell.take();
     items.push(item);
     cell.set(items);
-}
-
-fn deadline_after(started: Instant, timeout: Option<f64>) -> PyResult<Option<Instant>> {
-    let Some(timeout) = timeout else { return Ok(None) };
-    let duration = Duration::try_from_secs_f64(timeout).map_err(|_| PyValueError::new_err(format!("invalid timeout: {timeout}")))?;
-    // Beyond what `Instant` can hold is as good as no deadline.
-    Ok(started.checked_add(duration))
 }
 
 fn stream_misused(what: &str) -> PyErr {
@@ -644,16 +655,19 @@ impl PoolState {
     /// A streamed request's head arrived: resolve its open Future.
     fn stream_head(&mut self, py: Python<'_>, slot: usize, status: u16, version: Version, headers: HeaderMap) -> PyResult<()> {
         let Some(meta) = self.meta(slot).filter(|meta| !meta.cancelled) else { return Ok(()) };
+        if let Some(stream) = meta.stream.as_mut() {
+            stream.head = true;
+        }
         let fut = meta.fut.clone_ref(py);
         let outcome = self.glue.stream_head(py, status, version, headers).map(Bound::into_any);
         Glue::settle(py, &fut, outcome)
     }
 
     /// Hand a free connection on: to the next request waiting on its origin, else the pool (or
-    /// close it, when the pool keeps none).
+    /// close it, when the pool keeps none or has closed).
     fn release_connection(&mut self, py: Python<'_>, conn: usize, sender: Sender) -> PyResult<()> {
         self.conns[conn].sender = Some(sender);
-        if self.idle_policy.pools() {
+        if self.idle_policy.pools() && !self.is_closed {
             self.dispatch(py, conn)
         } else {
             self.expire(py, conn)
@@ -1034,7 +1048,7 @@ impl PoolState {
         body: Option<&Bound<'_, PyAny>>,
         body_kind: u8,
         decode: Option<Py<PyAny>>,
-        timeout: Option<f64>,
+        timeout: Option<Duration>,
         raises: Option<Py<PyAny>>,
         typed_headers: Option<Py<PyAny>>,
         headers_only: bool,
@@ -1047,7 +1061,7 @@ impl PoolState {
         let origin = self.origin_for(&prepared.url, prepared.route);
         let fut = self.event_loop.create_future.call0(py)?;
         let started = Instant::now();
-        let deadline = deadline_after(started, timeout)?;
+        let deadline = timeout.and_then(|timeout| self.clock.deadline(started, timeout));
         let meta = Meta {
             request: Some(prepared.request),
             redirect: prepared.redirect,
@@ -1083,7 +1097,7 @@ impl PoolState {
         auth: Option<&str>,
         body: Option<&Bound<'_, PyAny>>,
         body_kind: u8,
-        timeout: Option<f64>,
+        timeout: Option<Duration>,
         verb_headers: VerbHeaders,
     ) -> PyResult<(usize, u32, Py<PyAny>)> {
         if self.is_closed {
@@ -1091,7 +1105,6 @@ impl PoolState {
         }
         let prepared =
             self.config.prepare_with(py, &self.glue, method.to_str()?, path, query, headers, auth, body, body_kind, verb_headers)?;
-        let timeout = total_timeout(timeout)?;
         let request_info = self.glue.request_info_of(py, &method, &prepared.url)?.unbind();
         let origin = self.origin_for(&prepared.url, prepared.route);
         let fut = self.event_loop.create_future.call0(py)?;
@@ -1117,6 +1130,7 @@ impl PoolState {
                 end: None,
                 done: false,
                 opened: false,
+                head: false,
                 timeout,
             })),
         };
@@ -1132,26 +1146,24 @@ impl PoolState {
         if !self.is_live(slot, generation) {
             return Err(stream_misused("a stream was opened after it closed"));
         }
-        let started = Instant::now();
+        let (started, clock) = (Instant::now(), self.clock);
         let Some(meta) = self.meta(slot) else { return Err(stream_misused("a stream lost its state")) };
         let Some(stream) = meta.stream.as_mut().filter(|stream| !stream.opened) else {
             return Err(stream_misused("a stream was opened twice"));
         };
         stream.opened = true;
-        let deadline = stream.timeout.and_then(|timeout| started.checked_add(timeout));
+        let deadline = stream.timeout.and_then(|timeout| clock.deadline(started, timeout));
         meta.exchange.started = started;
         let (origin, fut) = (meta.origin, meta.fut.clone_ref(py));
         self.enqueue(py, slot, generation, origin, started, deadline)?;
         Ok(fut)
     }
 
-    /// The Future of an open stream's next chunk (`bytes`), or `None` at the end of its body.
+    /// The Future of an open stream's next chunk (`bytes`), or `None` at the end of its body. A
+    /// stream that reads on (`Meta::reads_on`) still reads once the pool has closed.
     fn stream_read(&mut self, py: Python<'_>, slot: usize, generation: u32) -> PyResult<Py<PyAny>> {
-        if self.is_closed {
-            return Err(Glue::closed_error());
-        }
         if !self.is_live(slot, generation) {
-            return Err(stream_misused("a stream was read after it closed"));
+            return Err(if self.is_closed { Glue::closed_error() } else { stream_misused("a stream was read after it closed") });
         }
         let fut = self.event_loop.create_future.call0(py)?;
         let Some(stream) = self.meta(slot).and_then(|meta| meta.stream.as_mut()) else {
@@ -1190,11 +1202,32 @@ impl PoolState {
                 stream.channel.close();
             }
         }
-        shutdown(self.conns[conn].fd);
+        if self.is_closed {
+            // Its connection is retired right here: after the pool's close, the loop may not run
+            // again to report the socket.
+            self.cut_off(conn);
+        } else {
+            shutdown(self.conns[conn].fd);
+        }
         self.run(py)
     }
 
-    /// Fail everything still pending, drop every connection and the timer.
+    /// Shut `conn`'s socket down and wake whatever waits on it, so its tasks see the hang-up on
+    /// their next poll, not once the loop reports the socket.
+    fn cut_off(&self, conn: usize) {
+        let c = &self.conns[conn];
+        shutdown(c.fd);
+        if let Some(ready) = &c.ready {
+            for waker in [ready.set_readable(), ready.set_writable()].into_iter().flatten() {
+                waker.wake();
+            }
+        }
+    }
+
+    /// Fail everything still pending and drop every connection and the timer, except what the
+    /// streams that read on (`Meta::reads_on`) still need: as on pyreqwest, each one's body
+    /// outlives the client, its deadline included, and its connection is closed, never pooled,
+    /// once the body ends or the stream is closed.
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         self.is_closed = true;
         self.reap_at = None;
@@ -1202,6 +1235,9 @@ impl PoolState {
             handle.bind(py).call_method0(intern!(py, "cancel"))?;
         }
         for slot in 0..self.slots.len() {
+            if self.slots[slot].meta.as_ref().is_some_and(Meta::reads_on) {
+                continue;
+            }
             if let Some(meta) = self.release(slot) {
                 Glue::settle(py, &meta.fut, Err(Glue::closed_error()))?;
                 if let Some(read) = meta.stream.and_then(|stream| stream.read) {
@@ -1209,21 +1245,51 @@ impl PoolState {
                 }
             }
         }
-        for conn in 0..self.conns.len() {
-            if self.conns[conn].state != State::Dead {
-                self.event_loop.close_conn.call1(py, (conn,))?;
-            }
+        // Every other connection is cut off and its tasks run to their end before its socket is
+        // closed, so none can touch the descriptor's number once a new socket reuses it.
+        let slots = &self.slots;
+        let reading_on = |c: &Conn| c.current.is_some_and(|slot| slots[slot].meta.is_some());
+        let cut: Vec<usize> = (0..self.conns.len()).filter(|&conn| self.conns[conn].state != State::Dead && !reading_on(&self.conns[conn])).collect();
+        for &conn in &cut {
+            self.cut_off(conn);
         }
-        // Dropping the executor drops every hyper future still in it; anything they reported
-        // refers to connections that no longer exist.
-        self.exec = LocalPool::new();
-        self.spawner = self.exec.spawner();
-        drop((self.done.take(), self.closed.take(), self.writers.take(), self.handshaken.take()));
-        drop((self.readers.take(), self.stream_events.take()));
-        self.conns.clear();
-        self.origins.clear();
-        self.deadlines.clear();
-        Ok(())
+        self.exec.run_until_stalled();
+        for &conn in &cut {
+            self.drop_connection(py, conn)?;
+        }
+        for origin in &mut self.origins {
+            origin.waiting.clear();
+            origin.connecting = 0;
+        }
+        // What their tasks reported goes with them; the streams that read on keep theirs.
+        drop((self.done.take(), self.handshaken.take()));
+        let events = self.stream_events.take();
+        let slots = &self.slots;
+        let live = |slot: usize| slots[slot].meta.is_some();
+        let kept: Vec<StreamEvent> = events
+            .into_iter()
+            .filter(|event| match event {
+                StreamEvent::Arrived(slot) | StreamEvent::End { slot, .. } => live(*slot),
+                StreamEvent::Head { .. } | StreamEvent::Hop { .. } => false,
+            })
+            .collect();
+        self.stream_events.set(kept);
+        if self.slots.iter().all(|slot| slot.meta.is_none()) {
+            // Nothing reads on: dropping the executor drops anything still in it.
+            self.exec = LocalPool::new();
+            self.spawner = self.exec.spawner();
+            drop((self.closed.take(), self.writers.take(), self.readers.take(), self.stream_events.take()));
+            self.conns.clear();
+            self.origins.clear();
+            self.deadlines.clear();
+            return Ok(());
+        }
+        let slots = &self.slots;
+        self.deadlines.retain(|Reverse((_, s, g))| slots[*s].generation == *g && slots[*s].meta.is_some());
+        if let Some(Reverse((deadline, _, _))) = self.deadlines.peek().copied() {
+            self.arm(py, deadline)?;
+        }
+        self.run(py)
     }
 }
 
@@ -1307,6 +1373,7 @@ impl Pool {
                 on_readable: None,
             },
             glue: Glue::new(py, glue)?,
+            clock: DeadlineClock::new(),
             is_closed: false,
         };
         Ok(Self { state: ThreadBound::new(state) })
@@ -1336,7 +1403,7 @@ impl Pool {
         body: Option<Bound<'_, PyAny>>,
         body_kind: u8,
         decode: Option<Py<PyAny>>,
-        timeout: Option<f64>,
+        timeout: Option<Duration>,
         raises: Option<Py<PyAny>>,
         typed_headers: Option<Py<PyAny>>,
         headers_only: bool,
@@ -1373,7 +1440,7 @@ impl Pool {
         auth: Option<&str>,
         body: Option<Bound<'_, PyAny>>,
         body_kind: u8,
-        timeout: Option<f64>,
+        timeout: Option<Duration>,
         accept: Option<&str>,
         last_event_id: Option<&str>,
     ) -> PyResult<AsyncStream> {
@@ -1424,7 +1491,8 @@ impl Pool {
         self.state.get_mut()?.on_deadline(py)
     }
 
-    /// The client is closing: pending requests fail with `RuntimeError`, connections are dropped.
+    /// The client is closing: pending requests fail with `RuntimeError`, connections are dropped,
+    /// all but those of streams whose head has arrived, which read on.
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         self.state.get_mut()?.close(py)
     }

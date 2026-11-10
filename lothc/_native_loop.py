@@ -121,9 +121,9 @@ class _LoopConnections:
     def close(self, conn: int) -> None:
         self._close(conn)
 
-    def close_all(self) -> None:
+    def stop(self) -> None:
+        """The pool has closed: connect nothing more. It has closed every socket already but
+        those of streams still reading their bodies, which it closes as each one ends."""
         self._pool = None
         for task in self._connecting:
             task.cancel()
-        for conn in list(self._sockets):
-            self._close(conn)

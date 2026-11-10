@@ -1,8 +1,11 @@
 import asyncio
-import os
+import queue
+import socket
+import threading
 import time
 from collections.abc import AsyncGenerator, Generator
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from importlib.metadata import version
 from typing import Any
 from urllib.parse import urlsplit
@@ -11,7 +14,7 @@ import pytest
 from _helpers import echoed_header_values, echoed_headers
 from pydantic import BaseModel
 
-from lothc import HTTPClient, HTTPConnectionError, SyncHTTPClient
+from lothc import HTTPClient, HTTPConnectionError, HTTPTimeoutError, SyncHTTPClient
 
 
 class _DefaultHeaders(BaseModel):
@@ -25,6 +28,52 @@ async def _async_bearer_auth() -> str:
 
 def _sync_bearer_auth() -> str:
     return "token-value"
+
+
+@dataclass(slots=True)
+class _TwoHalvesServer:
+    """A server for one request, its answer sent in two halves: the head and the body's first
+    half at once, the rest once `release` is set. `after_body` then gets what the client did with
+    the connection: `b""` for closing it, the start of another request, or `None` for leaving it
+    open."""
+
+    url: str
+    release: threading.Event
+    after_body: queue.Queue[bytes | None]
+
+
+def _answer_in_two_halves(
+    listener: socket.socket, release: threading.Event, after_body: queue.Queue[bytes | None]
+) -> None:
+    conn, _ = listener.accept()
+    with conn:
+        conn.settimeout(2.0)
+        request = b""
+        while b"\r\n\r\n" not in request:
+            request += conn.recv(65536)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nab")
+        release.wait(2.0)
+        conn.sendall(b"cd")
+        try:
+            after_body.put(conn.recv(65536))
+        except TimeoutError:
+            after_body.put(None)
+
+
+@pytest.fixture(name="two_halves_server")
+def _two_halves_server() -> Generator[_TwoHalvesServer]:
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        listener.settimeout(2.0)
+        server = _TwoHalvesServer(
+            f"http://127.0.0.1:{listener.getsockname()[1]}/", threading.Event(), queue.Queue()
+        )
+        thread = threading.Thread(
+            target=_answer_in_two_halves, args=(listener, server.release, server.after_body)
+        )
+        thread.start()
+        yield server
+        server.release.set()
+        thread.join()
 
 
 @pytest.fixture(name="user_agent_client")
@@ -228,11 +277,6 @@ async def test_a_stream_still_waiting_for_its_head_when_the_client_closes_raises
     assert time.monotonic() - closed_at < 0.5
 
 
-@pytest.mark.xfail(
-    os.environ.get("LOTHC_TRANSPORT") == "native",
-    reason="the native async pool fails a stream's reads when its client closes",
-    strict=True,
-)
 async def test_a_stream_whose_head_has_arrived_reads_on_after_the_client_closes(
     base_url: str, server_key: str
 ) -> None:
@@ -247,6 +291,40 @@ async def test_a_stream_whose_head_has_arrived_reads_on_after_the_client_closes(
         await stream.aclose()
 
     assert received == 2**20
+
+
+async def test_a_stream_read_to_its_end_after_the_client_closes_closes_its_connection(
+    two_halves_server: _TwoHalvesServer,
+) -> None:
+    # Closed, not pooled for a client that will never send on it again.
+    client = HTTPClient(base_url=two_halves_server.url)
+    await client.__aenter__()
+    stream = client.stream_get("two-halves")
+    try:
+        received = await anext(stream)
+        await client.__aexit__(None, None, None)
+        two_halves_server.release.set()
+        received += b"".join([chunk async for chunk in stream])
+    finally:
+        await stream.aclose()
+
+    assert received == b"abcd"
+    assert two_halves_server.after_body.get(timeout=3.0) == b""
+
+
+async def test_a_stream_whose_head_has_arrived_still_times_out_after_the_client_closes(
+    base_url: str,
+) -> None:
+    client = HTTPClient(base_url=base_url)
+    await client.__aenter__()
+    stream = client.stream_get("stall-after-first-chunk", params={"seconds": 1.0}, timeout=0.2)
+    try:
+        await anext(stream)
+        await client.__aexit__(None, None, None)
+        with pytest.raises(HTTPTimeoutError):
+            await anext(stream)
+    finally:
+        await stream.aclose()
 
 
 async def test_exiting_a_client_that_is_not_open_is_harmless(base_url: str) -> None:
@@ -655,3 +733,36 @@ def test_sync_a_stream_whose_head_has_arrived_reads_on_after_the_client_closes(
         stream.close()
 
     assert received == 2**20
+
+
+def test_sync_a_stream_read_to_its_end_after_the_client_closes_closes_its_connection(
+    two_halves_server: _TwoHalvesServer,
+) -> None:
+    client = SyncHTTPClient(base_url=two_halves_server.url)
+    client.__enter__()
+    stream = client.stream_get("two-halves")
+    try:
+        received = next(stream)
+        client.__exit__(None, None, None)
+        two_halves_server.release.set()
+        received += b"".join(stream)
+    finally:
+        stream.close()
+
+    assert received == b"abcd"
+    assert two_halves_server.after_body.get(timeout=3.0) == b""
+
+
+def test_sync_a_stream_whose_head_has_arrived_still_times_out_after_the_client_closes(
+    base_url: str,
+) -> None:
+    client = SyncHTTPClient(base_url=base_url)
+    client.__enter__()
+    stream = client.stream_get("stall-after-first-chunk", params={"seconds": 1.0}, timeout=0.2)
+    try:
+        next(stream)
+        client.__exit__(None, None, None)
+        with pytest.raises(HTTPTimeoutError):
+            next(stream)
+    finally:
+        stream.close()

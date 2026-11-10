@@ -39,7 +39,7 @@ use http::{Request, Response};
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::client::conn::http1;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString, PyTuple};
 use rustls::pki_types::ServerName;
@@ -51,7 +51,7 @@ use crate::idle::IdlePolicy;
 use crate::io::{shutdown, PollReady, Stream};
 use crate::proxy::{Handshake, Proxies, Route};
 use crate::redirect::Redirect;
-use crate::request::{connect_address, total_timeout, ClientConfig, OriginKey, Prepared, VerbHeaders};
+use crate::request::{connect_address, ClientConfig, DeadlineClock, OriginKey, Prepared, VerbHeaders};
 use crate::response::{fetch, send, Exchange, Fetched, Glue, Head, Sender};
 use crate::stream::BodyStream;
 use crate::tls::{TlsSettings, TlsSocket};
@@ -332,6 +332,7 @@ pub(crate) struct SyncPool {
     in_flight: Arc<Mutex<InFlight>>,
     closed: AtomicBool,
     glue: Glue,
+    clock: DeadlineClock,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -639,6 +640,7 @@ impl SyncPool {
             in_flight: Arc::default(),
             closed: AtomicBool::new(false),
             glue: Glue::new(py, glue)?,
+            clock: DeadlineClock::new(),
         })
     }
 
@@ -656,7 +658,7 @@ impl SyncPool {
         body: Option<Bound<'py, PyAny>>,
         body_kind: u8,
         decode: Option<Py<PyAny>>,
-        timeout: Option<f64>,
+        timeout: Option<Duration>,
         raises: Option<Py<PyAny>>,
         typed_headers: Option<Py<PyAny>>,
         headers_only: bool,
@@ -680,12 +682,7 @@ impl SyncPool {
             Err(message) => return Err(self.glue.connection_error(py, message)),
         };
         let started = Instant::now();
-        let deadline = match timeout {
-            Some(timeout) => started.checked_add(
-                Duration::try_from_secs_f64(timeout).map_err(|_| PyValueError::new_err(format!("invalid timeout: {timeout}")))?,
-            ),
-            None => None,
-        };
+        let deadline = timeout.and_then(|timeout| self.clock.deadline(started, timeout));
         let result = self.send_following(py, target, request, deadline, redirect)?;
         let exchange = Exchange {
             method: method.unbind(),
@@ -712,7 +709,7 @@ impl SyncPool {
         auth: Option<&str>,
         body: Option<Bound<'_, PyAny>>,
         body_kind: u8,
-        timeout: Option<f64>,
+        timeout: Option<Duration>,
         accept: Option<&str>,
         last_event_id: Option<&str>,
     ) -> PyResult<SyncStream> {
@@ -733,7 +730,6 @@ impl SyncPool {
             body_kind,
             verb_headers,
         )?;
-        let timeout = total_timeout(timeout)?;
         let request_info = pool.glue.request_info_of(py, &method, &url)?.unbind();
         let prepared = Box::new(PreparedStream { target: Self::target(&url, route), request, redirect });
         Ok(SyncStream { pool: slf.clone().unbind(), request_info, timeout, state: Mutex::new(StreamState::Prepared(prepared)) })
@@ -852,7 +848,7 @@ impl SyncStream {
                 return Err(pool.glue.connection_error(py, message));
             }
         };
-        let deadline = self.timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+        let deadline = self.timeout.and_then(|timeout| pool.clock.deadline(Instant::now(), timeout));
         let (target, conn, response) = match pool.open_following(py, target, request, deadline, redirect) {
             Ok(opened) => opened,
             Err(error) => {

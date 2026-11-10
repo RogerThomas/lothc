@@ -19,7 +19,7 @@
 //! A redirect's hop (`redirect.rs`) starts from step 4's headers before `host`, as reqwest's
 //! redirect layer copies them, and gets its own `host` and request target.
 use std::net::IpAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::prelude::BASE64_STANDARD;
 use base64::write::EncoderWriter;
@@ -55,11 +55,28 @@ pub(crate) const BODY_FORM: u8 = 3;
 /// Far below `HeaderMap`'s own limit, which panics rather than erroring in `extend`.
 const MAX_HEADERS: usize = 8192;
 
-/// A request's total `timeout`, checked when it is built (pyreqwest's builder checks it there).
-pub(crate) fn total_timeout(timeout: Option<f64>) -> PyResult<Option<Duration>> {
-    timeout
-        .map(|timeout| Duration::try_from_secs_f64(timeout).map_err(|_| PyValueError::new_err(format!("invalid timeout: {timeout}"))))
-        .transpose()
+/// Requests' deadlines as reqwest's timer sets them. A request's total `timeout` arrives as the
+/// `Duration` pyo3 makes of a `timedelta`, as pyreqwest's builder takes it. tokio rounds each
+/// deadline up to the end of its millisecond, counted from when its clock started, so a zero or
+/// sub-millisecond timeout still leaves an exchange until that millisecond ends: on pyreqwest a
+/// `timeout=0` request to a quick server usually succeeds, and to a slower one always times out.
+#[derive(Clone, Copy)]
+pub(crate) struct DeadlineClock {
+    epoch: Instant,
+}
+
+impl DeadlineClock {
+    pub(crate) fn new() -> Self {
+        Self { epoch: Instant::now() }
+    }
+
+    /// When a request started at `started` with total `timeout` times out; `None` (no deadline)
+    /// beyond what `Instant` can hold.
+    pub(crate) fn deadline(self, started: Instant, timeout: Duration) -> Option<Instant> {
+        let since = started.checked_add(timeout)?.saturating_duration_since(self.epoch);
+        let millis = since.checked_add(Duration::from_nanos(999_999))?.as_millis();
+        self.epoch.checked_add(Duration::from_millis(u64::try_from(millis).ok()?))
+    }
 }
 
 /// Where a request's connection goes: pooled per scheme, host and port.

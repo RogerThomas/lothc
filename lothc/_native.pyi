@@ -153,7 +153,7 @@ class Pool:
         body: object,
         body_kind: int,
         decode: Callable[[bytes], object] | None,
-        timeout: float | None,
+        timeout: timedelta | None,
         raises: type[HTTPResponseError[Any]] | None,
         typed_headers: type | None,
         headers_only: bool,
@@ -162,8 +162,11 @@ class Pool:
 
         `query` (and a `data=` form `body`) is a `dict` (a `list`/`tuple` value repeats the key)
         or `(name, value)` pairs. `body_kind`: 0 raw `bytes`/`str`, 1 already-encoded JSON, 2 a
-        `dict`/`list` to serialize, 3 a form. `raises` is `None` for no status check. Raises
-        before any I/O for a request that can't be built (`ValueError`, `HTTPTransportError`).
+        `dict`/`list` to serialize, 3 a form. `raises` is `None` for no status check. `timeout`
+        is the request's total timeout, as pyreqwest's builder takes it (a negative one raises
+        `ValueError`), its deadline rounded up to the end of a millisecond as tokio's timer rounds
+        reqwest's. Raises before any I/O for a request that can't be built (`ValueError`,
+        `HTTPTransportError`).
         """
 
     def stream(
@@ -175,7 +178,7 @@ class Pool:
         auth: str | None,
         body: object,
         body_kind: int,
-        timeout: float | None,
+        timeout: timedelta | None,
         accept: str | None,
         last_event_id: str | None,
     ) -> Stream:
@@ -194,7 +197,8 @@ class Pool:
 
     def on_deadline(self) -> None: ...
     def close(self) -> None:
-        """Fail every pending request with `RuntimeError` and drop every connection."""
+        """Fail every pending request with `RuntimeError` and drop every connection. A stream
+        whose head has arrived reads on, its connection closed once its body ends."""
 
 @final
 class SyncPool:
@@ -231,7 +235,7 @@ class SyncPool:
         body: object,
         body_kind: int,
         decode: Callable[[bytes], object] | None,
-        timeout: float | None,
+        timeout: timedelta | None,
         raises: type[HTTPResponseError[Any]] | None,
         typed_headers: type | None,
         headers_only: bool,
@@ -247,7 +251,7 @@ class SyncPool:
         auth: str | None,
         body: object,
         body_kind: int,
-        timeout: float | None,
+        timeout: timedelta | None,
         accept: str | None,
         last_event_id: str | None,
     ) -> SyncStream:

@@ -122,7 +122,9 @@ or editing Python here.
 - **Selected with `native=True`**, read once at construction. `LOTHC_TRANSPORT=native` is a
   test-only override that wins over the argument (a `bool` can't tell an explicit `False` from
   the default); user docs don't mention it.
-- **POSIX only:** it needs `poll(2)` and `loop.add_reader`, so Windows raises at construction.
+- **POSIX only, and pyreqwest stays as Windows' transport** (decided 2026-11-10): native needs
+  `poll(2)` and `loop.add_reader`, which Windows' default loop lacks, and an I/O thread there would
+  bring back the cross-thread hop native exists to avoid. So `native=True` raises on Windows.
 - **It must match pyreqwest exactly**: the same wire bytes, results and exception classes. The
   only accepted difference is that a transport error's `str()` is a flat cause chain. Crate pins
   follow pyreqwest 0.15.0's lockfile, and each feature uses reqwest's own crates where they exist
@@ -144,7 +146,11 @@ or editing Python here.
   reads, so a slow consumer never buffers a whole body.
 - **Measured choices:** one shared deadline timer and heap (a per-request `call_later` cost
   ~1.3us); lazy headers; PGO is worth ~6-7%.
-- **Not built yet:** the sync waiting queue, `form=`, HTTP/2, the mocker, and wheels.
+- **HTTP/2 is deferred** until someone asks (decided 2026-11-10): it's the largest port and rarely
+  used, so `http2=True` stays on pyreqwest.
+- **The mocker will run through native's own request code** (decided 2026-11-10), answering from
+  Python handlers instead of the network, so mocked tests still see the exact request sent.
+- **Not built yet:** the sync waiting queue, `form=`, the mocker, and wheels.
 
 ## Decisions
 
