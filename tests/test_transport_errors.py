@@ -198,3 +198,15 @@ def test_sync_using_a_closed_client_raises_runtime_error(base_url: str) -> None:
 
     with pytest.raises(RuntimeError, match="client is closed"):
         client.get("items/7")
+
+
+def test_sync_download_cut_short_raises_connection_error(sync_client: SyncHTTPClient) -> None:
+    with pytest.raises(HTTPConnectionError):
+        sync_client.download("truncated-content-length")
+
+
+def test_sync_invalid_json_body_raises_the_stdlib_json_error(sync_client: SyncHTTPClient) -> None:
+    with pytest.raises(json.JSONDecodeError) as exc_info:
+        sync_client.get("invalid-json", into=dict)
+
+    assert type(exc_info.value) is json.JSONDecodeError

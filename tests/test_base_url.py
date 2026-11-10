@@ -6,7 +6,10 @@ The test server has no route that echoes the request path, so every assertion re
 or from the `HTTPResponseError` on a 404 (anything under `/prefix/` doesn't exist on the server).
 """
 
+from urllib.parse import urlsplit
+
 import pytest
+from _helpers import echoed_headers
 
 from lothc import HTTPClient, HTTPResponseError, SyncHTTPClient
 
@@ -97,3 +100,45 @@ def test_sync_base_path_without_trailing_slash_is_rejected(base_url: str) -> Non
         SyncHTTPClient(base_url=f"{base_url}prefix"),
     ):
         pass
+
+
+async def test_a_protocol_relative_url_overrides_the_base_host_auth_included(
+    base_url: str,
+) -> None:
+    # Another host name for the same server, reached through `resolve`. The client's auth goes to
+    # whichever host the URL names: lothc doesn't restrict it to `base_url`'s.
+    port = urlsplit(base_url).port
+    async with HTTPClient(
+        base_url=f"{base_url}prefix/",
+        bearer_token="token-value",
+        resolve={"other.test": "127.0.0.1"},
+    ) as client:
+        result = await client.get(f"//other.test:{port}/echo-headers", into=dict)
+
+    assert result.request.url == f"http://other.test:{port}/echo-headers"
+    assert echoed_headers(result.data)["authorization"] == "Bearer token-value"
+
+
+def test_sync_a_protocol_relative_url_overrides_the_base_host_auth_included(
+    base_url: str,
+) -> None:
+    port = urlsplit(base_url).port
+    with SyncHTTPClient(
+        base_url=f"{base_url}prefix/",
+        bearer_token="token-value",
+        resolve={"other.test": "127.0.0.1"},
+    ) as client:
+        result = client.get(f"//other.test:{port}/echo-headers", into=dict)
+
+    assert result.request.url == f"http://other.test:{port}/echo-headers"
+    assert echoed_headers(result.data)["authorization"] == "Bearer token-value"
+
+
+async def test_an_absolute_url_on_another_host_also_gets_the_clients_auth(base_url: str) -> None:
+    port = urlsplit(base_url).port
+    async with HTTPClient(
+        base_url=base_url, bearer_token="token-value", resolve={"other.test": "127.0.0.1"}
+    ) as client:
+        result = await client.get(f"http://other.test:{port}/echo-headers", into=dict)
+
+    assert echoed_headers(result.data)["authorization"] == "Bearer token-value"

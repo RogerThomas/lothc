@@ -3,7 +3,7 @@ idempotent verb, retried once with a fresh one: `OAuthProvider` used to keep sen
 token, failing every call until it naturally expired.
 """
 
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from _oauth_server import TokenServer
@@ -151,3 +151,75 @@ def test_sync_a_401_after_reauthenticating_is_raised_as_the_clients_raises_class
         client.get("always-unauthorized", params={"key": f"{token_server.key}-api"})
 
     assert exc_info.value.error == {"hits": 2}
+
+
+type _ReplayedVerb = Literal["put", "delete", "head", "options", "patch"]
+
+
+async def _send_rejected(client: HTTPClient, verb: _ReplayedVerb, key: str) -> None:
+    # `/status-then-ok` rejecting every attempt with a 401, bodiless for HEAD.
+    params: dict[str, str | int] = {"key": key, "status": 401, "fail_times": 9}
+    match verb:
+        case "put":
+            await client.put("status-then-ok", params=params)
+        case "delete":
+            await client.delete("status-then-ok", params=params)
+        case "head":
+            await client.head("status-then-ok", params=params)
+        case "options":
+            await client.options("status-then-ok", params=params)
+        case "patch":
+            await client.patch("status-then-ok", params=params)
+
+
+def _send_rejected_sync(client: SyncHTTPClient, verb: _ReplayedVerb, key: str) -> None:
+    params: dict[str, str | int] = {"key": key, "status": 401, "fail_times": 9}
+    match verb:
+        case "put":
+            client.put("status-then-ok", params=params)
+        case "delete":
+            client.delete("status-then-ok", params=params)
+        case "head":
+            client.head("status-then-ok", params=params)
+        case "options":
+            client.options("status-then-ok", params=params)
+        case "patch":
+            client.patch("status-then-ok", params=params)
+
+
+@pytest.mark.parametrize(
+    ("verb", "attempts"),
+    [("put", 2), ("delete", 2), ("head", 2), ("options", 2), ("patch", 1)],
+)
+async def test_a_401_is_replayed_with_a_fresh_token_only_for_idempotent_verbs(
+    base_url: str, token_server: TokenServer, verb: _ReplayedVerb, attempts: int
+) -> None:
+    # PATCH, like POST, may not be safe to repeat, so its 401 is raised without a second token
+    # being fetched. The hit count is read with `skip_auth`, which fetches no token either.
+    api_key = f"{token_server.key}-api"
+    async with HTTPClient(base_url=base_url, bearer_auth=token_server.provider()) as client:
+        with pytest.raises(HTTPResponseError) as exc_info:
+            await _send_rejected(client, verb, api_key)
+        hits = (await client.get("hits", params={"key": api_key}, into=dict, skip_auth=True)).data
+
+    assert exc_info.value.status == 401
+    assert hits == {"hits": attempts}
+    assert len(token_server.requests()) == attempts
+
+
+@pytest.mark.parametrize(
+    ("verb", "attempts"),
+    [("put", 2), ("delete", 2), ("head", 2), ("options", 2), ("patch", 1)],
+)
+def test_sync_a_401_is_replayed_with_a_fresh_token_only_for_idempotent_verbs(
+    base_url: str, token_server: TokenServer, verb: _ReplayedVerb, attempts: int
+) -> None:
+    api_key = f"{token_server.key}-api"
+    with SyncHTTPClient(base_url=base_url, bearer_auth=token_server.sync_provider()) as client:
+        with pytest.raises(HTTPResponseError) as exc_info:
+            _send_rejected_sync(client, verb, api_key)
+        hits = client.get("hits", params={"key": api_key}, into=dict, skip_auth=True).data
+
+    assert exc_info.value.status == 401
+    assert hits == {"hits": attempts}
+    assert len(token_server.requests()) == attempts

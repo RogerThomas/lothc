@@ -21,7 +21,11 @@ class TokenEndpoint:
     applies (e.g. a 3600s `expires_in`, no refresh token).
     """
 
-    path: Literal["oauth/token", "oauth/token-custom", "oauth/token-boom"] = "oauth/token"
+    path: Literal["oauth/token", "oauth/token-custom", "oauth/token-boom", "oauth/token-broken"] = (
+        "oauth/token"
+    )
+    # `oauth/token-broken` only: what its 200 carries instead of a usable token.
+    broken: Literal["not-json", "no-access-token"] | None = None
     expires_in: int | None = None
     omit_expires_in: bool = False
     with_refresh: bool = False
@@ -50,6 +54,8 @@ class TokenEndpoint:
             params["refresh_omits_token"] = 1
         if self.later_mint_status is not None:
             params["later_mint_status"] = self.later_mint_status
+        if self.broken is not None:
+            params["shape"] = self.broken
         return f"{base_url}{self.path}?{urlencode(params)}"
 
 

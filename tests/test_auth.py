@@ -1,7 +1,8 @@
 import base64
+from typing import Any
 
 import pytest
-from _helpers import echoed_headers
+from _helpers import echoed_header_values, echoed_headers
 
 from lothc import HTTPClient, SyncHTTPClient
 
@@ -152,3 +153,51 @@ def test_sync_build_raises_when_more_than_one_auth_mechanism_provided(base_url: 
         ),
     ):
         pass
+
+
+async def test_basic_auth_without_a_password_sends_an_empty_one(base_url: str) -> None:
+    async with HTTPClient(base_url=base_url, basic_auth=("username", None)) as client:
+        result = (await client.get("echo-headers", into=dict)).data
+
+    expected = base64.b64encode(b"username:").decode()
+    assert echoed_headers(result)["authorization"] == f"Basic {expected}"
+
+
+def test_sync_basic_auth_without_a_password_sends_an_empty_one(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, basic_auth=("username", None)) as client:
+        result = client.get("echo-headers", into=dict).data
+
+    expected = base64.b64encode(b"username:").decode()
+    assert echoed_headers(result)["authorization"] == f"Basic {expected}"
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [{"bearer_token": "token-value"}, {"basic_auth": ("username", "password")}],
+    ids=["bearer_token", "basic_auth"],
+)
+async def test_a_per_request_authorization_header_replaces_the_clients_auth(
+    base_url: str, auth: dict[str, Any]
+) -> None:
+    async with HTTPClient(base_url=base_url, **auth) as client:
+        result = (
+            await client.get("echo-headers", headers={"authorization": "Custom value"}, into=dict)
+        ).data
+
+    assert echoed_header_values(result, "authorization") == ["Custom value"]
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [{"bearer_token": "token-value"}, {"basic_auth": ("username", "password")}],
+    ids=["bearer_token", "basic_auth"],
+)
+def test_sync_a_per_request_authorization_header_replaces_the_clients_auth(
+    base_url: str, auth: dict[str, Any]
+) -> None:
+    with SyncHTTPClient(base_url=base_url, **auth) as client:
+        result = client.get(
+            "echo-headers", headers={"authorization": "Custom value"}, into=dict
+        ).data
+
+    assert echoed_header_values(result, "authorization") == ["Custom value"]

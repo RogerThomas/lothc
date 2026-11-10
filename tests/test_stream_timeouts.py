@@ -209,3 +209,33 @@ def test_sync_stream_loses_nothing_when_the_consumer_falls_behind(base_url: str)
         if line.startswith(b"data: ")
     ]
     assert [event["msg"] for event in events] == [f"hello {i}" for i in range(400)]
+
+
+def test_sync_a_stalled_download_leaves_no_file(base_url: str, tmp_path: Path) -> None:
+    with (
+        SyncHTTPClient(base_url=base_url, timeout=0.1) as client,
+        pytest.raises(HTTPTimeoutError),
+    ):
+        client.download("stall-after-first-chunk", dest=tmp_path / "dest", params={"seconds": 1})
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_sync_an_explicit_per_call_timeout_still_caps_the_whole_stream(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url) as client, pytest.raises(HTTPTimeoutError):
+        for _ in client.stream_get("events", params={"interval": 0.05, "count": 6}, timeout=0.1):
+            pass
+
+
+def test_sync_read_timeout_replaces_the_idle_limit_when_set(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, timeout=0.05, read_timeout=1.0) as client:
+        body = b"".join(client.stream_get("events", params={"interval": 0.15, "count": 1}))
+
+    assert body.count(b"data: ") == 1
+
+
+def test_sync_sse_keeps_no_idle_limit(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, timeout=0.05) as client:
+        events = list(client.sse("events", params={"interval": 0.15, "count": 1}, max_reconnects=0))
+
+    assert len(events) == 1

@@ -1,7 +1,9 @@
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, cast
 
+import msgspec
 import pytest
 from msgspec import Struct
 from msgspec.json import Decoder
@@ -214,3 +216,80 @@ async def test_stream_get_decodes_many_ndjson_lines_arriving_in_one_chunk(
     ]
 
     assert lines == [{"i": i} for i in range(5000)]
+
+
+async def test_stream_get_hands_over_each_chunk_as_it_arrives(
+    base_url: str, server_key: str
+) -> None:
+    # `/endless` writes 5 bytes every 5ms and never finishes. Held back until pyreqwest's 64KB
+    # default read buffer filled, the first chunk would take over a minute; the 0.5s idle limit
+    # turns that into a failure here rather than a hang.
+    async with HTTPClient(base_url=base_url, timeout=0.5) as client:
+        stream = client.stream_get("endless", params={"key": server_key})
+        started = time.monotonic()
+        first = await anext(stream)
+        elapsed = time.monotonic() - started
+        await stream.aclose()
+
+    assert first.startswith(b"chunk")
+    assert elapsed < 0.4
+
+
+async def test_stream_post_hands_over_each_chunk_as_it_arrives(
+    base_url: str, server_key: str
+) -> None:
+    async with HTTPClient(base_url=base_url, timeout=0.5) as client:
+        stream = client.stream_post("endless", params={"key": server_key}, json={"a": 1})
+        started = time.monotonic()
+        first = await anext(stream)
+        elapsed = time.monotonic() - started
+        await stream.aclose()
+
+    assert first.startswith(b"chunk")
+    assert elapsed < 0.4
+
+
+def test_sync_stream_get_hands_over_each_chunk_as_it_arrives(
+    base_url: str, server_key: str
+) -> None:
+    with SyncHTTPClient(base_url=base_url, timeout=0.5) as client:
+        stream = client.stream_get("endless", params={"key": server_key})
+        started = time.monotonic()
+        first = next(stream)
+        elapsed = time.monotonic() - started
+        stream.close()
+
+    assert first.startswith(b"chunk")
+    assert elapsed < 0.4
+
+
+def test_sync_stream_post_hands_over_each_chunk_as_it_arrives(
+    base_url: str, server_key: str
+) -> None:
+    with SyncHTTPClient(base_url=base_url, timeout=0.5) as client:
+        stream = client.stream_post("endless", params={"key": server_key}, json={"a": 1})
+        started = time.monotonic()
+        first = next(stream)
+        elapsed = time.monotonic() - started
+        stream.close()
+
+    assert first.startswith(b"chunk")
+    assert elapsed < 0.4
+
+
+class _WrongLine(Struct):
+    i: str
+
+
+async def test_stream_get_raises_the_decoders_error_for_a_line_that_does_not_fit(
+    client: HTTPClient,
+) -> None:
+    with pytest.raises(msgspec.ValidationError):
+        [line async for line in client.stream_get("ndjson", into=_WrongLine)]
+
+
+def test_sync_stream_get_raises_the_decoders_error_for_a_line_that_does_not_fit(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(msgspec.ValidationError):
+        list(sync_client.stream_get("ndjson", into=_WrongLine))

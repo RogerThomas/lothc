@@ -1,9 +1,12 @@
 import asyncio
+import time
+from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import version
+from typing import Any
 from urllib.parse import urlsplit
 
 import pytest
-from _helpers import echoed_headers
+from _helpers import echoed_header_values, echoed_headers
 from pydantic import BaseModel
 
 from lothc import HTTPClient, HTTPConnectionError, SyncHTTPClient
@@ -331,3 +334,103 @@ def test_an_unjoinable_base_url_is_rejected_at_construction(
 ) -> None:
     with pytest.raises(ValueError, match="trailing slash"):
         client_class(base_url=base_url)
+
+
+async def test_a_per_request_header_replaces_a_default_header_of_the_same_name(
+    base_url: str,
+) -> None:
+    async with HTTPClient(base_url=base_url, default_headers={"X-Api-Key": "default"}) as client:
+        result = (
+            await client.get("echo-headers", headers={"x-api-key": "override"}, into=dict)
+        ).data
+
+    assert echoed_header_values(result, "x-api-key") == ["override"]
+
+
+def test_sync_a_per_request_header_replaces_a_default_header_of_the_same_name(
+    base_url: str,
+) -> None:
+    with SyncHTTPClient(base_url=base_url, default_headers={"X-Api-Key": "default"}) as client:
+        result = client.get("echo-headers", headers={"x-api-key": "override"}, into=dict).data
+
+    assert echoed_header_values(result, "x-api-key") == ["override"]
+
+
+async def _open_and_close(client: HTTPClient) -> None:
+    async with client:
+        pass
+
+
+def _open_and_close_sync(client: SyncHTTPClient) -> None:
+    with client:
+        pass
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"local_address": "not-an-ip"},
+        {"resolve": {"lothc.test": "not-an-ip"}},
+        {"max_connections": 0},
+        {"default_headers": {"bad name": "value"}},
+        {"timeout": -1.0},
+    ],
+    ids=["local_address", "resolve", "max_connections", "default_headers", "timeout"],
+)
+async def test_unusable_settings_raise_value_error_by_the_time_the_client_opens(
+    settings: dict[str, Any],
+) -> None:
+    # Construction or entry, whichever notices first; never a pyreqwest exception type.
+    with pytest.raises(ValueError, match=r".+") as exc_info:
+        await _open_and_close(HTTPClient(**settings))
+
+    assert not type(exc_info.value).__module__.startswith("pyreqwest")
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"local_address": "not-an-ip"},
+        {"resolve": {"lothc.test": "not-an-ip"}},
+        {"max_connections": 0},
+        {"default_headers": {"bad name": "value"}},
+        {"timeout": -1.0},
+    ],
+    ids=["local_address", "resolve", "max_connections", "default_headers", "timeout"],
+)
+def test_sync_unusable_settings_raise_value_error_by_the_time_the_client_opens(
+    settings: dict[str, Any],
+) -> None:
+    with pytest.raises(ValueError, match=r".+") as exc_info:
+        _open_and_close_sync(SyncHTTPClient(**settings))
+
+    assert not type(exc_info.value).__module__.startswith("pyreqwest")
+
+
+def test_sync_local_address_is_the_address_connections_come_from(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, local_address="127.0.0.1") as client:
+        result = client.get("items/7", into=dict).data
+
+    assert result == {"id": 7, "name": "item-7"}
+
+
+def test_sync_a_local_address_this_machine_does_not_have_fails_to_connect(base_url: str) -> None:
+    with (
+        SyncHTTPClient(base_url=base_url, local_address="192.0.2.1") as client,
+        pytest.raises(HTTPConnectionError),
+    ):
+        client.get("items/7")
+
+
+def test_sync_a_request_in_flight_when_the_client_closes_raises_runtime_error(
+    base_url: str,
+) -> None:
+    client = SyncHTTPClient(base_url=base_url)
+    client.__enter__()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        request = pool.submit(client.get, "slow", params={"seconds": 0.5})
+        time.sleep(0.1)
+        client.__exit__(None, None, None)
+
+        with pytest.raises(RuntimeError, match="client is closed"):
+            request.result()

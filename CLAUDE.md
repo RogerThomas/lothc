@@ -219,14 +219,28 @@ uv run basedpyright lothc tests
 - **`tests/_helpers.py`**: `echoed_headers(result)` turns `/echo-headers`' body into a lowercased
   name → value dict (last value wins; a duplicate-header test reads the raw list). Keep it free of
   pydantic/msgspec: `task test-no-extras` picks modules by grepping their own text, so an import
-  through a helper would slip past it.
+  through a helper would slip past it. `clear_proxy_variables(monkeypatch)` unsets every proxy
+  variable (and CGI's `REQUEST_METHOD`): reqwest applies them to loopback too, so a developer's
+  `HTTP_PROXY` would otherwise route a proxy test through their own proxy.
+- **`tests/_proxy_server.py` for proxy tests**: `serve_http_proxy(...)` (forwarding plus
+  `CONNECT`) and `serve_socks5_proxy(...)`, function-scoped stdlib servers that record each
+  request/handshake as received. Both connect upstream to `127.0.0.1`, whatever host was asked
+  for; `upstream_port=` reaches a test server for a URL on 80/443.
+- **`tests/test_wire_format.py` pins the exact wire output** (request line, headers in order with
+  casing, body, `RequestInfo`) via `/echo-request` and the proxies, the same golden value for both
+  clients, ports masked as `<port>` and the default user agent as `python-lothc/<version>`. It's
+  the contract any transport change must keep; regenerate a value only for a deliberate change.
+  Deliberately not pinned: an `int` outside i64 in `params=`/`data=` (sent as a lossy float, a
+  bug) and NaN/inf query values.
 - **The `client`/`sync_client` fixtures over an inline default client**, unless the test is about
   the client's lifecycle (reading after close, re-entry).
 
 ### Test suite speed
 
-~8.7s for ~850 tests; the growth since ~3.0s/385 tests is deliberate timing tests (stream idle
-limits, retries) and per-verb/per-case parametrization, not overhead. The fixed floor (interpreter, plugins, `import lothc`,
+~20s for ~1630 tests; the growth since ~3.0s/385 tests is deliberate timing tests (stream idle
+limits, retries, idle connections, two real 1s `Retry-After` waits), per-verb/per-case
+parametrization, and a function-scoped proxy per proxy/wire-format test (~3.2s for
+`test_proxies.py`'s 194), not overhead. The fixed floor (interpreter, plugins, `import lothc`,
 collection) is ~0.45s, and a typical test costs ~2ms *including* a real HTTP round trip and its
 own event loop, so sharing a client or a broader-scoped loop buys nothing and costs isolation.
 

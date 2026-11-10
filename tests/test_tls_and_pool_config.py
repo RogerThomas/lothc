@@ -3,10 +3,11 @@
 `max_connections`/`pool_timeout` get a real behavioural test: with one connection slot and a
 short `pool_timeout`, a second concurrent request times out waiting for the slot (without
 `max_connections` it never waits; without `pool_timeout` it waits and succeeds, so the test
-fails if either setting stops reaching pyreqwest). `connect_timeout`/`pool_idle_timeout`/
-`pool_max_idle_per_host` only get a "still builds and still makes a normal request" check: none
-has an observable effect against a local server that accepts connections instantly. The TLS
-settings are tested against a real HTTPS server in `tests/test_tls.py`.
+fails if either setting stops reaching pyreqwest). `connect_timeout` only gets a "still builds and
+still makes a normal request" check: it has no observable effect against a local server that
+accepts connections instantly. `pool_idle_timeout`/`pool_max_idle_per_host` are tested by which
+connection serves each request, in `tests/test_idle_connections.py`. The TLS settings are tested
+against a real HTTPS server in `tests/test_tls.py`.
 """
 
 import asyncio
