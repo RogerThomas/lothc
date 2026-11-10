@@ -105,6 +105,7 @@ class Pool:
         default_headers: dict[str, str] | None,
         user_agent: str,
         https_only: bool,
+        cookie_store: bool,
         follow_redirects: bool,
         max_redirects: int | None,
         root_certificates: Sequence[bytes],
@@ -133,7 +134,8 @@ class Pool:
         apply, read now. A `proxy` that isn't a URL raises `ValueError`. With
         `follow_redirects`, a request follows up to `max_redirects` (reqwest's 10 if `None`) as
         reqwest does, within its one timeout; a negative `max_redirects` raises `OverflowError`
-        even without, as pyreqwest's builder does."""
+        even without, as pyreqwest's builder does. With `cookie_store`, the pool keeps a cookie
+        jar, empty at first, as reqwest's `cookie_store(true)` does."""
 
     def set_callbacks(
         self,
@@ -212,6 +214,7 @@ class SyncPool:
         default_headers: dict[str, str] | None,
         user_agent: str,
         https_only: bool,
+        cookie_store: bool,
         follow_redirects: bool,
         max_redirects: int | None,
         root_certificates: Sequence[bytes],

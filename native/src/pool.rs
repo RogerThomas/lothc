@@ -64,6 +64,7 @@ use rustls::pki_types::ServerName;
 use rustls::ClientConnection;
 
 use crate::body::RequestBody;
+use crate::cookie::Cookies;
 use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
 use crate::io::{shutdown, LoopReady, Stream};
@@ -123,6 +124,9 @@ struct Meta {
     /// What a redirect is followed from (`None` if they aren't): taken by `start` with the
     /// request, and put back with it, or with the hop's request.
     redirect: Option<Box<Redirect>>,
+    /// Where the current request's response's cookies go, with `cookie_store=True` (the hop's,
+    /// once it has one).
+    cookies: Option<Cookies>,
     exchange: Exchange,
     /// What the request resolves: its `Response`, or a stream's head.
     fut: Py<PyAny>,
@@ -360,6 +364,7 @@ impl PoolState {
             return Err(PyRuntimeError::new_err("internal error: a queued request was already started"));
         };
         let mut redirect = meta.redirect.take();
+        let cookies = meta.cookies.clone();
         let channel = meta.stream.as_ref().map(|stream| stream.channel.clone());
         self.conns[conn].current = Some(slot);
         let done = self.done.clone();
@@ -367,7 +372,7 @@ impl PoolState {
             return self
                 .spawner
                 .spawn_local(async move {
-                    let result = fetch(&mut sender, request, redirect.as_deref_mut()).await;
+                    let result = fetch(&mut sender, request, redirect.as_deref_mut(), cookies.as_ref()).await;
                     push(&done, Completion { conn, slot, sender, result, redirect });
                 })
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()));
@@ -380,6 +385,9 @@ impl PoolState {
                     // Before the head: a failure like any request's (re-queued if unsent).
                     Err(failure) => return push(&done, Completion { conn, slot, sender, result: Err(failure), redirect }),
                 };
+                if let Some(cookies) = &cookies {
+                    cookies.store(response.headers());
+                }
                 if let Some(mut state) = redirect {
                     match state.next(response.status().as_u16(), response.headers()) {
                         Ok(None) => {}
@@ -721,6 +729,7 @@ impl PoolState {
         let Some(meta) = self.meta(slot) else { return Ok(()) };
         meta.request = Some(prepared.request);
         meta.redirect = Some(redirect);
+        meta.cookies = prepared.cookies;
         meta.origin = origin;
         self.place(py, slot, origin, Instant::now()).map(drop)
     }
@@ -1065,6 +1074,7 @@ impl PoolState {
         let meta = Meta {
             request: Some(prepared.request),
             redirect: prepared.redirect,
+            cookies: prepared.cookies,
             exchange: Exchange {
                 method: method.unbind(),
                 url: prepared.url,
@@ -1111,6 +1121,7 @@ impl PoolState {
         let meta = Meta {
             request: Some(prepared.request),
             redirect: prepared.redirect,
+            cookies: prepared.cookies,
             exchange: Exchange {
                 method: method.unbind(),
                 url: prepared.url,
@@ -1302,13 +1313,14 @@ pub(crate) struct Pool {
 impl Pool {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (base_url, default_headers, user_agent, https_only, follow_redirects, max_redirects, root_certificates, identity_pem, min_tls_version, max_tls_version, danger_accept_invalid_certs, timeout, pool_idle_timeout, pool_max_idle_per_host, proxy, no_proxy, glue, event_loop, spawn_connect, close_conn))]
+    #[pyo3(signature = (base_url, default_headers, user_agent, https_only, cookie_store, follow_redirects, max_redirects, root_certificates, identity_pem, min_tls_version, max_tls_version, danger_accept_invalid_certs, timeout, pool_idle_timeout, pool_max_idle_per_host, proxy, no_proxy, glue, event_loop, spawn_connect, close_conn))]
     fn new(
         py: Python<'_>,
         base_url: Option<&str>,
         default_headers: Option<&Bound<'_, PyAny>>,
         user_agent: &str,
         https_only: bool,
+        cookie_store: bool,
         follow_redirects: bool,
         max_redirects: Option<usize>,
         root_certificates: Vec<Vec<u8>>,
@@ -1336,7 +1348,8 @@ impl Pool {
             spawner,
             config: ClientConfig::new(base_url, default_headers, user_agent, https_only)?
                 .with_proxies(Proxies::new(proxy, no_proxy)?)
-                .with_redirects(follow_redirects, max_redirects),
+                .with_redirects(follow_redirects, max_redirects)
+                .with_cookies(cookie_store),
             tls: TlsSettings::new(
                 &root_certificates,
                 identity_pem.as_deref(),

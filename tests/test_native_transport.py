@@ -155,7 +155,6 @@ def test_sync_pyreqwest_still_works_on_windows(
 
 def _unported_settings() -> list[tuple[str, Any]]:
     return [
-        ("cookie_store", True),
         ("connect_timeout", 1.0),
         ("read_timeout", 1.0),
         ("http2", True),

@@ -13,13 +13,17 @@
 //! 4. a `json=` dict/list's content type, then reqwest's client defaults (`accept`, `user-agent`)
 //!    where absent, then an HTTP proxy's `proxy-authorization` where absent (reqwest's
 //!    `proxy_auth`, for an `http://` target only), then `accept-encoding` where absent
-//!    (tower-http's `Decompression`), then `host` where absent (hyper-util's). hyper adds
+//!    (tower-http's `Decompression`), then the cookie jar's `cookie` where absent, with
+//!    `cookie_store=True` (reqwest's `CookieService`, `cookie.rs`), then `host` where absent
+//!    (hyper-util's). hyper adds
 //!    `content-length` last. The request target is origin-form, or the whole URI when the
 //!    request goes to an HTTP proxy (`proxy.rs`).
 //!
-//! A redirect's hop (`redirect.rs`) starts from step 4's headers before `host`, as reqwest's
-//! redirect layer copies them, and gets its own `host` and request target.
+//! A redirect's hop (`redirect.rs`) starts from step 4's headers before the jar's `cookie` and
+//! `host`, as reqwest's redirect layer copies them, and gets its own of both, and its own request
+//! target.
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::prelude::BASE64_STANDARD;
@@ -38,6 +42,7 @@ use rustls::pki_types::ServerName;
 use url::{Host, Url};
 
 use crate::body::RequestBody;
+use crate::cookie::{Cookies, Jar};
 use crate::decompress;
 use crate::error::ClientBuildError;
 use crate::multipart::Form;
@@ -157,6 +162,8 @@ pub(crate) struct Prepared {
     /// What a redirect is followed from, when the client follows them (`None` for a hop, whose
     /// request keeps the state it came from).
     pub(crate) redirect: Option<Box<Redirect>>,
+    /// Where its response's cookies go, with `cookie_store=True`.
+    pub(crate) cookies: Option<Cookies>,
 }
 
 /// A client's request-building settings, fixed when it is opened.
@@ -170,6 +177,8 @@ pub(crate) struct ClientConfig {
     proxies: Proxies,
     /// `None` when redirects aren't followed.
     redirects: Option<Policy>,
+    /// `cookie_store=True`'s jar (`cookie.rs`).
+    cookies: Option<Arc<Jar>>,
 }
 
 enum QueryFailure {
@@ -466,7 +475,7 @@ impl ClientConfig {
         // reqwest's `user_agent()` keeps the error for `build()`, which raises it as its own.
         let user_agent = HeaderValue::from_str(user_agent).map_err(|e| ClientBuildError::new_err(format!("builder error: {e}")))?;
         client_headers.insert(USER_AGENT, user_agent);
-        Ok(Self { base_url, default_headers, client_headers, https_only, proxies: Proxies::none(), redirects: None })
+        Ok(Self { base_url, default_headers, client_headers, https_only, proxies: Proxies::none(), redirects: None, cookies: None })
     }
 
     /// The client's proxies (`proxy.rs`), which `prepare` routes every request by.
@@ -479,6 +488,12 @@ impl ClientConfig {
     pub(crate) fn with_redirects(self, follow: bool, max: Option<usize>) -> Self {
         let redirects = Policy::new(follow, max, self.https_only);
         Self { redirects, ..self }
+    }
+
+    /// `cookie_store`, as reqwest's builder takes it: a new, empty jar when enabled.
+    pub(crate) fn with_cookies(self, enabled: bool) -> Self {
+        let cookies = enabled.then(Arc::default);
+        Self { cookies, ..self }
     }
 
     /// The user agent reqwest's connector also sends on a `CONNECT`.
@@ -655,19 +670,23 @@ impl ClientConfig {
         let redirect = self
             .redirects
             .map(|policy| Box::new(Redirect::new(policy, method.clone(), uri.clone(), headers.clone(), copy)));
+        // reqwest's `CookieService`, inside the redirect layer.
+        let cookies = self.cookies.as_ref().and_then(|jar| Cookies::add(jar, &uri, &mut headers));
         let request = sendable(method, &uri, &route, headers, body, invalid_uri)?;
-        Ok(Prepared { request, url, route, redirect })
+        Ok(Prepared { request, url, route, redirect, cookies })
     }
 
-    /// The request a redirect's `hop` makes from `redirect` (`redirect.rs`), routed and given its
-    /// `host` and target as hyper-util does any request, but not the proxy credentials reqwest
-    /// adds only for a first request (`execute_request`), which the hop already carries if any.
+    /// The request a redirect's `hop` makes from `redirect` (`redirect.rs`), routed and given the
+    /// jar's cookies for its URL, its `host` and its target as any request, but not the proxy
+    /// credentials reqwest adds only for a first request (`execute_request`), which the hop
+    /// already carries if any.
     pub(crate) fn hop(&self, py: Python<'_>, glue: &Glue, redirect: &Redirect, hop: Hop) -> PyResult<Prepared> {
-        let Hop { url, headers, body } = hop;
+        let Hop { url, mut headers, body } = hop;
         let route = self.proxies.route(&redirect.uri)?;
         let invalid_uri = || glue.builder_error(py, format!("builder error for url ({url}): Parsed Url is not a valid Uri"));
+        let cookies = self.cookies.as_ref().and_then(|jar| Cookies::add(jar, &redirect.uri, &mut headers));
         let request = sendable(redirect.method.clone(), &redirect.uri, &route, headers, RequestBody::full(body), invalid_uri)?;
-        Ok(Prepared { request, url, route, redirect: None })
+        Ok(Prepared { request, url, route, redirect: None, cookies })
     }
 }
 

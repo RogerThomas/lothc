@@ -75,7 +75,6 @@ def _reject_unported_settings(settings: _TransportSettings) -> None:
     """Refuse, at construction, any setting the native transport doesn't implement yet, rather
     than silently behaving differently from the pyreqwest transport."""
     unported = {
-        "cookie_store": settings.cookie_store,
         "connect_timeout": settings.connect_timeout is not None,
         "read_timeout": settings.read_timeout is not None,
         "http2": settings.http2,
@@ -997,6 +996,7 @@ class _NativeTransport:
                 else _encode_headers(settings.default_headers),
                 settings.user_agent if settings.user_agent is not None else _default_user_agent(),
                 settings.https_only,
+                settings.cookie_store,
                 settings.follow_redirects,
                 settings.max_redirects,
                 list(settings.root_certificates or ()),
@@ -1528,6 +1528,7 @@ class _SyncNativeTransport:
                 else _encode_headers(settings.default_headers),
                 settings.user_agent if settings.user_agent is not None else _default_user_agent(),
                 settings.https_only,
+                settings.cookie_store,
                 settings.follow_redirects,
                 settings.max_redirects,
                 list(settings.root_certificates or ()),

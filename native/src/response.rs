@@ -14,6 +14,7 @@ use pyo3::types::{PyBytes, PyString, PyTuple};
 use url::Url;
 
 use crate::body::RequestBody;
+use crate::cookie::Cookies;
 use crate::decompress;
 use crate::error::{error_chain, Failure};
 use crate::headers::RawHeaders;
@@ -53,8 +54,18 @@ pub(crate) enum Fetched {
 
 /// Send one request on a ready connection and read the whole response (see `send`), unless
 /// `redirect` (the request's redirect state, when the client follows redirects) says to follow it.
-pub(crate) async fn fetch(sender: &mut Sender, request: http::Request<RequestBody>, redirect: Option<&mut Redirect>) -> Result<Fetched, Failure> {
+/// The response's cookies go into the jar first (`cookies`, with `cookie_store=True`), a redirect's
+/// included.
+pub(crate) async fn fetch(
+    sender: &mut Sender,
+    request: http::Request<RequestBody>,
+    redirect: Option<&mut Redirect>,
+    cookies: Option<&Cookies>,
+) -> Result<Fetched, Failure> {
     let response = send(sender, request).await?;
+    if let Some(cookies) = cookies {
+        cookies.store(response.headers());
+    }
     if let Some(redirect) = redirect {
         if let Some(hop) = redirect.next(response.status().as_u16(), response.headers())? {
             return Ok(Fetched::Hop(hop));

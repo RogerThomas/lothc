@@ -17,8 +17,10 @@
 //! - `idle`: when an idle connection may be reused, as reqwest's pool decides it;
 //! - `proxy`: which proxy a request goes through, and the proxy handshakes, as reqwest's;
 //! - `redirect`: following redirects, as reqwest's default policy does;
+//! - `cookie`: `cookie_store=True`'s cookie jar, as reqwest's;
 //! - `headers`: `RawHeaders`, a response's headers until `_LazyHeaders` reads them.
 mod body;
+mod cookie;
 mod decompress;
 mod error;
 mod headers;
@@ -39,8 +41,8 @@ use pyo3::prelude::*;
 // Free-threading safe without the GIL: `Pool` keeps its state in a `ThreadBound`, usable only on
 // the thread that created it (another thread gets a `RuntimeError`), and a `Stream` reaches
 // only that state; `SyncPool` is frozen, with its mutable state (idle connections, the lazily
-// built TLS config) behind `Mutex`es and atomics, and so is a `SyncStream`, whose state no call
-// holds locked while it waits; `RawHeaders` is frozen and immutable.
+// built TLS config, the cookie jar) behind locks and atomics, and so is a `SyncStream`, whose
+// state no call holds locked while it waits; `RawHeaders` is frozen and immutable.
 #[pymodule(gil_used = false)]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pool::Pool>()?;
