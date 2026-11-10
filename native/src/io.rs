@@ -66,6 +66,9 @@ pub(crate) trait Readiness: Unpin {
     fn wait_readable(&self, cx: &mut Context<'_>);
     /// `send` said `EAGAIN`: wait (with `cx`'s waker) until the socket is writable again.
     fn wait_writable(&self, cx: &mut Context<'_>);
+    /// A TLS handshake over the socket has started (`true`) or finished (`false`): until it
+    /// finishes, the connection is still connecting, as far as `connect_timeout` goes.
+    fn set_handshaking(&self, handshaking: bool);
 }
 
 /// One loop-driven socket's readiness. `Cell`s, not `RefCell`s: nothing here can be borrowed
@@ -80,6 +83,8 @@ struct LoopFlags {
     /// Whether the pool stopped watching the socket (`loop.remove_reader`) because nothing was
     /// reading it: a streamed body whose consumer is behind, with data waiting unread.
     paused: Cell<bool>,
+    /// A TLS handshake is under way over the socket.
+    handshaking: Cell<bool>,
 }
 
 /// Readiness from the asyncio loop: `loop.add_reader` is registered (level-triggered) except
@@ -128,6 +133,11 @@ impl LoopReady {
         self.flags.writer_requested.set(false);
         self.flags.write_waker.take()
     }
+
+    /// Whether a TLS handshake is still under way over the socket.
+    pub(crate) fn handshaking(&self) -> bool {
+        self.flags.handshaking.get()
+    }
 }
 
 impl Readiness for LoopReady {
@@ -158,6 +168,10 @@ impl Readiness for LoopReady {
             self.writers.set(writers);
         }
     }
+
+    fn set_handshaking(&self, handshaking: bool) {
+        self.flags.handshaking.set(handshaking);
+    }
 }
 
 /// Readiness from `poll(2)` on the calling thread: the sync pool's request loop polls the socket
@@ -168,11 +182,16 @@ pub(crate) struct PollReady(Arc<PollFlags>);
 struct PollFlags {
     readable: AtomicBool,
     writable: AtomicBool,
+    handshaking: AtomicBool,
 }
 
 impl PollReady {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(PollFlags { readable: AtomicBool::new(false), writable: AtomicBool::new(true) }))
+        Self(Arc::new(PollFlags {
+            readable: AtomicBool::new(false),
+            writable: AtomicBool::new(true),
+            handshaking: AtomicBool::new(false),
+        }))
     }
 
     pub(crate) fn set_readable(&self) {
@@ -186,6 +205,11 @@ impl PollReady {
     /// Whether a send is blocked, so the next `poll(2)` should also wait for `POLLOUT`.
     pub(crate) fn wants_writable(&self) -> bool {
         !self.0.writable.load(Ordering::Relaxed)
+    }
+
+    /// Whether a TLS handshake is still under way over the socket.
+    pub(crate) fn handshaking(&self) -> bool {
+        self.0.handshaking.load(Ordering::Relaxed)
     }
 }
 
@@ -204,6 +228,10 @@ impl Readiness for PollReady {
 
     fn wait_writable(&self, _cx: &mut Context<'_>) {
         self.0.writable.store(false, Ordering::Relaxed);
+    }
+
+    fn set_handshaking(&self, handshaking: bool) {
+        self.0.handshaking.store(handshaking, Ordering::Relaxed);
     }
 }
 

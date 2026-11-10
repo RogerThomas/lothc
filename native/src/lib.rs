@@ -7,6 +7,8 @@
 //! caller gets back is built from lothc's own classes (`response.rs`), so the two transports agree
 //! on the wire and in Python.
 //!
+//! - `connect`: how a connection's socket is set up (`resolve`, `local_address`, keepalive), and
+//!   `connect_timeout`/`read_timeout`, as reqwest's connector does it;
 //! - `io`: non-blocking sockets for hyper, and where their readiness comes from;
 //! - `tls`: rustls over those sockets, configured as reqwest 0.13 configures it;
 //! - `request`: URL joining, query/form/JSON encoding, header order;
@@ -19,6 +21,7 @@
 //! - `redirect`: following redirects, as reqwest's default policy does;
 //! - `headers`: `RawHeaders`, a response's headers until `_LazyHeaders` reads them.
 mod body;
+mod connect;
 mod decompress;
 mod error;
 mod headers;
@@ -48,5 +51,6 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<sync_pool::SyncPool>()?;
     m.add_class::<sync_pool::SyncStream>()?;
     m.add_class::<headers::RawHeaders>()?;
+    m.add_class::<connect::ConnectOptions>()?;
     m.add("ClientBuildError", m.py().get_type::<error::ClientBuildError>())
 }

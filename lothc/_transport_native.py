@@ -40,6 +40,7 @@ from ._errors import (
 from ._form import _form_parts, _FormPart
 from ._headers import CaseInsensitiveDict, _LazyHeaders
 from ._native import ClientBuildError as _NativeClientBuildError
+from ._native import ConnectOptions as _NativeConnectOptions
 from ._native import Pool as _NativePool
 from ._native import RawHeaders, Stream, SyncStream
 from ._native import SyncPool as _NativeSyncPool
@@ -76,12 +77,7 @@ def _reject_unported_settings(settings: _TransportSettings) -> None:
     than silently behaving differently from the pyreqwest transport."""
     unported = {
         "cookie_store": settings.cookie_store,
-        "connect_timeout": settings.connect_timeout is not None,
-        "read_timeout": settings.read_timeout is not None,
         "http2": settings.http2,
-        "resolve": settings.resolve is not None,
-        "local_address": settings.local_address is not None,
-        "tcp_keepalive": settings.tcp_keepalive is not None,
         "max_connections": settings.max_connections is not None,
         "pool_timeout": settings.pool_timeout is not None,
     }
@@ -108,6 +104,24 @@ def _native_call_timeout(timeout: float) -> timedelta:
     infinite or an out-of-range one raises the same error, here, and a negative one the same
     `ValueError`, from the native side's conversion as from pyreqwest's."""
     return timedelta(seconds=timeout)
+
+
+def _optional_timedelta(seconds: float | None) -> timedelta | None:
+    return None if seconds is None else timedelta(seconds=seconds)
+
+
+def _native_connect_options(settings: _TransportSettings) -> _NativeConnectOptions:
+    """`resolve`, `local_address`, `tcp_keepalive`, `connect_timeout` and `read_timeout` as the
+    pyreqwest transport hands its builder them: each address checked as pyreqwest checks it (a
+    `ValueError`), each duration a `timedelta`, so a bad one fails on entry with the same error.
+    """
+    return _NativeConnectOptions(
+        list((settings.resolve or {}).items()),
+        settings.local_address,
+        _optional_timedelta(settings.tcp_keepalive),
+        _optional_timedelta(settings.connect_timeout),
+        _optional_timedelta(settings.read_timeout),
+    )
 
 
 def _native_idle_timeout(settings: _TransportSettings) -> timedelta | None:
@@ -784,7 +798,8 @@ class _NativeTransport:
     _retry: _RetryPolicy | None = _dataclass_field(init=False)
     _retried_methods: frozenset[str] = _dataclass_field(init=False)
     # The longest gap `stream_get`/`stream_post`/`download` tolerate between chunks: the client's
-    # `timeout` (see `_PyreqwestTransport`; `read_timeout` isn't ported). Not applied to `sse`.
+    # `timeout`, unless `read_timeout` was set, which the native side then enforces at the socket
+    # (see `_PyreqwestTransport`). Not applied to `sse`.
     _stream_idle_timeout: float | None = _dataclass_field(init=False)
     # The client's `timeout`, converted on entry (`_native_total_timeout`): each request's, unless
     # the call passes its own.
@@ -986,8 +1001,9 @@ class _NativeTransport:
             raise RuntimeError("This HTTPClient is already open; enter it once at a time.")
         settings = self._settings
         event_loop = asyncio.get_running_loop()
-        connections = _LoopConnections(event_loop)
         total_timeout = _native_total_timeout(settings)
+        connect = _native_connect_options(settings)
+        connections = _LoopConnections(event_loop, connect)
         # A plain `ValueError` from the native one, as `_client_build_error` makes pyreqwest's.
         try:
             pool = _NativePool(
@@ -1010,6 +1026,7 @@ class _NativeTransport:
                 settings.proxy,
                 _native_no_proxy(settings),
                 _native_glue(),
+                connect,
                 event_loop,
                 connections.spawn,
                 connections.close,
@@ -1321,7 +1338,8 @@ class _SyncNativeTransport:
     _retry: _RetryPolicy | None = _dataclass_field(init=False)
     _retried_methods: frozenset[str] = _dataclass_field(init=False)
     # The longest gap `stream_get`/`stream_post`/`download` tolerate between chunks: the client's
-    # `timeout` (see `_PyreqwestTransport`; `read_timeout` isn't ported). Not applied to `sse`.
+    # `timeout`, unless `read_timeout` was set, which the native side then enforces at the socket
+    # (see `_PyreqwestTransport`). Not applied to `sse`.
     _stream_idle_timeout: float | None = _dataclass_field(init=False)
     # The client's `timeout`, converted on entry (`_native_total_timeout`): each request's, unless
     # the call passes its own.
@@ -1541,6 +1559,7 @@ class _SyncNativeTransport:
                 settings.proxy,
                 _native_no_proxy(settings),
                 _native_glue(),
+                _native_connect_options(settings),
             )
         except _NativeClientBuildError as error:
             raise ValueError(str(error)) from error

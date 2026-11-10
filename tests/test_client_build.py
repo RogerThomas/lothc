@@ -483,6 +483,13 @@ async def test_tcp_keepalive_is_accepted(base_url: str) -> None:
     assert result == {"id": 7, "name": "item-7"}
 
 
+def test_sync_tcp_keepalive_is_accepted(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, tcp_keepalive=30.0) as client:
+        result = client.get("items/7", into=dict).data
+
+    assert result == {"id": 7, "name": "item-7"}
+
+
 @pytest.mark.parametrize("client_class", [HTTPClient, SyncHTTPClient], ids=["async", "sync"])
 @pytest.mark.parametrize("base_url", ["http://host/api", "http://host/api/?key=value"])
 def test_an_unjoinable_base_url_is_rejected_at_construction(
@@ -535,6 +542,10 @@ def _open_and_close_sync(client: SyncHTTPClient) -> None:
         {"max_tls_version": "TLSv1.1"},
         {"min_tls_version": "TLSv1.3", "max_tls_version": "TLSv1.2"},
         {"timeout": float("nan")},
+        {"tcp_keepalive": -1.0},
+        {"connect_timeout": -1.0},
+        {"read_timeout": -1.0},
+        {"tcp_keepalive": float("nan")},
     ],
     ids=[
         "local_address",
@@ -547,6 +558,10 @@ def _open_and_close_sync(client: SyncHTTPClient) -> None:
         "max_tls_version",
         "min_above_max_tls_version",
         "nan",
+        "tcp_keepalive",
+        "connect_timeout",
+        "read_timeout",
+        "nan_tcp_keepalive",
     ],
 )
 async def test_unusable_settings_raise_value_error_by_the_time_the_client_opens(
@@ -572,6 +587,10 @@ async def test_unusable_settings_raise_value_error_by_the_time_the_client_opens(
         {"max_tls_version": "TLSv1.1"},
         {"min_tls_version": "TLSv1.3", "max_tls_version": "TLSv1.2"},
         {"timeout": float("nan")},
+        {"tcp_keepalive": -1.0},
+        {"connect_timeout": -1.0},
+        {"read_timeout": -1.0},
+        {"tcp_keepalive": float("nan")},
     ],
     ids=[
         "local_address",
@@ -584,6 +603,10 @@ async def test_unusable_settings_raise_value_error_by_the_time_the_client_opens(
         "max_tls_version",
         "min_above_max_tls_version",
         "nan",
+        "tcp_keepalive",
+        "connect_timeout",
+        "read_timeout",
+        "nan_tcp_keepalive",
     ],
 )
 def test_sync_unusable_settings_raise_value_error_by_the_time_the_client_opens(
@@ -605,6 +628,26 @@ async def test_a_timeout_too_large_to_represent_raises_overflow_error(timeout: f
 def test_sync_a_timeout_too_large_to_represent_raises_overflow_error(timeout: float) -> None:
     with pytest.raises(OverflowError):
         _open_and_close_sync(SyncHTTPClient(timeout=timeout))
+
+
+@pytest.mark.parametrize("setting", ["tcp_keepalive", "connect_timeout", "read_timeout"])
+async def test_a_connection_duration_too_large_to_represent_raises_overflow_error(
+    setting: str,
+) -> None:
+    settings: dict[str, Any] = {setting: 1e20}
+
+    with pytest.raises(OverflowError):
+        await _open_and_close(HTTPClient(**settings))
+
+
+@pytest.mark.parametrize("setting", ["tcp_keepalive", "connect_timeout", "read_timeout"])
+def test_sync_a_connection_duration_too_large_to_represent_raises_overflow_error(
+    setting: str,
+) -> None:
+    settings: dict[str, Any] = {setting: 1e20}
+
+    with pytest.raises(OverflowError):
+        _open_and_close_sync(SyncHTTPClient(**settings))
 
 
 # pyreqwest's `BuilderError` from building the client is re-raised as a plain `ValueError` with

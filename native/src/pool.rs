@@ -13,6 +13,13 @@
 //! as the timeout. In-flight state lives in a generation-tagged slab (O(1), no hashing), and heap
 //! entries for finished requests are dropped lazily.
 //!
+//! `connect_timeout` and `read_timeout` (`connect.rs`) ride the same timer: a connection's connect
+//! deadline covers Python's connect, a proxy's handshake and TLS's (driven by its first request),
+//! and a request's read deadline is fixed until its head arrives, then re-armed lazily from the
+//! last time its socket was read (`Conn::last_read`) when it fires. A streamed body read ahead
+//! into a full channel isn't read, so a consumer slower than `read_timeout` times out, as
+//! pyreqwest's does once its body reader's buffer fills.
+//!
 //! Connections are pooled per origin (scheme, host, port), opened on demand when requests queue
 //! up, and replaced when one dies. A request hyper reports as never sent (a stale keep-alive
 //! connection) is re-queued, as reqwest's pool does; anything else fails. Idle connections expire
@@ -43,6 +50,7 @@
 use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
+use std::net::IpAddr;
 use std::mem::ManuallyDrop;
 use std::os::fd::RawFd;
 use std::rc::Rc;
@@ -64,6 +72,7 @@ use rustls::pki_types::ServerName;
 use rustls::ClientConnection;
 
 use crate::body::RequestBody;
+use crate::connect::{ConnectOptions, ConnectSettings};
 use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
 use crate::io::{shutdown, LoopReady, Stream};
@@ -132,6 +141,9 @@ struct Meta {
     cancelled: bool,
     /// `Some` for a streamed request; boxed, so a buffered one stays small.
     stream: Option<Box<StreamMeta>>,
+    /// With `read_timeout`: when the final response's head arrived (set by its `fetch`, or for a
+    /// stream by the pool).
+    head_at: Option<Rc<Cell<Option<Instant>>>>,
 }
 
 impl Meta {
@@ -180,6 +192,27 @@ struct Slot {
     meta: Option<Meta>,
 }
 
+/// What a deadline in the shared heap is for. Each is checked when it fires, and dropped if
+/// what it was for has moved on (a slot or connection with another generation).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Timer {
+    /// A request's total timeout: (slot, generation).
+    Total(usize, u32),
+    /// A request's `read_timeout`: (slot, generation).
+    Read(usize, u32),
+    /// A connection's `connect_timeout`: (conn, generation).
+    Connect(usize, u32),
+}
+
+/// What a request's `read_timeout` says when its deadline fires.
+enum ReadCheck {
+    Expired,
+    /// The body was read since: not before then.
+    Until(Instant),
+    /// Nothing left for it to time out (a stream whose body has ended).
+    Done,
+}
+
 struct Completion {
     conn: usize,
     slot: usize,
@@ -208,6 +241,8 @@ struct Conn {
     ready: Option<LoopReady>,
     /// The slab slot of the request it is running.
     current: Option<usize>,
+    /// With `read_timeout`: when its socket was last readable while hyper was waiting to read.
+    last_read: Option<Instant>,
 }
 
 struct Origin {
@@ -219,6 +254,10 @@ struct Origin {
     route: Route,
     /// The target host a `socks5://` proxy wants resolved first.
     resolve: Option<String>,
+    /// `resolve=`'s addresses for `host`, which Python then doesn't look up.
+    addresses: Option<Vec<String>>,
+    /// `resolve=`'s address for a `socks5://` proxy's target, which then isn't looked up.
+    socks_address: Option<IpAddr>,
     /// `Some` for https: what the certificate is checked against, or why it can't be.
     server_name: Option<Result<ServerName<'static>, String>>,
     /// (conn, when it went idle), oldest first; checkout takes from the end.
@@ -249,6 +288,7 @@ struct PoolState {
     exec: LocalPool,
     spawner: LocalSpawner,
     config: ClientConfig,
+    connect: Arc<ConnectSettings>,
     tls: TlsSettings,
     tls_config: Option<Arc<rustls::ClientConfig>>,
     idle_policy: IdlePolicy,
@@ -258,8 +298,8 @@ struct PoolState {
     conns: Vec<Conn>,
     slots: Vec<Slot>,
     free: Vec<usize>,
-    /// (deadline, slot, generation); stale entries are skipped when they surface.
-    deadlines: BinaryHeap<Reverse<(Instant, usize, u32)>>,
+    /// Every deadline; stale entries are skipped when they surface.
+    deadlines: BinaryHeap<Reverse<(Instant, Timer)>>,
     /// The one armed timer: when it fires, and its handle.
     armed: Option<(Instant, Py<PyAny>)>,
     done: Rc<Cell<Vec<Completion>>>,
@@ -292,6 +332,16 @@ fn push<T>(cell: &Cell<Vec<T>>, item: T) {
 
 fn stream_misused(what: &str) -> PyErr {
     PyRuntimeError::new_err(format!("internal error: {what}"))
+}
+
+/// Whether `timer` still has something to time out: its slot or connection is the same one.
+fn timer_live(slots: &[Slot], conns: &[Conn], timer: Timer) -> bool {
+    match timer {
+        Timer::Total(slot, generation) | Timer::Read(slot, generation) => {
+            slots.get(slot).is_some_and(|entry| entry.generation == generation && entry.meta.is_some())
+        }
+        Timer::Connect(conn, generation) => conns.get(conn).is_some_and(|c| c.generation == generation && c.state != State::Dead),
+    }
 }
 
 impl PoolState {
@@ -333,13 +383,18 @@ impl PoolState {
         let key = OriginKey::of(url);
         let (host, port) = route.connect_address(connect_address(url));
         let server_name = key.https.then(|| route.server_name(url));
+        let addresses = self.connect.override_for(&host).map(|ips| ips.iter().map(ToString::to_string).collect());
         let resolve = route.resolve_locally(&key.host);
+        let socks_address = resolve.as_deref().and_then(|target| self.connect.socks_override(target));
+        let resolve = resolve.filter(|_| socks_address.is_none());
         self.origins.push(Origin {
             key,
             host,
             port,
             route,
             resolve,
+            addresses,
+            socks_address,
             server_name,
             idle: Vec::new(),
             waiting: VecDeque::new(),
@@ -361,13 +416,14 @@ impl PoolState {
         };
         let mut redirect = meta.redirect.take();
         let channel = meta.stream.as_ref().map(|stream| stream.channel.clone());
+        let head = meta.head_at.clone();
         self.conns[conn].current = Some(slot);
         let done = self.done.clone();
         let Some(channel) = channel else {
             return self
                 .spawner
                 .spawn_local(async move {
-                    let result = fetch(&mut sender, request, redirect.as_deref_mut()).await;
+                    let result = fetch(&mut sender, request, redirect.as_deref_mut(), head.as_deref()).await;
                     push(&done, Completion { conn, slot, sender, result, redirect });
                 })
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()));
@@ -413,11 +469,16 @@ impl PoolState {
         }
     }
 
-    /// `place` a new request; with a `deadline`, the shared timer covers it.
+    /// `place` a new request; with a `deadline`, the shared timer covers it, and its read
+    /// deadline (`read_timeout` from `now`) too.
     fn enqueue(&mut self, py: Python<'_>, slot: usize, generation: u32, origin: usize, now: Instant, deadline: Option<Instant>) -> PyResult<()> {
         if let Some(deadline) = deadline {
-            self.deadlines.push(Reverse((deadline, slot, generation)));
+            self.deadlines.push(Reverse((deadline, Timer::Total(slot, generation))));
             self.arm(py, deadline)?;
+        }
+        if let Some(head_by) = self.connect.read_timeout.and_then(|timeout| self.clock.deadline(now, timeout)) {
+            self.deadlines.push(Reverse((head_by, Timer::Read(slot, generation))));
+            self.arm(py, head_by)?;
         }
         if self.place(py, slot, origin, now)? {
             self.run(py)
@@ -440,6 +501,7 @@ impl PoolState {
                         sender: None,
                         ready: None,
                         current: None,
+                        last_read: None,
                     });
                     self.conns.len() - 1
                 }
@@ -447,9 +509,16 @@ impl PoolState {
             let c = &mut self.conns[conn];
             c.origin = origin;
             c.state = State::Connecting;
+            c.last_read = None;
+            let generation = c.generation;
             let o = &mut self.origins[origin];
             o.connecting += 1;
-            self.event_loop.spawn_connect.call1(py, (conn, o.host.as_str(), o.port, o.resolve.as_deref()))?;
+            let addresses = o.addresses.clone();
+            self.event_loop.spawn_connect.call1(py, (conn, o.host.as_str(), o.port, o.resolve.as_deref(), addresses))?;
+            if let Some(at) = self.connect.connect_timeout.and_then(|timeout| self.clock.deadline(Instant::now(), timeout)) {
+                self.deadlines.push(Reverse((at, Timer::Connect(conn, generation))));
+                self.arm(py, at)?;
+            }
         }
         Ok(())
     }
@@ -559,16 +628,16 @@ impl PoolState {
 
     /// Drop heap entries for requests that already finished (keeps the heap near live size).
     fn prune_deadlines(&mut self) {
-        while let Some(Reverse((_, slot, generation))) = self.deadlines.peek() {
-            if self.is_live(*slot, *generation) {
+        while let Some(Reverse((_, timer))) = self.deadlines.peek() {
+            if timer_live(&self.slots, &self.conns, *timer) {
                 break;
             }
             self.deadlines.pop();
         }
         let live = self.slots.len() - self.free.len();
         if self.deadlines.len() > 4 * live + 64 {
-            let slots = &self.slots;
-            self.deadlines.retain(|Reverse((_, s, g))| slots[*s].generation == *g && slots[*s].meta.is_some());
+            let (slots, conns) = (&self.slots, &self.conns);
+            self.deadlines.retain(|Reverse((_, timer))| timer_live(slots, conns, *timer));
         }
     }
 
@@ -583,11 +652,11 @@ impl PoolState {
 
     /// Fail the oldest request waiting on `origin`, if a connection it was counting on failed
     /// (reqwest fails the request whose connect failed).
-    fn fail_waiting(&mut self, py: Python<'_>, origin: usize, message: String) -> PyResult<()> {
+    fn fail_waiting(&mut self, py: Python<'_>, origin: usize, failure: Failure) -> PyResult<()> {
         let o = &mut self.origins[origin];
         let slot = if o.waiting.len() > o.connecting { o.waiting.pop_front() } else { None };
         if let Some(meta) = slot.and_then(|slot| self.release(slot)) {
-            Glue::settle(py, &meta.fut, Err(self.glue.connection_error(py, message)))?;
+            Glue::settle(py, &meta.fut, Err(self.glue.failure(py, failure)))?;
         }
         Ok(())
     }
@@ -657,6 +726,9 @@ impl PoolState {
         let Some(meta) = self.meta(slot).filter(|meta| !meta.cancelled) else { return Ok(()) };
         if let Some(stream) = meta.stream.as_mut() {
             stream.head = true;
+        }
+        if let Some(head) = &meta.head_at {
+            head.set(Some(Instant::now()));
         }
         let fut = meta.fut.clone_ref(py);
         let outcome = self.glue.stream_head(py, status, version, headers).map(Bound::into_any);
@@ -845,14 +917,15 @@ impl PoolState {
         Ok(Stream::Tls(Box::new(TlsSocket::new(fd, ready, tls))))
     }
 
-    /// A connection that won't be made after all (its connect or proxy handshake failed): it
-    /// stops counting as connecting, and the oldest request counting on it fails.
-    fn abandon(&mut self, py: Python<'_>, conn: usize, message: String) -> PyResult<()> {
+    /// A connection that won't be made after all (its connect or proxy handshake failed, or its
+    /// `connect_timeout` passed): it stops counting as connecting, and the oldest request
+    /// counting on it fails.
+    fn abandon(&mut self, py: Python<'_>, conn: usize, failure: Failure) -> PyResult<()> {
         let origin = self.conns[conn].origin;
         self.origins[origin].connecting = self.origins[origin].connecting.saturating_sub(1);
         // Not `retire`: replacing it would only fail the same way, again and again.
         self.drop_connection(py, conn)?;
-        self.fail_waiting(py, origin, message)
+        self.fail_waiting(py, origin, failure)
     }
 
     /// Socket `fd` is connected to the origin, directly or through a finished proxy handshake:
@@ -872,7 +945,7 @@ impl PoolState {
             Err(message) => {
                 // Not `retire`: replacing it would only fail the same way, again and again.
                 self.drop_connection(py, conn)?;
-                return self.fail_waiting(py, origin, message);
+                return self.fail_waiting(py, origin, Failure::Transport(message));
             }
         };
         let closed = self.closed.clone();
@@ -896,18 +969,19 @@ impl PoolState {
         let Some(c) = self.conns.get(conn).filter(|c| c.state == State::Connecting) else {
             return self.event_loop.close_conn.call1(py, (conn,)).map(drop);
         };
+        self.connect.keepalive(fd);
         let origin = &self.origins[c.origin];
         let generation = c.generation;
         let ready = LoopReady::new(conn, self.writers.clone(), self.readers.clone());
         // A scope id (`fe80::1%en0`) isn't part of a SOCKS address.
-        let resolved = resolved.and_then(|address| address.split('%').next()?.parse().ok());
+        let resolved = resolved.and_then(|address| address.split('%').next()?.parse().ok()).or(origin.socks_address);
         let handshake = match origin.route.handshake(&origin.key.host, origin.key.port, self.config.user_agent(), resolved) {
             Ok(Some(handshake)) => handshake,
             Ok(None) => {
                 self.establish(py, conn, fd, ready)?;
                 return self.run(py);
             }
-            Err(message) => return self.abandon(py, conn, message),
+            Err(message) => return self.abandon(py, conn, Failure::Transport(message)),
         };
         let c = &mut self.conns[conn];
         c.fd = fd;
@@ -931,25 +1005,93 @@ impl PoolState {
         let (fd, ready) = (c.fd, c.ready.clone());
         match (result, ready) {
             (Ok(()), Some(ready)) => self.establish(py, conn, fd, ready),
-            (Err(message), _) => self.abandon(py, conn, message),
-            (Ok(()), None) => self.abandon(py, conn, "internal error: a proxied connection lost its socket".to_owned()),
+            (Err(message), _) => self.abandon(py, conn, Failure::Transport(message)),
+            (Ok(()), None) => self.abandon(py, conn, Failure::Transport("internal error: a proxied connection lost its socket".to_owned())),
         }
     }
 
-    fn connect_failed(&mut self, py: Python<'_>, conn: usize, message: String) -> PyResult<()> {
+    /// Python's connect for `conn` failed (`timed_out`: a connect attempt's timeout, or the
+    /// system's, which reqwest also reports as a timeout).
+    fn connect_failed(&mut self, py: Python<'_>, conn: usize, message: String, timed_out: bool) -> PyResult<()> {
         let Some(c) = self.conns.get_mut(conn).filter(|c| c.state == State::Connecting) else { return Ok(()) };
         let origin = c.origin;
         c.state = State::Dead;
         c.generation = c.generation.wrapping_add(1);
         self.origins[origin].connecting = self.origins[origin].connecting.saturating_sub(1);
-        self.fail_waiting(py, origin, message)
+        self.fail_waiting(py, origin, if timed_out { Failure::Timeout } else { Failure::Transport(message) })
+    }
+
+    /// `conn`'s `connect_timeout` passed: if it is still connecting (Python's connect, a proxy's
+    /// handshake, or TLS's, which its first request drives), it is given up, timing out the
+    /// request counting on it.
+    fn connect_expired(&mut self, py: Python<'_>, conn: usize, generation: u32) -> PyResult<()> {
+        let Some(c) = self.conns.get(conn).filter(|c| c.generation == generation) else { return Ok(()) };
+        match c.state {
+            State::Connecting | State::Handshaking => self.abandon(py, conn, Failure::Timeout),
+            State::Ready if c.ready.as_ref().is_some_and(LoopReady::handshaking) => match c.current {
+                Some(slot) => {
+                    let fd = c.fd;
+                    if let Some(meta) = self.meta(slot) {
+                        meta.timed_out = true;
+                    }
+                    shutdown(fd);
+                    Ok(())
+                }
+                None => self.retire(py, conn),
+            },
+            State::Ready | State::Dead => Ok(()),
+        }
+    }
+
+    /// Time a request out: one in flight has its socket shut down, which fails hyper's I/O and
+    /// is reported as the timeout; one still waiting for a connection fails here.
+    fn time_out(&mut self, py: Python<'_>, slot: usize) -> PyResult<()> {
+        if let Some(conn) = self.running(slot) {
+            if let Some(meta) = self.meta(slot) {
+                meta.timed_out = true;
+            }
+            shutdown(self.conns[conn].fd);
+        } else if let Some(origin) = self.meta(slot).map(|meta| meta.origin) {
+            if let Some(pos) = self.origins[origin].waiting.iter().position(|s| *s == slot) {
+                self.origins[origin].waiting.remove(pos);
+                if let Some(meta) = self.release(slot) {
+                    self.deliver(py, &meta, Err(Failure::Timeout))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Where `slot`'s `read_timeout` stands: before its head, its deadline from the start has
+    /// passed; after, the body's gap runs from the head or the last read of its socket.
+    fn read_check(&self, slot: usize, now: Instant) -> ReadCheck {
+        let (Some(timeout), Some(meta)) = (self.connect.read_timeout, self.slots.get(slot).and_then(|entry| entry.meta.as_ref())) else {
+            return ReadCheck::Done;
+        };
+        let Some(head) = meta.head_at.as_ref().and_then(|head| head.get()) else { return ReadCheck::Expired };
+        if meta.stream.as_ref().is_some_and(|stream| stream.done) {
+            return ReadCheck::Done;
+        }
+        let Some(conn) = self.running(slot) else { return ReadCheck::Done };
+        let from = self.conns[conn].last_read.map_or(head, |read| read.max(head));
+        match self.clock.deadline(from, timeout) {
+            Some(due) if due > now => ReadCheck::Until(due),
+            Some(_) => ReadCheck::Expired,
+            None => ReadCheck::Done,
+        }
     }
 
     fn on_readable(&mut self, py: Python<'_>, conn: usize) -> PyResult<()> {
-        if let Some(c) = self.conns.get(conn) {
+        let tracks_reads = self.connect.read_timeout.is_some();
+        if let Some(c) = self.conns.get_mut(conn) {
             if let Some(ready) = c.ready.as_ref() {
                 match ready.set_readable() {
-                    Some(waker) => waker.wake(),
+                    Some(waker) => {
+                        if tracks_reads {
+                            c.last_read = Some(Instant::now());
+                        }
+                        waker.wake();
+                    }
                     // Nothing waits to read it (a streamed body's consumer is behind): stop
                     // watching until a read would wait, rather than be called again at once.
                     None => {
@@ -1001,29 +1143,22 @@ impl PoolState {
         self.armed = None;
         let now = Instant::now();
         let mut next = None;
-        while let Some(Reverse((deadline, slot, generation))) = self.deadlines.peek().copied() {
+        while let Some(Reverse((deadline, timer))) = self.deadlines.peek().copied() {
             if deadline > now {
                 next = Some(deadline);
                 break;
             }
             self.deadlines.pop();
-            if !self.is_live(slot, generation) {
-                continue;
-            }
-            if let Some(conn) = self.running(slot) {
-                // In flight: shutting the socket down fails hyper's I/O, and the completion
-                // reports it as the timeout.
-                if let Some(meta) = self.meta(slot) {
-                    meta.timed_out = true;
-                }
-                shutdown(self.conns[conn].fd);
-            } else if let Some(origin) = self.meta(slot).map(|meta| meta.origin) {
-                if let Some(pos) = self.origins[origin].waiting.iter().position(|s| *s == slot) {
-                    self.origins[origin].waiting.remove(pos);
-                    if let Some(meta) = self.release(slot) {
-                        self.deliver(py, &meta, Err(Failure::Timeout))?;
-                    }
-                }
+            match timer {
+                Timer::Total(slot, generation) if self.is_live(slot, generation) => self.time_out(py, slot)?,
+                Timer::Read(slot, generation) if self.is_live(slot, generation) => match self.read_check(slot, now) {
+                    ReadCheck::Expired => self.time_out(py, slot)?,
+                    // Read since: due again later, which the loop's next look at the heap sees.
+                    ReadCheck::Until(due) => self.deadlines.push(Reverse((due, timer))),
+                    ReadCheck::Done => {}
+                },
+                Timer::Connect(conn, generation) => self.connect_expired(py, conn, generation)?,
+                Timer::Total(..) | Timer::Read(..) => {}
             }
         }
         if self.reap_at.is_some_and(|at| at <= now) {
@@ -1079,6 +1214,7 @@ impl PoolState {
             timed_out: false,
             cancelled: false,
             stream: None,
+            head_at: self.connect.read_timeout.map(|_| Rc::default()),
         };
         let (slot, generation) = self.alloc(meta);
         self.enqueue(py, slot, generation, origin, started, deadline)?;
@@ -1133,6 +1269,7 @@ impl PoolState {
                 head: false,
                 timeout,
             })),
+            head_at: self.connect.read_timeout.map(|_| Rc::default()),
         };
         let (slot, generation) = self.alloc(meta);
         Ok((slot, generation, request_info))
@@ -1284,9 +1421,9 @@ impl PoolState {
             self.deadlines.clear();
             return Ok(());
         }
-        let slots = &self.slots;
-        self.deadlines.retain(|Reverse((_, s, g))| slots[*s].generation == *g && slots[*s].meta.is_some());
-        if let Some(Reverse((deadline, _, _))) = self.deadlines.peek().copied() {
+        let (slots, conns) = (&self.slots, &self.conns);
+        self.deadlines.retain(|Reverse((_, timer))| matches!(timer, Timer::Total(..) | Timer::Read(..)) && timer_live(slots, conns, *timer));
+        if let Some(Reverse((deadline, _))) = self.deadlines.peek().copied() {
             self.arm(py, deadline)?;
         }
         self.run(py)
@@ -1302,7 +1439,7 @@ pub(crate) struct Pool {
 impl Pool {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (base_url, default_headers, user_agent, https_only, follow_redirects, max_redirects, root_certificates, identity_pem, min_tls_version, max_tls_version, danger_accept_invalid_certs, timeout, pool_idle_timeout, pool_max_idle_per_host, proxy, no_proxy, glue, event_loop, spawn_connect, close_conn))]
+    #[pyo3(signature = (base_url, default_headers, user_agent, https_only, follow_redirects, max_redirects, root_certificates, identity_pem, min_tls_version, max_tls_version, danger_accept_invalid_certs, timeout, pool_idle_timeout, pool_max_idle_per_host, proxy, no_proxy, glue, connect, event_loop, spawn_connect, close_conn))]
     fn new(
         py: Python<'_>,
         base_url: Option<&str>,
@@ -1322,6 +1459,7 @@ impl Pool {
         proxy: Option<&str>,
         no_proxy: Option<&str>,
         glue: &Bound<'_, PyAny>,
+        connect: &ConnectOptions,
         event_loop: &Bound<'_, PyAny>,
         spawn_connect: Py<PyAny>,
         close_conn: Py<PyAny>,
@@ -1337,6 +1475,7 @@ impl Pool {
             config: ClientConfig::new(base_url, default_headers, user_agent, https_only)?
                 .with_proxies(Proxies::new(proxy, no_proxy)?)
                 .with_redirects(follow_redirects, max_redirects),
+            connect: connect.settings.clone(),
             tls: TlsSettings::new(
                 &root_certificates,
                 identity_pem.as_deref(),
@@ -1467,9 +1606,10 @@ impl Pool {
         self.state.get_mut()?.connected(py, conn, fd, resolved)
     }
 
-    /// Connecting `conn` failed with `message`.
-    fn connect_failed(&mut self, py: Python<'_>, conn: usize, message: String) -> PyResult<()> {
-        self.state.get_mut()?.connect_failed(py, conn, message)
+    /// Connecting `conn` failed with `message`; `timed_out` if that was a timeout.
+    #[pyo3(signature = (conn, message, timed_out=false))]
+    fn connect_failed(&mut self, py: Python<'_>, conn: usize, message: String, timed_out: bool) -> PyResult<()> {
+        self.state.get_mut()?.connect_failed(py, conn, message, timed_out)
     }
 
     fn on_readable(&mut self, py: Python<'_>, conn: usize) -> PyResult<()> {
