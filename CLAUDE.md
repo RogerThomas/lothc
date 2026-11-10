@@ -5,8 +5,10 @@
 `SyncHTTPClient` (sync), with pydantic and msgspec as optional extras (`lothc/_compat.py`) for
 decoding and encoding. lothc must work with neither, either or both installed.
 
-This file records decisions and the *why*, tersely. Don't add narrative or anything the code,
-a docstring or a test already says.
+Design decisions and their reasons are records in `adrs/` (index: `adrs/README.md`). Read the
+relevant one before changing the behaviour it covers, and add a new record for a new decision.
+This file keeps only what every session needs: no narrative, and nothing the code, a docstring or
+a test already says.
 
 ## Commands
 
@@ -93,96 +95,13 @@ or editing Python here.
   default asserts a bracket, not a floor. Rejected: pytest-xdist.
 - Prefer doctests for small algorithmic functions.
 
-## Decisions
-
-### Configuration
-- **Settings are validated at construction**, including a bad `base_url`, and the pyreqwest
-  client is built on each entry, so a client is re-enterable across `asyncio.run()` calls.
-- **`base_url` joining is RFC 3986**: a leading `/` drops the base's path, and an absolute URL
-  overrides the base, auth included.
-- **Auth is `bearer_token`/`bearer_auth`/`basic_auth`**, one pyreqwest mechanism each, at most one.
-- **`max_retry_after` (60s) stops retrying instead of clamping**, leaving the caller to schedule
-  from `Retry-After`; an early retry against a long wait is usually rejected again.
-- **A 401 re-authenticates once**, idempotent verbs only, through any `bearer_auth` that can
-  `invalidate()`. A stale invalidation is a no-op, so concurrent 401s can't discard a fresh token.
-
-### Requests
-- **`data=` is urlencoded and `form=` multipart**, as in requests/httpx.
-- **A `list`/`tuple` in `Params` repeats the key.**
-- **A `Form` repeat tuple must be homogeneous**: a mixed one read as a file but had no filename.
-- **pydantic models encode by alias** (their own `serialize_by_alias`) at every encode site.
-- **`RequestInfo` is captured before `.send()`**: a sent request can't be read.
-
-### Responses and decoding
-- **Every non-streaming verb returns a `Response`**: lothc is a general client, and most callers
-  need status and headers. No body-only flag, since a runtime `bool` can't drive overloads.
-- **Overloads, not one generic signature with casts.** The adapter overload must precede the
-  `TypeForm` one (ty), and bare `dict` has its own (`dict[Any, Any]`, for zuban).
-- **`into=` takes any type expression.** A `Struct` goes to msgspec and a pydantic marker to
-  pydantic; both is a `TypeError`, and so is a type msgspec can't decode when pydantic is
-  missing. That's always decided before sending, never after.
-- **Decoders are cached by form** (a `TypeAdapter` costs ~31us to build), except for forms whose
-  metadata compares by identity, which would grow the cache forever; 4096 entries is the
-  backstop.
-- **`str` means raw text**, like `bytes`. Every decode failure is a `ValueError`; a decode
-  library's validation errors propagate unwrapped.
-- **`raises=` is a subclass pinning `HTTPResponseError[E]`**, because Python can't `except` a
-  parametrized generic. It's resolved before sending, and the error body is decoded
-  best-effort, so a proxy's HTML 502 still surfaces as a status error.
-- **`Response.headers` is a `CaseInsensitiveDict`**, a `MutableMapping` rather than a `dict`
-  subclass (which would lose case-insensitivity under `dict(h)`). It's built on first read
-  (~15% throughput).
-- **Dropped:** `TypedDict`/`typeguard` decoding (slower, no capability the libraries lack).
-
-### Errors
-- **Never leak pyreqwest's exception types.** Transport errors map to `HTTPTransportError` and
-  its subclasses; a client build error is a plain `ValueError`.
-- **Status errors stay separate from transport errors.**
-- **A `BuilderError` is permanent**: never retried or reconnected.
-- **A body cut off partway is retried; a corrupt one isn't.**
-- **A multipart `form=` request is sent once, never retried or re-authenticated:** its streamed
-  body can't be cloned, and buffering it instead means a second multipart encoder holding uploads
-  in memory. reqwest's own retry policy skips such a body too.
-
-### Streaming, SSE and downloads
-- **On streaming verbs the client `timeout` is a gap limit, not a total cap**, which killed
-  healthy long streams; a per-call `timeout=` is still a total cap. Sync enforces it by reading
-  on a worker thread (bounded queue), since a blocked read can't be cancelled.
-- **`streamed_read_buffer_limit(1)` everywhere**, or trickling bytes are withheld until EOF.
-- **`sse()` follows the WHATWG EventSource model** for reconnects; the client's total `timeout`
-  never touches the stream. `SSEEvent.id` is a `str`, `""` when absent, as in the spec.
-- **Streaming verbs are typed `Generator`/`AsyncGenerator`**, so callers can close them early.
-- **`download()` exists to cut `get()`'s peak memory**, and writes `dest=` atomically.
-
-### Optional extras and typing
-- **`_compat.py`'s fallback stubs must be subscriptable**: annotations are evaluated at import.
-- **Public aliases use structural `Protocol`s**, so a missing extra doesn't turn unrelated
-  overloads `Unknown` for strict checkers.
-- **On 3.13, define a class before an annotation uses it**; don't quote the annotation.
-
-### OAuth (`lothc/_oauth.py`)
-- **Token requests are urlencoded**, with lothc building the Basic header per RFC 6749 §2.3.1.
-- **The providers are plain classes, not dataclasses**: zuban rejects a dataclass as
-  `bearer_auth=`.
-- **Expiry is wall-clock**, and `refresh_leeway` is clamped to half the lifetime. A failed
-  refresh mints again only on 400/401.
-- **`OAuthTokenError` wraps everything renewal raises**, since it surfaces inside the caller's
-  own request.
-- **The lock is created per running loop**, so a module-level provider survives `asyncio.run()`.
-- **The token cache is `0600` plaintext, one file per token URL, client and scope**, as the AWS
-  CLI and gcloud do. `invalidate()` also marks the cached token expired, so a new process doesn't
-  reload a revoked one.
-
-### `lothc.testing`
-- **No pyreqwest type in its public API, and no builder pattern.**
-- **Matching shares the real request path's encoding**, so a mock matches what a real request
-  sends.
-- **Strict by default**, unlike pyreqwest's plugin.
-
 ## Pitfalls
 
 Each of these was a real bug or a lost hour once.
 
+- **`_compat.py`'s fallback stubs must be subscriptable**: annotations are evaluated at import, so
+  `import lothc` crashes without an extra otherwise.
+- **On 3.13, define a class before an annotation uses it**; don't quote the annotation.
 - **In the `form=` `match`, `case list()` comes before the `File` patterns**: a sequence pattern
   matches a list too, so `["a.png", b"..."]` was read as a file.
 - **`_LazyHeaders` holds pyreqwest's `HeaderMap`, not the response**: a read response caches its

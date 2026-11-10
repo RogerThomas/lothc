@@ -1,0 +1,102 @@
+# Architecture decision records
+
+One record per decision: the context that forced it, what was decided, and what follows.
+Files are named `YYYY.MM.DD-slug.md`, by the day the decision was made.
+An accepted record isn't rewritten: a new one supersedes it, and the old one's status says so.
+
+- [2026.08.18](./2026.08.18-make-lothc-backend-agnostic.md) Make lothc backend-agnostic (superseded)
+- [2026.08.18](./2026.08.18-build-on-pyreqwest-as-the-only-backend.md) Build on pyreqwest as the only backend
+- [2026.08.18](./2026.08.18-name-the-library-lothc.md) Name the library lothc
+- [2026.08.18](./2026.08.18-support-python-3-13-and-later-only.md) Support Python 3.13 and later only
+- [2026.08.18](./2026.08.18-pydantic-and-msgspec-are-optional-extras.md) pydantic and msgspec are optional extras
+- [2026.08.18](./2026.08.18-decode-typeddict-validated-by-typeguard.md) Decode into a `TypedDict`, validated by typeguard when installed (superseded)
+- [2026.08.18](./2026.08.18-lothc-json-is-the-only-plain-dict-target.md) `lothc.JSON` is the only plain-dict decode target (superseded)
+- [2026.08.18](./2026.08.18-verbs-return-the-decoded-body.md) Verbs return the decoded body (superseded)
+- [2026.08.18](./2026.08.18-overloads-instead-of-one-generic-signature.md) Overloads instead of one generic signature with casts
+- [2026.08.18](./2026.08.18-the-sync-and-async-clients-mirror-each-other.md) The sync and async clients mirror each other
+- [2026.08.18](./2026.08.18-clients-are-dataclasses-opened-through-build.md) Clients are dataclasses opened through `build()` (superseded)
+- [2026.08.18](./2026.08.18-keep-the-client-in-one-module.md) Keep the client in one module until it earns a split
+- [2026.08.18](./2026.08.18-never-leak-pyreqwest-exception-types.md) Never leak pyreqwest's exception types
+- [2026.08.18](./2026.08.18-status-errors-stay-separate-from-transport-errors.md) Status errors stay separate from transport errors
+- [2026.08.18](./2026.08.18-decode-library-errors-propagate-unwrapped.md) A decode library's validation errors propagate unwrapped
+- [2026.08.18](./2026.08.18-transport-errors-shadow-the-builtin-names.md) Transport errors shadow the builtin exception names (superseded)
+- [2026.08.18](./2026.08.18-auth-settings-name-their-mechanism.md) Auth settings name their mechanism, at most one per client
+- [2026.08.18](./2026.08.18-basedpyright-strict-is-the-contract.md) basedpyright strict is the type-checking contract
+- [2026.08.18](./2026.08.18-type-aliases-are-named-at-the-instance-level.md) Type aliases are named at the instance level
+- [2026.08.18](./2026.08.18-calver-derived-from-the-git-tag.md) CalVer, derived from the git tag (superseded)
+- [2026.08.18](./2026.08.18-retry-only-idempotent-verbs-by-default.md) Retry only idempotent verbs by default
+- [2026.08.20](./2026.08.20-stream-verbs-yield-raw-chunks-or-ndjson.md) `stream_get`/`stream_post` yield raw chunks, or NDJSON lines
+- [2026.08.20](./2026.08.20-sse-id-type-accepts-a-union.md) SSE `id_type=` accepts a union such as `int | None` (superseded)
+- [2026.08.20](./2026.08.20-other-clients-are-benchmark-comparisons-only.md) Other HTTP clients are benchmark comparisons only
+- [2026.08.21](./2026.08.21-exceptions-are-http-prefixed.md) Exceptions are `HTTP`-prefixed
+- [2026.08.21](./2026.08.21-semver-not-calver.md) SemVer, not CalVer
+- [2026.08.21](./2026.08.21-the-version-comes-from-the-git-tag.md) The version comes from the git tag
+- [2026.08.21](./2026.08.21-publish-to-pypi-with-trusted-publishing.md) Publish to PyPI with Trusted Publishing
+- [2026.08.21](./2026.08.21-task-release-creates-the-github-release.md) `task release` creates the GitHub Release that publishes (superseded)
+- [2026.08.21](./2026.08.21-download-exists-to-cut-peak-memory.md) `download()` exists to cut peak memory
+- [2026.08.21](./2026.08.21-track-lothc-own-performance-with-asv.md) Track lothc's own performance with asv
+- [2026.08.21](./2026.08.21-the-sdist-has-an-explicit-include-allowlist.md) The sdist has an explicit include allowlist
+- [2026.08.21](./2026.08.21-docs-install-with-uv-add.md) Docs install lothc with `uv add`, never `pip install`
+- [2026.08.23](./2026.08.23-add-verb-result-twins.md) Add `<verb>_result` twins for status and headers (superseded)
+- [2026.08.23](./2026.08.23-requests-shaped-calls-and-typed-bodies.md) lothc gives pyreqwest a requests-shaped API and typed bodies
+- [2026.08.23](./2026.08.23-in-form-a-tuple-repeats-a-part.md) In `form=`, a tuple repeats a part and a list is one JSON part
+- [2026.08.24](./2026.08.24-drop-typeddict-and-typeguard-decoding.md) Drop `TypedDict` and typeguard decoding
+- [2026.08.24](./2026.08.24-bare-dict-replaces-lothc-json.md) Bare `dict` replaces `lothc.JSON`, with its own overload (superseded)
+- [2026.08.24](./2026.08.24-sse-ids-take-id-type-plus-allow-missing-id.md) SSE ids take `id_type=` plus `allow_missing_id=` (superseded)
+- [2026.08.24](./2026.08.24-tests-type-check-under-four-checkers.md) `tests/` type-checks under mypy, ty and zuban too
+- [2026.08.24](./2026.08.24-public-type-aliases-use-structural-protocols.md) Public type aliases use structural Protocols
+- [2026.08.24](./2026.08.24-error-type-decodes-error-bodies.md) `error_type=` decodes error bodies onto `.parsed_body` (superseded)
+- [2026.08.27](./2026.08.27-deliver-streamed-bytes-as-they-arrive.md) Deliver streamed bytes as they arrive
+- [2026.08.31](./2026.08.31-sync-sse-reads-on-a-worker-thread.md) Sync SSE reads on a worker thread so Ctrl-C works
+- [2026.09.02](./2026.09.02-sse-follows-the-whatwg-eventsource-model.md) `sse()` follows the WHATWG EventSource model
+- [2026.09.07](./2026.09.07-oauth-providers-plug-into-bearer-auth.md) OAuth providers plug into `bearer_auth`
+- [2026.09.07](./2026.09.07-oauth-providers-are-plain-classes.md) OAuth providers are plain classes
+- [2026.09.07](./2026.09.07-oauth-expiry-is-wall-clock-with-a-clamped-leeway.md) OAuth expiry is wall-clock, with a clamped leeway
+- [2026.09.07](./2026.09.07-oauthtokenerror-wraps-everything-renewal-raises.md) `OAuthTokenError` wraps everything renewal raises
+- [2026.09.07](./2026.09.07-oauth-token-requests-use-lothc-basic-header.md) OAuth token requests are urlencoded, with lothc's own Basic header
+- [2026.09.07](./2026.09.07-the-oauth-token-cache-is-one-0600-file.md) The OAuth token cache is one `0600` file (superseded)
+- [2026.09.10](./2026.09.10-lothc-testing-exposes-no-pyreqwest-type.md) `lothc.testing` exposes no pyreqwest type and no builder
+- [2026.09.10](./2026.09.10-the-mocker-is-strict-by-default.md) The mocker is strict by default
+- [2026.09.11](./2026.09.11-a-list-in-params-repeats-the-key.md) A list in `Params` repeats the key
+- [2026.09.22](./2026.09.22-a-form-repeat-tuple-must-be-homogeneous.md) A `Form` repeat tuple must be homogeneous
+- [2026.09.22](./2026.09.22-response-headers-are-a-case-insensitive-mapping.md) Response headers are a `CaseInsensitiveDict`, not a `dict`
+- [2026.09.22](./2026.09.22-a-buildererror-is-permanent.md) A `BuilderError` is permanent
+- [2026.09.22](./2026.09.22-dont-parallelize-tests-with-pytest-xdist.md) Don't parallelize the test suite with pytest-xdist
+- [2026.09.23](./2026.09.23-construct-clients-directly-open-as-context.md) Clients are constructed directly and opened as context managers
+- [2026.09.23](./2026.09.23-with-result-returns-status-and-headers.md) `client.with_result.<verb>` returns status and headers (superseded)
+- [2026.09.23](./2026.09.23-max-retry-after-stops-retrying.md) `max_retry_after` stops retrying instead of clamping
+- [2026.09.23](./2026.09.23-re-authenticate-once-on-a-401.md) Re-authenticate once on a 401
+- [2026.09.23](./2026.09.23-pydantic-models-encode-by-alias.md) pydantic models encode by alias
+- [2026.09.23](./2026.09.23-client-timeout-is-a-gap-limit-on-streams.md) The client timeout is a gap limit on streaming verbs
+- [2026.09.23](./2026.09.23-error-type-decoding-is-best-effort.md) `error_type` decoding is best-effort (superseded)
+- [2026.09.23](./2026.09.23-every-decode-failure-is-a-valueerror.md) Every decode failure is a `ValueError`
+- [2026.09.23](./2026.09.23-sseevent-id-is-a-str.md) `SSEEvent.id` is a `str`, `""` when absent
+- [2026.09.23](./2026.09.23-data-is-urlencoded-and-form-is-multipart.md) `data=` is urlencoded and `form=` is multipart
+- [2026.09.23](./2026.09.23-deferred-and-deliberately-unexposed-features.md) What's deferred, and what's deliberately not exposed
+- [2026.09.23](./2026.09.23-ci-runs-tests-without-the-extras.md) CI runs the extras-free tests without pydantic or msgspec
+- [2026.09.23](./2026.09.23-support-only-pyreqwest-0-13-and-later.md) Support only pyreqwest 0.13.0 and later
+- [2026.09.23](./2026.09.23-readme-uses-absolute-urls-only.md) README.md uses absolute URLs only
+- [2026.09.23](./2026.09.23-base-url-joins-per-rfc-3986.md) `base_url` joins per RFC 3986
+- [2026.09.23](./2026.09.23-retry-a-body-cut-off-partway-not-a-corrupt-one.md) Retry a body cut off partway, not a corrupt one
+- [2026.09.23](./2026.09.23-streaming-verbs-are-typed-as-generators.md) Streaming verbs are typed as generators
+- [2026.09.25](./2026.09.25-every-non-streaming-verb-returns-a-response.md) Every non-streaming verb returns a `Response`
+- [2026.09.25](./2026.09.25-oauth-token-cache-is-one-file-per-scope.md) The OAuth token cache is one `0600` plaintext file per URL, client and scope
+- [2026.09.28](./2026.09.28-release-please-cuts-releases.md) release-please cuts releases from Conventional Commits
+- [2026.09.28](./2026.09.28-publishing-is-dispatched-against-the-tag.md) Publishing is dispatched against the tag
+- [2026.09.28](./2026.09.28-pre-1-0-feat-bumps-patch-breaking-bumps-minor.md) Pre-1.0, `feat` bumps the patch and a breaking change the minor
+- [2026.10.04](./2026.10.04-stay-on-pyreqwest-not-a-direct-reqwest-binding.md) Stay on pyreqwest, not a direct reqwest binding
+- [2026.10.21](./2026.10.21-continuous-benchmarks-on-codspeed.md) Continuous benchmarks on CodSpeed, through the mocker
+- [2026.10.23](./2026.10.23-into-takes-any-type-expression.md) `into=` takes any type expression
+- [2026.10.23](./2026.10.23-json-object-forms-decode-with-stdlib-json.md) JSON-object forms decode with stdlib `json`
+- [2026.10.23](./2026.10.23-typed-error-bodies-through-a-raises-subclass.md) Typed error bodies through a `raises=` subclass
+- [2026.10.23](./2026.10.23-cache-decoders-by-type-form.md) Cache decoders by type form
+- [2026.10.23](./2026.10.23-forms-msgspec-would-get-wrong-go-to-pydantic.md) Forms msgspec would decode wrongly go to pydantic
+- [2026.10.23](./2026.10.23-into-str-means-raw-text.md) `into=str` means raw text, mirroring `bytes`
+- [2026.10.23](./2026.10.23-build-response-headers-on-first-read.md) Build `Response.headers` on first read
+- [2026.10.23](./2026.10.23-invalidate-marks-the-cached-token-expired.md) `invalidate()` marks the cached OAuth token expired on disk
+- [2026.10.23](./2026.10.23-per-test-server-state-uses-a-fresh-key.md) Per-test server state is keyed by a fresh `server_key`
+- [2026.10.23](./2026.10.23-ci-tests-free-threaded-python.md) CI tests free-threaded Python with the GIL off
+- [2026.11.10](./2026.11.10-a-multipart-form-request-is-sent-once.md) A multipart `form=` request is sent once, never retried or replayed
+- [2026.11.10](./2026.11.10-today-s-pyreqwest-behaviour-is-the-contract.md) Today's pyreqwest behaviour is the contract
+- [2026.11.10](./2026.11.10-claude-md-holds-decisions-and-reasons-only.md) `CLAUDE.md` holds decisions and their reasons only (superseded)
+- [2026.11.10](./2026.11.10-record-decisions-as-adrs.md) Record decisions as ADRs
