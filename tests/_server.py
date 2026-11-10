@@ -917,6 +917,31 @@ class TestAppHandler(BaseHTTPRequestHandler):
             headers["Set-Cookie"] = f"{params['cookie'][0]}; Path=/"
         self._write_bodyless(int(params.get("status", ["302"])[0]), headers)
 
+    def _handle_cookies(self, query: str) -> None:
+        # Any path under `/cookies/`, any method: a `Set-Cookie` for each `set=` value, the
+        # `status` (200 by default), a `Location` if `to=` is given, and the `Cookie` the request
+        # came with (`null` without one). With `key=`, only the key's first `fail_times` requests
+        # get `status` (503 by default) and the cookies; later ones a plain 200.
+        params = parse_qs(query)
+        self._drain_body()
+        status = int(params.get("status", ["200"])[0])
+        set_cookies = params.get("set", [])
+        if "key" in params:
+            failed = self._bump_counter(params["key"][0]) <= int(params["fail_times"][0])
+            status = int(params.get("status", ["503"])[0]) if failed else 200
+            set_cookies = set_cookies if failed else []
+        body = json.dumps({"cookie": self.headers.get("Cookie")}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for value in set_cookies:
+            self.send_header("Set-Cookie", value)
+        if "to" in params:
+            self.send_header("Location", params["to"][0])
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
     def _handle_redirect_chain(self, query: str) -> None:
         # `hops` redirects in a row, then a 200.
         hops = int(parse_qs(query)["hops"][0])
@@ -1034,6 +1059,9 @@ class TestAppHandler(BaseHTTPRequestHandler):
             return True
         if parsed.path in plain_routes:
             plain_routes[parsed.path]()
+            return True
+        if parsed.path.startswith("/cookies/"):
+            self._handle_cookies(parsed.query)
             return True
         return False
 

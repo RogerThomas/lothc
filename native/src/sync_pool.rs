@@ -46,6 +46,7 @@ use rustls::ClientConnection;
 use url::Url;
 
 use crate::body::RequestBody;
+use crate::cookie::Cookies;
 use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
 use crate::io::{shutdown, PollReady, Stream};
@@ -218,9 +219,15 @@ fn drive<F: Future>(
 
 /// Drive `conn`'s hyper driver and one request until the request finishes (or gets a redirect
 /// to follow, see `fetch`).
-fn run_on(conn: &mut SyncConn, request: Request<RequestBody>, deadline: Option<Instant>, redirect: Option<&mut Redirect>) -> Result<Fetched, Failure> {
+fn run_on(
+    conn: &mut SyncConn,
+    request: Request<RequestBody>,
+    deadline: Option<Instant>,
+    redirect: Option<&mut Redirect>,
+    cookies: Option<&Cookies>,
+) -> Result<Fetched, Failure> {
     let SyncConn { fd, ready, sender, driver, closed, .. } = conn;
-    drive(*fd, ready, driver, closed, std::pin::pin!(fetch(sender, request, redirect)), deadline)?
+    drive(*fd, ready, driver, closed, std::pin::pin!(fetch(sender, request, redirect, cookies)), deadline)?
 }
 
 /// Drive `conn`'s hyper driver and one request until its response's head arrives.
@@ -474,10 +481,11 @@ impl SyncPool {
         mut request: Request<RequestBody>,
         deadline: Option<Instant>,
         mut redirect: Option<&mut Redirect>,
+        cookies: Option<&Cookies>,
     ) -> Result<Fetched, Failure> {
         for _ in 0..3 {
             let mut conn = self.checkout(target, deadline)?;
-            let outcome = run_on(&mut conn, request, deadline, redirect.as_deref_mut());
+            let outcome = run_on(&mut conn, request, deadline, redirect.as_deref_mut(), cookies);
             if conn.leave() {
                 // `close()` shut its socket down: whatever came back doesn't count, not even a body
                 // that looks whole (one that ends with the connection reads as complete).
@@ -503,12 +511,12 @@ impl SyncPool {
         Err(Failure::Transport("connection closed before the request could be sent".to_owned()))
     }
 
-    /// The hop a redirect leads to: its request and where it goes (`Err` the exception it fails
-    /// with before any I/O).
-    fn hop(&self, py: Python<'_>, redirect: &Redirect, hop: crate::redirect::Hop) -> PyResult<(Target, Request<RequestBody>)> {
-        let Prepared { request, url, route, .. } = self.config.hop(py, &self.glue, redirect, hop)?;
+    /// The hop a redirect leads to: its request, where it goes, and where its response's cookies
+    /// go (`Err` the exception it fails with before any I/O).
+    fn hop(&self, py: Python<'_>, redirect: &Redirect, hop: crate::redirect::Hop) -> PyResult<(Target, Request<RequestBody>, Option<Cookies>)> {
+        let Prepared { request, url, route, cookies, .. } = self.config.hop(py, &self.glue, redirect, hop)?;
         match Self::target(&url, route) {
-            Ok(target) => Ok((target, request)),
+            Ok(target) => Ok((target, request, cookies)),
             Err(message) => Err(self.glue.connection_error(py, message)),
         }
     }
@@ -522,12 +530,13 @@ impl SyncPool {
         mut request: Request<RequestBody>,
         deadline: Option<Instant>,
         mut redirect: Option<Box<Redirect>>,
+        mut cookies: Option<Cookies>,
     ) -> PyResult<Result<Head, Failure>> {
         loop {
             let state = redirect.as_deref_mut();
-            let fetched = py.detach(|| self.send_blocking(&target, request, deadline, state));
+            let fetched = py.detach(|| self.send_blocking(&target, request, deadline, state, cookies.as_ref()));
             match (fetched, redirect.as_deref()) {
-                (Ok(Fetched::Hop(hop)), Some(state)) => (target, request) = self.hop(py, state, hop)?,
+                (Ok(Fetched::Hop(hop)), Some(state)) => (target, request, cookies) = self.hop(py, state, hop)?,
                 (Ok(Fetched::Hop(_)), None) => return Ok(Err(Failure::Transport("internal error: a redirect lost its state".to_owned()))),
                 (Ok(Fetched::Head(head)), _) => return Ok(Ok(head)),
                 (Err(failure), _) => return Ok(Err(failure)),
@@ -544,9 +553,13 @@ impl SyncPool {
         mut request: Request<RequestBody>,
         deadline: Option<Instant>,
         mut redirect: Option<Box<Redirect>>,
+        mut cookies: Option<Cookies>,
     ) -> PyResult<(Target, SyncConn, Response<Incoming>)> {
         loop {
             let (conn, response) = py.detach(|| self.open_stream(&target, request, deadline)).map_err(|f| self.glue.failure(py, f))?;
+            if let Some(cookies) = &cookies {
+                cookies.store(response.headers());
+            }
             let Some(state) = redirect.as_deref_mut() else { return Ok((target, conn, response)) };
             let next = state.next(response.status().as_u16(), response.headers());
             if matches!(next, Ok(None)) {
@@ -558,7 +571,7 @@ impl SyncPool {
                 self.put_idle(&target.key, conn);
             }
             match next {
-                Ok(Some(hop)) => (target, request) = self.hop(py, state, hop)?,
+                Ok(Some(hop)) => (target, request, cookies) = self.hop(py, state, hop)?,
                 Ok(None) => unreachable!("handled above"),
                 Err(failure) => return Err(self.glue.failure(py, failure)),
             }
@@ -599,13 +612,14 @@ impl SyncPool {
 impl SyncPool {
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (base_url, default_headers, user_agent, https_only, follow_redirects, max_redirects, root_certificates, identity_pem, min_tls_version, max_tls_version, danger_accept_invalid_certs, timeout, pool_idle_timeout, pool_max_idle_per_host, proxy, no_proxy, glue))]
+    #[pyo3(signature = (base_url, default_headers, user_agent, https_only, cookie_store, follow_redirects, max_redirects, root_certificates, identity_pem, min_tls_version, max_tls_version, danger_accept_invalid_certs, timeout, pool_idle_timeout, pool_max_idle_per_host, proxy, no_proxy, glue))]
     fn new(
         py: Python<'_>,
         base_url: Option<&str>,
         default_headers: Option<&Bound<'_, PyAny>>,
         user_agent: &str,
         https_only: bool,
+        cookie_store: bool,
         follow_redirects: bool,
         max_redirects: Option<usize>,
         root_certificates: Vec<Vec<u8>>,
@@ -626,7 +640,8 @@ impl SyncPool {
         Ok(Self {
             config: ClientConfig::new(base_url, default_headers, user_agent, https_only)?
                 .with_proxies(Proxies::new(proxy, no_proxy)?)
-                .with_redirects(follow_redirects, max_redirects),
+                .with_redirects(follow_redirects, max_redirects)
+                .with_cookies(cookie_store),
             tls: TlsSettings::new(
                 &root_certificates,
                 identity_pem.as_deref(),
@@ -666,7 +681,7 @@ impl SyncPool {
         if self.closed.load(Ordering::Relaxed) {
             return Err(Glue::closed_error());
         }
-        let Prepared { request, url, route, redirect } = self.config.prepare(
+        let Prepared { request, url, route, redirect, cookies } = self.config.prepare(
             py,
             &self.glue,
             method.to_str()?,
@@ -683,7 +698,7 @@ impl SyncPool {
         };
         let started = Instant::now();
         let deadline = timeout.and_then(|timeout| self.clock.deadline(started, timeout));
-        let result = self.send_following(py, target, request, deadline, redirect)?;
+        let result = self.send_following(py, target, request, deadline, redirect, cookies)?;
         let exchange = Exchange {
             method: method.unbind(),
             url,
@@ -718,7 +733,7 @@ impl SyncPool {
             return Err(Glue::closed_error());
         }
         let verb_headers = VerbHeaders::sse(accept, last_event_id)?;
-        let Prepared { request, url, route, redirect } = pool.config.prepare_with(
+        let Prepared { request, url, route, redirect, cookies } = pool.config.prepare_with(
             py,
             &pool.glue,
             method.to_str()?,
@@ -731,7 +746,7 @@ impl SyncPool {
             verb_headers,
         )?;
         let request_info = pool.glue.request_info_of(py, &method, &url)?.unbind();
-        let prepared = Box::new(PreparedStream { target: Self::target(&url, route), request, redirect });
+        let prepared = Box::new(PreparedStream { target: Self::target(&url, route), request, redirect, cookies });
         Ok(SyncStream { pool: slf.clone().unbind(), request_info, timeout, state: Mutex::new(StreamState::Prepared(prepared)) })
     }
 
@@ -759,6 +774,7 @@ struct PreparedStream {
     target: Result<Target, String>,
     request: Request<RequestBody>,
     redirect: Option<Box<Redirect>>,
+    cookies: Option<Cookies>,
 }
 
 /// Where a `SyncStream` is.
@@ -833,7 +849,7 @@ impl SyncStream {
 
     /// Send the request and wait for its head: `(status, RawHeaders, http_version)`.
     fn open<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        let PreparedStream { target, request, redirect } = match self.take() {
+        let PreparedStream { target, request, redirect, cookies } = match self.take() {
             StreamState::Prepared(prepared) => *prepared,
             other => {
                 self.put(other);
@@ -849,7 +865,7 @@ impl SyncStream {
             }
         };
         let deadline = self.timeout.and_then(|timeout| pool.clock.deadline(Instant::now(), timeout));
-        let (target, conn, response) = match pool.open_following(py, target, request, deadline, redirect) {
+        let (target, conn, response) = match pool.open_following(py, target, request, deadline, redirect, cookies) {
             Ok(opened) => opened,
             Err(error) => {
                 self.put(StreamState::Done);

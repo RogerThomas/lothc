@@ -1543,3 +1543,135 @@ def test_sync_native_transport_sends_what_pyreqwest_sends_of_a_form_it_cant_fini
     _sync_post_partial(native_client, keys[1], form)
 
     assert _partial_seen(base_url, keys[1]) == _partial_seen(base_url, keys[0])
+
+
+# --- cookie_store= --------------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class _CookieCase:
+    """`case`, sent with `cookie_store=True` once `setup`'s paths (`_path`'s placeholders filled
+    in) have been fetched on the same client, filling its jar."""
+
+    case: _Case
+    setup: list[str]
+
+
+def _cookie_cases() -> list[_CookieCase]:
+    jar = ["/cookies/set?set=a=1;%20Path=/&set=b=2;%20Path=/"]
+    return [
+        _CookieCase(
+            _Case(
+                "jar-cookies",
+                client={"bearer_token": "token", "default_headers": {"X-Default": "0"}},
+                call={"headers": {"X-1": "1"}},
+            ),
+            jar,
+        ),
+        _CookieCase(_Case("jar-cookies-json", verb="post", call={"json": {"a": 1}}), jar),
+        _CookieCase(
+            _Case("jar-cookies-and-an-own-host", call={"headers": {"Host": "host"}}),
+            jar,
+        ),
+        _CookieCase(_Case("an-own-cookie-header", call={"headers": {"Cookie": "own"}}), jar),
+        _CookieCase(_Case("an-empty-jar"), []),
+        _CookieCase(
+            _Case("a-cookie-set-by-a-redirect", path="/redirect-to?to=/echo-request&cookie=c=1"),
+            jar,
+        ),
+        _CookieCase(
+            _Case(
+                "jar-cookies-for-another-origin",
+                path="/redirect-to?to={other}echo-request",
+                call={"headers": {"Cookie": "own", "X-1": "1"}},
+            ),
+            [*jar, "{other}cookies/set?set=o=1;%20Path=/"],
+        ),
+    ]
+
+
+async def _async_cookie_seen(client: HTTPClient, case: _CookieCase, base_url: str) -> _Seen:
+    async with client:
+        for path in case.setup:
+            await client.get(_path(_Case("setup", path=path), base_url))
+        send: Callable[..., Awaitable[Any]] = getattr(client, case.case.verb)
+        response = await send(_path(case.case, base_url), error_for_status=False, **case.case.call)
+        return _seen(response)
+
+
+def _sync_cookie_seen(client: SyncHTTPClient, case: _CookieCase, base_url: str) -> _Seen:
+    with client:
+        for path in case.setup:
+            client.get(_path(_Case("setup", path=path), base_url))
+        send: Callable[..., Any] = getattr(client, case.case.verb)
+        return _seen(send(_path(case.case, base_url), error_for_status=False, **case.case.call))
+
+
+@pytest.mark.parametrize("case", _cookie_cases(), ids=lambda case: case.case.id)
+async def test_native_transport_sends_the_cookie_jars_cookies_as_pyreqwest_does(
+    base_url: str, case: _CookieCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = partial(HTTPClient, base_url=base_url, cookie_store=True, **case.case.client)
+    pyreqwest_client, native_client = _pair(factory, monkeypatch)
+
+    expected = await _async_cookie_seen(pyreqwest_client, case, base_url)
+    actual = await _async_cookie_seen(native_client, case, base_url)
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize("case", _cookie_cases(), ids=lambda case: case.case.id)
+def test_sync_native_transport_sends_the_cookie_jars_cookies_as_pyreqwest_does(
+    base_url: str, case: _CookieCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    factory = partial(SyncHTTPClient, base_url=base_url, cookie_store=True, **case.case.client)
+    pyreqwest_client, native_client = _pair(factory, monkeypatch)
+
+    expected = _sync_cookie_seen(pyreqwest_client, case, base_url)
+    actual = _sync_cookie_seen(native_client, case, base_url)
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize("userinfo", ["", "user:pass@"], ids=["no-credentials", "credentials"])
+@pytest.mark.parametrize("case", _cookie_cases(), ids=lambda case: case.case.id)
+async def test_native_transport_sends_the_cookie_jars_cookies_to_a_proxy_as_pyreqwest_does(
+    base_url: str, case: _CookieCase, userinfo: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_proxy_variables(monkeypatch)
+    with serve_http_proxy(upstream_port=urlsplit(base_url).port) as proxy:
+        factory = partial(
+            HTTPClient,
+            base_url=base_url,
+            cookie_store=True,
+            proxy=proxy.url.replace("://", f"://{userinfo}"),
+            **case.case.client,
+        )
+        pyreqwest_client, native_client = _pair(factory, monkeypatch)
+
+        expected = await _async_cookie_seen(pyreqwest_client, case, base_url), _taken(proxy)
+        actual = await _async_cookie_seen(native_client, case, base_url), _taken(proxy)
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize("userinfo", ["", "user:pass@"], ids=["no-credentials", "credentials"])
+@pytest.mark.parametrize("case", _cookie_cases(), ids=lambda case: case.case.id)
+def test_sync_native_transport_sends_the_cookie_jars_cookies_to_a_proxy_as_pyreqwest_does(
+    base_url: str, case: _CookieCase, userinfo: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_proxy_variables(monkeypatch)
+    with serve_http_proxy(upstream_port=urlsplit(base_url).port) as proxy:
+        factory = partial(
+            SyncHTTPClient,
+            base_url=base_url,
+            cookie_store=True,
+            proxy=proxy.url.replace("://", f"://{userinfo}"),
+            **case.case.client,
+        )
+        pyreqwest_client, native_client = _pair(factory, monkeypatch)
+
+        expected = _sync_cookie_seen(pyreqwest_client, case, base_url), _taken(proxy)
+        actual = _sync_cookie_seen(native_client, case, base_url), _taken(proxy)
+
+    assert actual == expected
