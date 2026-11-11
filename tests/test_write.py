@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, TypedDict, cast
 
 import pytest
-from _helpers import echoed_headers, make_unreadable, partial_body_seen
+from _helpers import echoed_headers, make_unreadable, opens_but_fails_to_read, partial_body_seen
 from msgspec import Struct
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -1032,34 +1032,34 @@ def test_sync_an_unreadable_form_file_raises_before_anything_is_sent(
 async def test_a_form_file_that_cant_be_read_fails_the_request_after_the_parts_before_it(
     client: HTTPClient, base_url: str, server_key: str, tmp_path: Path
 ) -> None:
-    (tmp_path / "directory").mkdir()
+    unreadable = tmp_path / "unreadable"
 
-    with pytest.raises(HTTPConnectionError):
+    with opens_but_fails_to_read(unreadable), pytest.raises(HTTPConnectionError):
         await client.post(
-            "partial-body", params={"key": server_key}, form={"a": "b", "f": tmp_path / "directory"}
+            "partial-body", params={"key": server_key}, form={"a": "b", "f": unreadable}
         )
 
     body = partial_body_seen(base_url, server_key)["body"]
     assert 'name="a"\r\n\r\nb\r\n--' in body
     assert body.endswith(
-        'name="f"; filename="directory"\r\nContent-Type: application/octet-stream\r\n\r\n'
+        'name="f"; filename="unreadable"\r\nContent-Type: application/octet-stream\r\n\r\n'
     )
 
 
 def test_sync_a_form_file_that_cant_be_read_fails_the_request_after_the_parts_before_it(
     sync_client: SyncHTTPClient, base_url: str, server_key: str, tmp_path: Path
 ) -> None:
-    (tmp_path / "directory").mkdir()
+    unreadable = tmp_path / "unreadable"
 
-    with pytest.raises(HTTPConnectionError):
+    with opens_but_fails_to_read(unreadable), pytest.raises(HTTPConnectionError):
         sync_client.post(
-            "partial-body", params={"key": server_key}, form={"a": "b", "f": tmp_path / "directory"}
+            "partial-body", params={"key": server_key}, form={"a": "b", "f": unreadable}
         )
 
     body = partial_body_seen(base_url, server_key)["body"]
     assert 'name="a"\r\n\r\nb\r\n--' in body
     assert body.endswith(
-        'name="f"; filename="directory"\r\nContent-Type: application/octet-stream\r\n\r\n'
+        'name="f"; filename="unreadable"\r\nContent-Type: application/octet-stream\r\n\r\n'
     )
 
 

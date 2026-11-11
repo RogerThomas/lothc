@@ -2210,7 +2210,11 @@ async def test_connect_timeout_covers_the_origin_handshake_inside_an_https_proxy
     # arrives through the proxy's TLS mustn't count as the origin's handshake finishing.
     with (
         serve_https_proxy(tls_server_context(tls_ca), stalled_handshake=b"\x16\x03\x03") as origin,
-        serve_https_proxy(tls_server_context(tls_ca), upstream_port=_port(origin.url)) as proxy,
+        # The proxy as `127.0.0.1`, not `localhost`, which also resolves to `::1`: Windows takes
+        # about a second to refuse that, more than the `connect_timeout`.
+        serve_https_proxy(
+            tls_server_context(tls_ca), host="127.0.0.1", upstream_port=_port(origin.url)
+        ) as proxy,
     ):
         async with HTTPClient(
             proxy=proxy.url, root_certificates=[tls_ca_pem], connect_timeout=0.05, timeout=5.0
@@ -2228,7 +2232,11 @@ def test_sync_connect_timeout_covers_the_origin_handshake_inside_an_https_proxy_
 ) -> None:
     with (
         serve_https_proxy(tls_server_context(tls_ca), stalled_handshake=b"\x16\x03\x03") as origin,
-        serve_https_proxy(tls_server_context(tls_ca), upstream_port=_port(origin.url)) as proxy,
+        # The proxy as `127.0.0.1`, not `localhost`, which also resolves to `::1`: Windows takes
+        # about a second to refuse that, more than the `connect_timeout`.
+        serve_https_proxy(
+            tls_server_context(tls_ca), host="127.0.0.1", upstream_port=_port(origin.url)
+        ) as proxy,
         SyncHTTPClient(
             proxy=proxy.url, root_certificates=[tls_ca_pem], connect_timeout=0.05, timeout=5.0
         ) as client,

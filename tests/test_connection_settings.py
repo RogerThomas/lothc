@@ -355,11 +355,18 @@ def test_sync_connect_timeout_bounds_a_socks5_handshake() -> None:
     assert time.monotonic() - started < 1
 
 
+def _ipv4_url(https_url: str) -> str:
+    """`https_url` naming the address the test servers listen on rather than `localhost`, which
+    also resolves to `::1`: Windows takes about a second to refuse that (it retries the SYN), more
+    than a short `connect_timeout` allows. The certificate names `127.0.0.1` too."""
+    return https_url.replace("localhost", "127.0.0.1")
+
+
 async def test_connect_timeout_ends_once_the_tls_handshake_has(
     https_base_url: str, tls_ca_pem: bytes
 ) -> None:
     async with HTTPClient(
-        base_url=https_base_url, root_certificates=[tls_ca_pem], connect_timeout=0.1
+        base_url=_ipv4_url(https_base_url), root_certificates=[tls_ca_pem], connect_timeout=0.1
     ) as client:
         result = await client.get("slow", params={"seconds": 0.15}, into=dict)
 
@@ -370,7 +377,7 @@ def test_sync_connect_timeout_ends_once_the_tls_handshake_has(
     https_base_url: str, tls_ca_pem: bytes
 ) -> None:
     with SyncHTTPClient(
-        base_url=https_base_url, root_certificates=[tls_ca_pem], connect_timeout=0.1
+        base_url=_ipv4_url(https_base_url), root_certificates=[tls_ca_pem], connect_timeout=0.1
     ) as client:
         result = client.get("slow", params={"seconds": 0.15}, into=dict)
 

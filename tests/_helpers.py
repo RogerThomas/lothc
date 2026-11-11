@@ -60,6 +60,23 @@ def make_unreadable(path: Path) -> None:
 
 
 @contextmanager
+def opens_but_fails_to_read(path: Path) -> Generator[None]:
+    """Make `path` something that opens as a file but fails on its first read, for the block: a
+    directory on POSIX; on Windows, which won't open a directory as a file, a file whose first
+    byte another handle holds locked."""
+    if sys.platform == "win32":
+        import msvcrt  # Windows only
+
+        path.write_bytes(b"x")
+        with path.open("rb") as file:
+            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+            yield
+    else:
+        path.mkdir()
+        yield
+
+
+@contextmanager
 def read_only_directory(path: Path) -> Generator[None]:
     """The directory `path` refusing new files (so also any file replaced by renaming one into
     it) until the block ends. On Windows, where `chmod` only sets the read-only flag, which a
