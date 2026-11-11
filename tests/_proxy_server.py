@@ -1,11 +1,12 @@
 """Stdlib-only proxies for the proxy tests: an HTTP forward proxy that also tunnels `CONNECT`
-(`serve_http_proxy`), and a minimal SOCKS5 server (`serve_socks5_proxy`). Each records what it
+(`serve_http_proxy`), the same behind TLS (`serve_https_proxy`, an `https://` proxy), and minimal
+SOCKS5 and SOCKS4/4a servers (`serve_socks5_proxy`, `serve_socks4_proxy`). Each records what it
 received, so a test can assert that a request really went through it, exactly how it was written,
 and with which credentials.
 
-Both are function-scoped (one per test, ~1ms to start), so a test reads only its own records.
+All are function-scoped (one per test, ~1ms to start), so a test reads only its own records.
 Records are appended before the proxy answers, so they're complete once the client's call returns.
-Both connect upstream to the requested port on `127.0.0.1`, whatever host was asked for, since
+All connect upstream to the requested port on `127.0.0.1`, whatever host was asked for, since
 every test server listens there: a client that resolved `localhost` to `::1`, or asked for a name
 that doesn't resolve, still reaches it, and the record keeps what it really asked for. The HTTP
 proxy's `upstream_port` sends everything to one port instead, so a request for a port no test
@@ -15,6 +16,7 @@ server can bind (80, 443) still reaches one.
 import selectors
 import socket
 import socketserver
+import ssl
 import threading
 import time
 from base64 import b64encode
@@ -22,6 +24,7 @@ from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from enum import Enum
+from functools import partial
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import override
@@ -62,6 +65,16 @@ class SocksBehaviour(Enum):
     WRONG_METHOD = "wrong-method"
 
 
+class Socks4Behaviour(Enum):
+    """How the SOCKS4 server answers a request."""
+
+    SERVE = "serve"
+    # Read the request, then never answer.
+    SILENT = "silent"
+    # Read the request, then close the connection without a reply.
+    HANG_UP = "hang-up"
+
+
 @dataclass(slots=True)
 class ProxiedRequest:
     """One request as the HTTP proxy received it: the raw request line, every header in arrival
@@ -84,6 +97,30 @@ class SocksHandshake:
     address_type: int
     host: str
     port: int
+
+
+@dataclass(slots=True)
+class Socks4Request:
+    """One SOCKS4 request as the server received it: its bytes as they arrived, and what they
+    ask for."""
+
+    raw: bytes
+    port: int
+    # `DSTIP`: for SOCKS4a, `0.0.0.x` with `x` nonzero, and `domain` the name to resolve.
+    ip: str
+    user_id: bytes
+    domain: str | None
+
+
+@dataclass(slots=True)
+class ProxyTLSHandshake:
+    """One TLS handshake as the HTTPS proxy completed it: the name the client asked for (SNI,
+    `None` without one), the protocol ALPN settled on (`None` when the client offered none of
+    the proxy's), and whether the client presented a certificate."""
+
+    server_name: str | None
+    alpn: str | None
+    client_certificate: bool
 
 
 class _HTTPProxyServer(ThreadingHTTPServer):
@@ -116,6 +153,61 @@ class _HTTPProxyServer(ThreadingHTTPServer):
         pass  # a client that hangs up mid-tunnel is expected; nothing worth a traceback here
 
 
+def _remember_server_name(
+    names: threading.local, _connection: object, server_name: str | None, _context: object
+) -> None:
+    """`sni_callback`: the name a handshake asked for, kept for the thread doing it."""
+    names.server_name = server_name
+
+
+class _HTTPSProxyServer(_HTTPProxyServer):
+    """`_HTTPProxyServer` behind TLS: each connection's handshake runs on its handler thread, as
+    `_tls_server.py`'s does, and is recorded once it completes. A failed one is dropped silently,
+    since it's what the negative controls expect."""
+
+    def __init__(
+        self,
+        context: ssl.SSLContext,
+        credentials: tuple[str, str] | None,
+        connect_status: int,
+        behaviour: ProxyBehaviour,
+        upstream_port: int | None,
+        *,
+        stalled_handshake: bytes | None,
+    ) -> None:
+        super().__init__(credentials, connect_status, behaviour, upstream_port, None)
+        self.context = context
+        self.stalled_handshake = stalled_handshake
+        self.tls_handshakes: list[ProxyTLSHandshake] = []
+        self._names = threading.local()
+        context.set_alpn_protocols(["http/1.1"])
+        context.sni_callback = partial(_remember_server_name, self._names)
+
+    @override
+    def finish_request(
+        self, request: socket.socket | tuple[bytes, socket.socket], client_address: object
+    ) -> None:
+        if not isinstance(request, socket.socket):
+            raise TypeError(f"Expected a stream socket, got {type(request)!r}")
+        if self.stalled_handshake is not None:
+            request.sendall(self.stalled_handshake)
+            _drain(request)
+            return
+        try:
+            tls_socket = self.context.wrap_socket(request, server_side=True)
+        except (ssl.SSLError, ConnectionError):
+            return
+        with tls_socket:
+            self.tls_handshakes.append(
+                ProxyTLSHandshake(
+                    self._names.server_name,
+                    tls_socket.selected_alpn_protocol(),
+                    tls_socket.getpeercert(binary_form=True) is not None,
+                )
+            )
+            super().finish_request(tls_socket, client_address)
+
+
 class _SocksServer(ThreadingHTTPServer):
     def __init__(
         self,
@@ -137,10 +229,28 @@ class _SocksServer(ThreadingHTTPServer):
         pass  # as `_HTTPProxyServer`
 
 
+class _Socks4Server(ThreadingHTTPServer):
+    def __init__(
+        self, behaviour: Socks4Behaviour, port: int, connect_reply: list[bytes] | None
+    ) -> None:
+        super().__init__(("127.0.0.1", port), _Socks4Handler)
+        self.behaviour = behaviour
+        self.connect_reply = connect_reply
+        self.requests: list[Socks4Request] = []
+
+    @override
+    def handle_error(
+        self, request: socket.socket | tuple[bytes, socket.socket], client_address: object
+    ) -> None:
+        pass  # as `_HTTPProxyServer`
+
+
 @dataclass(slots=True)
 class HTTPProxy:
     url: str
     requests: list[ProxiedRequest] = field(default_factory=list[ProxiedRequest])
+    # An `https://` proxy's TLS handshakes; always empty for an `http://` one.
+    tls_handshakes: list[ProxyTLSHandshake] = field(default_factory=list[ProxyTLSHandshake])
 
 
 @dataclass(slots=True)
@@ -150,8 +260,25 @@ class SocksProxy:
     handshakes: list[SocksHandshake] = field(default_factory=list[SocksHandshake])
 
 
+@dataclass(slots=True)
+class Socks4Proxy:
+    # `host:port`, for the test to put a scheme (`socks4://`/`socks4a://`) and credentials on.
+    address: str
+    requests: list[Socks4Request] = field(default_factory=list[Socks4Request])
+
+
+def _received(source: socket.socket) -> bytes:
+    """What `source` has to read now. From a TLS socket, the rest of the record too: bytes it has
+    already decrypted are invisible to `select`."""
+    chunk = source.recv(65536)
+    while chunk and isinstance(source, ssl.SSLSocket) and source.pending():
+        chunk += source.recv(source.pending())
+    return chunk
+
+
 def _pipe(client: socket.socket, upstream: socket.socket) -> None:
-    """Copy bytes both ways until both sides have closed (each EOF is passed on as a half-close)."""
+    """Copy bytes both ways until both sides have closed (each EOF is passed on as a half-close,
+    except to a TLS socket, whose `shutdown` drops TLS: the pipe ends there instead)."""
     with selectors.DefaultSelector() as selector:
         selector.register(client, selectors.EVENT_READ, (client, upstream))
         selector.register(upstream, selectors.EVENT_READ, (upstream, client))
@@ -160,12 +287,14 @@ def _pipe(client: socket.socket, upstream: socket.socket) -> None:
             for key, _ in selector.select():
                 source, destination = key.data
                 try:
-                    chunk = source.recv(65536)
+                    chunk = _received(source)
                 except OSError:
                     return
                 if chunk:
                     destination.sendall(chunk)
                     continue
+                if isinstance(destination, ssl.SSLSocket):
+                    return
                 selector.unregister(source)
                 open_sides -= 1
                 with suppress(OSError):
@@ -411,6 +540,63 @@ class _SocksHandler(socketserver.StreamRequestHandler):
             _pipe(self.connection, upstream)
 
 
+class _Socks4Handler(socketserver.StreamRequestHandler):
+    """SOCKS4 `CONNECT`, with SOCKS4a's domain names: a request whose `DSTIP` is `0.0.0.x` (`x`
+    nonzero) names the host after its user ID."""
+
+    rbufsize = 0
+
+    def _server(self) -> _Socks4Server:
+        server = self.server
+        if not isinstance(server, _Socks4Server):
+            raise TypeError(f"Expected the SOCKS4 server, got {type(server)!r}")
+        return server
+
+    def _read_terminated(self) -> bytes:
+        """A NUL-terminated field, its NUL included."""
+        data = _read_exactly(self, 1)
+        while not data.endswith(b"\x00"):
+            data += _read_exactly(self, 1)
+        return data
+
+    def _read_request(self) -> Socks4Request:
+        head = _read_exactly(self, 8)
+        user_id = self._read_terminated()
+        address = head[4:8]
+        is_4a = address[:3] == b"\x00\x00\x00" and address[3] != 0
+        domain = self._read_terminated() if is_4a else b""
+        return Socks4Request(
+            head + user_id + domain,
+            int.from_bytes(head[2:4]),
+            socket.inet_ntop(socket.AF_INET, address),
+            user_id[:-1],
+            domain[:-1].decode() if is_4a else None,
+        )
+
+    @override
+    def handle(self) -> None:
+        server = self._server()
+        request = self._read_request()
+        server.requests.append(request)
+        if server.behaviour is Socks4Behaviour.SILENT:
+            _drain(self.connection)
+            return
+        if server.behaviour is Socks4Behaviour.HANG_UP:
+            return
+        try:
+            upstream = socket.create_connection(("127.0.0.1", request.port), timeout=10)
+        except OSError:
+            self.wfile.write(b"\x00\x5b" + bytes(6))  # request rejected or failed
+            return
+        upstream.settimeout(None)
+        for index, part in enumerate(server.connect_reply or [b"\x00\x5a" + bytes(6)]):
+            if index:
+                time.sleep(0.02)  # so each part arrives in a read of its own
+            self.wfile.write(part)
+        with upstream:
+            _pipe(self.connection, upstream)
+
+
 @contextmanager
 def serve_http_proxy(
     *,
@@ -432,6 +618,52 @@ def serve_http_proxy(
     )
     with serve_in_background(server):
         yield HTTPProxy(f"http://127.0.0.1:{server.server_port}", server.requests)
+
+
+@contextmanager
+def serve_https_proxy(
+    context: ssl.SSLContext,
+    *,
+    host: str = "localhost",
+    stalled_handshake: bytes | None = None,
+    credentials: tuple[str, str] | None = None,
+    connect_status: int = 200,
+    behaviour: ProxyBehaviour = ProxyBehaviour.TUNNEL,
+    upstream_port: int | None = None,
+) -> Generator[HTTPProxy]:
+    """`serve_http_proxy`'s proxy behind TLS with `context` (an `https://` proxy), its URL naming
+    it as `host`. Each completed handshake is recorded (`tls_handshakes`), with ALPN offering
+    `http/1.1` (this sets `context`'s ALPN protocols and SNI callback). With
+    `stalled_handshake`, it accepts connections but never finishes a TLS handshake: it writes
+    those bytes (`b""` for none), then reads and drops whatever arrives."""
+    server = _HTTPSProxyServer(
+        context,
+        credentials,
+        connect_status,
+        behaviour,
+        upstream_port,
+        stalled_handshake=stalled_handshake,
+    )
+    with serve_in_background(server):
+        yield HTTPProxy(
+            f"https://{host}:{server.server_port}", server.requests, server.tls_handshakes
+        )
+
+
+@contextmanager
+def serve_socks4_proxy(
+    *,
+    behaviour: Socks4Behaviour = Socks4Behaviour.SERVE,
+    port: int = 0,
+    connect_reply: list[bytes] | None = None,
+) -> Generator[Socks4Proxy]:
+    """A SOCKS4/4a proxy on `127.0.0.1` (on `port`, any free one by default) for the block,
+    answering as `behaviour` says. `connect_reply` replaces its reply to a `CONNECT` it could
+    carry out (granted, bound to `0.0.0.0:0`), written in those parts 20ms apart; it still pipes
+    the connection through whatever the reply says."""
+    server = _Socks4Server(behaviour, port, connect_reply)
+    with serve_in_background(server):
+        yield Socks4Proxy(f"127.0.0.1:{server.server_port}", server.requests)
 
 
 @contextmanager

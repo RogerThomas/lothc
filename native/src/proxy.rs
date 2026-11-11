@@ -10,29 +10,40 @@
 //! How a connection goes through it (reqwest's `connect.rs`): an `http://` target through an HTTP
 //! proxy is sent to the proxy in absolute form, with the proxy URL's credentials as
 //! `Proxy-Authorization` (`request.rs`); an `https://` target goes through a `CONNECT` tunnel
-//! (hyper-util's `tunnel.rs`, byte for byte), then TLS to the origin; a SOCKS5 proxy does
-//! hyper-util's (non-optimistic) SOCKS5 handshake, the target resolved locally for `socks5://`
-//! and by the proxy for `socks5h://`. The handshake runs on the connection's own socket before TLS,
-//! for both pools (`Handshake::run`), driven by the same readiness as hyper's I/O.
+//! (hyper-util's `tunnel.rs`, byte for byte), then TLS to the origin. An `https://` proxy is the
+//! same over TLS to the proxy itself (hyper-rustls's connector, `tls.rs`): its certificate is
+//! checked against its host with the client's TLS settings, and ALPN offers `http/1.1` when
+//! requests are forwarded over it, nothing when it carries a tunnel (reqwest's `tls_proxy`), whose
+//! handshake runs to its end before the `CONNECT` goes out.
 //!
-//! An `https://` proxy (TLS to the proxy itself) and SOCKS4 aren't ported: a request that would use
-//! one is a `NotImplementedError`, never sent some other way.
+//! A SOCKS5 proxy does hyper-util's (non-optimistic) SOCKS5 handshake, the target resolved
+//! locally for `socks5://` and by the proxy for `socks5h://`. A SOCKS4 one does hyper-util's
+//! SOCKS4: one request, its user ID always empty (a proxy URL's credentials go nowhere), with the
+//! IPv4 address the target resolved to locally for `socks4://`, SOCKS4a's domain name for
+//! `socks4a://`, and an IPv6 address an error. The handshake runs on the connection's own socket
+//! before TLS to the origin, for both pools (`Handshake::run`), driven by the same readiness as
+//! hyper's I/O.
 use std::future::poll_fn;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
-use std::os::fd::RawFd;
-use std::task::Poll;
+use std::net::{IpAddr, SocketAddr, SocketAddrV4};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{ready, Poll};
 
 use http::header::HeaderValue;
 use http::Uri;
+use hyper::rt::ReadBuf;
 use hyper_util::client::proxy::matcher::{Intercept, Matcher};
-use pyo3::exceptions::{PyNotImplementedError, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::PyResult;
 use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, ClientConnection};
 use url::Url;
 
-use crate::io::{recv, send, Readiness};
+use crate::error::error_chain;
+use crate::io::{Carrier, PlainSocket, Readiness, Transport};
 use crate::request::server_name;
+use crate::tls::TlsSocket;
 
 /// The variables hyper-util's `Matcher::from_env` reads a proxy from: with none set it can never
 /// intercept anything, so a client without proxies never consults it.
@@ -44,8 +55,11 @@ const TUNNEL_RESPONSE_LIMIT: usize = 8192;
 const TUNNEL_MAX_HEADERS: usize = 100;
 /// hyper-util's SOCKS5 send buffer, shared by the whole handshake (`BytesMut::with_capacity(262)`).
 const SOCKS_SEND_LIMIT: usize = 262;
-/// hyper-util's SOCKS5 receive buffer (`BytesMut::with_capacity(513)`), read 513 bytes at a time.
+/// hyper-util's SOCKS5 receive buffer (`BytesMut::with_capacity(513)`); every SOCKS read is 513
+/// bytes at a time.
 const SOCKS_RECEIVE_LIMIT: usize = 513;
+/// hyper-util's SOCKS4 receive buffer (`BytesMut::with_capacity(1024)`).
+const SOCKS4_RECEIVE_LIMIT: usize = 1024;
 
 /// A client's proxy rules, fixed when it opens.
 pub(crate) struct Proxies {
@@ -58,6 +72,9 @@ pub(crate) struct Endpoint {
     /// Without an IPv6 address's brackets, ready to connect to.
     pub(crate) host: String,
     pub(crate) port: u16,
+    /// For an `https://` proxy, the name its certificate is checked against (SNI too, for a
+    /// name), or why its host can't be one.
+    tls: Option<Result<ServerName<'static>, String>>,
 }
 
 /// How a request's connection is made.
@@ -69,6 +86,8 @@ pub(crate) enum Route {
     Tunnel { proxy: Endpoint, auth: Option<HeaderValue> },
     /// Through a SOCKS5 proxy, which resolves the target itself when `remote_dns` (`socks5h://`).
     Socks5 { proxy: Endpoint, auth: Option<(String, String)>, remote_dns: bool },
+    /// Through a SOCKS4 proxy, which resolves the target itself when `remote_dns` (`socks4a://`).
+    Socks4 { proxy: Endpoint, remote_dns: bool },
 }
 
 /// What a SOCKS5 `CONNECT` asks for.
@@ -77,17 +96,19 @@ pub(crate) enum SocksAddress {
     Domain(String, u16),
 }
 
-/// What a new connection's socket does before TLS and HTTP: a proxy's handshake.
-pub(crate) enum Handshake {
-    /// The `CONNECT` request, written out whole.
-    Tunnel(Vec<u8>),
-    Socks5 { auth: Option<(String, String)>, address: SocksAddress },
+/// What a SOCKS4 `CONNECT` asks for: an IPv4 address, or SOCKS4a's domain name.
+pub(crate) enum Socks4Address {
+    Ip(SocketAddrV4),
+    Domain(String, u16),
 }
 
-fn unported(feature: &str) -> pyo3::PyErr {
-    PyNotImplementedError::new_err(format!(
-        "{feature} is not supported by the native transport yet (native=True)"
-    ))
+/// What a new connection's socket does before TLS and HTTP: a proxy's handshake.
+pub(crate) enum Handshake {
+    /// The `CONNECT` request, written out whole, inside TLS to the proxy (`tls`, not started
+    /// yet; boxed, as it's far bigger than the rest) for an `https://` one.
+    Tunnel { request: Vec<u8>, tls: Option<Box<ClientConnection>> },
+    Socks5 { auth: Option<(String, String)>, address: SocksAddress },
+    Socks4(Socks4Address),
 }
 
 /// `proxy=` as pyreqwest hands it to reqwest: parsed as a URL (pyreqwest's `UrlType`, its error a
@@ -113,11 +134,14 @@ fn explicit_proxy(proxy: &str) -> PyResult<String> {
 
 impl Endpoint {
     /// hyper-util's `HttpConnector`: the URI's host, and its port or the scheme's (443 for https,
-    /// 80 for anything else, SOCKS from the environment included).
+    /// 80 for anything else, SOCKS from the environment included). For https, hyper-rustls's
+    /// `DefaultServerNameResolver`: the host is the certificate's name.
     fn of(uri: &Uri) -> Self {
         let host = bare_host(uri.host().unwrap_or_default());
-        let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("https") { 443 } else { 80 });
-        Self { host: host.to_owned(), port }
+        let https = uri.scheme_str() == Some("https");
+        let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
+        let tls = https.then(|| ServerName::try_from(host.to_owned()).map_err(|e| e.to_string()));
+        Self { host: host.to_owned(), port, tls }
     }
 }
 
@@ -137,8 +161,7 @@ impl Proxies {
         Ok(Self { matcher })
     }
 
-    /// The route to `uri` (a request's whole URI): direct unless a proxy intercepts it. A proxy
-    /// this transport can't speak is a `NotImplementedError`.
+    /// The route to `uri` (a request's whole URI): direct unless a proxy intercepts it.
     pub(crate) fn route(&self, uri: &Uri) -> PyResult<Route> {
         let Some(intercept) = self.matcher.as_ref().and_then(|matcher| matcher.intercept(uri)) else {
             return Ok(Route::Direct);
@@ -151,12 +174,14 @@ impl Proxies {
         let endpoint = Endpoint::of(proxy);
         let raw_auth = || intercept.raw_auth().map(|(user, pass)| (user.to_owned(), pass.to_owned()));
         match proxy.scheme_str().unwrap_or_default() {
-            "http" if https => Ok(Route::Tunnel { proxy: endpoint, auth: intercept.basic_auth().cloned() }),
-            "http" => Ok(Route::Forward { proxy: endpoint, auth: intercept.basic_auth().cloned() }),
+            "http" | "https" if https => Ok(Route::Tunnel { proxy: endpoint, auth: intercept.basic_auth().cloned() }),
+            "http" | "https" => Ok(Route::Forward { proxy: endpoint, auth: intercept.basic_auth().cloned() }),
             "socks5" => Ok(Route::Socks5 { proxy: endpoint, auth: raw_auth(), remote_dns: false }),
             "socks5h" => Ok(Route::Socks5 { proxy: endpoint, auth: raw_auth(), remote_dns: true }),
-            "https" => Err(unported(&format!("an https:// proxy ({proxy}, TLS to the proxy itself)"))),
-            scheme => Err(unported(&format!("a {scheme}:// proxy ({proxy})"))),
+            "socks4" => Ok(Route::Socks4 { proxy: endpoint, remote_dns: false }),
+            "socks4a" => Ok(Route::Socks4 { proxy: endpoint, remote_dns: true }),
+            // hyper-util's matcher keeps a proxy of no other scheme.
+            scheme => Err(PyRuntimeError::new_err(format!("internal error: a {scheme}:// proxy ({proxy})"))),
         }
     }
 }
@@ -171,7 +196,7 @@ impl Route {
     pub(crate) fn connect_address(&self, origin: (String, u16)) -> (String, u16) {
         match self {
             Self::Direct => origin,
-            Self::Forward { proxy, .. } | Self::Tunnel { proxy, .. } | Self::Socks5 { proxy, .. } => {
+            Self::Forward { proxy, .. } | Self::Tunnel { proxy, .. } | Self::Socks5 { proxy, .. } | Self::Socks4 { proxy, .. } => {
                 (proxy.host.clone(), proxy.port)
             }
         }
@@ -181,35 +206,84 @@ impl Route {
         matches!(self, Self::Forward { .. })
     }
 
+    /// Whether its connections tunnel inside TLS to the proxy, which `handshake` then needs
+    /// `tls::tunnel_config` for.
+    pub(crate) fn tunnels_in_tls(&self) -> bool {
+        matches!(self, Self::Tunnel { proxy: Endpoint { tls: Some(_), .. }, .. })
+    }
+
     /// The name an https origin's certificate is verified against. Through a tunnel or SOCKS,
     /// reqwest takes it from the URI's host as is (`ServerName::try_from`), so an IPv6 address,
     /// which keeps its brackets there, is refused, unlike on a direct connection.
-    pub(crate) fn server_name(&self, url: &Url) -> Result<ServerName<'static>, String> {
+    fn server_name(&self, url: &Url) -> Result<ServerName<'static>, String> {
         match self {
-            Self::Tunnel { .. } | Self::Socks5 { .. } => {
+            Self::Tunnel { .. } | Self::Socks5 { .. } | Self::Socks4 { .. } => {
                 ServerName::try_from(url.host_str().unwrap_or_default().to_owned()).map_err(|_| "Invalid Server Name".to_owned())
             }
             Self::Direct | Self::Forward { .. } => server_name(url),
         }
     }
 
-    /// The host a `socks5://` proxy wants resolved here before connecting to it, if any: the
-    /// target's (`host` as a URL serializes it), unless it is an IPv4 address already. reqwest
-    /// resolves the URI's host as written, so an IPv6 address goes to the resolver in its
-    /// brackets, which no resolver takes: such a request fails, as it does with pyreqwest.
+    /// For a connection to `url`'s origin whose requests go over TLS (`Some`), the name the TLS
+    /// session hyper talks through checks a certificate against: an https origin's, or for an
+    /// http one forwarded to an `https://` proxy, the proxy's. `Err` is why it can't be one.
+    pub(crate) fn tls_name(&self, url: &Url) -> Option<Result<ServerName<'static>, String>> {
+        match self {
+            _ if url.scheme() == "https" => Some(self.server_name(url)),
+            Self::Forward { proxy, .. } => proxy.tls.clone(),
+            _ => None,
+        }
+    }
+
+    /// The host a `socks4://` or `socks5://` proxy wants resolved here before connecting to it,
+    /// if any: the target's (`host` as a URL serializes it), unless it is an IPv4 address
+    /// already. reqwest resolves the URI's host as written, so an IPv6 address goes to the
+    /// resolver in its brackets, which no resolver takes: such a request fails, as it does with
+    /// pyreqwest.
     pub(crate) fn resolve_locally(&self, host: &str) -> Option<String> {
-        let Self::Socks5 { remote_dns: false, .. } = self else { return None };
+        let (Self::Socks5 { remote_dns: false, .. } | Self::Socks4 { remote_dns: false, .. }) = self else { return None };
         host.parse::<IpAddr>().is_err().then(|| host.to_owned())
     }
 
     /// The handshake a new connection to the origin `host` (as a URL serializes it, an IPv6
     /// address in brackets) and `port` needs, given what `resolve_locally` asked for (`resolved`:
     /// the first address, or `None` if there was none). `user_agent` goes on a `CONNECT`, as
-    /// reqwest's connector sends its client's user agent there.
-    pub(crate) fn handshake(&self, host: &str, port: u16, user_agent: Option<&HeaderValue>, resolved: Option<IpAddr>) -> Result<Option<Handshake>, String> {
+    /// reqwest's connector sends its client's user agent there. `tunnel_config` is the TLS config
+    /// a route that `tunnels_in_tls` needs.
+    pub(crate) fn handshake(
+        &self,
+        host: &str,
+        port: u16,
+        user_agent: Option<&HeaderValue>,
+        resolved: Option<IpAddr>,
+        tunnel_config: Option<Arc<ClientConfig>>,
+    ) -> Result<Option<Handshake>, String> {
         match self {
             Self::Direct | Self::Forward { .. } => Ok(None),
-            Self::Tunnel { auth, .. } => Ok(Some(Handshake::Tunnel(connect_request(host, port, user_agent, auth.as_ref())))),
+            Self::Tunnel { proxy, auth } => {
+                let request = connect_request(host, port, user_agent, auth.as_ref());
+                let tls = match (&proxy.tls, tunnel_config) {
+                    (None, _) => None,
+                    (Some(name), Some(config)) => Some(Box::new(ClientConnection::new(config, name.clone()?).map_err(|e| error_chain(&e))?)),
+                    (Some(_), None) => return Err("internal error: a tunnel through an https:// proxy had no TLS config".to_owned()),
+                };
+                Ok(Some(Handshake::Tunnel { request, tls }))
+            }
+            Self::Socks4 { remote_dns, .. } => {
+                // hyper-util's `SocksV4`, after reqwest's local resolution for `socks4://`.
+                let host = bare_host(host);
+                let ip = match (host.parse::<IpAddr>(), resolved) {
+                    (Ok(ip), _) => Some(ip),
+                    (Err(_), Some(ip)) if !remote_dns => Some(ip),
+                    (Err(_), _) => None,
+                };
+                let address = match ip {
+                    Some(IpAddr::V4(ip)) => Socks4Address::Ip(SocketAddrV4::new(ip, port)),
+                    Some(IpAddr::V6(_)) => return Err(socks_error("IPV6 is not supported")),
+                    None => Socks4Address::Domain(host.to_owned(), port),
+                };
+                Ok(Some(Handshake::Socks4(address)))
+            }
             Self::Socks5 { auth, remote_dns, .. } => {
                 let host = bare_host(host);
                 let address = match (host.parse::<IpAddr>(), resolved) {
@@ -254,61 +328,37 @@ fn socks_error(message: &str) -> String {
     format!("error connecting to socks proxy: SOCKS error: {message}")
 }
 
-/// One `send` of `buf`'s start, waiting for the socket to be writable.
-async fn write_some<R: Readiness>(fd: RawFd, ready: &R, buf: &[u8]) -> io::Result<usize> {
-    poll_fn(|cx| match send(fd, buf) {
-        Ok(n) => Poll::Ready(Ok(n)),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            ready.wait_writable(cx);
-            Poll::Pending
-        }
-        Err(error) => Poll::Ready(Err(error)),
-    })
-    .await
-}
-
-async fn write_all<R: Readiness>(fd: RawFd, ready: &R, mut buf: &[u8]) -> io::Result<()> {
+/// Write all of `buf`, waiting for the transport to take it, then flush it (out of a TLS
+/// session's buffer too).
+async fn write_all<T: Transport>(io: &mut T, mut buf: &[u8]) -> io::Result<()> {
     while !buf.is_empty() {
-        match write_some(fd, ready, buf).await? {
+        match poll_fn(|cx| Pin::new(&mut *io).poll_write(cx, buf)).await? {
             0 => return Err(io::ErrorKind::WriteZero.into()),
             n => buf = &buf[n..],
         }
     }
-    Ok(())
+    poll_fn(|cx| Pin::new(&mut *io).poll_flush(cx)).await
 }
 
-/// One `recv` into `buf`, waiting for the socket to be readable; `Ok(0)` is the peer closing.
-async fn read<R: Readiness>(fd: RawFd, ready: &R, buf: &mut [u8]) -> io::Result<usize> {
+/// One read into `buf`, waiting for the transport to be readable; `Ok(0)` is the peer closing.
+async fn read<T: Transport>(io: &mut T, buf: &mut [u8]) -> io::Result<usize> {
     poll_fn(|cx| {
-        if !ready.poll_readable(cx) {
-            return Poll::Pending;
-        }
-        match recv(fd, buf) {
-            Ok(n) => {
-                if n > 0 && n < buf.len() {
-                    ready.mark_drained();
-                }
-                Poll::Ready(Ok(n))
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                ready.wait_readable(cx);
-                Poll::Pending
-            }
-            Err(error) => Poll::Ready(Err(error)),
-        }
+        let mut received = ReadBuf::new(&mut *buf);
+        ready!(Pin::new(&mut *io).poll_read(cx, received.unfilled()))?;
+        Poll::Ready(Ok(received.filled().len()))
     })
     .await
 }
 
 /// hyper-util's `tunnel`: send the `CONNECT`, then read until the response's head parses; only a
 /// 200 opens the tunnel.
-async fn tunnel<R: Readiness>(fd: RawFd, ready: &R, request: &[u8]) -> Result<(), String> {
+async fn tunnel<T: Transport>(io: &mut T, request: &[u8]) -> Result<(), String> {
     let io_error = |e: io::Error| format!("tunnel error: io error establishing tunnel: {e}");
-    write_all(fd, ready, request).await.map_err(io_error)?;
+    write_all(io, request).await.map_err(io_error)?;
     let mut buf = [0; TUNNEL_RESPONSE_LIMIT];
     let mut pos = 0;
     loop {
-        let n = read(fd, ready, &mut buf[pos..]).await.map_err(io_error)?;
+        let n = read(io, &mut buf[pos..]).await.map_err(io_error)?;
         if n == 0 {
             return Err("tunnel error: unexpected end of file".to_owned());
         }
@@ -342,13 +392,9 @@ enum Parse {
 type Parser<T> = fn(&[u8]) -> Result<(T, usize), Parse>;
 
 /// hyper-util's `read_message`: parse the next message from what has arrived, reading more while
-/// it's incomplete; what's left over stays for the next message.
-async fn read_message<R: Readiness, T>(
-    fd: RawFd,
-    ready: &R,
-    received: &mut Vec<u8>,
-    parse: Parser<T>,
-) -> Result<T, String> {
+/// it's incomplete; what's left over stays for the next message. `limit` is the size of the
+/// buffer hyper-util receives into: an end of file once that's full is a parse error.
+async fn read_message<T: Transport, M>(io: &mut T, received: &mut Vec<u8>, parse: Parser<M>, limit: usize) -> Result<M, String> {
     let mut chunk = [0; SOCKS_RECEIVE_LIMIT];
     loop {
         match parse(received) {
@@ -359,9 +405,9 @@ async fn read_message<R: Readiness, T>(
             Err(Parse::Other) => return Err(socks_error("failed parsing server response")),
             Err(Parse::Incomplete) => {}
         }
-        let n = read(fd, ready, &mut chunk).await.map_err(|e| socks_error(&format!("io error during SOCKS handshake: {e}")))?;
+        let n = read(io, &mut chunk).await.map_err(|e| socks_error(&format!("io error during SOCKS handshake: {e}")))?;
         if n == 0 {
-            return Err(if received.len() >= SOCKS_RECEIVE_LIMIT {
+            return Err(if received.len() >= limit {
                 socks_error("failed parsing server response")
             } else {
                 socks_error("io error during SOCKS handshake: unexpected eof")
@@ -460,13 +506,13 @@ fn socks_address(address: &SocksAddress, buf: &mut Vec<u8>) {
 /// hyper-util's `SocksConfig::execute`, without optimistic sending (reqwest's setting): offer one
 /// method, authenticate if it was username/password, then `CONNECT`. hyper-util writes every
 /// message into one 262-byte buffer, so a handshake that doesn't fit fails to serialize.
-async fn socks5<R: Readiness>(fd: RawFd, ready: &R, auth: Option<&(String, String)>, address: &SocksAddress) -> Result<(), String> {
+async fn socks5<T: Transport>(io: &mut T, auth: Option<&(String, String)>, address: &SocksAddress) -> Result<(), String> {
     let io_error = |e: io::Error| socks_error(&format!("io error during SOCKS handshake: {e}"));
     let method = if auth.is_some() { 0x02 } else { 0x00 };
     let mut received = Vec::with_capacity(SOCKS_RECEIVE_LIMIT);
     let mut sent = 3;
-    write_all(fd, ready, &[0x05, 0x01, method]).await.map_err(io_error)?;
-    match read_message(fd, ready, &mut received, negotiation).await? {
+    write_all(io, &[0x05, 0x01, method]).await.map_err(io_error)?;
+    match read_message(io, &mut received, negotiation, SOCKS_RECEIVE_LIMIT).await? {
         0xFF => return Err(socks_error("server does not support user/pass authentication")),
         selected if selected != method => return Err(socks_error("server implements authentication incorrectly")),
         _ => {}
@@ -482,8 +528,8 @@ async fn socks5<R: Readiness>(fd: RawFd, ready: &R, auth: Option<&(String, Strin
         message.extend_from_slice(username.as_bytes());
         message.push(password.len() as u8);
         message.extend_from_slice(password.as_bytes());
-        write_all(fd, ready, &message).await.map_err(io_error)?;
-        if !read_message(fd, ready, &mut received, authentication).await? {
+        write_all(io, &message).await.map_err(io_error)?;
+        if !read_message(io, &mut received, authentication, SOCKS_RECEIVE_LIMIT).await? {
             return Err(socks_error("credentials not accepted"));
         }
     }
@@ -493,21 +539,80 @@ async fn socks5<R: Readiness>(fd: RawFd, ready: &R, auth: Option<&(String, Strin
     if sent > SOCKS_SEND_LIMIT {
         return Err(socks_error("failed serialize request"));
     }
-    write_all(fd, ready, &message).await.map_err(io_error)?;
-    match read_message(fd, ready, &mut received, reply).await? {
+    write_all(io, &message).await.map_err(io_error)?;
+    match read_message(io, &mut received, reply, SOCKS_RECEIVE_LIMIT).await? {
         None => Ok(()),
         Some(status) => Err(socks_error(status)),
     }
 }
 
+/// A SOCKS4 reply: version 0, the status, then a port and address only `BIND` uses. `Ok(None)` is
+/// the request granted, `Ok(Some(status))` its refusal, hyper-util's message for it.
+fn socks4_reply(buf: &[u8]) -> Result<(Option<&'static str>, usize), Parse> {
+    let [version, status, _, _, _, _, _, _, ..] = buf else { return Err(Parse::Incomplete) };
+    if *version != 0x00 {
+        return Err(Parse::Other);
+    }
+    let refusal = match status {
+        90 => None,
+        91 => Some("server failed to execute command"),
+        92 => Some("server ident service failed"),
+        93 => Some("server ident service did not recognise client identifier"),
+        _ => return Err(Parse::Other),
+    };
+    Ok((refusal, 8))
+}
+
+/// hyper-util's SOCKS4 `SocksConfig::execute`: one `CONNECT`, its user ID empty, then the reply.
+/// A domain name (SOCKS4a) goes after it, behind the address `0.0.0.255`; its length isn't
+/// limited, as hyper-util's growable buffer has no limit.
+async fn socks4<T: Transport>(io: &mut T, address: &Socks4Address) -> Result<(), String> {
+    let mut message = vec![0x04, 0x01];
+    match address {
+        Socks4Address::Ip(address) => {
+            message.extend_from_slice(&address.port().to_be_bytes());
+            message.extend_from_slice(&address.ip().octets());
+            message.push(0x00);
+        }
+        Socks4Address::Domain(domain, port) => {
+            message.extend_from_slice(&port.to_be_bytes());
+            message.extend_from_slice(&[0x00, 0x00, 0x00, 0xFF, 0x00]);
+            message.extend_from_slice(domain.as_bytes());
+            message.push(0x00);
+        }
+    }
+    write_all(io, &message).await.map_err(|e| socks_error(&format!("io error during SOCKS handshake: {e}")))?;
+    let mut received = Vec::with_capacity(SOCKS4_RECEIVE_LIMIT);
+    match read_message(io, &mut received, socks4_reply, SOCKS4_RECEIVE_LIMIT).await? {
+        None => Ok(()),
+        Some(refusal) => Err(socks_error(refusal)),
+    }
+}
+
 impl Handshake {
-    /// Run the handshake on connection socket `fd`, waiting on `ready` as hyper's I/O does, so
-    /// it is the same code on the asyncio loop and on a sync caller's thread. `Err` is the
-    /// connection error's message.
-    pub(crate) async fn run<R: Readiness>(self, fd: RawFd, ready: R) -> Result<(), String> {
-        match &self {
-            Self::Tunnel(request) => tunnel(fd, &ready, request).await,
-            Self::Socks5 { auth, address } => socks5(fd, &ready, auth.as_ref(), address).await,
+    /// Run the handshake on a new connection's `socket`, waiting on its readiness as hyper's I/O
+    /// does, so it is the same code on the asyncio loop and on a sync caller's thread: what
+    /// hyper then talks through (`Carrier`), or the connection error's message.
+    pub(crate) async fn run<R: Readiness>(self, mut socket: PlainSocket<R>) -> Result<Carrier<R>, String> {
+        match self {
+            Self::Tunnel { request, tls: None } => {
+                tunnel(&mut socket, &request).await?;
+                Ok(Carrier::Plain(socket))
+            }
+            Self::Tunnel { request, tls: Some(tls) } => {
+                let mut proxy = TlsSocket::new(socket, *tls);
+                proxy.handshake().await.map_err(|e| format!("tunnel error: failed to create underlying connection: {e}"))?;
+                tunnel(&mut proxy, &request).await?;
+                Ok(Carrier::Tls(Box::new(proxy)))
+            }
+            Self::Socks5 { auth, address } => {
+                socks5(&mut socket, auth.as_ref(), &address).await?;
+                Ok(Carrier::Plain(socket))
+            }
+            Self::Socks4(address) => {
+                socks4(&mut socket, &address).await?;
+                Ok(Carrier::Plain(socket))
+            }
         }
     }
 }

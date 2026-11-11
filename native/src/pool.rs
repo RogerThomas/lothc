@@ -29,9 +29,10 @@
 //! same shared timer as the request deadlines (`reap_at`), so pooling a connection arms nothing.
 //!
 //! A connection through a proxy connects its socket to the proxy, then runs the proxy's handshake
-//! (`proxy.rs`) on the executor over the same loop readiness, before TLS and hyper. It counts as
-//! connecting until then, so the requests waiting for it (and their deadlines) cover the proxy
-//! hop. For a `socks5://` proxy, Python resolves the target first (`loop.getaddrinfo`).
+//! (`proxy.rs`, TLS to an `https://` proxy included when it carries a tunnel) on the executor over
+//! the same loop readiness, before TLS and hyper. It counts as connecting until then, so the
+//! requests waiting for it (and their deadlines) cover the proxy hop. For a `socks4://` or
+//! `socks5://` proxy, Python resolves the target first (`loop.getaddrinfo`).
 //!
 //! A redirect to follow (`redirect.rs`) keeps the request's slot, its Future and its deadline, so
 //! one total timeout covers every hop, as reqwest's does: the redirect's connection goes back to
@@ -84,14 +85,14 @@ use crate::connect::{ConnectOptions, ConnectSettings};
 use crate::cookie::Cookies;
 use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
-use crate::io::{has_input, shutdown, LoopReady, Stream};
+use crate::io::{has_input, shutdown, Carrier, LoopReady, PlainSocket, Stream};
 use crate::limit::{checked_max_connections, Permits};
 use crate::proxy::{Proxies, Route};
 use crate::redirect::{Hop, Redirect};
 use crate::request::{connect_address, ClientConfig, DeadlineClock, OriginKey, VerbHeaders};
 use crate::response::{fetch, send, Exchange, Fetched, Glue, Head, Sender};
 use crate::stream::{BodyStream, Channel};
-use crate::tls::{TlsSettings, TlsSocket};
+use crate::tls::{tunnel_config, TlsSettings};
 
 /// A value usable only on the thread that created it, which is what lets `Pool` hold the
 /// executor's `Rc`s and still be an ordinary (`Send + Sync`) pyclass: another thread's access is
@@ -267,13 +268,14 @@ struct Origin {
     port: u16,
     /// Direct, or through which proxy; fixed for the client's life, as the matcher is.
     route: Route,
-    /// The target host a `socks5://` proxy wants resolved first.
+    /// The target host a `socks4://` or `socks5://` proxy wants resolved first.
     resolve: Option<String>,
     /// `resolve=`'s addresses for `host`, which Python then doesn't look up.
     addresses: Option<Vec<String>>,
-    /// `resolve=`'s address for a `socks5://` proxy's target, which then isn't looked up.
+    /// `resolve=`'s address for that proxy's target, which then isn't looked up.
     socks_address: Option<IpAddr>,
-    /// `Some` for https: what the certificate is checked against, or why it can't be.
+    /// `Some` when requests go over TLS (`Route::tls_name`): what the certificate is checked
+    /// against, or why it can't be.
     server_name: Option<Result<ServerName<'static>, String>>,
     /// (conn, when it went idle), oldest first; checkout takes from the end.
     idle: Vec<(usize, Instant)>,
@@ -306,6 +308,8 @@ struct PoolState {
     connect: Arc<ConnectSettings>,
     tls: TlsSettings,
     tls_config: Option<Arc<rustls::ClientConfig>>,
+    /// `tls_config` for the TLS to an `https://` proxy that carries a tunnel (`tunnel_config`).
+    tunnel_tls_config: Option<Arc<rustls::ClientConfig>>,
     idle_policy: IdlePolicy,
     /// When the idle reaper next runs; `None` while it isn't running (no idle connections).
     reap_at: Option<Instant>,
@@ -338,8 +342,9 @@ struct PoolState {
     is_closed: bool,
 }
 
-/// A finished proxy handshake: (conn, generation, `Err` the connection error's message).
-type Handshaken = (usize, u32, Result<(), String>);
+/// A finished proxy handshake: (conn, generation, what hyper talks through or the connection
+/// error's message).
+type Handshaken = (usize, u32, Result<Carrier<LoopReady>, String>);
 
 fn push<T>(cell: &Cell<Vec<T>>, item: T) {
     let mut items = cell.take();
@@ -454,7 +459,7 @@ impl PoolState {
         }
         let key = OriginKey::of(url);
         let (host, port) = route.connect_address(connect_address(url));
-        let server_name = key.https.then(|| route.server_name(url));
+        let server_name = route.tls_name(url);
         let addresses = self.connect.override_for(&host).map(|ips| ips.iter().map(ToString::to_string).collect());
         let resolve = route.resolve_locally(&key.host);
         let socks_address = resolve.as_deref().and_then(|target| self.connect.socks_override(target));
@@ -1025,16 +1030,26 @@ impl PoolState {
         Ok(config)
     }
 
-    /// The stream a new connection's socket becomes: plain, or TLS for an https origin.
-    fn stream(&mut self, conn: usize, fd: RawFd, ready: LoopReady) -> Result<Stream<LoopReady>, String> {
+    fn tunnel_tls_config(&mut self) -> Result<Arc<rustls::ClientConfig>, String> {
+        if let Some(config) = &self.tunnel_tls_config {
+            return Ok(config.clone());
+        }
+        let config = tunnel_config(&*self.tls_config()?);
+        self.tunnel_tls_config = Some(config.clone());
+        Ok(config)
+    }
+
+    /// The stream a new connection becomes over `carrier` (its socket, or its tunnel's TLS to a
+    /// proxy): as is, or with TLS inside it when its requests go over TLS.
+    fn stream(&mut self, conn: usize, carrier: Carrier<LoopReady>) -> Result<Stream<LoopReady>, String> {
         let origin = self.conns[conn].origin;
         let name = match &self.origins[origin].server_name {
-            None => return Ok(Stream::plain(fd, ready)),
+            None => return Ok(carrier.into_stream(None)),
             Some(name) => name.clone()?,
         };
         let config = self.tls_config()?;
         let tls = ClientConnection::new(config, name).map_err(|e| error_chain(&e))?;
-        Ok(Stream::Tls(Box::new(TlsSocket::new(fd, ready, tls))))
+        Ok(carrier.into_stream(Some(tls)))
     }
 
     /// A connection that won't be made after all (its connect or proxy handshake failed, or its
@@ -1048,15 +1063,16 @@ impl PoolState {
         self.fail_waiting(py, origin, failure)
     }
 
-    /// Socket `fd` is connected to the origin, directly or through a finished proxy handshake:
-    /// set up TLS (for https) and hyper's connection over it, and give it a request.
-    fn establish(&mut self, py: Python<'_>, conn: usize, fd: RawFd, ready: LoopReady) -> PyResult<()> {
+    /// Socket `fd` is connected to the origin, directly or through a finished proxy handshake
+    /// (`carrier`, over it): set up TLS (when requests go over TLS) and hyper's connection over
+    /// it, and give it a request.
+    fn establish(&mut self, py: Python<'_>, conn: usize, fd: RawFd, ready: LoopReady, carrier: Carrier<LoopReady>) -> PyResult<()> {
         let origin = self.conns[conn].origin;
         let generation = self.conns[conn].generation;
         self.origins[origin].connecting = self.origins[origin].connecting.saturating_sub(1);
         // http1's handshake does no I/O: it is ready on the first poll. The TLS handshake
         // happens lazily, driven by the first request's write and reads.
-        let handshake = self.stream(conn, fd, ready.clone()).and_then(|stream| {
+        let handshake = self.stream(conn, carrier).and_then(|stream| {
             futures_executor::block_on(http1::Builder::new().title_case_headers(true).handshake(stream))
                 .map_err(|e| error_chain(&e))
         });
@@ -1089,16 +1105,23 @@ impl PoolState {
         let Some(c) = self.conns.get(conn).filter(|c| c.state == State::Connecting) else {
             return self.event_loop.close_conn.call1(py, (conn,)).map(drop);
         };
+        let (origin, generation) = (c.origin, c.generation);
         self.connect.keepalive(fd);
-        let origin = &self.origins[c.origin];
-        let generation = c.generation;
         let ready = LoopReady::new(conn, self.writers.clone(), self.readers.clone());
+        let tunnel_config = match self.origins[origin].route.tunnels_in_tls().then(|| self.tunnel_tls_config()).transpose() {
+            Ok(config) => config,
+            Err(message) => {
+                self.abandon(py, conn, Failure::Transport(message))?;
+                return self.regrant(py);
+            }
+        };
+        let origin = &self.origins[origin];
         // A scope id (`fe80::1%en0`) isn't part of a SOCKS address.
         let resolved = resolved.and_then(|address| address.split('%').next()?.parse().ok()).or(origin.socks_address);
-        let handshake = match origin.route.handshake(&origin.key.host, origin.key.port, self.config.user_agent(), resolved) {
+        let handshake = match origin.route.handshake(&origin.key.host, origin.key.port, self.config.user_agent(), resolved, tunnel_config) {
             Ok(Some(handshake)) => handshake,
             Ok(None) => {
-                self.establish(py, conn, fd, ready)?;
+                self.establish(py, conn, fd, ready.clone(), Carrier::Plain(PlainSocket::new(fd, ready)))?;
                 return self.run(py);
             }
             Err(message) => {
@@ -1113,7 +1136,7 @@ impl PoolState {
         let handshaken = self.handshaken.clone();
         self.spawner
             .spawn_local(async move {
-                let result = handshake.run(fd, ready).await;
+                let result = handshake.run(PlainSocket::new(fd, ready)).await;
                 push(&handshaken, (conn, generation, result));
             })
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -1121,15 +1144,15 @@ impl PoolState {
     }
 
     /// `conn`'s proxy handshake finished: on to TLS and hyper, or the connection is given up.
-    fn handshake_finished(&mut self, py: Python<'_>, conn: usize, generation: u32, result: Result<(), String>) -> PyResult<()> {
+    fn handshake_finished(&mut self, py: Python<'_>, conn: usize, generation: u32, result: Result<Carrier<LoopReady>, String>) -> PyResult<()> {
         let Some(c) = self.conns.get(conn).filter(|c| c.generation == generation && c.state == State::Handshaking) else {
             return Ok(());
         };
         let (fd, ready) = (c.fd, c.ready.clone());
         match (result, ready) {
-            (Ok(()), Some(ready)) => self.establish(py, conn, fd, ready),
+            (Ok(carrier), Some(ready)) => self.establish(py, conn, fd, ready, carrier),
             (Err(message), _) => self.abandon(py, conn, Failure::Transport(message)),
-            (Ok(()), None) => self.abandon(py, conn, Failure::Transport("internal error: a proxied connection lost its socket".to_owned())),
+            (Ok(_), None) => self.abandon(py, conn, Failure::Transport("internal error: a proxied connection lost its socket".to_owned())),
         }
     }
 
@@ -1648,6 +1671,7 @@ impl Pool {
                 danger_accept_invalid_certs,
             )?,
             tls_config: None,
+            tunnel_tls_config: None,
             idle_policy: IdlePolicy::new(pool_idle_timeout, pool_max_idle_per_host),
             reap_at: None,
             permits: Permits::new(max_connections, pool_timeout),

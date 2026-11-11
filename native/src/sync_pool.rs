@@ -9,8 +9,9 @@
 //! ones. There is no reaper, since nothing runs between a sync client's calls without a thread of
 //! its own, so an unused client's idle sockets stay open until its next request or `close()`.
 //!
-//! A connection through a proxy does the proxy's handshake (`proxy.rs`) on its socket first, on
-//! the same thread and under the same deadline.
+//! A connection through a proxy does the proxy's handshake (`proxy.rs`, TLS to an `https://`
+//! proxy included when it carries a tunnel) on its socket first, on the same thread and under the
+//! same deadline.
 //!
 //! Sockets are set up as `connect.rs` says, and every wait is bounded by the request's `Limits`:
 //! its total timeout, `connect_timeout` while connecting (a TLS handshake included, which the
@@ -76,14 +77,14 @@ use crate::connect::{ConnectOptions, ConnectSettings};
 use crate::cookie::Cookies;
 use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
-use crate::io::{has_input, shutdown, PollReady, Stream};
+use crate::io::{has_input, shutdown, Carrier, PlainSocket, PollReady};
 use crate::limit::{checked_max_connections, SyncLimiter, SyncPermit};
 use crate::proxy::{Proxies, Route};
 use crate::redirect::Redirect;
 use crate::request::{connect_address, ClientConfig, DeadlineClock, OriginKey, Prepared, VerbHeaders};
 use crate::response::{fetch, send, Exchange, Fetched, Glue, Head, Sender};
 use crate::stream::BodyStream;
-use crate::tls::{TlsSettings, TlsSocket};
+use crate::tls::{tunnel_config, TlsSettings};
 
 /// A waker that only records that something was woken, so the loop re-polls before waiting.
 struct FlagWaker(AtomicBool);
@@ -159,14 +160,14 @@ impl SyncConn {
 }
 
 /// Where one request goes: its origin, where its connection connects (the origin, or a proxy),
-/// and the name an https one is verified against.
+/// and the name its TLS, if it goes over TLS, is verified against (`Route::tls_name`).
 struct Target {
     key: OriginKey,
     host: String,
     port: u16,
     server_name: Option<ServerName<'static>>,
     route: Route,
-    /// The target host a `socks5://` proxy wants resolved here first.
+    /// The target host a `socks4://` or `socks5://` proxy wants resolved here first.
     resolve: Option<String>,
 }
 
@@ -367,8 +368,9 @@ impl WakePipe {
 type Driver = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// A proxy's handshake on a new connection, boxed so that a request handed another connection
-/// mid handshake can leave it to finish on a thread of its own. `Err` is the connection error.
-type HandshakeFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
+/// mid handshake can leave it to finish on a thread of its own: what hyper then talks through, or
+/// the connection error.
+type HandshakeFuture = Pin<Box<dyn Future<Output = Result<Carrier<PollReady>, String>> + Send>>;
 
 /// Drive a connection's hyper driver and `fut` (which runs on that connection) until `fut`
 /// finishes, waiting for socket `fd` in poll(2) until `waits` says to stop.
@@ -422,24 +424,30 @@ fn send_on(conn: &mut SyncConn, request: Request<RequestBody>, limits: Limits) -
     sent?
 }
 
-/// Drive a new connection's proxy handshake on the calling thread until it finishes (`Ok(true)`),
-/// `deadline` passes first, or `wake` fires (`Ok(false)`): another thread handed the request a
-/// connection, and the handshake, unfinished, can go on elsewhere.
-fn drive_handshake(handshake: &mut HandshakeFuture, fd: RawFd, ready: &PollReady, deadline: Option<Instant>, wake: Option<&WakePipe>) -> Result<bool, Failure> {
+/// Drive a new connection's proxy handshake on the calling thread until it finishes (`Ok(Some)`,
+/// what hyper then talks through), `deadline` passes first, or `wake` fires (`Ok(None)`): another
+/// thread handed the request a connection, and the handshake, unfinished, can go on elsewhere.
+fn drive_handshake(
+    handshake: &mut HandshakeFuture,
+    fd: RawFd,
+    ready: &PollReady,
+    deadline: Option<Instant>,
+    wake: Option<&WakePipe>,
+) -> Result<Option<Carrier<PollReady>>, Failure> {
     let flag = Arc::new(FlagWaker(AtomicBool::new(false)));
     let waker = Waker::from(flag.clone());
     let mut cx = Context::from_waker(&waker);
     loop {
         flag.0.store(false, Ordering::Relaxed);
         if let Poll::Ready(result) = handshake.as_mut().poll(&mut cx) {
-            return result.map(|()| true).map_err(Failure::Transport);
+            return result.map(Some).map_err(Failure::Transport);
         }
         if flag.0.load(Ordering::Relaxed) {
             continue;
         }
         match wait_or_woken(fd, ready, wake, deadline)? {
             Woke::Socket => {}
-            Woke::Pipe => return Ok(false),
+            Woke::Pipe => return Ok(None),
             Woke::TimedOut => return Err(Failure::Timeout),
         }
     }
@@ -667,21 +675,22 @@ struct Opening {
     connect_by: Option<Instant>,
 }
 
-/// What an https connection's TLS is set up with, or `None` for plain http.
+/// What the TLS a connection's requests go over is set up with, or `None` for plain http.
 type TlsSetup = Option<(Arc<rustls::ClientConfig>, ServerName<'static>)>;
 
 impl Opening {
-    /// Set up TLS (for https) and hyper's connection over the socket, once its proxy's handshake
-    /// is done: neither does any I/O yet (TLS's handshake runs with the first request).
-    fn establish(self, tls: TlsSetup) -> Result<SyncConn, Failure> {
+    /// The socket itself, for a connection without a proxy handshake.
+    fn plain(&self) -> Carrier<PollReady> {
+        Carrier::Plain(PlainSocket::new(self.fd, self.ready.clone()))
+    }
+
+    /// Set up TLS (when its requests go over TLS) and hyper's connection over `carrier` (the
+    /// socket, or what its proxy's handshake left), once that handshake is done: neither does any
+    /// I/O yet (TLS's handshake runs with the first request).
+    fn establish(self, carrier: Carrier<PollReady>, tls: TlsSetup) -> Result<SyncConn, Failure> {
         let Self { busy, stream, fd, ready, connect_by, .. } = self;
-        let io = match tls {
-            None => Stream::plain(fd, ready.clone()),
-            Some((config, name)) => {
-                let tls = ClientConnection::new(config, name).map_err(|e| Failure::Transport(error_chain(&e)))?;
-                Stream::Tls(Box::new(TlsSocket::new(fd, ready.clone(), tls)))
-            }
-        };
+        let tls = tls.map(|(config, name)| ClientConnection::new(config, name)).transpose();
+        let io = carrier.into_stream(tls.map_err(|e| Failure::Transport(error_chain(&e)))?);
         let (sender, driver) = futures_executor::block_on(http1::Builder::new().title_case_headers(true).handshake(io))
             .map_err(|e| Failure::Transport(error_chain(&e)))?;
         let driver: Driver = Box::pin(async move {
@@ -695,7 +704,8 @@ impl Opening {
     /// only (closing the pool shuts its socket down); without one, it is finished right here.
     fn finish_elsewhere(mut self, shared: &Arc<Shared>, key: &OriginKey, tls: TlsSetup) {
         let Some(mut handshake) = self.handshake.take() else {
-            if let Ok(conn) = self.establish(tls) {
+            let carrier = self.plain();
+            if let Ok(conn) = self.establish(carrier, tls) {
                 shared.put_back(key, conn);
             }
             return;
@@ -703,8 +713,8 @@ impl Opening {
         let (shared, key) = (shared.clone(), key.clone());
         // If no thread can be started, the connection is closed with the closure.
         let _ = thread::Builder::new().name("lothc-connect".to_owned()).spawn(move || {
-            if matches!(drive_handshake(&mut handshake, self.fd, &self.ready, self.connect_by, None), Ok(true)) {
-                if let Ok(conn) = self.establish(tls) {
+            if let Ok(Some(carrier)) = drive_handshake(&mut handshake, self.fd, &self.ready, self.connect_by, None) {
+                if let Ok(conn) = self.establish(carrier, tls) {
                     shared.put_back(&key, conn);
                 }
             }
@@ -718,6 +728,8 @@ pub(crate) struct SyncPool {
     connect: Arc<ConnectSettings>,
     tls: TlsSettings,
     tls_config: Mutex<Option<Arc<rustls::ClientConfig>>>,
+    /// `tls_config` for the TLS to an `https://` proxy that carries a tunnel (`tunnel_config`).
+    tunnel_tls_config: Mutex<Option<Arc<rustls::ClientConfig>>>,
     shared: Arc<Shared>,
     /// `max_connections`' slots; `None` without it.
     limiter: Option<Arc<SyncLimiter>>,
@@ -741,6 +753,16 @@ impl SyncPool {
         Ok(built)
     }
 
+    fn tunnel_tls_config(&self) -> Result<Arc<rustls::ClientConfig>, Failure> {
+        let mut config = lock(&self.tunnel_tls_config);
+        if let Some(config) = config.as_ref() {
+            return Ok(config.clone());
+        }
+        let built = tunnel_config(&*self.tls_config()?);
+        *config = Some(built.clone());
+        Ok(built)
+    }
+
     /// Enter a connection's socket `fd` into `InFlight`, unless the pool has closed.
     fn enter(&self, fd: RawFd) -> Result<Busy, Failure> {
         let mut in_flight = lock(&self.in_flight);
@@ -758,7 +780,7 @@ impl SyncPool {
         lock(&self.in_flight).closed
     }
 
-    /// The TLS an https `target`'s connection is set up with.
+    /// The TLS `target`'s requests go over, if any (`Route::tls_name`).
     fn tls_setup(&self, target: &Target) -> Result<TlsSetup, Failure> {
         target.server_name.as_ref().map(|name| Ok((self.tls_config()?, name.clone()))).transpose()
     }
@@ -773,8 +795,11 @@ impl SyncPool {
         stream.set_nonblocking(true).map_err(transport)?;
         let fd = stream.as_raw_fd();
         let ready = PollReady::new();
-        let handshake = target.route.handshake(&target.key.host, target.key.port, self.config.user_agent(), resolved).map_err(Failure::Transport)?;
-        let handshake = handshake.map(|handshake| -> HandshakeFuture { Box::pin(handshake.run(fd, ready.clone())) });
+        let tunnel_config = target.route.tunnels_in_tls().then(|| self.tunnel_tls_config()).transpose()?;
+        let handshake = target.route.handshake(&target.key.host, target.key.port, self.config.user_agent(), resolved, tunnel_config);
+        let handshake = handshake.map_err(Failure::Transport)?.map(|handshake| -> HandshakeFuture {
+            Box::pin(handshake.run(PlainSocket::new(fd, ready.clone())))
+        });
         Ok(Opening { busy, stream, fd, ready, handshake, connect_by })
     }
 
@@ -797,7 +822,8 @@ impl SyncPool {
     fn connect(&self, target: &Target, limits: Limits, ticket: Option<&Ticket<'_>>) -> Result<SyncConn, Failure> {
         let connect_by = self.connect.connect_timeout.and_then(|timeout| self.clock.deadline(Instant::now(), timeout));
         let deadline = earliest(limits.before_head(), connect_by);
-        // reqwest resolves a `socks5://` proxy's target before connecting to the proxy.
+        // reqwest resolves a `socks4://` or `socks5://` proxy's target before connecting to the
+        // proxy.
         let connected = match &target.resolve {
             Some(host) => self.connect.resolve_first(host),
             None => Ok(None),
@@ -813,21 +839,24 @@ impl SyncPool {
         }
         let (stream, resolved) = connected?;
         let mut opening = self.opening(target, stream, resolved, connect_by)?;
-        if let Some(mut handshake) = opening.handshake.take() {
-            let wake = ticket.and_then(Ticket::wake);
-            loop {
-                // Checked before each wait, as a connection handed over before the pipe was
-                // attached didn't write to it.
-                if let Some(handed) = ticket.and_then(Ticket::handed) {
-                    opening.handshake = Some(handshake);
-                    return self.take_handed(target, handed, Some(opening));
-                }
-                if drive_handshake(&mut handshake, opening.fd, &opening.ready, deadline, wake.as_deref())? {
-                    break;
+        let carrier = match opening.handshake.take() {
+            None => opening.plain(),
+            Some(mut handshake) => {
+                let wake = ticket.and_then(Ticket::wake);
+                loop {
+                    // Checked before each wait, as a connection handed over before the pipe was
+                    // attached didn't write to it.
+                    if let Some(handed) = ticket.and_then(Ticket::handed) {
+                        opening.handshake = Some(handshake);
+                        return self.take_handed(target, handed, Some(opening));
+                    }
+                    if let Some(carrier) = drive_handshake(&mut handshake, opening.fd, &opening.ready, deadline, wake.as_deref())? {
+                        break carrier;
+                    }
                 }
             }
-        }
-        opening.establish(self.tls_setup(target)?)
+        };
+        opening.establish(carrier, self.tls_setup(target)?)
     }
 
     /// `conn`, entered into `InFlight` for a request.
@@ -979,7 +1008,7 @@ impl SyncPool {
     fn target(url: &Url, route: Route) -> Result<Target, String> {
         let (host, port) = route.connect_address(connect_address(url));
         let key = OriginKey::of(url);
-        let server_name = key.https.then(|| route.server_name(url)).transpose()?;
+        let server_name = route.tls_name(url).transpose()?;
         let resolve = route.resolve_locally(&key.host);
         Ok(Target { key, host, port, server_name, route, resolve })
     }
@@ -1032,6 +1061,7 @@ impl SyncPool {
                 danger_accept_invalid_certs,
             )?,
             tls_config: Mutex::new(None),
+            tunnel_tls_config: Mutex::new(None),
             shared: Arc::new(Shared {
                 idle_policy: IdlePolicy::new(pool_idle_timeout, pool_max_idle_per_host),
                 origins: Mutex::default(),

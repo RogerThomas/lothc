@@ -151,7 +151,7 @@ class Pool:
     ) -> None:
         """`spawn_connect(conn, host, port, resolve, addresses)` asks Python to connect a
         socket for connection `conn` (to the origin or its proxy), at `addresses` (`resolve=`'s
-        for `host`) if given, resolving `resolve` first if it isn't `None` (a `socks5://` proxy's
+        for `host`) if given, resolving `resolve` first if it isn't `None` (a SOCKS proxy's
         target), then `connected` or `connect_failed`; `close_conn(conn)` to unregister and close
         it, or to give up on its connect (`connect_timeout`). `timeout` is the client's, only
         converted (a negative one raises `ValueError`, as pyreqwest's builder does); each request

@@ -10,23 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use crate::tls::TlsSocket;
+use rustls::ClientConnection;
 
-/// `recv(2)` into an initialised buffer, retrying on `EINTR`.
-pub(crate) fn recv(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
-    loop {
-        // SAFETY: `buf` is a live, writable slice of exactly `buf.len()` bytes for the whole call,
-        // and recv(2) writes at most that many bytes into it.
-        let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
-        if let Ok(n) = usize::try_from(n) {
-            return Ok(n);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
+use crate::tls::TlsSocket;
 
 /// `send(2)`, retrying on `EINTR`. `MSG_NOSIGNAL` so a peer that has gone away is an `EPIPE`
 /// error rather than a `SIGPIPE` (Python ignores it anyway, embedders might not).
@@ -246,10 +232,30 @@ impl Readiness for PollReady {
     }
 }
 
+/// What a TLS session runs over: a socket, or another TLS session (an `https://` proxy's, which a
+/// tunnel's TLS to the origin runs inside).
+pub(crate) trait Transport: hyper::rt::Read + hyper::rt::Write + Unpin {
+    /// A TLS handshake over it has started (`true`) or finished (`false`): `Readiness`'s, for the
+    /// socket underneath.
+    fn set_handshaking(&self, handshaking: bool);
+}
+
 /// A plain TCP socket for hyper.
 pub(crate) struct PlainSocket<R> {
     fd: RawFd,
     ready: R,
+}
+
+impl<R: Readiness> PlainSocket<R> {
+    pub(crate) fn new(fd: RawFd, ready: R) -> Self {
+        Self { fd, ready }
+    }
+}
+
+impl<R: Readiness> Transport for PlainSocket<R> {
+    fn set_handshaking(&self, handshaking: bool) {
+        self.ready.set_handshaking(handshaking);
+    }
 }
 
 impl<R: Readiness> hyper::rt::Read for PlainSocket<R> {
@@ -317,12 +323,28 @@ impl<R: Readiness> hyper::rt::Write for PlainSocket<R> {
 /// `SendRequest`/`Connection` type.
 pub(crate) enum Stream<R> {
     Plain(PlainSocket<R>),
-    Tls(Box<TlsSocket<R>>),
+    Tls(Box<TlsSocket<PlainSocket<R>>>),
+    /// TLS to the origin inside TLS to an `https://` proxy: a tunnel through it.
+    TlsInTls(Box<TlsSocket<TlsSocket<PlainSocket<R>>>>),
 }
 
-impl<R: Readiness> Stream<R> {
-    pub(crate) fn plain(fd: RawFd, ready: R) -> Self {
-        Self::Plain(PlainSocket { fd, ready })
+/// A new connection's socket once its proxy's handshake is done (`proxy.rs`), before hyper: the
+/// socket itself, or the TLS session to an `https://` proxy a tunnel was opened in.
+pub(crate) enum Carrier<R> {
+    Plain(PlainSocket<R>),
+    Tls(Box<TlsSocket<PlainSocket<R>>>),
+}
+
+impl<R: Readiness> Carrier<R> {
+    /// The stream hyper runs over: the carrier, or a TLS session inside it (`tls`, for an https
+    /// origin, or an http one forwarded through an `https://` proxy).
+    pub(crate) fn into_stream(self, tls: Option<ClientConnection>) -> Stream<R> {
+        match (self, tls) {
+            (Self::Plain(socket), None) => Stream::Plain(socket),
+            (Self::Plain(socket), Some(tls)) => Stream::Tls(Box::new(TlsSocket::new(socket, tls))),
+            (Self::Tls(proxy), None) => Stream::Tls(proxy),
+            (Self::Tls(proxy), Some(tls)) => Stream::TlsInTls(Box::new(TlsSocket::new(*proxy, tls))),
+        }
     }
 }
 
@@ -335,6 +357,7 @@ impl<R: Readiness> hyper::rt::Read for Stream<R> {
         match self.get_mut() {
             Self::Plain(socket) => Pin::new(socket).poll_read(cx, buf),
             Self::Tls(socket) => Pin::new(socket.as_mut()).poll_read(cx, buf),
+            Self::TlsInTls(socket) => Pin::new(socket.as_mut()).poll_read(cx, buf),
         }
     }
 }
@@ -344,6 +367,7 @@ impl<R: Readiness> hyper::rt::Write for Stream<R> {
         match self.get_mut() {
             Self::Plain(socket) => Pin::new(socket).poll_write(cx, buf),
             Self::Tls(socket) => Pin::new(socket.as_mut()).poll_write(cx, buf),
+            Self::TlsInTls(socket) => Pin::new(socket.as_mut()).poll_write(cx, buf),
         }
     }
 
@@ -351,6 +375,7 @@ impl<R: Readiness> hyper::rt::Write for Stream<R> {
         match self.get_mut() {
             Self::Plain(socket) => Pin::new(socket).poll_flush(cx),
             Self::Tls(socket) => Pin::new(socket.as_mut()).poll_flush(cx),
+            Self::TlsInTls(socket) => Pin::new(socket.as_mut()).poll_flush(cx),
         }
     }
 
@@ -358,6 +383,7 @@ impl<R: Readiness> hyper::rt::Write for Stream<R> {
         match self.get_mut() {
             Self::Plain(socket) => Pin::new(socket).poll_shutdown(cx),
             Self::Tls(socket) => Pin::new(socket.as_mut()).poll_shutdown(cx),
+            Self::TlsInTls(socket) => Pin::new(socket.as_mut()).poll_shutdown(cx),
         }
     }
 }

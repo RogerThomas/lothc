@@ -1,7 +1,7 @@
 """Which transport a client gets, and what the native transport (`native=True`) refuses rather
 than silently doing differently from the pyreqwest one: every client setting and request feature it
 hasn't ported is a `NotImplementedError` naming it, at construction for a setting, on use for
-anything else (a proxy the environment names included).
+anything else.
 `test_transport_wire_parity.py` covers what it does support.
 
 The transport a client got shows through `http2=True`: the native transport is HTTP/1.1 by design,
@@ -16,7 +16,6 @@ from collections.abc import AsyncGenerator, Generator
 from typing import Any
 
 import pytest
-from _helpers import clear_proxy_variables
 
 from lothc import HTTPClient, HTTPTimeoutError, SyncHTTPClient
 
@@ -173,104 +172,6 @@ def test_sync_native_transport_refuses_an_unported_setting(setting: str, value: 
 
     with pytest.raises(NotImplementedError, match=f"{setting}= is not supported by the native"):
         SyncHTTPClient(native=True, **settings)
-
-
-def _unported_proxies() -> list[tuple[str, str]]:
-    return [
-        ("https://127.0.0.1:1", "an https:// proxy"),
-        ("HTTPS://127.0.0.1:1", "an https:// proxy"),
-        ("socks4://127.0.0.1:1", "a socks4:// proxy"),
-        ("socks4a://127.0.0.1:1", "a socks4a:// proxy"),
-    ]
-
-
-@pytest.mark.parametrize(("proxy", "message"), _unported_proxies())
-def test_native_transport_refuses_an_unported_proxy(proxy: str, message: str) -> None:
-    with pytest.raises(NotImplementedError, match=f"{message} .*is not supported by the native"):
-        HTTPClient(proxy=proxy, native=True)
-
-
-@pytest.mark.parametrize(("proxy", "message"), _unported_proxies())
-def test_sync_native_transport_refuses_an_unported_proxy(proxy: str, message: str) -> None:
-    with pytest.raises(NotImplementedError, match=f"{message} .*is not supported by the native"):
-        SyncHTTPClient(proxy=proxy, native=True)
-
-
-def _unported_proxy_variables() -> list[tuple[str, str, str, str]]:
-    """(variable, its value, the fixture of a server the request goes to, the refusal)."""
-    return [
-        ("HTTPS_PROXY", "https://127.0.0.1:1", "https_base_url", "an https:// proxy"),
-        ("HTTP_PROXY", "https://127.0.0.1:1", "base_url", "an https:// proxy"),
-        ("ALL_PROXY", "socks4://127.0.0.1:1", "base_url", "a socks4:// proxy"),
-    ]
-
-
-@pytest.mark.parametrize(
-    ("variable", "value", "server_url_fixture", "message"), _unported_proxy_variables()
-)
-async def test_native_transport_refuses_an_unported_proxy_variable_when_a_request_uses_it(
-    variable: str,
-    value: str,
-    server_url_fixture: str,
-    message: str,
-    monkeypatch: pytest.MonkeyPatch,
-    request: pytest.FixtureRequest,
-) -> None:
-    clear_proxy_variables(monkeypatch)
-    monkeypatch.setenv(variable, value)
-    server_url: str = request.getfixturevalue(server_url_fixture)
-
-    async with HTTPClient(base_url=server_url, native=True) as client:
-        with pytest.raises(
-            NotImplementedError, match=f"{message} .*is not supported by the native"
-        ):
-            await client.get("items/7")
-
-
-@pytest.mark.parametrize(
-    ("variable", "value", "server_url_fixture", "message"), _unported_proxy_variables()
-)
-def test_sync_native_transport_refuses_an_unported_proxy_variable_when_a_request_uses_it(
-    variable: str,
-    value: str,
-    server_url_fixture: str,
-    message: str,
-    monkeypatch: pytest.MonkeyPatch,
-    request: pytest.FixtureRequest,
-) -> None:
-    clear_proxy_variables(monkeypatch)
-    monkeypatch.setenv(variable, value)
-    server_url: str = request.getfixturevalue(server_url_fixture)
-
-    with (
-        SyncHTTPClient(base_url=server_url, native=True) as client,
-        pytest.raises(NotImplementedError, match=f"{message} .*is not supported by the native"),
-    ):
-        client.get("items/7")
-
-
-async def test_native_transport_sends_what_an_unported_proxy_variable_does_not_cover(
-    base_url: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    clear_proxy_variables(monkeypatch)
-    monkeypatch.setenv("HTTPS_PROXY", "https://127.0.0.1:1")
-
-    async with HTTPClient(base_url=base_url, native=True) as client:
-        result = await client.get("items/7", into=dict)
-
-    assert result.data == {"id": 7, "name": "item-7"}
-
-
-def test_sync_native_transport_sends_what_an_unported_proxy_variable_does_not_cover(
-    base_url: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    clear_proxy_variables(monkeypatch)
-    monkeypatch.setenv("HTTPS_PROXY", "https://127.0.0.1:1")
-
-    with SyncHTTPClient(base_url=base_url, native=True) as client:
-        result = client.get("items/7", into=dict)
-
-    assert result.data == {"id": 7, "name": "item-7"}
 
 
 async def test_native_transport_pools_connections_per_origin(

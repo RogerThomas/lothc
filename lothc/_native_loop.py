@@ -101,8 +101,9 @@ def _family(address: IPv4Address | IPv6Address) -> int:
 
 
 async def _first_address(event_loop: asyncio.AbstractEventLoop, host: str) -> str | None:
-    """reqwest's local resolution for a `socks5://` proxy's target: the first address `host`
-    resolves to (`None` if none), which goes in the SOCKS request instead of the name."""
+    """reqwest's local resolution for a `socks4://` or `socks5://` proxy's target: the first
+    address `host` resolves to (`None` if none), which goes in the SOCKS request instead of the
+    name."""
     try:
         infos = await event_loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
     except OSError as error:
@@ -143,7 +144,8 @@ async def _open_connection_socket(
     event_loop: asyncio.AbstractEventLoop, target: _Target, resolve: str | None
 ) -> tuple[socket.socket, str | None]:
     """`_open_socket` to `target` (the origin, or its proxy), after resolving `resolve` first if
-    asked (a `socks5://` proxy's target, which reqwest resolves before connecting the proxy)."""
+    asked (a `socks4://` or `socks5://` proxy's target, which reqwest resolves before connecting
+    the proxy)."""
     resolved = None if resolve is None else await _first_address(event_loop, resolve)
     return await _open_socket(event_loop, target), resolved
 

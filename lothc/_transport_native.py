@@ -19,7 +19,6 @@ from enum import IntEnum
 from functools import partial
 from pathlib import Path
 from typing import Any, ClassVar, NoReturn
-from urllib.parse import urlsplit
 
 from ._compat import (
     BaseModel,
@@ -137,23 +136,6 @@ def _native_pool_timeout(settings: _TransportSettings) -> timedelta | None:
     if settings.pool_timeout is None:
         return None
     return timedelta(seconds=settings.pool_timeout)
-
-
-def _unported(feature: str) -> NotImplementedError:
-    return NotImplementedError(
-        f"{feature} is not supported by the native transport yet (native=True)"
-    )
-
-
-def _reject_unported_proxy(proxy: str | None) -> None:
-    """Refuse, at construction, a `proxy=` the native transport can't speak yet: TLS to the
-    proxy itself, and SOCKS4. A proxy from the environment is refused by the native side, when a
-    request would use it (`native/src/proxy.rs`)."""
-    scheme = "" if proxy is None else urlsplit(proxy).scheme.lower()
-    if scheme == "https":
-        raise _unported("an https:// proxy (TLS to the proxy itself)")
-    if scheme in {"socks4", "socks4a"}:
-        raise _unported(f"a {scheme}:// proxy")
 
 
 def _native_no_proxy(settings: _TransportSettings) -> str | None:
@@ -818,7 +800,6 @@ class _NativeTransport:
 
     def __post_init__(self) -> None:
         _reject_unported_settings(self._settings)
-        _reject_unported_proxy(self._settings.proxy)
         self._static_auth = _static_authorization(self._bearer_token, self._basic_auth)
         self._reauth = (
             self._bearer_auth if isinstance(self._bearer_auth, _InvalidatableAuth) else None
@@ -1360,7 +1341,6 @@ class _SyncNativeTransport:
 
     def __post_init__(self) -> None:
         _reject_unported_settings(self._settings)
-        _reject_unported_proxy(self._settings.proxy)
         self._static_auth = _static_authorization(self._bearer_token, self._basic_auth)
         self._reauth = (
             self._bearer_auth if isinstance(self._bearer_auth, _SyncInvalidatableAuth) else None
