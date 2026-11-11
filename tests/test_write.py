@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, TypedDict, cast
 
 import pytest
-from _helpers import echoed_headers, partial_body_seen
+from _helpers import echoed_headers, make_unreadable, partial_body_seen
 from msgspec import Struct
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -995,8 +995,10 @@ def test_sync_a_missing_form_file_raises_before_anything_is_sent(
     assert sync_client.get("hits", params={"key": server_key}, into=dict).data == {"hits": 0}
 
 
-# Root reads a file whatever its permissions say.
-_skip_as_root = pytest.mark.skipif(os.geteuid() == 0, reason="root can read an unreadable file")
+# Root reads a file whatever its permissions say (Windows has no root, nor `os.geteuid`).
+_skip_as_root = pytest.mark.skipif(
+    sys.platform != "win32" and os.geteuid() == 0, reason="root can read an unreadable file"
+)
 
 
 @_skip_as_root
@@ -1005,7 +1007,7 @@ async def test_an_unreadable_form_file_raises_before_anything_is_sent(
 ) -> None:
     locked = tmp_path / "locked.txt"
     locked.write_bytes(b"locked")
-    locked.chmod(0)
+    make_unreadable(locked)
 
     with pytest.raises(PermissionError):
         await client.post("status-then-ok", params={"key": server_key}, form={"f": locked})
@@ -1019,7 +1021,7 @@ def test_sync_an_unreadable_form_file_raises_before_anything_is_sent(
 ) -> None:
     locked = tmp_path / "locked.txt"
     locked.write_bytes(b"locked")
-    locked.chmod(0)
+    make_unreadable(locked)
 
     with pytest.raises(PermissionError):
         sync_client.post("status-then-ok", params={"key": server_key}, form={"f": locked})
@@ -1081,11 +1083,21 @@ def _upload_peak_growth_script(*, use_async: bool) -> str:
         "received, growth = response.data['received'], _peak() - before\n"
     )
     return (
-        "import asyncio, resource, sys\n"
+        "import asyncio, sys\n"
         "from pathlib import Path\n"
         "from lothc import HTTPClient, SyncHTTPClient\n"
         "base_url, path = sys.argv[1], Path(sys.argv[2])\n"
         "def _peak():\n"
+        "    if sys.platform == 'win32':\n"
+        "        # The peak working set: PROCESS_MEMORY_COUNTERS (72 bytes on 64-bit) starts with\n"
+        "        # two DWORDs, its size and a count, then PeakWorkingSetSize.\n"
+        "        import ctypes\n"
+        "        counters = (ctypes.c_size_t * 9)(72)\n"
+        "        process = ctypes.c_void_p(-1)  # GetCurrentProcess()'s pseudo-handle\n"
+        "        if not ctypes.windll.kernel32.K32GetProcessMemoryInfo(process, counters, 72):\n"
+        "            raise ctypes.WinError()\n"
+        "        return counters[1]\n"
+        "    import resource\n"
         "    # Bytes on macOS, kilobytes on Linux.\n"
         "    scale = 1 if sys.platform == 'darwin' else 1024\n"
         "    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * scale\n"

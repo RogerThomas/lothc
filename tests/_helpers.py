@@ -1,12 +1,22 @@
 """Small helpers shared by several test modules."""
 
 import json
+import subprocess
+import sys
 import time
+from collections.abc import Generator
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from lothc import SyncHTTPClient
+
+
+def _icacls(path: Path, *arguments: str) -> None:
+    """Edit `path`'s Windows ACL; `*S-1-1-0` is everyone."""
+    subprocess.run(["icacls", str(path), *arguments], check=True, capture_output=True)
 
 
 def echoed_headers(result: dict[str, Any]) -> dict[str, str]:
@@ -38,6 +48,33 @@ def clear_proxy_variables(monkeypatch: pytest.MonkeyPatch) -> None:
         "REQUEST_METHOD",
     ):
         monkeypatch.delenv(name, raising=False)
+
+
+def make_unreadable(path: Path) -> None:
+    """Stop this process opening the file `path` for reading. On Windows, where `chmod` only sets
+    the read-only flag, that takes an ACL entry denying everyone its data."""
+    if sys.platform == "win32":
+        _icacls(path, "/deny", "*S-1-1-0:(RD)")
+    else:
+        path.chmod(0)
+
+
+@contextmanager
+def read_only_directory(path: Path) -> Generator[None]:
+    """The directory `path` refusing new files (so also any file replaced by renaming one into
+    it) until the block ends. On Windows, where `chmod` only sets the read-only flag, which a
+    directory ignores, that takes an ACL entry."""
+    if sys.platform == "win32":
+        _icacls(path, "/deny", "*S-1-1-0:(WD,AD)")
+    else:
+        path.chmod(0o500)
+    try:
+        yield
+    finally:
+        if sys.platform == "win32":
+            _icacls(path, "/remove:d", "*S-1-1-0")
+        else:
+            path.chmod(0o700)
 
 
 def partial_body_seen(base_url: str, key: str) -> dict[str, Any]:

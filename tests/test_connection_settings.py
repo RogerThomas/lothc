@@ -237,6 +237,14 @@ def test_sync_local_address_only_tries_addresses_of_its_own_family(base_url: str
 
 
 # reqwest's defaults: 15s idle, a probe every 15s, 3 of them; `tcp_keepalive` sets the idle time.
+# Not on Windows, where reqwest can't set the probe count, and a socket isn't a file descriptor
+# for `_keepalive_of` to find.
+_posix_keepalive = pytest.mark.skipif(
+    sys.platform == "win32", reason="reqwest sets the keepalive probe count only on POSIX"
+)
+
+
+@_posix_keepalive
 @pytest.mark.parametrize(("tcp_keepalive", "idle"), [(None, 15), (30.0, 30)])
 async def test_every_connection_keeps_alive_as_reqwest_does(
     base_url: str, tcp_keepalive: float | None, idle: int
@@ -248,6 +256,7 @@ async def test_every_connection_keeps_alive_as_reqwest_does(
     assert keepalive == (True, idle, 15, 3)
 
 
+@_posix_keepalive
 @pytest.mark.parametrize(("tcp_keepalive", "idle"), [(None, 15), (30.0, 30)])
 def test_sync_every_connection_keeps_alive_as_reqwest_does(
     base_url: str, tcp_keepalive: float | None, idle: int

@@ -16,6 +16,7 @@ and compare everything else byte for byte.
 import io
 import json
 import re
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -42,6 +43,11 @@ from msgspec import Struct
 from pydantic import BaseModel, Field
 
 from lothc import HTTPClient, HTTPConnectionError, RequestInfo, SyncHTTPClient
+
+# Every test here sends through the native transport, which is POSIX only.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32", reason="the native transport is POSIX only"
+)
 
 
 class _QueryStruct(Struct):

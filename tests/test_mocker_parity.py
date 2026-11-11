@@ -5,6 +5,7 @@ response. A multipart body's boundary is random, so it's masked in its `Content-
 """
 
 import re
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -16,6 +17,11 @@ from pydantic import BaseModel, Field
 
 from lothc import HTTPClient, RequestInfo, SyncHTTPClient
 from lothc.testing import LOTHCMocker, MockRequest
+
+# Every test here sends through the native transport, which is POSIX only.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32", reason="the native transport is POSIX only"
+)
 
 
 class _ItemStruct(Struct):

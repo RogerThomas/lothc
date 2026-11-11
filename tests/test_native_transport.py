@@ -19,6 +19,12 @@ import pytest
 
 from lothc import HTTPClient, HTTPTimeoutError, SyncHTTPClient
 
+# The native transport is POSIX only: on Windows `native=True` raises, which the tests below that
+# fake the platform check everywhere.
+_native_only = pytest.mark.skipif(
+    sys.platform == "win32", reason="the native transport is POSIX only"
+)
+
 
 @pytest.fixture(name="native_client")
 async def _native_client(base_url: str) -> AsyncGenerator[HTTPClient]:
@@ -36,6 +42,7 @@ def _pyreqwest_selections() -> list[dict[str, Any]]:
     return [{"native": False}, {}]
 
 
+@_native_only
 def test_native_true_selects_the_native_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LOTHC_TRANSPORT", raising=False)
 
@@ -43,6 +50,7 @@ def test_native_true_selects_the_native_transport(monkeypatch: pytest.MonkeyPatc
         HTTPClient(http2=True, native=True)
 
 
+@_native_only
 def test_sync_native_true_selects_the_native_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LOTHC_TRANSPORT", raising=False)
 
@@ -74,6 +82,7 @@ def test_sync_native_false_or_the_default_selects_pyreqwest(
     assert result.data == {"id": 7, "name": "item-7"}
 
 
+@_native_only
 def test_the_transport_override_wins_over_native_false(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LOTHC_TRANSPORT", "native")
 
@@ -81,6 +90,7 @@ def test_the_transport_override_wins_over_native_false(monkeypatch: pytest.Monke
         HTTPClient(http2=True, native=False)
 
 
+@_native_only
 def test_sync_the_transport_override_wins_over_native_false(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -158,6 +168,7 @@ def _unported_settings() -> list[tuple[str, Any]]:
     ]
 
 
+@_native_only
 @pytest.mark.parametrize(("setting", "value"), _unported_settings())
 def test_native_transport_refuses_an_unported_setting(setting: str, value: object) -> None:
     settings: dict[str, Any] = {setting: value}
@@ -166,6 +177,7 @@ def test_native_transport_refuses_an_unported_setting(setting: str, value: objec
         HTTPClient(native=True, **settings)
 
 
+@_native_only
 @pytest.mark.parametrize(("setting", "value"), _unported_settings())
 def test_sync_native_transport_refuses_an_unported_setting(setting: str, value: object) -> None:
     settings: dict[str, Any] = {setting: value}
@@ -174,6 +186,7 @@ def test_sync_native_transport_refuses_an_unported_setting(setting: str, value: 
         SyncHTTPClient(native=True, **settings)
 
 
+@_native_only
 async def test_native_transport_pools_connections_per_origin(
     base_url: str, https_base_url: str, tls_ca_pem: bytes
 ) -> None:
@@ -189,6 +202,7 @@ async def test_native_transport_pools_connections_per_origin(
     ]
 
 
+@_native_only
 def test_sync_native_transport_pools_connections_per_origin(
     base_url: str, https_base_url: str, tls_ca_pem: bytes
 ) -> None:
@@ -204,6 +218,7 @@ def test_sync_native_transport_pools_connections_per_origin(
     ]
 
 
+@_native_only
 async def test_native_transport_keeps_working_after_a_cancelled_request(
     native_client: HTTPClient,
 ) -> None:
@@ -213,6 +228,7 @@ async def test_native_transport_keeps_working_after_a_cancelled_request(
     assert (await native_client.get("items/7", into=dict)).status == 200
 
 
+@_native_only
 async def test_native_transport_times_out_a_request_in_flight(native_client: HTTPClient) -> None:
     with pytest.raises(HTTPTimeoutError):
         await native_client.get("slow", params={"seconds": 5}, timeout=0.05)
@@ -220,6 +236,7 @@ async def test_native_transport_times_out_a_request_in_flight(native_client: HTT
     assert (await native_client.get("items/7", into=dict)).status == 200
 
 
+@_native_only
 def test_sync_native_transport_times_out_a_request_in_flight(
     sync_native_client: SyncHTTPClient,
 ) -> None:
