@@ -1,5 +1,6 @@
 """Temporary CI diagnostic (to be removed): sleep accuracy, connect latency and /events gaps."""
 
+import os
 import socket
 import sys
 import time
@@ -58,8 +59,12 @@ def _client_gaps(port: int, label: str) -> None:
     print(f"{label} pyreqwest gaps: {_summary(gaps[1:])}")
 
 
+print("PRIO_DARWIN_PROCESS", os.getpriority(os.PRIO_DARWIN_PROCESS, 0))
 _sleeps()
-for nodelay in (False, True, False, True):
+os.setpriority(os.PRIO_DARWIN_PROCESS, 0, 0)
+print("PRIO_DARWIN_PROCESS cleared", os.getpriority(os.PRIO_DARWIN_PROCESS, 0))
+_sleeps()
+for nodelay in (False, True):
     TestAppHandler.disable_nagle_algorithm = nodelay
     with serve_in_background(make_server()) as server:
         if not nodelay:
