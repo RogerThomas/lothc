@@ -41,7 +41,8 @@ tasks:
 
   test-native:
     # The experimental native transport (lothc._native), selected per client by this env var.
-    # Expect NotImplementedError failures for what it hasn't ported yet (see CLAUDE.md).
+    # Only the tests that need `http2=True` fail, with NotImplementedError: native hasn't ported
+    # HTTP/2 (see CLAUDE.md). CI runs this minus those tests.
     desc: Run the test suite with every client on the native transport (LOTHC_TRANSPORT=native)
     env:
       LOTHC_TRANSPORT: native
