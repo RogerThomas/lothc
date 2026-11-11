@@ -103,8 +103,8 @@ or editing Python here.
 - **`tests/test_transport_wire_parity.py` sends every case through both transports** and compares
   what the server (or proxy) received, byte for byte. It unsets `LOTHC_TRANSPORT` first, since
   that override would make both clients native.
-- **Under `task test-native`, only refusals and `test_mocker.py` may fail**: anything else is a
-  native bug.
+- **Under `task test-native`, only the `http2=` refusals may fail**: anything else is a native
+  bug.
 - **Speed (~20s):** test servers poll at 0.01s; scale a timing pair down together, never a lone
   margin; `backoff_base=0.001` where only *that* a retry happened matters; a test below a
   default asserts a bracket, not a floor. Rejected: pytest-xdist.
@@ -129,8 +129,7 @@ or editing Python here.
   only accepted difference is that a transport error's `str()` is a flat cause chain. Crate pins
   follow pyreqwest 0.15.0's lockfile, and each feature uses reqwest's own crates where they exist
   (hyper-util's proxy matcher, compression-codecs), never a hand port.
-- **Anything unported raises `NotImplementedError`**, never a silent difference: HTTP/2, and
-  `lothc.testing`'s mocker, which patches pyreqwest.
+- **Anything unported raises `NotImplementedError`**, never a silent difference: HTTP/2.
 - **Known differences that don't raise:**
   - `form=` files are read on the loop thread in reads of up to 64 KiB (pyreqwest reads them off
     it), so a slow filesystem stalls the loop.
@@ -155,9 +154,11 @@ or editing Python here.
   ~1.3us); lazy headers; PGO is worth ~6-7%.
 - **HTTP/2 is deferred** until someone asks (decided 2026-11-10): it's the largest port and rarely
   used, so `http2=True` stays on pyreqwest.
-- **The mocker will run through native's own request code** (decided 2026-11-10), answering from
+- **The mocker runs through native's own request code** (decided 2026-11-10), answering from
   Python handlers instead of the network, so mocked tests still see the exact request sent.
-- **Not built yet:** the mocker and wheels.
+  The engine is lothc's own (`lothc/_mocking.py`, decided 2026-11-11), not a port of pyreqwest's
+  Apache-2.0 mocker; both transports check one hook, and nothing patches pyreqwest.
+- **Not built yet:** wheels.
 
 ## Decisions
 
@@ -258,8 +259,8 @@ Each of these was a real bug or a lost hour once.
 - **Keep `_send_method` one async layer deep**: each extra layer is a frame on every resume.
 - **The async idle limit wraps each chunk read, never a `yield`**, or a slow consumer looks like
   a stalled server.
-- **The mocker validates before registering** (pyreqwest registers a mock as soon as the call
-  returns) **and applies `data=` before `headers=`** (`.body_json()` appends a Content-Type).
+- **The mocker validates before registering** (a rule matches from the moment it's added) **and
+  applies `data=` before `headers=`** (`.body_json()` appends a Content-Type).
 - **OAuth:** aliased pydantic token models need `ConfigDict(validate_by_name=True)`, and the
   token-request types are `Callable[..., JSONPayload]` because a `Protocol` fails 3 of 4
   checkers.
