@@ -122,7 +122,18 @@ jobs:
           workspaces: native
       - run: uv sync --all-extras --no-default-groups --group dev
       - if: runner.os == 'macOS'
-        run: uv run --no-sync python experiments/ci_diag.py
+        continue-on-error: true
+        run: |
+          sysctl kern.timer.coalescing_enabled kern.timer_coalesce_bg_ns_max kern.timer_coalesce_tier3_ns_max
+          uv run --no-sync python experiments/ci_diag.py baseline
+          sudo sysctl -w kern.timer.coalescing_enabled=0
+          uv run --no-sync python experiments/ci_diag.py coalescing-off
+          saved=$(sysctl -n kern.timer_coalesce_bg_ns_max kern.timer_coalesce_tier3_ns_max kern.timer_coalesce_tier2_ns_max | tr '\n' ' ')
+          sudo sysctl -w kern.timer_coalesce_bg_ns_max=0 kern.timer_coalesce_tier3_ns_max=0 kern.timer_coalesce_tier2_ns_max=0
+          uv run --no-sync python experiments/ci_diag.py ns-max-zero
+          set -- $saved
+          sudo sysctl -w kern.timer_coalesce_bg_ns_max=$1 kern.timer_coalesce_tier3_ns_max=$2 kern.timer_coalesce_tier2_ns_max=$3
+          uv run --no-sync python experiments/ci_diag.py restored-ns-max
       - run: uv run --no-sync pytest tests
       # Even after a failure on pyreqwest, so each transport's result shows.
       - if: ${{ !cancelled() && runner.os != 'Windows' }}
