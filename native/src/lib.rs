@@ -23,25 +23,49 @@
 //! - `cookie`: `cookie_store=True`'s cookie jar, as reqwest's;
 //! - `mock`: how `lothc.testing`'s mocker answers a request a pool built, instead of the network;
 //! - `headers`: `RawHeaders`, a response's headers until `_LazyHeaders` reads them.
+//!
+//! All of that is POSIX only (`poll(2)`, raw fds, `loop.add_reader`). On Windows, where
+//! `native=True` raises, the module is `unsupported`: the same names, with nothing behind them.
+#[cfg(unix)]
 mod body;
+#[cfg(unix)]
 mod connect;
+#[cfg(unix)]
 mod cookie;
+#[cfg(unix)]
 mod decompress;
+#[cfg(unix)]
 mod error;
+#[cfg(unix)]
 mod headers;
+#[cfg(unix)]
 mod idle;
+#[cfg(unix)]
 mod io;
+#[cfg(unix)]
 mod limit;
+#[cfg(unix)]
 mod mock;
+#[cfg(unix)]
 mod multipart;
+#[cfg(unix)]
 mod pool;
+#[cfg(unix)]
 mod proxy;
+#[cfg(unix)]
 mod redirect;
+#[cfg(unix)]
 mod request;
+#[cfg(unix)]
 mod response;
+#[cfg(unix)]
 mod stream;
+#[cfg(unix)]
 mod sync_pool;
+#[cfg(unix)]
 mod tls;
+#[cfg(not(unix))]
+mod unsupported;
 
 use pyo3::prelude::*;
 
@@ -51,6 +75,7 @@ use pyo3::prelude::*;
 // connections, the lazily built TLS config, the cookie jar) behind locks and atomics, and so are
 // a `SyncStream`, whose state no call holds locked while it waits, and a `SyncIntercepted`;
 // `RawHeaders` is frozen and immutable, and the mock hook sits behind a lock and an atomic.
+#[cfg(unix)]
 #[pymodule(gil_used = false)]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pool::Pool>()?;
@@ -63,4 +88,20 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<sync_pool::SyncIntercepted>()?;
     m.add_function(wrap_pyfunction!(mock::set_mock_hook, m)?)?;
     m.add("ClientBuildError", m.py().get_type::<error::ClientBuildError>())
+}
+
+// The same names as above, so lothc imports this module unchanged on every platform.
+#[cfg(not(unix))]
+#[pymodule(gil_used = false)]
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<unsupported::Pool>()?;
+    m.add_class::<unsupported::Stream>()?;
+    m.add_class::<unsupported::SyncPool>()?;
+    m.add_class::<unsupported::SyncStream>()?;
+    m.add_class::<unsupported::RawHeaders>()?;
+    m.add_class::<unsupported::ConnectOptions>()?;
+    m.add_class::<unsupported::Intercepted>()?;
+    m.add_class::<unsupported::SyncIntercepted>()?;
+    m.add_function(wrap_pyfunction!(unsupported::set_mock_hook, m)?)?;
+    m.add("ClientBuildError", m.py().get_type::<unsupported::ClientBuildError>())
 }
