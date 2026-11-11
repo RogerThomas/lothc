@@ -44,7 +44,9 @@ a docstring or a test already says.
 - **CI:** 3.13/3.14/3.15 plus free-threaded 3.14t/3.15t with `PYTHON_GIL=0` (lothc shares
   state across threads, and users share a client across threads), and `test-no-extras` with
   pydantic/msgspec uninstalled. The `perf` group's clients stay out of `dev`: one has no
-  free-threaded wheel.
+  free-threaded wheel. Each of those runs the suite on native too, and `test-platforms` adds
+  Linux Arm, macOS Arm and Intel, and Windows (pyreqwest only) on 3.14. macOS runners turn timer
+  coalescing off, or a 0.02s sleep takes ~0.08s.
 - **README.md uses absolute URLs only**, since it's the PyPI description.
 - **Check the sdist's file list after a packaging change**: a default once shipped the whole repo.
 - **TODO (GitHub UI):** add a tag-pattern protection rule to the `pypi` environment.
@@ -97,15 +99,15 @@ or editing Python here.
 - **`tests/test_wire_format.py` is the wire contract** (request line, header order and casing,
   body). Regenerate a value only for a deliberate change.
 - **TLS tests use a real HTTPS server** (`trustme`), and pin the rustls failure in `match=`.
-  Wording differs between macOS and Linux, so check a new pin on Linux.
+  Wording differs between platforms; CI covers Linux, macOS and Windows.
 - **Mutation runs use `python -B`**: a same-size edit restored within a second leaves a stale
   `.pyc`.
 - **`tests/test_transport_wire_parity.py` sends every case through both transports** and compares
   what the server (or proxy) received, byte for byte. It unsets `LOTHC_TRANSPORT` first, since
   that override would make both clients native.
 - **Under `task test-native`, only the `http2=` refusals may fail**: anything else is a native
-  bug.
-- **Speed (~20s):** test servers poll at 0.01s; scale a timing pair down together, never a lone
+  bug. CI deselects them by name (`NATIVE_DESELECT` in `ci.yml`), so add any new one there.
+- **Speed (~45s):** test servers poll at 0.01s; scale a timing pair down together, never a lone
   margin; `backoff_base=0.001` where only *that* a retry happened matters; a test below a
   default asserts a bracket, not a floor. Rejected: pytest-xdist.
 - Prefer doctests for small algorithmic functions.
@@ -124,7 +126,9 @@ or editing Python here.
   the default); user docs don't mention it.
 - **POSIX only, and pyreqwest stays as Windows' transport** (decided 2026-11-10): native needs
   `poll(2)` and `loop.add_reader`, which Windows' default loop lacks, and an I/O thread there would
-  bring back the cross-thread hop native exists to avoid. So `native=True` raises on Windows.
+  bring back the cross-thread hop native exists to avoid. So `native=True` raises on Windows,
+  where the crate is `cfg(unix)`-gated down to a stub module of the same names, so lothc's
+  imports don't change.
 - **It must match pyreqwest exactly**: the same wire bytes, results and exception classes. The
   only accepted difference is that a transport error's `str()` is a flat cause chain. Crate pins
   follow pyreqwest 0.15.0's lockfile, and each feature uses reqwest's own crates where they exist
