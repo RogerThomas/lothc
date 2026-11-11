@@ -21,7 +21,9 @@
 //! pyreqwest's does once its body reader's buffer fills.
 //!
 //! Connections are pooled per origin (scheme, host, port), opened on demand when requests queue
-//! up, and replaced when one dies. A request hyper reports as never sent (a stale keep-alive
+//! up, and replaced when one dies. A free connection is looked at (`has_input`) before it takes
+//! another request, since the loop may report a server's close only after the next request was
+//! sent on it. A request hyper still reports as never sent (a stale keep-alive
 //! connection) is re-queued, as reqwest's pool does; anything else fails. Idle connections expire
 //! as reqwest's do (`idle.rs`); the reaper that closes them with no request arriving rides the
 //! same shared timer as the request deadlines (`reap_at`), so pooling a connection arms nothing.
@@ -82,7 +84,7 @@ use crate::connect::{ConnectOptions, ConnectSettings};
 use crate::cookie::Cookies;
 use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
-use crate::io::{shutdown, LoopReady, Stream};
+use crate::io::{has_input, shutdown, LoopReady, Stream};
 use crate::limit::{checked_max_connections, Permits};
 use crate::proxy::{Proxies, Route};
 use crate::redirect::{Hop, Redirect};
@@ -666,14 +668,32 @@ impl PoolState {
         }
     }
 
-    /// The most recently idled connection to `origin` still fresh at `now`, closing the expired
-    /// ones it passes (hyper-util's checkout).
+    /// Whether free connection `conn` can take another request. The loop reports a server's
+    /// close only once it next polls, which may be after the coroutine reusing the connection
+    /// has sent on it (always, for a stream whose end was read ahead), so look first, as the
+    /// sync pool does: anything to read goes to hyper's driver, which ends on EOF.
+    fn still_open(&mut self, conn: usize) -> bool {
+        let c = &self.conns[conn];
+        if has_input(c.fd) {
+            if let Some(waker) = c.ready.as_ref().and_then(LoopReady::set_readable) {
+                waker.wake();
+            }
+            self.exec.run_until_stalled();
+        }
+        self.conns[conn].sender.as_ref().is_some_and(|sender| !sender.is_closed())
+    }
+
+    /// The most recently idled connection to `origin` still fresh at `now` and open, closing the
+    /// expired and closed ones it passes (hyper-util's checkout).
     fn checkout(&mut self, py: Python<'_>, origin: usize, now: Instant) -> PyResult<Option<usize>> {
         while let Some((conn, idle_at)) = self.origins[origin].idle.pop() {
-            if !self.idle_policy.expired(idle_at, now) {
+            if self.idle_policy.expired(idle_at, now) {
+                self.expire(py, conn)?;
+            } else if self.still_open(conn) {
                 return Ok(Some(conn));
+            } else {
+                self.retire(py, conn)?;
             }
-            self.expire(py, conn)?;
         }
         Ok(None)
     }
@@ -823,11 +843,16 @@ impl PoolState {
     /// close it, when the pool keeps none or has closed).
     fn release_connection(&mut self, py: Python<'_>, conn: usize, sender: Sender) -> PyResult<()> {
         self.conns[conn].sender = Some(sender);
-        if self.idle_policy.pools() && !self.is_closed {
-            self.dispatch(py, conn)
-        } else {
-            self.expire(py, conn)
+        if !self.idle_policy.pools() || self.is_closed {
+            return self.expire(py, conn);
         }
+        // A request waiting takes it right away, so it is looked at now, as checkout looks at
+        // an idle one.
+        let waiting = !self.origins[self.conns[conn].origin].waiting.is_empty();
+        if waiting && !self.still_open(conn) {
+            return self.retire(py, conn);
+        }
+        self.dispatch(py, conn)
     }
 
     /// hyper handed `slot`'s request back unsent (`conn` was already closing): it goes to the

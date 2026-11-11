@@ -241,18 +241,16 @@ def test_sync_each_attempt_of_a_retried_request_takes_the_slot_in_turn(
 
 
 async def test_a_stream_holds_its_slot_until_its_body_has_been_read(
-    base_url: str, one_slot_client: HTTPClient, server_key: str
+    one_slot_client: HTTPClient, server_key: str
 ) -> None:
-    # Not until the stream is closed: the request after it runs first. `/large` closes its
-    # connection after the body, so that request goes to another origin.
-    other_origin = base_url.replace("127.0.0.1", "localhost")
+    # Not until the stream is closed: the request after it runs first.
     stream = one_slot_client.stream_get("large", params={"key": server_key, "size": 2**20})
     try:
         received = len(await anext(stream))
         with pytest.raises(HTTPTimeoutError):
             await one_slot_client.get("items/7")
         received += sum([len(chunk) async for chunk in stream])
-        after = (await one_slot_client.get(f"{other_origin}items/7")).data
+        after = (await one_slot_client.get("items/7")).data
     finally:
         await stream.aclose()
 
@@ -261,9 +259,8 @@ async def test_a_stream_holds_its_slot_until_its_body_has_been_read(
 
 
 def test_sync_a_stream_holds_its_slot_until_its_body_has_been_read(
-    base_url: str, sync_one_slot_stream_client: SyncHTTPClient, server_key: str
+    sync_one_slot_stream_client: SyncHTTPClient, server_key: str
 ) -> None:
-    other_origin = base_url.replace("127.0.0.1", "localhost")
     client = sync_one_slot_stream_client
     stream = client.stream_get("large", params={"key": server_key, "size": 2**20})
     try:
@@ -271,7 +268,7 @@ def test_sync_a_stream_holds_its_slot_until_its_body_has_been_read(
         with pytest.raises(HTTPTimeoutError):
             client.get("items/7")
         received += sum(len(chunk) for chunk in stream)
-        after = client.get(f"{other_origin}items/7").data
+        after = client.get("items/7").data
     finally:
         stream.close()
 

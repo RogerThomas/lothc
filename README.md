@@ -12,7 +12,7 @@
 [![License](https://img.shields.io/pypi/l/lothc)](https://github.com/RogerThomas/lothc/blob/main/LICENSE)
 
 **L**ord **O**f **T**he **H**ttp **C**lients — a typed HTTP client for Python, built on
-[pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (an awesome Rust-backed HTTP client), with
+[pyreqwest](https://github.com/MarkusSintonen/pyreqwest) (an awesome Rust-backed HTTP client), with
 first-class optional support for **pydantic** and **msgspec** as both decode *and* encode targets.
 
 ## Installing
@@ -108,5 +108,5 @@ task check        # lint + format-check + typecheck (what CI runs)
 ## License
 
 lothc is [MIT](https://github.com/RogerThomas/lothc/blob/main/LICENSE). It's built on
-[pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (Apache-2.0), which is built on the Rust
+[pyreqwest](https://github.com/MarkusSintonen/pyreqwest) (Apache-2.0), which is built on the Rust
 crate [reqwest](https://github.com/seanmonstar/reqwest) (MIT or Apache-2.0). Thanks to both.

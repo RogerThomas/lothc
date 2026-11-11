@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 `lothc` ("Lord Of The Http Clients") is a typed HTTP client: `HTTPClient` (async) and
-`SyncHTTPClient` (sync), on [pyreqwest](https://github.com/mostafa-hussein/pyreqwest) by default or
+`SyncHTTPClient` (sync), on [pyreqwest](https://github.com/MarkusSintonen/pyreqwest) by default or
 lothc's own native transport with `native=True`, with pydantic and msgspec as optional extras
 (`lothc/_compat.py`) for decoding and encoding. lothc must work with neither, either or both
 installed.
@@ -141,7 +141,8 @@ or editing Python here.
   - A sync request in a blocking TCP connect sees a connection another thread freed only once
     its connect returns.
   - A request cancelled while waiting for a `max_connections` slot leaves the queue and is never
-    sent; pyreqwest still sends it.
+    sent, deliberately (decided 2026-11-11): pyreqwest still sends it, so a caller who saw the
+    cancel and retried a POST would submit it twice.
   - Addresses are tried in order (no happy eyeballs), and an async client is bound to the loop
     that opened it.
 - **Redirects run in Rust; retries and re-auth in Python.** A hop's headers must be reqwest's,

@@ -76,7 +76,7 @@ use crate::connect::{ConnectOptions, ConnectSettings};
 use crate::cookie::Cookies;
 use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
-use crate::io::{shutdown, PollReady, Stream};
+use crate::io::{has_input, shutdown, PollReady, Stream};
 use crate::limit::{checked_max_connections, SyncLimiter, SyncPermit};
 use crate::proxy::{Proxies, Route};
 use crate::redirect::Redirect;
@@ -448,9 +448,7 @@ fn drive_handshake(handshake: &mut HandshakeFuture, fd: RawFd, ready: &PollReady
 /// Whether a pooled connection is still usable: nothing reads an idle socket here (no event
 /// loop), so a server's silent close is only noticed by looking, as urllib3 does before reuse.
 fn still_open(conn: &mut SyncConn) -> bool {
-    let mut pfd = libc::pollfd { fd: conn.fd, events: libc::POLLIN, revents: 0 };
-    // SAFETY: `pfd` is one valid, writable `pollfd` for the whole call, matching `nfds` = 1.
-    if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
+    if has_input(conn.fd) {
         // EOF (or stray bytes): let hyper's driver read it and decide.
         conn.ready.set_readable();
         let mut cx = Context::from_waker(Waker::noop());
@@ -626,9 +624,14 @@ struct Ticket<'a> {
 
 impl Ticket<'_> {
     /// The connection another thread freed for this request, if one has been (it leaves the
-    /// queue then).
+    /// queue then) and the server hasn't closed it since: then the request goes on with its own.
     fn handed(&self) -> Option<SyncConn> {
-        lock(&self.shared.origins).leave(self.key, self.id, true)
+        let mut conn = lock(&self.shared.origins).leave(self.key, self.id, true)?;
+        if still_open(&mut conn) {
+            return Some(conn);
+        }
+        close_idle(conn);
+        None
     }
 
     /// A pipe that wakes this request's poll(2) when a connection is handed to it; `None` if no

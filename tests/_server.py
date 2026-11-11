@@ -244,6 +244,17 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self.wfile.write(record.encode())
             self.wfile.flush()
 
+    def _write_sse_silent_close(self) -> None:
+        # One event in a body of known length, then the connection closes with no
+        # `Connection: close` to say it will, as `/silent-close` does.
+        body = b"id: 0\ndata: only\n\n"
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _write_sse_no_content(self) -> None:
         self.close_connection = True
         self.send_response(204)
@@ -1194,6 +1205,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/events-lenient": self._write_sse_lenient_cases,
             "/events-truncated": self._write_sse_truncated,
             "/events-no-content": self._write_sse_no_content,
+            "/events-silent-close": self._write_sse_silent_close,
             "/events-wrong-content-type": self._write_sse_wrong_content_type,
             "/events-spec-edge-cases": self._write_sse_spec_edge_cases,
             "/boom": self._handle_boom,

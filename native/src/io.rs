@@ -45,6 +45,17 @@ pub(crate) fn send(fd: RawFd, buf: &[u8]) -> io::Result<usize> {
     }
 }
 
+/// Whether a socket has anything to read right now (bytes, the peer's close, or an error), from a
+/// `recv(2)` that peeks and doesn't wait. Not a zero-timeout poll(2): on macOS, polling a socket
+/// the asyncio loop's kqueue also watches cost the async pool a third of its throughput.
+pub(crate) fn has_input(fd: RawFd) -> bool {
+    let mut byte = 0u8;
+    // SAFETY: `byte` is one live, writable byte for the whole call, and recv(2) with `MSG_PEEK`
+    // writes at most `len` = 1 byte into it.
+    let n = unsafe { libc::recv(fd, (&raw mut byte).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT) };
+    n >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::WouldBlock
+}
+
 /// Shut both directions of a socket down, failing whatever hyper is waiting on (EOF/EPIPE) while
 /// leaving the descriptor itself for its owner to close.
 pub(crate) fn shutdown(fd: RawFd) {
