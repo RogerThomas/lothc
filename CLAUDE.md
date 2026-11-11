@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 `lothc` ("Lord Of The Http Clients") is a typed HTTP client on
-[pyreqwest](https://github.com/mostafa-hussein/pyreqwest): `HTTPClient` (async) and
+[pyreqwest](https://github.com/MarkusSintonen/pyreqwest): `HTTPClient` (async) and
 `SyncHTTPClient` (sync), with pydantic and msgspec as optional extras (`lothc/_compat.py`) for
 decoding and encoding. lothc must work with neither, either or both installed.
 
