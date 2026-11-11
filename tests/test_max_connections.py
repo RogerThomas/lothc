@@ -251,6 +251,9 @@ async def test_a_stream_holds_its_slot_until_its_body_has_been_read(
         with pytest.raises(HTTPTimeoutError):
             await one_slot_client.get("items/7")
         received += sum([len(chunk) async for chunk in stream])
+        # `/large` closes its connection behind it without saying so: a request racing that close
+        # on the same connection is lost by every client (test_connection_reuse.py), so let it land.
+        time.sleep(0.05)
         after = (await one_slot_client.get("items/7")).data
     finally:
         await stream.aclose()
@@ -269,6 +272,9 @@ def test_sync_a_stream_holds_its_slot_until_its_body_has_been_read(
         with pytest.raises(HTTPTimeoutError):
             client.get("items/7")
         received += sum(len(chunk) for chunk in stream)
+        # `/large` closes its connection behind it without saying so: a request racing that close
+        # on the same connection is lost by every client (test_connection_reuse.py), so let it land.
+        time.sleep(0.05)
         after = client.get("items/7").data
     finally:
         stream.close()
