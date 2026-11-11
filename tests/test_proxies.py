@@ -10,6 +10,7 @@ bytes a proxy receives.
 import asyncio
 import socket
 import ssl
+import sys
 import time
 from base64 import b64encode
 from collections.abc import AsyncGenerator, Generator
@@ -722,6 +723,13 @@ def test_sync_a_proxy_variable_proxies_its_own_scheme(
     assert _proxied_schemes(http_proxy) == proxied
 
 
+# Both variables at once: on Windows, whose environment ignores a name's case, they're one.
+_case_sensitive_environment = pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows environment variable names ignore case"
+)
+
+
+@_case_sensitive_environment
 @pytest.mark.parametrize(
     ("uppercase", "lowercase", "server_url_fixture"),
     [
@@ -750,6 +758,7 @@ async def test_an_uppercase_proxy_variable_wins_over_the_lowercase_one(
     assert len(http_proxy.requests) == 1
 
 
+@_case_sensitive_environment
 @pytest.mark.parametrize(
     ("uppercase", "lowercase", "server_url_fixture"),
     [
@@ -778,6 +787,7 @@ def test_sync_an_uppercase_proxy_variable_wins_over_the_lowercase_one(
     assert len(http_proxy.requests) == 1
 
 
+@_case_sensitive_environment
 async def test_an_uppercase_no_proxy_wins_over_the_lowercase_one(
     base_url: str, http_proxy: HTTPProxy, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -791,6 +801,7 @@ async def test_an_uppercase_no_proxy_wins_over_the_lowercase_one(
     assert _lines(http_proxy) == [f"GET {base_url}items/7 HTTP/1.1"]
 
 
+@_case_sensitive_environment
 def test_sync_an_uppercase_no_proxy_wins_over_the_lowercase_one(
     base_url: str, http_proxy: HTTPProxy, monkeypatch: pytest.MonkeyPatch
 ) -> None:
