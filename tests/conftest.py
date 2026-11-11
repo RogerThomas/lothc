@@ -1,4 +1,6 @@
+import os
 import ssl
+import sys
 from collections.abc import AsyncGenerator, Generator
 from pathlib import Path
 from uuid import uuid4
@@ -11,6 +13,14 @@ from _server import make_server, serve_in_background
 from _tls_server import serve_tls, tls_server_context
 
 from lothc import HTTPClient, SyncHTTPClient
+
+
+def pytest_configure() -> None:
+    # GitHub's macOS runners start a job's processes in the background (`PRIO_DARWIN_BG`), where
+    # macOS coalesces timers: a 0.02s sleep takes ~0.1s there, past the margins the timing tests
+    # keep. Taken out of it, this process times as it would on a developer's Mac.
+    if sys.platform == "darwin":
+        os.setpriority(os.PRIO_DARWIN_PROCESS, 0, 0)
 
 
 @pytest.fixture(scope="session", name="base_url")
