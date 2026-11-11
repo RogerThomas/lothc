@@ -12,6 +12,7 @@ as the caller asks (an idle limit reads it ahead on a worker thread instead).
 """
 
 import asyncio
+import os
 import time
 from collections.abc import AsyncGenerator, Generator
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -315,6 +316,49 @@ async def test_cancelling_a_request_waiting_for_a_slot_raises_cancelled_error(
             await waiting
         await holder
         assert (await client.get("items/7")).data == b'{"id": 7, "name": "item-7"}'
+
+
+# pyreqwest keeps running a request after its caller is cancelled: `spawn_handled` drops the task's
+# `JoinHandle`, which in tokio detaches the task instead of stopping it.
+_pyreqwest_runs_cancelled_requests = pytest.mark.xfail(
+    os.environ.get("LOTHC_TRANSPORT") != "native",
+    reason="pyreqwest keeps running a cancelled request in the background",
+    strict=True,
+)
+
+
+@_pyreqwest_runs_cancelled_requests
+async def test_a_request_cancelled_while_waiting_for_a_slot_is_never_sent(
+    base_url: str, server_key: str
+) -> None:
+    async with HTTPClient(base_url=base_url, max_connections=1) as client:
+        holder = asyncio.create_task(client.get("slow", params={"seconds": 0.2}))
+        await asyncio.sleep(0.05)
+        waiting = asyncio.create_task(client.get("flaky", params={"key": server_key}))
+        await asyncio.sleep(0.05)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        await holder
+        await asyncio.sleep(0.1)
+        hits = (await client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert hits == {"hits": 0}
+
+
+@_pyreqwest_runs_cancelled_requests
+async def test_a_request_cancelled_mid_response_gives_its_slot_back_at_once(base_url: str) -> None:
+    async with HTTPClient(base_url=base_url, max_connections=1) as client:
+        slow = asyncio.create_task(client.get("slow", params={"seconds": 1.0}))
+        await asyncio.sleep(0.1)
+        slow.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await slow
+        started = time.monotonic()
+        await client.get("items/7")
+        waited = time.monotonic() - started
+
+    assert waited < 0.5
 
 
 async def test_a_request_waiting_for_a_slot_when_the_client_closes_raises_runtime_error(
