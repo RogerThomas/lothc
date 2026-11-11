@@ -63,6 +63,10 @@ pub(crate) struct TlsSocket<T> {
     handshaking: bool,
     /// Records as received, before rustls decrypts them.
     rx: Box<[u8]>,
+    /// `rx[rx_start..rx_end]` is what rustls hasn't taken yet: the rest of a read, held back while
+    /// rustls has plaintext waiting to be read out (`poll_fill`).
+    rx_start: usize,
+    rx_end: usize,
     /// Plaintext out of rustls, before it is copied into hyper's buffer. Kept, so a read doesn't
     /// zero a fresh 16KB every time.
     plain: Box<[u8]>,
@@ -80,6 +84,8 @@ impl<T: Transport> TlsSocket<T> {
             tls,
             handshaking: true,
             rx: vec![0; RECORD_BUFFER].into_boxed_slice(),
+            rx_start: 0,
+            rx_end: 0,
             plain: vec![0; 16 * 1024].into_boxed_slice(),
         }
     }
@@ -97,32 +103,46 @@ impl<T: Transport> TlsSocket<T> {
         Poll::Ready(Ok(()))
     }
 
-    /// Feed one read's worth of records to rustls; `Ok(0)` is the peer closing the connection.
+    /// Feed records to rustls until it has plaintext waiting, reading the transport only once the
+    /// last read's records have all gone in; returns how many went in, `Ok(0)` being the peer
+    /// closing the connection. The rest of a read waits in `rx` while plaintext is waiting, as
+    /// tokio-rustls leaves it in the socket (`read_io` while `wants_read()`): past 16KB of
+    /// plaintext rustls refuses more records (`received plaintext buffer full`), and one read can
+    /// hold more than that, the rest of a full record followed by small ones.
     fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        let n = {
-            let mut received = hyper::rt::ReadBuf::new(&mut self.rx);
-            ready!(Pin::new(&mut self.io).poll_read(cx, received.unfilled()))?;
-            received.filled().len()
-        };
-        let mut records = &self.rx[..n];
+        if self.rx_start == self.rx_end {
+            let n = {
+                let mut received = hyper::rt::ReadBuf::new(&mut self.rx);
+                ready!(Pin::new(&mut self.io).poll_read(cx, received.unfilled()))?;
+                received.filled().len()
+            };
+            self.rx_start = 0;
+            self.rx_end = n;
+        }
+        let first = self.rx_start;
         loop {
             // An empty slice tells rustls the peer closed (EOF).
-            if let Err(error) = self.tls.read_tls(&mut records) {
-                return Poll::Ready(Err(error));
+            let mut records = &self.rx[self.rx_start..self.rx_end];
+            match self.tls.read_tls(&mut records) {
+                Ok(taken) => self.rx_start += taken,
+                Err(error) => return Poll::Ready(Err(error)),
             }
             if let Err(error) = self.tls.process_new_packets() {
                 // Send the alert rustls queued for the server; the error is what matters.
                 let _ = self.tls.write_tls(&mut TransportWriter { io: &mut self.io, cx });
                 return Poll::Ready(Err(tls_error(error)));
             }
-            if records.is_empty() {
-                if self.handshaking && !self.tls.is_handshaking() {
-                    self.handshaking = false;
-                    self.io.set_handshaking(false);
-                }
-                return Poll::Ready(Ok(n));
+            // `wants_read()` is false while plaintext waits to be read out or handshake messages
+            // to be sent, and once the peer's close_notify has come (rustls takes nothing after).
+            if self.rx_start == self.rx_end || !self.tls.wants_read() {
+                break;
             }
         }
+        if self.handshaking && !self.tls.is_handshaking() {
+            self.handshaking = false;
+            self.io.set_handshaking(false);
+        }
+        Poll::Ready(Ok(self.rx_start - first))
     }
 
     /// Run the handshake to its end, as tokio-rustls's `connect` does before handing the

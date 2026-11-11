@@ -602,6 +602,22 @@ class TestAppHandler(BaseHTTPRequestHandler):
                 self.wfile.write(block)
                 self._counters[written] += len(block)
 
+    def _handle_mixed_records(self, query: str) -> None:
+        # `rounds` rounds of one 16KB write then 150 one-byte writes, all zeros. Over TLS each
+        # write is a record of its own, so every full record is followed by tiny ones: read late,
+        # from a socket already full, one read holds more plaintext than rustls buffers (16KB).
+        # No Nagle, so the tiny writes don't wait on the client's ACKs.
+        rounds = int(parse_qs(query)["rounds"][0])
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(rounds * (16 * 1024 + 150)))
+        self.end_headers()
+        for _ in range(rounds):
+            self.wfile.write(bytes(16 * 1024))
+            for _ in range(150):
+                self.wfile.write(b"\x00")
+
     def _handle_counted_redirect(self, query: str) -> None:
         # A 302 to `to`, counting every request it gets (per `key`, read back via `/hits`), so a
         # test can tell how many times the whole chain was started over.
@@ -1189,6 +1205,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/stall-unframed": self._handle_stall_unframed,
             "/echo-request-sse": self._write_sse_echo_request,
             "/large": self._handle_large,
+            "/mixed-records": self._handle_mixed_records,
             "/compressed-zeros": self._handle_compressed_zeros,
             "/redirect-counted": self._handle_counted_redirect,
             "/slow-redirect": self._handle_slow_redirect,

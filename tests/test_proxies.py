@@ -1813,6 +1813,36 @@ def test_sync_a_large_body_crosses_an_https_proxy_both_ways(
     assert result.data["body"] == "x" * 300_000
 
 
+async def test_a_body_read_late_in_tls_records_of_mixed_sizes_crosses_an_https_proxy(
+    https_base_url: str, https_proxy: HTTPProxy, tls_ca_pem: bytes
+) -> None:
+    # `test_tls.py`'s case inside a tunnel: the origin's TLS records reach the tunnel's TLS as the
+    # origin wrote them, while the proxy's TLS carries them in records of its own sizes.
+    async with HTTPClient(
+        base_url=https_base_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        stream = client.stream_get("mixed-records", params={"rounds": 12})
+        received = len(await anext(stream))
+        await asyncio.sleep(0.1)
+        received += sum([len(chunk) async for chunk in stream])
+
+    assert received == 12 * (16 * 1024 + 150)
+
+
+def test_sync_a_body_read_late_in_tls_records_of_mixed_sizes_crosses_an_https_proxy(
+    https_base_url: str, https_proxy: HTTPProxy, tls_ca_pem: bytes
+) -> None:
+    with SyncHTTPClient(
+        base_url=https_base_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        stream = client.stream_get("mixed-records", params={"rounds": 12})
+        received = len(next(stream))
+        time.sleep(0.1)
+        received += sum(len(chunk) for chunk in stream)
+
+    assert received == 12 * (16 * 1024 + 150)
+
+
 @pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
 async def test_an_https_proxy_gets_its_credentials_as_proxy_authorization(
     tls_ca: trustme.CA, tls_ca_pem: bytes, server_url_fixture: str, request: pytest.FixtureRequest
