@@ -68,7 +68,9 @@ dev = [
     "trustme>=1.2.1",
     "ty>=0.0.74",
     "vulture>=2.16",
-    "yeetr[uvloop]>=2026.8.14.post1",
+    # uvloop doesn't support Windows.
+    "yeetr[uvloop]>=2026.8.14.post1; sys_platform != 'win32'",
+    "yeetr>=2026.8.14.post1; sys_platform == 'win32'",
     "zuban>=0.9.1",
 ]
 # The other HTTP clients perf.py races lothc against (plus requests' stubs, since `basedpyright .`
