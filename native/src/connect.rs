@@ -4,8 +4,8 @@
 //!
 //! - `resolve=` (reqwest's `DnsResolverWithOverrides`): a host named there, lowercased, takes its
 //!   addresses instead of the system resolver's, whatever the connection connects to (the origin,
-//!   or the proxy) and for a `socks5://` proxy's target, which reqwest resolves with the same
-//!   resolver. An IP address is never looked up, and the port is always the URL's (or the
+//!   or the proxy) and for a `socks4://` or `socks5://` proxy's target, which reqwest resolves
+//!   with the same resolver. An IP address is never looked up, and the port is always the URL's (or the
 //!   scheme's), since lothc gives each override port 0. The URL keeps its host, so `Host`, SNI and
 //!   the certificate check still use the name;
 //! - `local_address=`: each socket is bound to it, port 0, before connecting, but only for an
@@ -73,7 +73,8 @@ impl ConnectSettings {
         self.overrides.get(host)
     }
 
-    /// The `resolve=` override for a `socks5://` proxy's target (as the URL writes its host).
+    /// The `resolve=` override for a `socks4://` or `socks5://` proxy's target (as the URL writes
+    /// its host).
     pub(crate) fn socks_override(&self, host: &str) -> Option<IpAddr> {
         self.overrides.get(host).and_then(|addresses| addresses.first().copied())
     }
@@ -108,8 +109,8 @@ impl ConnectSettings {
         let _ = SockRef::from(&fd).set_tcp_keepalive(&self.keepalive);
     }
 
-    /// Where a `socks5://` proxy's target `host` resolves, first address only: its override, or
-    /// the system resolver's.
+    /// Where a `socks4://` or `socks5://` proxy's target `host` resolves, first address only: its
+    /// override, or the system resolver's.
     pub(crate) fn resolve_first(&self, host: &str) -> Result<Option<IpAddr>, Failure> {
         if let Some(ip) = self.socks_override(host) {
             return Ok(Some(ip));

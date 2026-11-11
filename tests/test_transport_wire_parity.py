@@ -4,7 +4,8 @@ reports what arrived (request line, every header in order with its casing, body)
 response's `RequestInfo`.
 
 Through a proxy, what's compared is what the proxy received (`_proxy_server.py` records it): the
-absolute-form request to an HTTP proxy, the `CONNECT` before a tunnel, the SOCKS5 handshake. That
+absolute-form request to an HTTP proxy, the `CONNECT` before a tunnel, an `https://` proxy's TLS
+handshake, the SOCKS5 handshake and the SOCKS4 request. That
 is also how every hop of a followed redirect and every attempt of a retried request is compared:
 the proxy sees them all.
 
@@ -24,8 +25,19 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 
 import pytest
+import trustme
 from _helpers import clear_proxy_variables, partial_body_seen
-from _proxy_server import HTTPProxy, SocksProxy, serve_http_proxy, serve_socks5_proxy
+from _proxy_server import (
+    HTTPProxy,
+    ProxyTLSHandshake,
+    Socks4Proxy,
+    SocksProxy,
+    serve_http_proxy,
+    serve_https_proxy,
+    serve_socks4_proxy,
+    serve_socks5_proxy,
+)
+from _tls_server import tls_server_context
 from msgspec import Struct
 from pydantic import BaseModel, Field
 
@@ -1093,6 +1105,121 @@ def test_sync_native_transport_speaks_socks5_as_pyreqwest_does(
 
         expected = _sync_seen(pyreqwest_client, _Case("socks"), origin), _taken_handshakes(proxy)
         actual = _sync_seen(native_client, _Case("socks"), origin), _taken_handshakes(proxy)
+
+    assert actual == expected
+
+
+def _taken_socks4(proxy: Socks4Proxy) -> list[bytes]:
+    received = [request.raw for request in proxy.requests]
+    proxy.requests.clear()
+    return received
+
+
+@pytest.mark.parametrize("userinfo", ["", "user:pass@"], ids=["no-credentials", "credentials"])
+@pytest.mark.parametrize("scheme", ["socks4", "socks4a"])
+async def test_native_transport_speaks_socks4_as_pyreqwest_does(
+    base_url: str, scheme: str, userinfo: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_proxy_variables(monkeypatch)
+    origin = base_url.replace("127.0.0.1", "localhost")
+    with serve_socks4_proxy() as proxy:
+        factory = partial(
+            HTTPClient,
+            base_url=origin,
+            proxy=f"{scheme}://{userinfo}{proxy.address}",
+            resolve={"localhost": "127.0.0.1"},
+        )
+        pyreqwest_client, native_client = _pair(factory, monkeypatch)
+
+        expected = await _async_seen(pyreqwest_client, _Case("socks"), origin), _taken_socks4(proxy)
+        actual = await _async_seen(native_client, _Case("socks"), origin), _taken_socks4(proxy)
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize("userinfo", ["", "user:pass@"], ids=["no-credentials", "credentials"])
+@pytest.mark.parametrize("scheme", ["socks4", "socks4a"])
+def test_sync_native_transport_speaks_socks4_as_pyreqwest_does(
+    base_url: str, scheme: str, userinfo: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clear_proxy_variables(monkeypatch)
+    origin = base_url.replace("127.0.0.1", "localhost")
+    with serve_socks4_proxy() as proxy:
+        factory = partial(
+            SyncHTTPClient,
+            base_url=origin,
+            proxy=f"{scheme}://{userinfo}{proxy.address}",
+            resolve={"localhost": "127.0.0.1"},
+        )
+        pyreqwest_client, native_client = _pair(factory, monkeypatch)
+
+        expected = _sync_seen(pyreqwest_client, _Case("socks"), origin), _taken_socks4(proxy)
+        actual = _sync_seen(native_client, _Case("socks"), origin), _taken_socks4(proxy)
+
+    assert actual == expected
+
+
+def _taken_over_tls(
+    proxy: HTTPProxy,
+) -> tuple[list[tuple[str, list[tuple[str, str]], bytes]], list[ProxyTLSHandshake]]:
+    """`_taken`, and the TLS handshakes the requests came over, forgotten once read."""
+    handshakes = list(proxy.tls_handshakes)
+    proxy.tls_handshakes.clear()
+    return _taken(proxy), handshakes
+
+
+@pytest.mark.parametrize("userinfo", ["", "us%20er:p%40ss@"], ids=["no-credentials", "credentials"])
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_native_transport_uses_an_https_proxy_as_pyreqwest_does(
+    tls_ca: trustme.CA,
+    tls_ca_pem: bytes,
+    server_url_fixture: str,
+    userinfo: str,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    clear_proxy_variables(monkeypatch)
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    case = _Case("over-tls", verb="post", call={"params": {"a": "b"}, "json": {"c": "d"}})
+    with serve_https_proxy(tls_server_context(tls_ca)) as proxy:
+        factory = partial(
+            HTTPClient,
+            base_url=server_url,
+            root_certificates=[tls_ca_pem],
+            proxy=proxy.url.replace("://", f"://{userinfo}"),
+        )
+        pyreqwest_client, native_client = _pair(factory, monkeypatch)
+
+        expected = await _async_seen(pyreqwest_client, case, server_url), _taken_over_tls(proxy)
+        actual = await _async_seen(native_client, case, server_url), _taken_over_tls(proxy)
+
+    assert actual == expected
+
+
+@pytest.mark.parametrize("userinfo", ["", "us%20er:p%40ss@"], ids=["no-credentials", "credentials"])
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_native_transport_uses_an_https_proxy_as_pyreqwest_does(
+    tls_ca: trustme.CA,
+    tls_ca_pem: bytes,
+    server_url_fixture: str,
+    userinfo: str,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    clear_proxy_variables(monkeypatch)
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    case = _Case("over-tls", verb="post", call={"params": {"a": "b"}, "json": {"c": "d"}})
+    with serve_https_proxy(tls_server_context(tls_ca)) as proxy:
+        factory = partial(
+            SyncHTTPClient,
+            base_url=server_url,
+            root_certificates=[tls_ca_pem],
+            proxy=proxy.url.replace("://", f"://{userinfo}"),
+        )
+        pyreqwest_client, native_client = _pair(factory, monkeypatch)
+
+        expected = _sync_seen(pyreqwest_client, case, server_url), _taken_over_tls(proxy)
+        actual = _sync_seen(native_client, case, server_url), _taken_over_tls(proxy)
 
     assert actual == expected
 

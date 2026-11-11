@@ -2,14 +2,20 @@
 //! rustls-platform-verifier, `root_certificates` as extra roots, `identity_pem` as the client
 //! cert, `min_tls_version`/`max_tls_version` filtering the protocol versions, ALPN `http/1.1`
 //! since lothc is HTTP/1.1-only), over the same non-blocking sockets as plain HTTP. rustls is
-//! sans-I/O: records read from the socket go into `read_tls` + `process_new_packets`, plaintext
-//! comes out of `reader()`, and whatever rustls wants sent (handshake, alerts, encrypted writes)
-//! goes out through `write_tls`.
+//! sans-I/O: records read from the transport go into `read_tls` + `process_new_packets`,
+//! plaintext comes out of `reader()`, and whatever rustls wants sent (handshake, alerts, encrypted
+//! writes) goes out through `write_tls`.
+//!
+//! The transport is a socket, or for a tunnel through an `https://` proxy, the TLS session to the
+//! proxy (`Transport`): reqwest's tokio-rustls stream over hyper-rustls's. Either way the session
+//! is set up with the same settings (the proxy's a clone of the client's config, ALPN cleared, as
+//! reqwest's `tls_proxy` is), so `root_certificates`, `danger_accept_invalid_certs`, the TLS
+//! versions and `identity_pem` apply to the proxy too.
+use std::future::poll_fn;
 use std::io::{self, Read as _, Write as _};
-use std::os::fd::RawFd;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{ready, Context, Poll};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::PyResult;
@@ -23,17 +29,24 @@ use rustls::{
 };
 
 use crate::error::ClientBuildError;
-use crate::io::{recv, send, Readiness};
+use crate::io::Transport;
 
-/// One `recv`'s worth of TLS records: a full record plus its header and tag.
+/// One read's worth of TLS records: a full record plus its header and tag.
 const RECORD_BUFFER: usize = 16 * 1024 + 256;
 
-/// `send(2)` for rustls's `write_tls`.
-struct FdWriter(RawFd);
+/// The transport as rustls's `write_tls` wants it, an `io::Write`: a write the transport can't
+/// take yet is `WouldBlock`, its wake-up already arranged by the transport.
+struct TransportWriter<'a, 'b, T> {
+    io: &'a mut T,
+    cx: &'a mut Context<'b>,
+}
 
-impl io::Write for FdWriter {
+impl<T: Transport> io::Write for TransportWriter<'_, '_, T> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        send(self.0, buf)
+        match Pin::new(&mut *self.io).poll_write(self.cx, buf) {
+            Poll::Ready(result) => result,
+            Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -41,10 +54,13 @@ impl io::Write for FdWriter {
     }
 }
 
-pub(crate) struct TlsSocket<R> {
-    fd: RawFd,
-    ready: R,
+pub(crate) struct TlsSocket<T> {
+    io: T,
     tls: ClientConnection,
+    /// Whether the handshake is still reported as under way (`Transport::set_handshaking`), so
+    /// its end is reported once: a session to a proxy, whose handshake ended long ago, mustn't
+    /// clear the flag the tunnel's TLS inside it has set.
+    handshaking: bool,
     /// Records as received, before rustls decrypts them.
     rx: Box<[u8]>,
     /// Plaintext out of rustls, before it is copied into hyper's buffer. Kept, so a read doesn't
@@ -56,50 +72,38 @@ fn tls_error(error: rustls::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
-impl<R: Readiness> TlsSocket<R> {
-    pub(crate) fn new(fd: RawFd, ready: R, tls: ClientConnection) -> Self {
-        ready.set_handshaking(true);
+impl<T: Transport> TlsSocket<T> {
+    pub(crate) fn new(io: T, tls: ClientConnection) -> Self {
+        io.set_handshaking(true);
         Self {
-            fd,
-            ready,
+            io,
             tls,
+            handshaking: true,
             rx: vec![0; RECORD_BUFFER].into_boxed_slice(),
             plain: vec![0; 16 * 1024].into_boxed_slice(),
         }
     }
 
-    /// Send everything rustls has queued. `Pending` means the socket's send buffer is full and a
-    /// wake-up for writability is arranged; what is left stays queued in rustls.
+    /// Send everything rustls has queued. `Pending` means the transport can't take more yet and
+    /// a wake-up for it is arranged; what is left stays queued in rustls.
     fn poll_flush_tls(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.tls.wants_write() {
-            match self.tls.write_tls(&mut FdWriter(self.fd)) {
+            match self.tls.write_tls(&mut TransportWriter { io: &mut self.io, cx }) {
                 Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.ready.wait_writable(cx);
-                    return Poll::Pending;
-                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Poll::Pending,
                 Err(error) => return Poll::Ready(Err(error)),
             }
         }
         Poll::Ready(Ok(()))
     }
 
-    /// Feed one `recv` worth of records to rustls; `Ok(0)` is the peer closing the connection.
+    /// Feed one read's worth of records to rustls; `Ok(0)` is the peer closing the connection.
     fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        if !self.ready.poll_readable(cx) {
-            return Poll::Pending;
-        }
-        let n = match recv(self.fd, &mut self.rx) {
-            Ok(n) => n,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                self.ready.wait_readable(cx);
-                return Poll::Pending;
-            }
-            Err(error) => return Poll::Ready(Err(error)),
+        let n = {
+            let mut received = hyper::rt::ReadBuf::new(&mut self.rx);
+            ready!(Pin::new(&mut self.io).poll_read(cx, received.unfilled()))?;
+            received.filled().len()
         };
-        if n > 0 && n < self.rx.len() {
-            self.ready.mark_drained();
-        }
         let mut records = &self.rx[..n];
         loop {
             // An empty slice tells rustls the peer closed (EOF).
@@ -108,20 +112,44 @@ impl<R: Readiness> TlsSocket<R> {
             }
             if let Err(error) = self.tls.process_new_packets() {
                 // Send the alert rustls queued for the server; the error is what matters.
-                let _ = self.tls.write_tls(&mut FdWriter(self.fd));
+                let _ = self.tls.write_tls(&mut TransportWriter { io: &mut self.io, cx });
                 return Poll::Ready(Err(tls_error(error)));
             }
             if records.is_empty() {
-                if !self.tls.is_handshaking() {
-                    self.ready.set_handshaking(false);
+                if self.handshaking && !self.tls.is_handshaking() {
+                    self.handshaking = false;
+                    self.io.set_handshaking(false);
                 }
                 return Poll::Ready(Ok(n));
             }
         }
     }
+
+    /// Run the handshake to its end, as tokio-rustls's `connect` does before handing the
+    /// session over, its last flight sent.
+    fn poll_handshake(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.tls.is_handshaking() {
+            ready!(self.poll_flush_tls(cx))?;
+            if ready!(self.poll_fill(cx))? == 0 {
+                return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, "tls handshake eof")));
+            }
+        }
+        self.poll_flush_tls(cx)
+    }
+
+    /// `poll_handshake` as a future.
+    pub(crate) async fn handshake(&mut self) -> io::Result<()> {
+        poll_fn(|cx| self.poll_handshake(cx)).await
+    }
 }
 
-impl<R: Readiness> hyper::rt::Read for TlsSocket<R> {
+impl<T: Transport> Transport for TlsSocket<T> {
+    fn set_handshaking(&self, handshaking: bool) {
+        self.io.set_handshaking(handshaking);
+    }
+}
+
+impl<T: Transport> hyper::rt::Read for TlsSocket<T> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -143,7 +171,7 @@ impl<R: Readiness> hyper::rt::Read for TlsSocket<R> {
                 Err(error) => return Poll::Ready(Err(error)),
             }
             // Handshake messages may be waiting to go out; a full send buffer doesn't stop the
-            // read, it only means the flush resumes when the socket is writable.
+            // read, it only means the flush resumes when the transport can take more.
             if let Poll::Ready(Err(error)) = this.poll_flush_tls(cx) {
                 return Poll::Ready(Err(error));
             }
@@ -156,7 +184,7 @@ impl<R: Readiness> hyper::rt::Read for TlsSocket<R> {
     }
 }
 
-impl<R: Readiness> hyper::rt::Write for TlsSocket<R> {
+impl<T: Transport> hyper::rt::Write for TlsSocket<T> {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
         loop {
@@ -166,13 +194,13 @@ impl<R: Readiness> hyper::rt::Write for TlsSocket<R> {
                 Err(error) => return Poll::Ready(Err(error)),
             };
             if n > 0 || buf.is_empty() {
-                // Push out what the socket takes now; the rest stays queued in rustls.
+                // Push out what the transport takes now; the rest stays queued in rustls.
                 if let Poll::Ready(Err(error)) = this.poll_flush_tls(cx) {
                     return Poll::Ready(Err(error));
                 }
                 return Poll::Ready(Ok(n));
             }
-            // rustls's buffer is full: drain it to the socket first, and if the handshake is
+            // rustls's buffer is full: drain it to the transport first, and if the handshake is
             // what holds the plaintext back, read the server's side of it.
             match this.poll_flush_tls(cx) {
                 Poll::Pending => return Poll::Pending,
@@ -195,14 +223,20 @@ impl<R: Readiness> hyper::rt::Write for TlsSocket<R> {
         }
     }
 
+    /// rustls's queue, then the transport's own (a proxy's TLS session, for a tunnel's).
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.get_mut().poll_flush_tls(cx)
+        let this = self.get_mut();
+        ready!(this.poll_flush_tls(cx))?;
+        Pin::new(&mut this.io).poll_flush(cx)
     }
 
+    /// close_notify, then the transport's own shutdown (a proxy's TLS session sends its own
+    /// close_notify), as tokio-rustls's stream does.
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
         this.tls.send_close_notify();
-        this.poll_flush_tls(cx)
+        ready!(this.poll_flush_tls(cx))?;
+        Pin::new(&mut this.io).poll_shutdown(cx)
     }
 }
 
@@ -376,4 +410,13 @@ impl TlsSettings {
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Arc::new(config))
     }
+}
+
+/// reqwest's `tls_proxy`: the client's config (`config`) with ALPN cleared, for the TLS to an
+/// `https://` proxy that carries a tunnel. A clone, so it shares the session cache, as reqwest's
+/// does. TLS to a proxy an http request is forwarded to uses the client's config itself.
+pub(crate) fn tunnel_config(config: &ClientConfig) -> Arc<ClientConfig> {
+    let mut config = config.clone();
+    config.alpn_protocols.clear();
+    Arc::new(config)
 }
