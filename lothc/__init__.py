@@ -61,3 +61,16 @@ __all__ = [
     "TokenResponseTyping",
     "TypedHeaders",
 ]
+
+
+# Report every public class as `lothc.<Name>`, the path callers import it from, rather than the
+# private module it lives in, so tracebacks and reprs read `lothc.HTTPResponseError` (httpx does
+# the same). Pickle still finds each class, since `lothc` exports it.
+def _report_as_public(namespace: dict[str, object], names: list[str], module: str) -> None:
+    for name in names:
+        exported = namespace[name]
+        if isinstance(exported, type):
+            exported.__module__ = module
+
+
+_report_as_public(globals(), __all__, __name__)

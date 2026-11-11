@@ -78,3 +78,15 @@ def test_no_pyreqwest_type_appears_in_the_public_api(module: ModuleType) -> None
             offenders[qualname] = sorted(set(found))
 
     assert offenders == {}
+
+
+@pytest.mark.parametrize("module", [lothc, lothc.testing], ids=["lothc", "lothc.testing"])
+def test_every_public_class_reports_the_module_it_is_imported_from(module: ModuleType) -> None:
+    wrong = {
+        name: exported.__module__
+        for name in module.__all__
+        if isinstance(exported := getattr(module, name), type)
+        and exported.__module__ != module.__name__
+    }
+
+    assert wrong == {}
