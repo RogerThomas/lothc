@@ -30,10 +30,10 @@ Issues = "https://github.com/RogerThomas/lothc/issues"
 [project.optional-dependencies]
 pydantic = ["pydantic>=2.12.5"]
 msgspec = ["msgspec>=0.19.0"]
-# Pins the pytest version lothc/testing.py's `lothc_mocker` fixture is tested against — pyreqwest
-# is already a hard dependency and ships its own `client_mocker` fixture that this one wraps, so
-# no extra transport-mocking dependency is needed here. NOTE: this extra does NOT gate whether the
-# fixture loads — see the [project.entry-points.pytest11] comment below.
+# Pins the pytest version lothc/testing.py's `lothc_mocker` fixture is tested against — its mock
+# engine is lothc's own (lothc/_mocking.py), so no extra transport-mocking dependency is needed
+# here. NOTE: this extra does NOT gate whether the fixture loads — see the
+# [project.entry-points.pytest11] comment below.
 testing = ["pytest>=9.0.2"]
 
 # Registers lothc/testing.py as a pytest plugin (the `lothc_mocker` fixture) — pytest discovers

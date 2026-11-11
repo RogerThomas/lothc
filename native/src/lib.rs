@@ -21,6 +21,7 @@
 //! - `proxy`: which proxy a request goes through, and the proxy handshakes, as reqwest's;
 //! - `redirect`: following redirects, as reqwest's default policy does;
 //! - `cookie`: `cookie_store=True`'s cookie jar, as reqwest's;
+//! - `mock`: how `lothc.testing`'s mocker answers a request a pool built, instead of the network;
 //! - `headers`: `RawHeaders`, a response's headers until `_LazyHeaders` reads them.
 mod body;
 mod connect;
@@ -31,6 +32,7 @@ mod headers;
 mod idle;
 mod io;
 mod limit;
+mod mock;
 mod multipart;
 mod pool;
 mod proxy;
@@ -44,10 +46,11 @@ mod tls;
 use pyo3::prelude::*;
 
 // Free-threading safe without the GIL: `Pool` keeps its state in a `ThreadBound`, usable only on
-// the thread that created it (another thread gets a `RuntimeError`), and a `Stream` reaches
-// only that state; `SyncPool` is frozen, with its mutable state (idle connections, the lazily
-// built TLS config, the cookie jar) behind locks and atomics, and so is a `SyncStream`, whose
-// state no call holds locked while it waits; `RawHeaders` is frozen and immutable.
+// the thread that created it (another thread gets a `RuntimeError`), and a `Stream` and an
+// `Intercepted` reach only that state; `SyncPool` is frozen, with its mutable state (idle
+// connections, the lazily built TLS config, the cookie jar) behind locks and atomics, and so are
+// a `SyncStream`, whose state no call holds locked while it waits, and a `SyncIntercepted`;
+// `RawHeaders` is frozen and immutable, and the mock hook sits behind a lock and an atomic.
 #[pymodule(gil_used = false)]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<pool::Pool>()?;
@@ -56,5 +59,8 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<sync_pool::SyncStream>()?;
     m.add_class::<headers::RawHeaders>()?;
     m.add_class::<connect::ConnectOptions>()?;
+    m.add_class::<pool::Intercepted>()?;
+    m.add_class::<sync_pool::SyncIntercepted>()?;
+    m.add_function(wrap_pyfunction!(mock::set_mock_hook, m)?)?;
     m.add("ClientBuildError", m.py().get_type::<error::ClientBuildError>())
 }

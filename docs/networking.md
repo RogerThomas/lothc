@@ -124,5 +124,5 @@ async with HTTPClient(base_url="https://api.example.com/", native=True) as clien
 
 `native=True` switches the client to lothc's experimental native transport, about twice as fast
 on `get(into=Struct)` in lothc's benchmarks. Not every setting is supported yet: an unsupported
-one raises `NotImplementedError` when the client is constructed. It isn't available on Windows,
-and `lothc.testing`'s mocker doesn't intercept its requests.
+one raises `NotImplementedError` when the client is constructed. It isn't available on Windows.
+`lothc.testing`'s mocker intercepts its requests exactly as it does the default transport's.

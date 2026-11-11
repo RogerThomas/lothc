@@ -95,6 +95,81 @@ class SyncStream:
     def close(self) -> None: ...
 
 @final
+class Intercepted:
+    """A request an async `Pool` built under a mock hook (`set_mock_hook`), handed to the hook's
+    `request` or `stream` instead of being sent: built by the pool's own request code as far as
+    pyreqwest's mock middleware sees one (no `accept`/`user-agent`/`accept-encoding`/`cookie`/
+    `host`, and no `data=`/`form=` body, which pyreqwest hands reqwest unseen). Answer it once."""
+
+    @property
+    def method(self) -> str: ...
+    @property
+    def url(self) -> str: ...
+    @property
+    def headers(self) -> list[tuple[str, str]]:
+        """In order, names lowercase; a value that isn't visible ASCII raises `ValueError`."""
+
+    @property
+    def body(self) -> bytes | None: ...
+    @property
+    def request_info(self) -> RequestInfo: ...
+    def send(self) -> asyncio.Future[Response[Any, Any]]:
+        """Send it for real, as `Pool.request` would have (failing as it does, scheme checks
+        included)."""
+
+    def cancel(self, fut: asyncio.Future[Response[Any, Any]]) -> None:
+        """`send`'s Future was cancelled: `Pool.cancel`."""
+
+    def stream(self) -> Stream:
+        """Prepare it for real, as `Pool.stream` would have, to `open`."""
+
+    def respond(
+        self, status: int, headers: Sequence[tuple[str, str]], body: bytes
+    ) -> Response[Any, Any]:
+        """Answer it: lothc's `Response` for this response, or the status error it raises, built
+        as `Pool.request`'s are (but never followed, decompressed or stored in the cookie jar)."""
+
+    def head(self, status: int, headers: Sequence[tuple[str, str]]) -> tuple[int, RawHeaders, str]:
+        """Answer a stream: the head its `open` resolves to."""
+
+@final
+class SyncIntercepted:
+    """`Intercepted` for a `SyncPool`, handed to the hook's `request_sync`/`stream_sync`."""
+
+    @property
+    def method(self) -> str: ...
+    @property
+    def url(self) -> str: ...
+    @property
+    def headers(self) -> list[tuple[str, str]]: ...
+    @property
+    def body(self) -> bytes | None: ...
+    @property
+    def request_info(self) -> RequestInfo: ...
+    def send(self) -> Response[Any, Any]: ...
+    def stream(self) -> SyncStream: ...
+    def respond(
+        self, status: int, headers: Sequence[tuple[str, str]], body: bytes
+    ) -> Response[Any, Any]: ...
+    def head(
+        self, status: int, headers: Sequence[tuple[str, str]]
+    ) -> tuple[int, RawHeaders, str]: ...
+
+class _MockHook(Protocol):
+    """What `set_mock_hook` installs: each pool hands it every request it would send. `stream`
+    and `stream_sync` return an object with `Stream`'s (or `SyncStream`'s) methods, which the
+    pools' `stream` then return."""
+
+    def request(self, intercepted: Intercepted, /) -> asyncio.Future[Response[Any, Any]]: ...
+    def stream(self, intercepted: Intercepted, /) -> object: ...
+    def request_sync(self, intercepted: SyncIntercepted, /) -> Response[Any, Any]: ...
+    def stream_sync(self, intercepted: SyncIntercepted, /) -> object: ...
+
+def set_mock_hook(hook: _MockHook | None) -> None:
+    """Install `hook` for every pool, in every thread (`None` removes it). Until then, a request
+    pays one atomic load for it."""
+
+@final
 class ConnectOptions:
     """A client's connection settings (`native/src/connect.rs`): `resolve` as (host, address)
     pairs, `local_address`, `tcp_keepalive`'s idle time (reqwest's 15s if `None`),

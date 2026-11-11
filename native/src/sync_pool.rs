@@ -66,8 +66,9 @@ use http::{Request, Response};
 use hyper::body::Incoming;
 use hyper::client::conn::http1;
 use pyo3::exceptions::PyRuntimeError;
+use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString, PyTuple};
+use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
 use rustls::pki_types::ServerName;
 use rustls::ClientConnection;
 use url::Url;
@@ -79,6 +80,7 @@ use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
 use crate::io::{has_input, shutdown, Carrier, PlainSocket, PollReady};
 use crate::limit::{checked_max_connections, SyncLimiter, SyncPermit};
+use crate::mock::{self, Call, Core, Settings};
 use crate::proxy::{Proxies, Route};
 use crate::redirect::Redirect;
 use crate::request::{connect_address, ClientConfig, DeadlineClock, OriginKey, Prepared, VerbHeaders};
@@ -1003,6 +1005,36 @@ impl SyncPool {
         Err(Failure::Transport("connection closed before the request could be sent".to_owned()))
     }
 
+    /// Send a prepared request and wait for its outcome: lothc's `Response`, or what it raises.
+    fn send_prepared<'py>(&self, py: Python<'py>, method: Py<PyString>, prepared: Prepared, settings: Settings) -> PyResult<Bound<'py, PyAny>> {
+        let Prepared { request, url, route, redirect, cookies } = prepared;
+        let Settings { decode, timeout, raises, typed_headers, headers_only } = settings;
+        let target = match Self::target(&url, route) {
+            Ok(target) => target,
+            Err(message) => return Err(self.glue.connection_error(py, message)),
+        };
+        let started = Instant::now();
+        let limits = Limits::new(self.clock, started, timeout, self.connect.read_timeout);
+        let result = match &self.limiter {
+            None => self.send_following(py, target, request, limits, redirect, cookies)?,
+            Some(limiter) => match py.detach(|| limiter.acquire(started, self.clock, limits.total)) {
+                // Given back once the body has been read, before it is decoded.
+                Ok(_permit) => self.send_following(py, target, request, limits.reading_from(Instant::now()), redirect, cookies)?,
+                Err(failure) => Err(failure),
+            },
+        };
+        let exchange = Exchange { method, url, decode, raises, typed_headers, headers_only, started };
+        self.glue.outcome(py, &exchange, result)
+    }
+
+    /// A prepared request's `SyncStream`, sending nothing until its `open`.
+    fn stream_prepared(slf: &Bound<'_, Self>, py: Python<'_>, method: &Bound<'_, PyString>, prepared: Prepared, timeout: Option<Duration>) -> PyResult<SyncStream> {
+        let Prepared { request, url, route, redirect, cookies } = prepared;
+        let request_info = slf.get().glue.request_info_of(py, method, &url)?.unbind();
+        let prepared = Box::new(PreparedStream { target: Self::target(&url, route), request, redirect, cookies });
+        Ok(SyncStream { pool: slf.clone().unbind(), request_info, timeout, state: Mutex::new(StreamState::Prepared(prepared)) })
+    }
+
     /// Where a request to `url` connects, and how; `Err` the connection error an https URL whose
     /// host can't be a certificate name raises.
     fn target(url: &Url, route: Route) -> Result<Target, String> {
@@ -1074,11 +1106,12 @@ impl SyncPool {
         })
     }
 
-    /// One blocking request: same arguments as `Pool.request`, returns lothc's `Response`.
+    /// One blocking request: same arguments as `Pool.request`, returns lothc's `Response`; under
+    /// a mock hook (`mock.rs`), whatever the hook's `request_sync` returns for it instead.
     #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, decode, timeout, raises, typed_headers, headers_only))]
     #[allow(clippy::too_many_arguments)]
     fn request<'py>(
-        &self,
+        slf: &Bound<'py, Self>,
         py: Python<'py>,
         method: Bound<'py, PyString>,
         path: &str,
@@ -1093,69 +1126,49 @@ impl SyncPool {
         typed_headers: Option<Py<PyAny>>,
         headers_only: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if self.shared.closed.load(Ordering::Relaxed) {
-            return Err(Glue::closed_error());
+        let settings = Settings { decode, timeout, raises, typed_headers, headers_only };
+        if let Some(hook) = mock::hook(py) {
+            let call = Call { path, query: query.as_ref(), headers: headers.as_ref(), auth, body: body.as_ref(), body_kind, verb_headers: VerbHeaders::default() };
+            let intercepted = SyncIntercepted::new(slf, py, method, call, settings)?;
+            return hook.bind(py).call_method1(intern!(py, "request_sync"), (intercepted,));
         }
-        let Prepared { request, url, route, redirect, cookies } = self.config.prepare(
-            py,
-            &self.glue,
-            method.to_str()?,
-            path,
-            query.as_ref(),
-            headers.as_ref(),
-            auth,
-            body.as_ref(),
-            body_kind,
-        )?;
-        let target = match Self::target(&url, route) {
-            Ok(target) => target,
-            Err(message) => return Err(self.glue.connection_error(py, message)),
-        };
-        let started = Instant::now();
-        let limits = Limits::new(self.clock, started, timeout, self.connect.read_timeout);
-        let result = match &self.limiter {
-            None => self.send_following(py, target, request, limits, redirect, cookies)?,
-            Some(limiter) => match py.detach(|| limiter.acquire(started, self.clock, limits.total)) {
-                // Given back once the body has been read, before it is decoded.
-                Ok(_permit) => self.send_following(py, target, request, limits.reading_from(Instant::now()), redirect, cookies)?,
-                Err(failure) => Err(failure),
-            },
-        };
-        let exchange = Exchange {
-            method: method.unbind(),
-            url,
-            decode,
-            raises,
-            typed_headers,
-            headers_only,
-            started,
-        };
-        self.glue.outcome(py, &exchange, result)
-    }
-
-    /// Prepare a streamed request (nothing is sent until its `open`): `Pool.stream`'s arguments.
-    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, timeout, accept, last_event_id))]
-    #[allow(clippy::too_many_arguments)]
-    fn stream(
-        slf: &Bound<'_, Self>,
-        py: Python<'_>,
-        method: Bound<'_, PyString>,
-        path: &str,
-        query: Option<Bound<'_, PyAny>>,
-        headers: Option<Bound<'_, PyAny>>,
-        auth: Option<&str>,
-        body: Option<Bound<'_, PyAny>>,
-        body_kind: u8,
-        timeout: Option<Duration>,
-        accept: Option<&str>,
-        last_event_id: Option<&str>,
-    ) -> PyResult<SyncStream> {
         let pool = slf.get();
         if pool.shared.closed.load(Ordering::Relaxed) {
             return Err(Glue::closed_error());
         }
+        let prepared = pool.config.prepare(py, &pool.glue, method.to_str()?, path, query.as_ref(), headers.as_ref(), auth, body.as_ref(), body_kind)?;
+        pool.send_prepared(py, method.unbind(), prepared, settings)
+    }
+
+    /// Prepare a streamed request (nothing is sent until its `open`): `Pool.stream`'s arguments;
+    /// under a mock hook, whatever its `stream_sync` returns, with `SyncStream`'s methods.
+    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, timeout, accept, last_event_id))]
+    #[allow(clippy::too_many_arguments)]
+    fn stream<'py>(
+        slf: &Bound<'py, Self>,
+        py: Python<'py>,
+        method: Bound<'py, PyString>,
+        path: &str,
+        query: Option<Bound<'py, PyAny>>,
+        headers: Option<Bound<'py, PyAny>>,
+        auth: Option<&str>,
+        body: Option<Bound<'py, PyAny>>,
+        body_kind: u8,
+        timeout: Option<Duration>,
+        accept: Option<&str>,
+        last_event_id: Option<&str>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let verb_headers = VerbHeaders::sse(accept, last_event_id)?;
-        let Prepared { request, url, route, redirect, cookies } = pool.config.prepare_with(
+        if let Some(hook) = mock::hook(py) {
+            let call = Call { path, query: query.as_ref(), headers: headers.as_ref(), auth, body: body.as_ref(), body_kind, verb_headers };
+            let intercepted = SyncIntercepted::new(slf, py, method, call, Settings { timeout, ..Settings::default() })?;
+            return hook.bind(py).call_method1(intern!(py, "stream_sync"), (intercepted,));
+        }
+        let pool = slf.get();
+        if pool.shared.closed.load(Ordering::Relaxed) {
+            return Err(Glue::closed_error());
+        }
+        let prepared = pool.config.prepare_with(
             py,
             &pool.glue,
             method.to_str()?,
@@ -1167,9 +1180,7 @@ impl SyncPool {
             body_kind,
             verb_headers,
         )?;
-        let request_info = pool.glue.request_info_of(py, &method, &url)?.unbind();
-        let prepared = Box::new(PreparedStream { target: Self::target(&url, route), request, redirect, cookies });
-        Ok(SyncStream { pool: slf.clone().unbind(), request_info, timeout, state: Mutex::new(StreamState::Prepared(prepared)) })
+        Ok(Bound::new(py, Self::stream_prepared(slf, py, &method, prepared, timeout)?)?.into_any())
     }
 
     /// Fail every request still running or waiting (see the module's doc) and drop every idle
@@ -1376,5 +1387,87 @@ impl SyncStream {
 
     fn __repr__(&self) -> &'static str {
         "<lothc._native.SyncStream>"
+    }
+}
+
+/// A request a `SyncPool` built under a mock hook, handed to the hook's `request_sync` or
+/// `stream_sync` (`mock.rs`) instead of being sent: `Intercepted`, for the sync pool.
+#[pyclass(frozen, module = "lothc._native")]
+pub(crate) struct SyncIntercepted {
+    pool: Py<SyncPool>,
+    core: Core,
+}
+
+impl SyncIntercepted {
+    fn new(pool: &Bound<'_, SyncPool>, py: Python<'_>, method: Bound<'_, PyString>, call: Call<'_, '_>, settings: Settings) -> PyResult<Py<Self>> {
+        let state = pool.get();
+        if state.shared.closed.load(Ordering::Relaxed) {
+            return Err(Glue::closed_error());
+        }
+        let core = Core::new(py, &state.config, &state.glue, method, call, settings)?;
+        Py::new(py, Self { pool: pool.clone().unbind(), core })
+    }
+
+    /// The staged request, finished for sending for real.
+    fn prepared(&self, py: Python<'_>) -> PyResult<Prepared> {
+        let pool = self.pool.get();
+        if pool.shared.closed.load(Ordering::Relaxed) {
+            return Err(Glue::closed_error());
+        }
+        pool.config.finish(py, &pool.glue, self.core.take()?)
+    }
+}
+
+#[pymethods]
+impl SyncIntercepted {
+    #[getter]
+    fn method(&self, py: Python<'_>) -> Py<PyString> {
+        self.core.method.clone_ref(py)
+    }
+
+    #[getter]
+    fn url(&self) -> &str {
+        self.core.url.as_str()
+    }
+
+    #[getter]
+    fn headers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        self.core.headers(py)
+    }
+
+    #[getter]
+    fn body<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.core.body(py)
+    }
+
+    #[getter]
+    fn request_info(&self, py: Python<'_>) -> Py<PyAny> {
+        self.core.request_info.clone_ref(py)
+    }
+
+    /// Send it for real, as the pool's `request` would have: its outcome.
+    fn send<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let prepared = self.prepared(py)?;
+        self.pool.get().send_prepared(py, self.core.method.clone_ref(py), prepared, self.core.settings.clone_ref(py))
+    }
+
+    /// Prepare it as the pool's `stream` would have, to open for real.
+    fn stream(&self, py: Python<'_>) -> PyResult<SyncStream> {
+        let prepared = self.prepared(py)?;
+        SyncPool::stream_prepared(self.pool.bind(py), py, self.core.method.bind(py), prepared, self.core.settings.timeout)
+    }
+
+    /// Answer it with the mock's response, as `Intercepted.respond`.
+    fn respond<'py>(&self, py: Python<'py>, status: u16, headers: &Bound<'py, PyAny>, body: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+        self.core.respond(py, &self.pool.get().glue, status, headers, body)
+    }
+
+    /// Answer a stream with the mock's response's head, as `Intercepted.head`.
+    fn head<'py>(&self, py: Python<'py>, status: u16, headers: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyTuple>> {
+        self.core.head(py, &self.pool.get().glue, status, headers)
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "<lothc._native.SyncIntercepted>"
     }
 }

@@ -22,6 +22,10 @@
 //! A redirect's hop (`redirect.rs`) starts from step 4's headers before the jar's `cookie` and
 //! `host`, as reqwest's redirect layer copies them, and gets its own of both, and its own request
 //! target.
+//!
+//! `prepare` is `stage` (what pyreqwest's builder does, through step 4's `json=` content type),
+//! then `finish` (what reqwest does while sending). A request `lothc.testing` mocks stops between
+//! the two (`mock.rs`), where pyreqwest's mock middleware sees one.
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -152,6 +156,21 @@ impl VerbHeaders {
             after: last_event_id.map(value).transpose()?.map(|value| (HeaderName::from_static("last-event-id"), value)),
         })
     }
+}
+
+/// A request built as far as pyreqwest's middleware sees one (`ClientConfig::stage`), which is
+/// where `lothc.testing`'s mocker takes over (`mock.rs`): steps 1-3 above and a `json=` body's
+/// content type, before anything reqwest checks or adds while sending it (`finish`).
+pub(crate) struct Staged {
+    method: Method,
+    pub(crate) url: Url,
+    pub(crate) headers: HeaderMap,
+    body: RequestBody,
+    /// The copy reqwest's redirect layer keeps of the body (`copyable`).
+    copy: Option<Bytes>,
+    /// The body as pyreqwest's middleware shows it, when `stage` was asked to keep it: a raw or
+    /// JSON body's bytes, but none for `data=` or `form=`, which pyreqwest hands reqwest unseen.
+    pub(crate) seen_body: Option<Bytes>,
 }
 
 pub(crate) struct Prepared {
@@ -509,11 +528,12 @@ impl ClientConfig {
         url.map_err(|e| PyValueError::new_err(e.to_string()))
     }
 
-    /// A body that's only bytes, and the copy reqwest's redirect layer keeps of it (made only
-    /// when the client follows redirects).
-    fn copyable(&self, bytes: Bytes) -> (RequestBody, Option<Bytes>) {
+    /// A body that's only bytes, the copy reqwest's redirect layer keeps of it (made only when the
+    /// client follows redirects), and, if `seen`, the bytes a mock sees (`Staged::seen_body`).
+    fn copyable(&self, bytes: Bytes, seen: bool) -> (RequestBody, Option<Bytes>, Option<Bytes>) {
         let copy = self.redirects.is_some().then(|| bytes.clone());
-        (RequestBody::full(bytes), copy)
+        let seen = seen.then(|| bytes.clone());
+        (RequestBody::full(bytes), copy, seen)
     }
 
     /// Everything about a request but the connection. Fails before any I/O: a `ValueError` for
@@ -551,6 +571,28 @@ impl ClientConfig {
         body_kind: u8,
         verb_headers: VerbHeaders,
     ) -> PyResult<Prepared> {
+        let staged = self.stage(py, glue, method_name, path, query, headers, auth, body, body_kind, verb_headers, false)?;
+        self.finish(py, glue, staged)
+    }
+
+    /// The request as pyreqwest's builder makes it, failing as its `build()` does (everything
+    /// `prepare` raises but the scheme checks, which reqwest makes while sending); with
+    /// `keep_seen`, keeping the body a mock sees.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn stage(
+        &self,
+        py: Python<'_>,
+        glue: &Glue,
+        method_name: &str,
+        path: &str,
+        query: Option<&Bound<'_, PyAny>>,
+        headers: Option<&Bound<'_, PyAny>>,
+        auth: Option<&str>,
+        body: Option<&Bound<'_, PyAny>>,
+        body_kind: u8,
+        verb_headers: VerbHeaders,
+        keep_seen: bool,
+    ) -> PyResult<Staged> {
         let method = method(method_name)?;
         let mut url = self.url(path)?;
         let mut reqwest_headers = HeaderMap::new();
@@ -594,24 +636,25 @@ impl ClientConfig {
             replacement.insert(name, value);
             set_request_headers(&mut defaults, &mut own, replacement)?;
         }
-        // The body as sent, and a copy for a redirect's next hop: `None` for a multipart body
-        // with parts, which reqwest streams, so its redirect layer can't copy it.
-        let (body, copy) = match body {
-            None => self.copyable(Bytes::new()),
+        // The body as sent, a copy for a redirect's next hop (`None` for a multipart body with
+        // parts, which reqwest streams, so its redirect layer can't copy it), and what a mock sees.
+        let (body, copy, seen_body) = match body {
+            None => self.copyable(Bytes::new(), false),
             Some(body) => match body_kind {
                 BODY_RAW => match body.cast::<PyBytes>() {
-                    Ok(bytes) => self.copyable(Bytes::copy_from_slice(bytes.as_bytes())),
-                    Err(_) => self.copyable(Bytes::from(body.extract::<String>()?)),
+                    Ok(bytes) => self.copyable(Bytes::copy_from_slice(bytes.as_bytes()), keep_seen),
+                    Err(_) => self.copyable(Bytes::from(body.extract::<String>()?), keep_seen),
                 },
                 BODY_ENCODED_JSON => {
                     let mut content_type = HeaderMap::with_capacity(1);
                     content_type.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                     set_request_headers(&mut defaults, &mut own, content_type)?;
-                    self.copyable(Bytes::copy_from_slice(body.cast::<PyBytes>()?.as_bytes()))
+                    self.copyable(Bytes::copy_from_slice(body.cast::<PyBytes>()?.as_bytes()), keep_seen)
                 }
                 BODY_JSON => {
                     let value: serde_json::Value = pythonize::depythonize(body)?;
-                    self.copyable(Bytes::from(serde_json::to_vec(&value).map_err(|e| PyValueError::new_err(e.to_string()))?))
+                    let bytes = serde_json::to_vec(&value).map_err(|e| PyValueError::new_err(e.to_string()))?;
+                    self.copyable(Bytes::from(bytes), keep_seen)
                 }
                 BODY_FORM => {
                     let mut serializer = Serializer::new(String::new());
@@ -623,18 +666,20 @@ impl ClientConfig {
                     if let Entry::Vacant(entry) = reqwest_headers.try_entry(CONTENT_TYPE).map_err(too_many_headers)? {
                         entry.insert(HeaderValue::from_static("application/x-www-form-urlencoded"));
                     }
-                    self.copyable(Bytes::from(serializer.finish()))
+                    self.copyable(Bytes::from(serializer.finish()), false)
                 }
-                BODY_MULTIPART => multipart_body(body, &mut reqwest_headers)?,
+                BODY_MULTIPART => {
+                    let (body, copy) = multipart_body(body, &mut reqwest_headers)?;
+                    (body, copy, None)
+                }
                 other => return Err(PyValueError::new_err(format!("unknown body kind {other}"))),
             },
         };
         if unsupported {
             return Err(glue.builder_error(py, "builder error: unsupported value".to_owned()));
         }
-        // reqwest's `IntoUrl` (a URL without a host) and `execute_request` (the scheme) checks.
-        let scheme = url.scheme();
-        if !url.has_host() || (scheme != "http" && scheme != "https") || (self.https_only && scheme != "https") {
+        // reqwest's `IntoUrl` check, made as the request is built: a URL without a host.
+        if !url.has_host() {
             return Err(glue.builder_error(py, format!("builder error for url ({url}): URL scheme is not allowed")));
         }
 
@@ -647,6 +692,17 @@ impl ClientConfig {
         }
         if body_kind == BODY_JSON {
             headers.try_insert(CONTENT_TYPE, HeaderValue::from_static("application/json")).map_err(too_many_headers)?;
+        }
+        Ok(Staged { method, url, headers, body, copy, seen_body })
+    }
+
+    /// Step 4 for a staged request: what reqwest checks and adds while sending it, from its
+    /// `execute_request` (the scheme, then its client defaults and proxy credentials) inward.
+    pub(crate) fn finish(&self, py: Python<'_>, glue: &Glue, staged: Staged) -> PyResult<Prepared> {
+        let Staged { method, url, mut headers, body, copy, .. } = staged;
+        let scheme = url.scheme();
+        if scheme != "https" && (self.https_only || scheme != "http") {
+            return Err(glue.builder_error(py, format!("builder error for url ({url}): URL scheme is not allowed")));
         }
         for (name, value) in &self.client_headers {
             if let Entry::Vacant(entry) = headers.try_entry(name).map_err(too_many_headers)? {

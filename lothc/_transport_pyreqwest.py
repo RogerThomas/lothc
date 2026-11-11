@@ -33,6 +33,7 @@ from pyreqwest.exceptions import RequestError as PyreqwestRequestError
 from pyreqwest.exceptions import RequestTimeoutError as PyreqwestRequestTimeoutError
 from pyreqwest.exceptions import TransportError as PyreqwestTransportError
 from pyreqwest.middleware import Next, SyncNext
+from pyreqwest.middleware.types import Middleware, SyncMiddleware
 from pyreqwest.proxy import ProxyBuilder
 from pyreqwest.request import (
     BaseRequestBuilder,
@@ -169,7 +170,24 @@ def _request_info(request: Request) -> RequestInfo:
     return RequestInfo(method=request.method, url=str(url), path=url.path, host=url.host_str)
 
 
+@dataclass(slots=True)
+class _PyreqwestMockHook:
+    """`lothc.testing`'s mocker on this transport, set by `_mocking.py` while a `lothc_mocker`
+    fixture is active and added to every request as it's built, so it sees whatever any client
+    sends, however and whenever that client was made. A request's own middleware runs after the
+    client's (retries, re-authentication), so a retry asks the mocks again, and before reqwest
+    sends anything, so a mocked 3xx is never followed. Unmocked, a request pays one read of it."""
+
+    middleware: Middleware | None = None
+    sync_middleware: SyncMiddleware | None = None
+
+
+_mock_hook = _PyreqwestMockHook()
+
+
 async def _send(request_builder: RequestBuilder) -> tuple[RawResponse, RequestInfo]:
+    if (mock := _mock_hook.middleware) is not None:
+        request_builder = request_builder.with_middleware(mock)
     # `.build()` (not just `.send()`) can raise — e.g. `BuilderError` when `https_only=True`
     # rejects a plain-http URL — so it must be inside this same try, not called by the caller
     # beforehand, or that exception type leaks past this translation layer entirely.
@@ -182,6 +200,8 @@ async def _send(request_builder: RequestBuilder) -> tuple[RawResponse, RequestIn
 
 
 def _send_sync(request_builder: SyncRequestBuilder) -> tuple[RawSyncResponse, RequestInfo]:
+    if (mock := _mock_hook.sync_middleware) is not None:
+        request_builder = request_builder.with_middleware(mock)
     try:
         built = request_builder.build()
         request_info = _request_info(built)
@@ -637,7 +657,10 @@ class _PyreqwestStreamSource:
         # happens, and makes a slow (say, 1KB/s) download look silent for over a minute to the
         # idle limit. 1 forces it to hand over whatever it has as soon as it has it. Measured: no
         # throughput cost (100MB in 79ms vs 80ms on the default).
-        request = self._request_builder.streamed_read_buffer_limit(1).build_streamed()
+        request_builder = self._request_builder.streamed_read_buffer_limit(1)
+        if (mock := _mock_hook.middleware) is not None:
+            request_builder = request_builder.with_middleware(mock)
+        request = request_builder.build_streamed()
         request_info = self._info = _request_info(request)
         raw_response = await stack.enter_async_context(request)
         if self._check_status is not None:
@@ -678,7 +701,10 @@ class _SyncPyreqwestStreamSource:
         if self._request_builder is None:
             raise RuntimeError("The stream was opened before it was prepared")
         # See the matching comment in `_PyreqwestStreamSource.open`.
-        request = self._request_builder.streamed_read_buffer_limit(1).build_streamed()
+        request_builder = self._request_builder.streamed_read_buffer_limit(1)
+        if (mock := _mock_hook.sync_middleware) is not None:
+            request_builder = request_builder.with_middleware(mock)
+        request = request_builder.build_streamed()
         request_info = self._info = _request_info(request)
         raw_response = stack.enter_context(request)
         if self._check_status is not None:

@@ -76,7 +76,7 @@ use hyper::client::conn::http1;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString};
+use pyo3::types::{PyBytes, PyList, PyString, PyTuple};
 use rustls::pki_types::ServerName;
 use rustls::ClientConnection;
 
@@ -87,9 +87,10 @@ use crate::error::{error_chain, Failure};
 use crate::idle::IdlePolicy;
 use crate::io::{has_input, shutdown, Carrier, LoopReady, PlainSocket, Stream};
 use crate::limit::{checked_max_connections, Permits};
+use crate::mock::{self, Call, Core, Settings};
 use crate::proxy::{Proxies, Route};
 use crate::redirect::{Hop, Redirect};
-use crate::request::{connect_address, ClientConfig, DeadlineClock, OriginKey, VerbHeaders};
+use crate::request::{connect_address, ClientConfig, DeadlineClock, OriginKey, Prepared, VerbHeaders};
 use crate::response::{fetch, send, Exchange, Fetched, Glue, Head, Sender};
 use crate::stream::{BodyStream, Channel};
 use crate::tls::{tunnel_config, TlsSettings};
@@ -1363,6 +1364,13 @@ impl PoolState {
         }
         let prepared =
             self.config.prepare(py, &self.glue, method.to_str()?, path, query, headers, auth, body, body_kind)?;
+        let settings = Settings { decode, timeout, raises, typed_headers, headers_only };
+        self.submit(py, method.unbind(), prepared, settings)
+    }
+
+    /// Queue a prepared request: the Future it resolves.
+    fn submit(&mut self, py: Python<'_>, method: Py<PyString>, prepared: Prepared, settings: Settings) -> PyResult<Py<PyAny>> {
+        let Settings { decode, timeout, raises, typed_headers, headers_only } = settings;
         let origin = self.origin_for(&prepared.url, prepared.route);
         let fut = self.event_loop.create_future.call0(py)?;
         let started = Instant::now();
@@ -1372,7 +1380,7 @@ impl PoolState {
             redirect: prepared.redirect,
             cookies: prepared.cookies,
             exchange: Exchange {
-                method: method.unbind(),
+                method,
                 url: prepared.url,
                 decode,
                 raises,
@@ -1413,6 +1421,11 @@ impl PoolState {
         }
         let prepared =
             self.config.prepare_with(py, &self.glue, method.to_str()?, path, query, headers, auth, body, body_kind, verb_headers)?;
+        self.add_stream(py, method, prepared, timeout)
+    }
+
+    /// Give a prepared stream its slot, sending nothing yet (`prepare_stream`).
+    fn add_stream(&mut self, py: Python<'_>, method: Bound<'_, PyString>, prepared: Prepared, timeout: Option<Duration>) -> PyResult<(usize, u32, Py<PyAny>)> {
         let request_info = self.glue.request_info_of(py, &method, &prepared.url)?.unbind();
         let origin = self.origin_for(&prepared.url, prepared.route);
         let fut = self.event_loop.create_future.call0(py)?;
@@ -1717,11 +1730,12 @@ impl Pool {
         Ok(())
     }
 
-    /// Start a request and return the asyncio Future it resolves (see `response.rs`).
+    /// Start a request and return the asyncio Future it resolves (see `response.rs`); under a
+    /// mock hook (`mock.rs`), whatever the hook's `request` returns for it instead.
     #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, decode, timeout, raises, typed_headers, headers_only))]
     #[allow(clippy::too_many_arguments)]
     fn request(
-        &mut self,
+        slf: &Bound<'_, Self>,
         py: Python<'_>,
         method: Bound<'_, PyString>,
         path: &str,
@@ -1736,7 +1750,13 @@ impl Pool {
         typed_headers: Option<Py<PyAny>>,
         headers_only: bool,
     ) -> PyResult<Py<PyAny>> {
-        self.state.get_mut()?.request(
+        if let Some(hook) = mock::hook(py) {
+            let call = Call { path, query: query.as_ref(), headers: headers.as_ref(), auth, body: body.as_ref(), body_kind, verb_headers: VerbHeaders::default() };
+            let settings = Settings { decode, timeout, raises, typed_headers, headers_only };
+            let intercepted = Intercepted::new(slf, py, method, call, settings)?;
+            return hook.call_method1(py, intern!(py, "request"), (intercepted,));
+        }
+        slf.try_borrow_mut()?.state.get_mut()?.request(
             py,
             method,
             path,
@@ -1755,7 +1775,8 @@ impl Pool {
 
     /// Prepare a streamed request (nothing is sent until its `open`): `request`'s arguments, less
     /// the decoding and status check (Python reads an error's body itself), plus `accept` and
-    /// `last_event_id`, the headers `sse()` sets.
+    /// `last_event_id`, the headers `sse()` sets. Under a mock hook, whatever its `stream`
+    /// returns, with `Stream`'s methods.
     #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, timeout, accept, last_event_id))]
     #[allow(clippy::too_many_arguments)]
     fn stream(
@@ -1771,8 +1792,13 @@ impl Pool {
         timeout: Option<Duration>,
         accept: Option<&str>,
         last_event_id: Option<&str>,
-    ) -> PyResult<AsyncStream> {
+    ) -> PyResult<Py<PyAny>> {
         let verb_headers = VerbHeaders::sse(accept, last_event_id)?;
+        if let Some(hook) = mock::hook(py) {
+            let call = Call { path, query: query.as_ref(), headers: headers.as_ref(), auth, body: body.as_ref(), body_kind, verb_headers };
+            let intercepted = Intercepted::new(slf, py, method, call, Settings { timeout, ..Settings::default() })?;
+            return hook.call_method1(py, intern!(py, "stream"), (intercepted,));
+        }
         let (slot, generation, request_info) = slf.try_borrow_mut()?.state.get_mut()?.prepare_stream(
             py,
             method,
@@ -1785,7 +1811,7 @@ impl Pool {
             timeout,
             verb_headers,
         )?;
-        Ok(AsyncStream { pool: slf.clone().unbind(), slot, generation, request_info })
+        Ok(Py::new(py, AsyncStream { pool: slf.clone().unbind(), slot, generation, request_info })?.into_any())
     }
 
     /// Python finished `sock_connect` for connection `conn`; `fd` is its socket, and `resolved`
@@ -1872,5 +1898,107 @@ impl AsyncStream {
 
     fn __repr__(&self) -> &'static str {
         "<lothc._native.Stream>"
+    }
+}
+
+/// A request an async `Pool` built under a mock hook, handed to the hook's `request` or `stream`
+/// (`mock.rs`) instead of being sent: what the mock sees of it, and the ways to answer it.
+#[pyclass(frozen, module = "lothc._native")]
+pub(crate) struct Intercepted {
+    pool: Py<Pool>,
+    core: Core,
+}
+
+impl Intercepted {
+    fn new(pool: &Bound<'_, Pool>, py: Python<'_>, method: Bound<'_, PyString>, call: Call<'_, '_>, settings: Settings) -> PyResult<Py<Self>> {
+        let core = {
+            let mut borrowed = pool.try_borrow_mut()?;
+            let state = borrowed.state.get_mut()?;
+            if state.is_closed {
+                return Err(Glue::closed_error());
+            }
+            Core::new(py, &state.config, &state.glue, method, call, settings)?
+        };
+        Py::new(py, Self { pool: pool.clone().unbind(), core })
+    }
+
+    fn with<T>(&self, py: Python<'_>, call: impl FnOnce(&mut PoolState) -> PyResult<T>) -> PyResult<T> {
+        let mut pool = self.pool.bind(py).try_borrow_mut()?;
+        call(pool.state.get_mut()?)
+    }
+
+    /// The staged request, finished for sending for real.
+    fn prepared(&self, py: Python<'_>, state: &PoolState) -> PyResult<Prepared> {
+        if state.is_closed {
+            return Err(Glue::closed_error());
+        }
+        state.config.finish(py, &state.glue, self.core.take()?)
+    }
+}
+
+#[pymethods]
+impl Intercepted {
+    #[getter]
+    fn method(&self, py: Python<'_>) -> Py<PyString> {
+        self.core.method.clone_ref(py)
+    }
+
+    #[getter]
+    fn url(&self) -> &str {
+        self.core.url.as_str()
+    }
+
+    #[getter]
+    fn headers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        self.core.headers(py)
+    }
+
+    #[getter]
+    fn body<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.core.body(py)
+    }
+
+    #[getter]
+    fn request_info(&self, py: Python<'_>) -> Py<PyAny> {
+        self.core.request_info.clone_ref(py)
+    }
+
+    /// Send it for real, as the pool's `request` would have: its Future.
+    fn send(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let settings = self.core.settings.clone_ref(py);
+        self.with(py, |state| {
+            let prepared = self.prepared(py, state)?;
+            state.submit(py, self.core.method.clone_ref(py), prepared, settings)
+        })
+    }
+
+    /// `send`'s Future was cancelled: as the pool's `cancel`.
+    fn cancel(&self, py: Python<'_>, fut: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.with(py, |state| state.cancel(py, fut))
+    }
+
+    /// Prepare it as the pool's `stream` would have, to open for real.
+    fn stream(&self, py: Python<'_>) -> PyResult<AsyncStream> {
+        let method = self.core.method.bind(py).clone();
+        let (slot, generation, request_info) = self.with(py, |state| {
+            let prepared = self.prepared(py, state)?;
+            state.add_stream(py, method, prepared, self.core.settings.timeout)
+        })?;
+        Ok(AsyncStream { pool: self.pool.clone_ref(py), slot, generation, request_info })
+    }
+
+    /// Answer it with the mock's response: what the pool's `request` resolves to for that
+    /// response (lothc's `Response`, or the status error it raises).
+    fn respond<'py>(&self, py: Python<'py>, status: u16, headers: &Bound<'py, PyAny>, body: &[u8]) -> PyResult<Py<PyAny>> {
+        self.with(py, |state| Ok(self.core.respond(py, &state.glue, status, headers, body)?.unbind()))
+    }
+
+    /// Answer a stream with the mock's response's head, as its `open` resolves to.
+    fn head<'py>(&self, py: Python<'py>, status: u16, headers: &Bound<'py, PyAny>) -> PyResult<Py<PyTuple>> {
+        self.with(py, |state| Ok(self.core.head(py, &state.glue, status, headers)?.unbind()))
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "<lothc._native.Intercepted>"
     }
 }
