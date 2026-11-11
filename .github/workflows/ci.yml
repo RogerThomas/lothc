@@ -31,6 +31,11 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
+      # The extension's dependencies, built once per job and Python version.
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: native
+          key: ${{ matrix.python-version }}
       - run: uv sync --all-extras --group dev --group perf
       - run: uv run ruff check .
       - run: uv run ruff format --check .
@@ -82,6 +87,11 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
+      # The extension's dependencies, built once per job and Python version.
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: native
+          key: ${{ matrix.python-version }}
       - run: uv sync --all-extras --no-default-groups --group dev
       - run: uv run --no-sync python -c "import sys; assert not sys._is_gil_enabled(), 'GIL is on'"
       - run: uv run --no-sync pytest tests
@@ -107,9 +117,15 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: native
       - run: uv sync --all-extras --no-default-groups --group dev
+      - if: runner.os == 'macOS'
+        run: uv run --no-sync python experiments/ci_diag.py
       - run: uv run --no-sync pytest tests
-      - if: runner.os != 'Windows'
+      # Even after a failure on pyreqwest, so each transport's result shows.
+      - if: ${{ !cancelled() && runner.os != 'Windows' }}
         run: uv run --no-sync pytest tests $NATIVE_DESELECT
         env:
           LOTHC_TRANSPORT: native
@@ -125,6 +141,9 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: "3.13"
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: native
       # The locked dev group minus the two extras, rather than a hand-picked `pytest ...` list,
       # so a new test-only dependency (e.g. trustme) can't silently break this job.
       - run: >-
