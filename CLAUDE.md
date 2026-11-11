@@ -129,8 +129,8 @@ or editing Python here.
   only accepted difference is that a transport error's `str()` is a flat cause chain. Crate pins
   follow pyreqwest 0.15.0's lockfile, and each feature uses reqwest's own crates where they exist
   (hyper-util's proxy matcher, compression-codecs), never a hand port.
-- **Anything unported raises `NotImplementedError`**, never a silent difference: HTTP/2,
-  `https://` and SOCKS4 proxies, and `lothc.testing`'s mocker, which patches pyreqwest.
+- **Anything unported raises `NotImplementedError`**, never a silent difference: HTTP/2, and
+  `lothc.testing`'s mocker, which patches pyreqwest.
 - **Known differences that don't raise:**
   - `form=` files are read on the loop thread in reads of up to 64 KiB (pyreqwest reads them off
     it), so a slow filesystem stalls the loop.
@@ -157,7 +157,7 @@ or editing Python here.
   used, so `http2=True` stays on pyreqwest.
 - **The mocker will run through native's own request code** (decided 2026-11-10), answering from
   Python handlers instead of the network, so mocked tests still see the exact request sent.
-- **Not built yet:** the mocker, SOCKS4 and `https://` proxies, and wheels.
+- **Not built yet:** the mocker and wheels.
 
 ## Decisions
 
