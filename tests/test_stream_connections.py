@@ -291,7 +291,10 @@ def test_sync_a_stream_given_up_waiting_for_its_head_leaves_the_client_working(
             next(stream)
         stream.close()
 
-        assert client.get("items/7", into=dict).data == {"id": 7, "name": "item-7"}
+        # Not held up until the abandoned request ends, 0.25s on: a new connection's connect and
+        # exchange had to fit in the client's 0.05s, which a stalled machine outlasted.
+        response = client.get("items/7", into=dict, timeout=0.2)
+        assert response.data == {"id": 7, "name": "item-7"}
 
 
 async def test_a_stream_given_up_mid_read_leaves_the_client_working(client: HTTPClient) -> None:
@@ -313,7 +316,9 @@ def test_sync_a_stream_given_up_mid_read_leaves_the_client_working(base_url: str
             next(stream)
         stream.close()
 
-        assert client.get("items/7", into=dict).data == {"id": 7, "name": "item-7"}
+        # As above: not held up until the parked read ends.
+        response = client.get("items/7", into=dict, timeout=0.2)
+        assert response.data == {"id": 7, "name": "item-7"}
 
 
 async def test_a_stream_with_a_revoked_token_is_retried_with_a_fresh_one(
