@@ -129,20 +129,21 @@ there's demand for an httpx/aiohttp/niquests backend, the author is happy to con
 lothc is built on top of the awesome [pyreqwest](https://github.com/MarkusSintonen/pyreqwest)
 package — a Rust-based HTTP client for Python. lothc then adds some nice abstractions on top of that
 (discussed in the other sections of these docs): typed decode targets, retries, SSE, streaming,
-and so on, adding a bit of Python-level overhead compared to calling pyreqwest directly. However, the
-actual HTTP work still happens in Rust, so lothc's throughput stays close to pyreqwest's own, and
-both are far faster than pure-Python HTTP libraries. With msgspec, whose decoder is native C, that
-overhead is almost nil, as the benchmarks below show.
+and so on. On pyreqwest, lothc's throughput stays close to pyreqwest's own, and far ahead of
+pure-Python HTTP libraries.
 
-![HTTP client throughput race — lothc and pyreqwest finish in well under a fifth of a second, other libraries take much longer](assets/perf-race.svg){: .perf-race-img }
+With `native=True`, lothc goes further: its own native transport (see
+[Networking](networking.md)) runs async `get(into=Struct)` at about **2.2x bare pyreqwest** under
+load, 97,501 requests a second decoding into a msgspec `Struct`.
 
-Benchmarked with `perf.py` against a tiny Rust-based static JSON server, 10,000 requests at
-concurrency 100 — including lothc's fully-typed decode targets (`into=` a msgspec
+![HTTP client throughput race — lothc's native transport finishes first, at more than twice pyreqwest's throughput, and other libraries take much longer](assets/perf-race.svg){: .perf-race-img }
+
+Benchmarked with `perf.py` on an AWS `c8a.xlarge`, 50,000 requests at concurrency 100 against a
+tiny Rust-based JSON server — including lothc's fully-typed decode targets (`into=` a msgspec
 `Struct` or a pydantic `BaseModel`), not just raw bytes or an untyped dict. The object handed back
 from those runs isn't just parsed JSON — it's a real, constructed, field-validated instance of
 your own type, and that validation cost is included in the numbers, not benchmarked around.
-Decoding into a real msgspec `Struct` even edged out the unvalidated dict path in this run. See
-[Benchmarks](benchmarks.md) for the full numbers behind the chart above.
+See [Benchmarks](benchmarks.md) for the full numbers behind the chart above.
 
 ## Highlights
 
