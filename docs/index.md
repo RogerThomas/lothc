@@ -22,6 +22,11 @@ uv add 'lothc[pydantic,msgspec]'
 
 Any subset of the extras works — the base package alone gets you `bytes`/`dict` support.
 
+Wheels cover Linux (glibc and musl) and macOS on x86_64 and Arm, and Windows on x86_64, for
+CPython 3.13 to 3.15 and free-threaded 3.14t and 3.15t; anywhere else, installing builds from
+source, which needs a Rust toolchain. Windows doesn't support
+[`native=True`](networking.md#native-transport-experimental).
+
 ## Quickstart
 
 Every snippet below is a complete, runnable script — hit the extra clipboard icon in its

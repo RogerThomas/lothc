@@ -125,7 +125,7 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 
 [tool.deptry]
-# examples/, perf.py, and asv_bench/ are dev-only utility/benchmark scripts, not part of the
+# examples/, perf.py, asv_bench/ and scripts/ are dev-only utility scripts, not part of the
 # installable package — they're expected to import dev-group dependencies directly. .asv/ holds
 # asv's own per-commit checkouts + venvs (a full copy of this repo, gitignored) — not our code,
 # and .claude/worktrees/ is the same category: agent git worktrees, each with its own .venv, so
@@ -136,6 +136,7 @@ exclude = [
     "experiments",
     "perf\\.py",
     "asv_bench",
+    "scripts",
     "\\.venv",
     "\\.asv",
     "tests",
