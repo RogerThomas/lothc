@@ -42,6 +42,8 @@ a docstring or a test already says.
 - **CI tests a `[profile.ci]` build** (release without fat LTO): no cache can hold the LTO step,
   and the shipped `release` binary is smoke-tested in Wheels. rust-cache is shared and saved from
   `main` only, since the repo's 10 GB was evicting.
+- **No BOLT, and no `target-cpu`** (measured 2026-11-12): BOLT breaks rustc's Cortex-A53
+  erratum 843419 workaround on aarch64, and neither gained anything on x86_64.
 - **release-please cuts releases**, so commit messages on `main` must be Conventional Commits.
   Tags are the bare version (no `v`, no component). Never add an
   `## [Unreleased]` section to `CHANGELOG.md`.
