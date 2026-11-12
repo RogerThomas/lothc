@@ -16,7 +16,6 @@ says. Through a tunnel, `/peer` names the proxy's connection to the server, one 
 """
 
 import asyncio
-import os
 import threading
 import time
 from collections.abc import AsyncGenerator, Generator
@@ -24,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 
 import pytest
 import trustme
+from _helpers import native_by_default
 from _proxy_server import HTTPProxy, serve_http_proxy
 from _tls_server import TLSServer, serve_tls_server, tls_server_context
 
@@ -76,7 +76,7 @@ def _sync_second_connection_done(proxy: HTTPProxy, server: TLSServer) -> None:
     """`_handshakes_done(server, 2)` for a sync client, or for native's sync pool, which has no
     thread to drive that handshake on and leaves it to the request that takes the connection,
     until `proxy` has answered the second `CONNECT`, which it pools the connection after."""
-    native = os.environ.get("LOTHC_TRANSPORT") == "native"
+    native = native_by_default()
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
         if len(proxy.answered_tunnels if native else server.handshakes) >= 2:

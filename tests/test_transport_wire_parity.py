@@ -1,4 +1,4 @@
-"""The native transport (`native=True`) puts the same request on the wire as the pyreqwest one:
+"""The native transport (`native="on"`) puts the same request on the wire as the pyreqwest one:
 every call below goes out through both, async and sync, and the test server's `/echo-request`
 reports what arrived (request line, every header in order with its casing, body), alongside each
 response's `RequestInfo`.
@@ -478,13 +478,13 @@ def _path(case: _Case, base_url: str) -> str:
 def _pair[TClient](
     factory: Callable[..., TClient], monkeypatch: pytest.MonkeyPatch
 ) -> tuple[TClient, TClient]:
-    """The same client twice: built with `native=False`, then with `native=True`.
+    """The same client twice: built with `native="off"`, then with `native="on"`.
 
     `LOTHC_TRANSPORT` is unset first because it wins over `native=`: left set, as under
-    `task test-native`, it would put both clients on the native transport.
+    `task test-native`, it would put both clients on one transport.
     """
     monkeypatch.delenv("LOTHC_TRANSPORT", raising=False)
-    return factory(native=False), factory(native=True)
+    return factory(native="off"), factory(native="on")
 
 
 async def _async_seen(client: HTTPClient, case: _Case, base_url: str) -> _Seen:

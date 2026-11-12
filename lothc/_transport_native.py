@@ -80,7 +80,7 @@ def _reject_unported_settings(settings: _TransportSettings) -> None:
     for name, used in unported.items():
         if used:
             raise NotImplementedError(
-                f"{name}= is not supported by the native transport yet (native=True)"
+                f'{name}= is not supported by the native transport yet (native="on")'
             )
 
 
@@ -754,9 +754,10 @@ class _SyncNativeStreamSource:
 
 @dataclass(slots=True, eq=False, repr=False)
 class _NativeTransport:
-    """`HTTPClient`'s experimental transport, selected by `native=True` when a client
-    is constructed: lothc's own HTTP/1.1 client in `lothc._native` (hyper on the asyncio loop's
-    thread, no tokio, see `native/src/pool.rs`), behind the same seam as `_PyreqwestTransport`.
+    """`HTTPClient`'s native transport, selected by `native=` (`_uses_native_transport`) when a
+    client is constructed: lothc's own HTTP/1.1 client in `lothc._native` (hyper on the asyncio
+    loop's thread, no tokio, see `native/src/pool.rs`), behind the same seam as
+    `_PyreqwestTransport`.
 
     Requests are built the way the pyreqwest transport builds them, byte for byte, and results
     come back as lothc's own `Response`/exceptions, built by the native side in one pass from
@@ -1297,8 +1298,8 @@ class _NativeTransport:
 
 @dataclass(slots=True, eq=False, repr=False)
 class _SyncNativeTransport:
-    """`SyncHTTPClient`'s experimental transport, selected by `native=True` when a
-    client is constructed: lothc's own HTTP/1.1 client in `lothc._native` (hyper driven on the
+    """`SyncHTTPClient`'s native transport, selected by `native=` (`_uses_native_transport`) when
+    a client is constructed: lothc's own HTTP/1.1 client in `lothc._native` (hyper driven on the
     calling thread, waiting in `poll(2)` with the GIL released, see `native/src/sync_pool.rs`),
     behind the same seam as `_SyncPyreqwestTransport`. Threads share one client's connections.
 

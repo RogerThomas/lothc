@@ -1165,7 +1165,7 @@ wheels = [
 
 [[package]]
 name = "lothc"
-version = "0.2.2"
+version = "0.2.3"
 source = { editable = "." }
 default-groups = ["dev", "perf"]
 dependencies = [

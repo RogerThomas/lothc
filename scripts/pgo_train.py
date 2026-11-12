@@ -201,7 +201,7 @@ async def _async_errors(client: HTTPClient, targets: _Targets) -> None:
 
 async def _async_retries(targets: _Targets) -> None:
     async with HTTPClient(
-        base_url=targets.http, max_retries=2, backoff_base=0.001, native=True
+        base_url=targets.http, max_retries=2, backoff_base=0.001, native="on"
     ) as client:
         for _ in range(targets.rounds):
             for path in ("flaky", "connection-flaky", "body-flaky"):
@@ -212,7 +212,7 @@ async def _async_retries(targets: _Targets) -> None:
 async def _async_limits(targets: _Targets) -> None:
     """A connection limit callers queue for, and a cookie jar."""
     async with HTTPClient(
-        base_url=targets.http, max_connections=2, cookie_store=True, native=True
+        base_url=targets.http, max_connections=2, cookie_store=True, native="on"
     ) as client:
         await _async_concurrent_requests(client, targets.rounds * 8)
         for _ in range(targets.rounds):
@@ -222,7 +222,7 @@ async def _async_limits(targets: _Targets) -> None:
 
 async def _async_stalls(targets: _Targets) -> None:
     """An idle limit that gives up on a stream gone quiet."""
-    async with HTTPClient(base_url=targets.http, read_timeout=0.01, native=True) as client:
+    async with HTTPClient(base_url=targets.http, read_timeout=0.01, native="on") as client:
         for _ in range(targets.rounds):
             with suppress(HTTPTimeoutError):
                 stream = client.stream_get("stall-after-first-chunk", params={"seconds": 0.05})
@@ -230,14 +230,14 @@ async def _async_stalls(targets: _Targets) -> None:
 
 
 async def _async_untrusted(targets: _Targets) -> None:
-    async with HTTPClient(base_url=targets.https, native=True) as client:
+    async with HTTPClient(base_url=targets.https, native="on") as client:
         for _ in range(targets.rounds):
             with suppress(HTTPConnectionError):
                 _ = await client.get("items/1")
 
 
 async def _train_async(targets: _Targets, requests: int) -> None:
-    async with HTTPClient(base_url=targets.http, native=True) as client:
+    async with HTTPClient(base_url=targets.http, native="on") as client:
         await _async_concurrent_requests(client, requests)
         await _async_requests(client, requests // 8)
         await _async_other_requests(client, targets)
@@ -247,7 +247,7 @@ async def _train_async(targets: _Targets, requests: int) -> None:
     async with HTTPClient(
         base_url=targets.https,
         root_certificates=[targets.ca_pem],
-        native=True,
+        native="on",
     ) as client:
         await _async_concurrent_requests(client, requests // 4)
         await _async_other_requests(client, targets)
@@ -324,7 +324,7 @@ def _sync_errors(client: SyncHTTPClient, targets: _Targets) -> None:
 
 def _sync_retries(targets: _Targets) -> None:
     with SyncHTTPClient(
-        base_url=targets.http, max_retries=2, backoff_base=0.001, native=True
+        base_url=targets.http, max_retries=2, backoff_base=0.001, native="on"
     ) as client:
         for _ in range(targets.rounds):
             for path in ("flaky", "connection-flaky", "body-flaky"):
@@ -335,7 +335,7 @@ def _sync_retries(targets: _Targets) -> None:
 def _sync_limits(targets: _Targets) -> None:
     """A connection limit callers queue for, and a cookie jar."""
     with SyncHTTPClient(
-        base_url=targets.http, max_connections=2, cookie_store=True, native=True
+        base_url=targets.http, max_connections=2, cookie_store=True, native="on"
     ) as client:
         _sync_concurrent_requests(client, targets.rounds * 8)
         for _ in range(targets.rounds):
@@ -345,21 +345,21 @@ def _sync_limits(targets: _Targets) -> None:
 
 def _sync_stalls(targets: _Targets) -> None:
     """An idle limit that gives up on a stream gone quiet."""
-    with SyncHTTPClient(base_url=targets.http, read_timeout=0.01, native=True) as client:
+    with SyncHTTPClient(base_url=targets.http, read_timeout=0.01, native="on") as client:
         for _ in range(targets.rounds):
             with suppress(HTTPTimeoutError):
                 _ = list(client.stream_get("stall-after-first-chunk", params={"seconds": 0.05}))
 
 
 def _sync_untrusted(targets: _Targets) -> None:
-    with SyncHTTPClient(base_url=targets.https, native=True) as client:
+    with SyncHTTPClient(base_url=targets.https, native="on") as client:
         for _ in range(targets.rounds):
             with suppress(HTTPConnectionError):
                 _ = client.get("items/1")
 
 
 def _train_sync(targets: _Targets, requests: int) -> None:
-    with SyncHTTPClient(base_url=targets.http, native=True) as client:
+    with SyncHTTPClient(base_url=targets.http, native="on") as client:
         _sync_concurrent_requests(client, requests)
         _sync_requests(client, requests // 8)
         _sync_other_requests(client, targets)
@@ -369,7 +369,7 @@ def _train_sync(targets: _Targets, requests: int) -> None:
     with SyncHTTPClient(
         base_url=targets.https,
         root_certificates=[targets.ca_pem],
-        native=True,
+        native="on",
     ) as client:
         _sync_concurrent_requests(client, requests // 4)
         _sync_other_requests(client, targets)

@@ -1,9 +1,9 @@
 # CLAUDE.md
 
 `lothc` ("Lord Of The Http Clients") is a typed HTTP client: `HTTPClient` (async) and
-`SyncHTTPClient` (sync), on [pyreqwest](https://github.com/MarkusSintonen/pyreqwest) by default or
-lothc's own native transport with `native=True`, with pydantic and msgspec as optional extras
-(`lothc/_compat.py`) for decoding and encoding. lothc must work with neither, either or both
+`SyncHTTPClient` (sync), on lothc's own native transport (the default on Linux/macOS) or
+[pyreqwest](https://github.com/MarkusSintonen/pyreqwest), with pydantic and msgspec as optional
+extras (`lothc/_compat.py`) for decoding and encoding. lothc must work with neither, either or both
 installed.
 
 This file records decisions and the *why*, tersely. Don't add narrative or anything the code,
@@ -15,8 +15,8 @@ a docstring or a test already says.
 - Lint / format / type-check: `task lint` / `task format` / `task typecheck`; everything CI
   runs: `task check`
 - Tests: `task test`, one test: `task test-one -- tests/test_foo.py::test_bar`, doctests:
-  `task test-doctests`, every test on the native transport: `task test-native`. Pass
-  `PYTEST_PROFILE=agent` for concise output; re-run a failure with `PYTEST_PROFILE=dev`.
+  `task test-doctests`, every test on one transport: `task test-native` / `task test-pyreqwest`.
+  Pass `PYTEST_PROFILE=agent` for concise output; re-run a failure with `PYTEST_PROFILE=dev`.
 - Pre-commit (`prek`, a drop-in for `pre-commit`): `task precommit-install`, `task precommit`
 - Benchmarks: `task bench-check` (working tree, before/after via `-- --against <hash>`),
   `task asv-*` (across git history), `task bench-codspeed` (the CI CodSpeed suite)
@@ -54,7 +54,8 @@ a docstring or a test already says.
 - **CI:** 3.13/3.14/3.15 plus free-threaded 3.14t/3.15t with `PYTHON_GIL=0` (lothc shares
   state across threads, and users share a client across threads), and `test-no-extras` with
   pydantic/msgspec uninstalled. The `perf` group's clients stay out of `dev`: one has no
-  free-threaded wheel. Each of those runs the suite on native too, and `test-platforms` adds
+  free-threaded wheel. Each of those runs the suite once per transport, forced with
+  `LOTHC_TRANSPORT` (`"auto"` would pick native for most clients), and `test-platforms` adds
   Linux Arm, macOS Arm and Intel, and Windows (pyreqwest only) on 3.14. macOS runners turn timer
   coalescing off, or a 0.02s sleep takes ~0.08s.
 - **README.md uses absolute URLs only**, since it's the PyPI description.
@@ -114,7 +115,7 @@ or editing Python here.
   `.pyc`.
 - **`tests/test_transport_wire_parity.py` sends every case through both transports** and compares
   what the server (or proxy) received, byte for byte. It unsets `LOTHC_TRANSPORT` first, since
-  that override would make both clients native.
+  that override would put both clients on one transport.
 - **Under `task test-native`, only the `http2=` refusals may fail**: anything else is a native
   bug. CI deselects them by name (`NATIVE_DESELECT` in `ci.yml`), so add any new one there.
 - **Speed (~45s):** test servers poll at 0.01s; scale a timing pair down together, never a lone
@@ -135,19 +136,22 @@ or editing Python here.
   polled by a single-thread executor on the loop thread, with futures created in Python. Sync
   drives the same futures on the calling thread in `poll(2)` with the GIL released; a sync
   wrapper over a background loop measured 2x the CPU.
-- **Selected with `native=True`**, read once at construction. `LOTHC_TRANSPORT=native` is a
-  test-only override that wins over the argument (a `bool` can't tell an explicit `False` from
-  the default); user docs don't mention it.
+- **Selected with `native="auto"|"off"|"on"`**, read once at construction. `"auto"` (default)
+  is native on POSIX and pyreqwest on Windows or with `http2=True`, so it never raises for a
+  supported configuration. `LOTHC_TRANSPORT=native|pyreqwest` is a test-only override that wins
+  over the argument, so one run covers a transport with no test changed; user docs don't
+  mention it.
 - **POSIX only, and pyreqwest stays as Windows' transport** (decided 2026-11-10): native needs
   `poll(2)` and `loop.add_reader`, which Windows' default loop lacks, and an I/O thread there would
-  bring back the cross-thread hop native exists to avoid. So `native=True` raises on Windows,
+  bring back the cross-thread hop native exists to avoid. So `native="on"` raises on Windows,
   where the crate is `cfg(unix)`-gated down to a stub module of the same names, so lothc's
   imports don't change.
 - **It must match pyreqwest exactly**: the same wire bytes, results and exception classes. The
   only accepted difference is that a transport error's `str()` is a flat cause chain. Crate pins
   follow pyreqwest 0.15.0's lockfile, and each feature uses reqwest's own crates where they exist
   (hyper-util's proxy matcher, compression-codecs), never a hand port.
-- **Anything unported raises `NotImplementedError`**, never a silent difference: HTTP/2.
+- **Anything unported raises `NotImplementedError`** under `"on"`, never a silent difference:
+  HTTP/2.
 - **Known differences that don't raise:**
   - `form=` files are read on the loop thread in reads of up to 64 KiB (pyreqwest reads them off
     it), so a slow filesystem stalls the loop.

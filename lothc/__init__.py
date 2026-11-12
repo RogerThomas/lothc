@@ -18,7 +18,7 @@ from ._response import (
     RequestInfo,
     Response,
 )
-from ._settings import TlsVersion
+from ._settings import NativeMode, TlsVersion
 from ._sse import SSEEvent
 from ._sync_client import SyncHTTPClient
 from ._types import (
@@ -46,6 +46,7 @@ __all__ = [
     "HTTPTransportError",
     "Headers",
     "JSONPayload",
+    "NativeMode",
     "OAuthProvider",
     "OAuthTokenError",
     "Params",
