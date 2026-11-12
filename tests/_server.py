@@ -178,6 +178,15 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self._counters[key] = self._counters.get(key, 0) + 1
         return self._counters[key]
 
+    def _close_counted(self, query: str) -> None:
+        # Close the connection now, rather than once the handler returns, then count the close
+        # (`<key>-closed`, read back via `/hits`) once it's on its way, so a test can wait for it
+        # rather than guess how long it takes.
+        with contextlib.suppress(OSError):
+            self.connection.shutdown(socket.SHUT_WR)
+        if "key" in (params := parse_qs(query)):
+            self._bump_counter(f"{params['key'][0]}-closed")
+
     def _start_sse_response(self, *, chunked: bool = False) -> None:
         self.close_connection = True
         self.send_response(200)
@@ -251,9 +260,10 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self.wfile.write(record.encode())
             self.wfile.flush()
 
-    def _write_sse_silent_close(self) -> None:
+    def _write_sse_silent_close(self, query: str) -> None:
         # One event in a body of known length, then the connection closes with no
-        # `Connection: close` to say it will, as `/silent-close` does.
+        # `Connection: close` to say it will, as `/silent-close` does: counted, with a `key`,
+        # as `/large` counts its close.
         body = b"id: 0\ndata: only\n\n"
         self.close_connection = True
         self.send_response(200)
@@ -261,6 +271,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+        self._close_counted(query)
 
     def _write_sse_no_content(self) -> None:
         self.close_connection = True
@@ -593,7 +604,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
         # `size` bytes in 64KB writes, counting how many it has written so far (per `key`, read
         # back from `/hits` as `<key>-written`): a client reading slower than this holds it back
         # once the socket buffers fill, rather than reading the body into memory ahead of its
-        # caller. Ends when the client hangs up.
+        # caller. Ends when the client hangs up. Then closes its connection without saying it
+        # will (`_close_counted`).
         params = parse_qs(query)
         written = f"{params['key'][0]}-written"
         size = int(params["size"][0])
@@ -608,6 +620,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             for _ in range(size // len(block)):
                 self.wfile.write(block)
                 self._counters[written] += len(block)
+        self._close_counted(query)
 
     def _handle_mixed_records(self, query: str) -> None:
         # `rounds` rounds of one 16KB write then 150 one-byte writes, all zeros. Over TLS each
@@ -1226,6 +1239,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/stall-unframed": self._handle_stall_unframed,
             "/echo-request-sse": self._write_sse_echo_request,
             "/large": self._handle_large,
+            "/events-silent-close": self._write_sse_silent_close,
             "/mixed-records": self._handle_mixed_records,
             "/compressed-zeros": self._handle_compressed_zeros,
             "/redirect-counted": self._handle_counted_redirect,
@@ -1243,7 +1257,6 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/events-lenient": self._write_sse_lenient_cases,
             "/events-truncated": self._write_sse_truncated,
             "/events-no-content": self._write_sse_no_content,
-            "/events-silent-close": self._write_sse_silent_close,
             "/events-wrong-content-type": self._write_sse_wrong_content_type,
             "/events-spec-edge-cases": self._write_sse_spec_edge_cases,
             "/boom": self._handle_boom,

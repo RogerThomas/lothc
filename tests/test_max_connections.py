@@ -20,7 +20,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import pytest
-from _helpers import arrived, release, sync_arrived, sync_release
+from _helpers import arrived, closed, release, sync_arrived, sync_release
 
 from lothc import HTTPClient, HTTPTimeoutError, SyncHTTPClient
 
@@ -266,7 +266,7 @@ def test_sync_each_attempt_of_a_retried_request_takes_the_slot_in_turn(
 
 
 async def test_a_stream_holds_its_slot_until_its_body_has_been_read(
-    one_slot_client: HTTPClient, server_key: str
+    base_url: str, one_slot_client: HTTPClient, server_key: str
 ) -> None:
     # Not until the stream is closed: the request after it runs first.
     stream = one_slot_client.stream_get("large", params={"key": server_key, "size": 2**20})
@@ -277,7 +277,7 @@ async def test_a_stream_holds_its_slot_until_its_body_has_been_read(
         received += sum([len(chunk) async for chunk in stream])
         # `/large` closes its connection behind it without saying so: a request racing that close
         # on the same connection is lost by every client (test_connection_reuse.py), so let it land.
-        time.sleep(0.05)
+        closed(base_url, server_key)
         after = (await one_slot_client.get("items/7")).data
     finally:
         await stream.aclose()
@@ -287,7 +287,7 @@ async def test_a_stream_holds_its_slot_until_its_body_has_been_read(
 
 
 def test_sync_a_stream_holds_its_slot_until_its_body_has_been_read(
-    sync_one_slot_stream_client: SyncHTTPClient, server_key: str
+    base_url: str, sync_one_slot_stream_client: SyncHTTPClient, server_key: str
 ) -> None:
     client = sync_one_slot_stream_client
     stream = client.stream_get("large", params={"key": server_key, "size": 2**20})
@@ -298,7 +298,7 @@ def test_sync_a_stream_holds_its_slot_until_its_body_has_been_read(
         received += sum(len(chunk) for chunk in stream)
         # `/large` closes its connection behind it without saying so: a request racing that close
         # on the same connection is lost by every client (test_connection_reuse.py), so let it land.
-        time.sleep(0.05)
+        closed(base_url, server_key)
         after = client.get("items/7").data
     finally:
         stream.close()

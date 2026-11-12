@@ -5,25 +5,20 @@ client, since reusing a dead connection would fail one of them.
 A server can also close a connection right behind a response without saying it will (`/large`,
 `/events-silent-close`). When the close has already arrived as the next request to that origin
 starts, that request goes out on a new connection, however the response was read (buffered,
-`stream_get`, `download` or `sse`), with or without `max_connections`. Each test first lets the
-close arrive (`_let_the_close_arrive`), since a request racing the close of the very connection
-it reuses is lost by every client: on Linux, loopback buffers can hold all of `/large`, so the
-close needn't have arrived by the time its body has been read."""
+`stream_get`, `download` or `sse`), with or without `max_connections`. Each test first waits for
+the server to have closed (`closed`), since a request racing the close of the very connection it
+reuses is lost by every client: on Linux, loopback buffers can hold all of `/large`, so the close
+needn't have arrived by the time its body has been read."""
 
 import asyncio
 import time
 
 import pytest
+from _helpers import closed
 
 from lothc import HTTPClient, SyncHTTPClient
 
 _item = b'{"id": 7, "name": "item-7"}'
-
-
-def _let_the_close_arrive() -> None:
-    # A blocking sleep, not `asyncio.sleep`: no turn of the event loop reports the close before
-    # the next request, as when the caller is busy, so the client must notice it on its own.
-    time.sleep(0.05)
 
 
 @pytest.mark.parametrize(
@@ -64,7 +59,7 @@ async def test_a_request_after_a_body_the_server_closed_behind_succeeds(
 ) -> None:
     async with HTTPClient(base_url=base_url, max_connections=max_connections) as client:
         body = (await client.get("large", params={"key": server_key, "size": 2**20})).data
-        _let_the_close_arrive()
+        closed(base_url, server_key)
         after = (await client.get("items/7")).data
 
     assert len(body) == 2**20
@@ -77,7 +72,7 @@ def test_sync_a_request_after_a_body_the_server_closed_behind_succeeds(
 ) -> None:
     with SyncHTTPClient(base_url=base_url, max_connections=max_connections) as client:
         body = client.get("large", params={"key": server_key, "size": 2**20}).data
-        _let_the_close_arrive()
+        closed(base_url, server_key)
         after = client.get("items/7").data
 
     assert len(body) == 2**20
@@ -91,7 +86,7 @@ async def test_a_request_after_a_stream_the_server_closed_behind_succeeds(
     async with HTTPClient(base_url=base_url, max_connections=max_connections) as client:
         stream = client.stream_get("large", params={"key": server_key, "size": 2**20})
         received = sum([len(chunk) async for chunk in stream])
-        _let_the_close_arrive()
+        closed(base_url, server_key)
         after = (await client.get("items/7")).data
 
     assert received == 2**20
@@ -105,7 +100,7 @@ def test_sync_a_request_after_a_stream_the_server_closed_behind_succeeds(
     with SyncHTTPClient(base_url=base_url, max_connections=max_connections) as client:
         stream = client.stream_get("large", params={"key": server_key, "size": 2**20})
         received = sum(len(chunk) for chunk in stream)
-        _let_the_close_arrive()
+        closed(base_url, server_key)
         after = client.get("items/7").data
 
     assert received == 2**20
@@ -118,7 +113,7 @@ async def test_a_request_after_a_download_the_server_closed_behind_succeeds(
 ) -> None:
     async with HTTPClient(base_url=base_url, max_connections=max_connections) as client:
         body = (await client.download("large", params={"key": server_key, "size": 2**20})).data
-        _let_the_close_arrive()
+        closed(base_url, server_key)
         after = (await client.get("items/7")).data
 
     assert len(body) == 2**20
@@ -131,7 +126,7 @@ def test_sync_a_request_after_a_download_the_server_closed_behind_succeeds(
 ) -> None:
     with SyncHTTPClient(base_url=base_url, max_connections=max_connections) as client:
         body = client.download("large", params={"key": server_key, "size": 2**20}).data
-        _let_the_close_arrive()
+        closed(base_url, server_key)
         after = client.get("items/7").data
 
     assert len(body) == 2**20
@@ -140,11 +135,14 @@ def test_sync_a_request_after_a_download_the_server_closed_behind_succeeds(
 
 @pytest.mark.parametrize("max_connections", [None, 1])
 async def test_a_request_after_an_sse_stream_the_server_closed_behind_succeeds(
-    base_url: str, max_connections: int | None
+    base_url: str, server_key: str, max_connections: int | None
 ) -> None:
     async with HTTPClient(base_url=base_url, max_connections=max_connections) as client:
-        data = [event.data async for event in client.sse("events-silent-close")]
-        _let_the_close_arrive()
+        data = [
+            event.data
+            async for event in client.sse("events-silent-close", params={"key": server_key})
+        ]
+        closed(base_url, server_key)
         after = (await client.get("items/7")).data
 
     assert data == ["only"]
@@ -153,11 +151,13 @@ async def test_a_request_after_an_sse_stream_the_server_closed_behind_succeeds(
 
 @pytest.mark.parametrize("max_connections", [None, 1])
 def test_sync_a_request_after_an_sse_stream_the_server_closed_behind_succeeds(
-    base_url: str, max_connections: int | None
+    base_url: str, server_key: str, max_connections: int | None
 ) -> None:
     with SyncHTTPClient(base_url=base_url, max_connections=max_connections) as client:
-        data = [event.data for event in client.sse("events-silent-close")]
-        _let_the_close_arrive()
+        data = [
+            event.data for event in client.sse("events-silent-close", params={"key": server_key})
+        ]
+        closed(base_url, server_key)
         after = client.get("items/7").data
 
     assert data == ["only"]
