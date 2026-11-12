@@ -803,6 +803,57 @@ def test_sync_a_form_put_is_not_retried(server_key: str, sync_retry_client: Sync
     assert hits == {"hits": 1}
 
 
+# An empty form is an empty body, which reqwest can copy, so it's retried like any other body.
+async def test_an_empty_form_put_is_retried(server_key: str, retry_client: HTTPClient) -> None:
+    result = (
+        await retry_client.put(
+            "status-then-ok", params={"key": server_key, "fail_times": 1}, form={}, into=dict
+        )
+    ).data
+
+    assert result == {"attempts": 2, "bodies": ["", ""]}
+
+
+def test_sync_an_empty_form_put_is_retried(
+    server_key: str, sync_retry_client: SyncHTTPClient
+) -> None:
+    result = sync_retry_client.put(
+        "status-then-ok", params={"key": server_key, "fail_times": 1}, form={}, into=dict
+    ).data
+
+    assert result == {"attempts": 2, "bodies": ["", ""]}
+
+
+async def test_a_form_stream_post_is_not_retried(base_url: str, server_key: str) -> None:
+    async with HTTPClient(
+        base_url=base_url, max_retries=2, backoff_base=0.001, retry_methods={"POST"}
+    ) as client:
+        chunks = client.stream_post(
+            "status-then-ok", params={"key": server_key, "fail_times": 1}, form={"a": "b"}
+        )
+        with pytest.raises(HTTPResponseError) as exc_info:
+            _ = [chunk async for chunk in chunks]
+        hits = (await client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert exc_info.value.status == 503
+    assert hits == {"hits": 1}
+
+
+def test_sync_a_form_stream_post_is_not_retried(base_url: str, server_key: str) -> None:
+    with SyncHTTPClient(
+        base_url=base_url, max_retries=2, backoff_base=0.001, retry_methods={"POST"}
+    ) as client:
+        chunks = client.stream_post(
+            "status-then-ok", params={"key": server_key, "fail_times": 1}, form={"a": "b"}
+        )
+        with pytest.raises(HTTPResponseError) as exc_info:
+            _ = list(chunks)
+        hits = client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert exc_info.value.status == 503
+    assert hits == {"hits": 1}
+
+
 async def test_a_timed_out_attempt_is_retried_with_its_own_timeout(base_url: str) -> None:
     # Three attempts of 0.05s each: the floor proves the timeouts were retried, the ceiling that
     # each attempt got its own `timeout` rather than one shared across the call. The server

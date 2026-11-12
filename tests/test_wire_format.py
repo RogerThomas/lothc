@@ -10,8 +10,10 @@ run to run or release to release. Every test starts with no proxy variables set.
 """
 
 import json
+import re
 from dataclasses import dataclass, field
 from importlib.metadata import version
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
@@ -2663,6 +2665,148 @@ def test_sync_a_large_body_goes_out_whole(
     assert seen.wire.body == _large_body()
     seen.wire.body = b""
     assert seen == case.expected
+
+
+# --- form= ---------------------------------------------------------------------------------------
+# A multipart body's boundary is random: it's checked against reqwest's format (four 16-digit hex
+# numbers joined by dashes), then written `<boundary>` wherever it appears.
+
+
+def _boundary_masked(seen: _Seen) -> _Seen:
+    """`seen` with the boundary its `Content-Type` names written `<boundary>` everywhere."""
+    assert seen.wire is not None
+    content_type = dict(seen.wire.headers)["Content-Type"]
+    match = re.fullmatch(
+        r"multipart/form-data; boundary=([0-9a-f]{16}(?:-[0-9a-f]{16}){3})", content_type
+    )
+    assert match is not None, content_type
+    boundary = match[1]
+    headers = [(name, value.replace(boundary, "<boundary>")) for name, value in seen.wire.headers]
+    body = seen.wire.body.replace(boundary.encode(), b"<boundary>")
+    return _Seen(seen.status, seen.request, _Wire(seen.wire.line, headers, body))
+
+
+def _pinned_form(files: Path) -> dict[str, Any]:
+    (files / "a.PNG").write_bytes(b"png")
+    (files / "noext").write_bytes(b"no-ext")
+    return {
+        "text": "value",
+        "number": 7,
+        "flag": True,
+        "empty": "",
+        "a b/ü": "encoded",
+        "bytes": b"\x00\xff",
+        "json": {"a": 1},
+        "file": ('q"uote\\ü.txt', b"file"),
+        "typed": ("n.bin", b"typed", "Application/X-Type; Charset=UTF-8"),
+        "path": files / "a.PNG",
+        "no-extension": files / "noext",
+        "repeat": ("1", "2"),
+    }
+
+
+def _form_seen(content_length: int, body: bytes) -> _Seen:
+    return _Seen(
+        status=200,
+        request=RequestInfo(
+            method="POST",
+            url="http://127.0.0.1:<port>/echo-request",
+            path="/echo-request",
+            host="127.0.0.1",
+        ),
+        wire=_Wire(
+            line="POST /echo-request HTTP/1.1",
+            headers=[
+                ("Content-Type", "multipart/form-data; boundary=<boundary>"),
+                ("Content-Length", str(content_length)),
+                ("X-1", "1"),
+                ("Accept", "*/*"),
+                ("User-Agent", "python-lothc/<version>"),
+                ("Accept-Encoding", "zstd,gzip,deflate,br"),
+                ("Host", "127.0.0.1:<port>"),
+            ],
+            body=body,
+        ),
+    )
+
+
+# Each part as reqwest writes it: a name that needs percent-encoding as `name*=utf-8''...`, a
+# filename's `"` and `\` escaped (non-ASCII as is), a file's type from its extension (unknown:
+# octet-stream), an explicit type as `mime` normalizes it, and `Content-Length` counted ahead.
+def _pinned_form_seen() -> _Seen:
+    return _form_seen(
+        1967,
+        b"--<boundary>\r\n"
+        b'Content-Disposition: form-data; name="text"\r\n\r\nvalue\r\n'
+        b"--<boundary>\r\n"
+        b'Content-Disposition: form-data; name="number"\r\n\r\n7\r\n'
+        b"--<boundary>\r\n"
+        b'Content-Disposition: form-data; name="flag"\r\n\r\ntrue\r\n'
+        b"--<boundary>\r\n"
+        b'Content-Disposition: form-data; name="empty"\r\n\r\n\r\n'
+        b"--<boundary>\r\n"
+        b"Content-Disposition: form-data; name*=utf-8''a%20b%2F%C3%BC\r\n\r\nencoded\r\n"
+        b"--<boundary>\r\n"
+        b'Content-Disposition: form-data; name="bytes"\r\n\r\n\x00\xff\r\n'
+        b"--<boundary>\r\n"
+        b'Content-Disposition: form-data; name="json"\r\n'
+        b"Content-Type: application/json\r\n\r\n"
+        b'{"a": 1}\r\n'
+        b"--<boundary>\r\n"
+        b'Content-Disposition: form-data; name="file"; filename="q\\"uote\\\\\xc3\xbc.txt"\r\n'
+        b"Content-Type: text/plain\r\n\r\n"
+        b"file\r\n"
+        b"--<boundary>\r\n"
+        b'Content-Disposition: form-data; name="typed"; filename="n.bin"\r\n'
+        b"Content-Type: application/x-type; charset=utf-8\r\n\r\n"
+        b"typed\r\n"
+        b"--<boundary>\r\n"
+        b'Content-Disposition: form-data; name="path"; filename="a.PNG"\r\n'
+        b"Content-Type: image/png\r\n\r\n"
+        b"png\r\n"
+        b"--<boundary>\r\n"
+        b'Content-Disposition: form-data; name="no-extension"; filename="noext"\r\n'
+        b"Content-Type: application/octet-stream\r\n\r\n"
+        b"no-ext\r\n"
+        b"--<boundary>\r\n"
+        b'Content-Disposition: form-data; name="repeat"\r\n\r\n1\r\n'
+        b"--<boundary>\r\n"
+        b'Content-Disposition: form-data; name="repeat"\r\n\r\n2\r\n'
+        b"--<boundary>--\r\n",
+    )
+
+
+async def test_a_form_goes_out_as_pinned(base_url: str, tmp_path: Path) -> None:
+    case = _Case("form", "post", call={"form": _pinned_form(tmp_path), "headers": {"X-1": "1"}})
+
+    seen = await _async_seen(HTTPClient(base_url=base_url), case, base_url, [_port(base_url)])
+
+    assert _boundary_masked(seen) == _pinned_form_seen()
+
+
+def test_sync_a_form_goes_out_as_pinned(base_url: str, tmp_path: Path) -> None:
+    case = _Case("form", "post", call={"form": _pinned_form(tmp_path), "headers": {"X-1": "1"}})
+
+    seen = _sync_seen(SyncHTTPClient(base_url=base_url), case, base_url, [_port(base_url)])
+
+    assert _boundary_masked(seen) == _pinned_form_seen()
+
+
+# No parts: an empty body, its length still sent, as reqwest sends it.
+async def test_an_empty_form_goes_out_as_pinned(base_url: str) -> None:
+    case = _Case("empty-form", "post", call={"form": {}, "headers": {"X-1": "1"}})
+
+    seen = await _async_seen(HTTPClient(base_url=base_url), case, base_url, [_port(base_url)])
+
+    assert _boundary_masked(seen) == _form_seen(0, b"")
+
+
+def test_sync_an_empty_form_goes_out_as_pinned(base_url: str) -> None:
+    case = _Case("empty-form", "post", call={"form": {}, "headers": {"X-1": "1"}})
+
+    seen = _sync_seen(SyncHTTPClient(base_url=base_url), case, base_url, [_port(base_url)])
+
+    assert _boundary_masked(seen) == _form_seen(0, b"")
 
 
 # --- Through an HTTP proxy --------------------------------------------------------------------

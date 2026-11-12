@@ -19,7 +19,7 @@ else:
         msgspec = None
         msgspec_installed = False
 
-        # `_client.py` has plenty of unquoted `Decoder[Any]` annotations, evaluated eagerly at
+        # lothc's modules have plenty of unquoted `Decoder[Any]` annotations, evaluated eagerly at
         # import time (no `from __future__ import annotations` in that file) — without
         # `__class_getitem__`, subscripting this stub crashes `import lothc` outright whenever
         # msgspec isn't installed, confirmed live.
@@ -39,7 +39,7 @@ else:
     except ImportError:
         pydantic_installed = False
 
-        # Same reasoning as Struct/Decoder above, for _client.py's `TypeAdapter[Any]` annotations.
+        # Same reasoning as Struct/Decoder above, for lothc's `TypeAdapter[Any]` annotations.
         class BaseModel:
             def __class_getitem__(cls, _item: object) -> type[Self]:
                 return cls

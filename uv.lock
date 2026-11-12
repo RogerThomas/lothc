@@ -2,8 +2,10 @@ version = 1
 revision = 5
 requires-python = ">=3.13"
 resolution-markers = [
-    "python_full_version >= '3.15'",
-    "python_full_version < '3.15'",
+    "python_full_version >= '3.15' and sys_platform != 'win32'",
+    "python_full_version >= '3.15' and sys_platform == 'win32'",
+    "python_full_version < '3.15' and sys_platform != 'win32'",
+    "python_full_version < '3.15' and sys_platform == 'win32'",
 ]
 
 [[package]]
@@ -1163,6 +1165,7 @@ wheels = [
 
 [[package]]
 name = "lothc"
+version = "0.2.2"
 source = { editable = "." }
 default-groups = ["dev", "perf"]
 dependencies = [
@@ -1202,7 +1205,8 @@ dev = [
     { name = "trustme" },
     { name = "ty" },
     { name = "vulture" },
-    { name = "yeetr", extra = ["uvloop"] },
+    { name = "yeetr" },
+    { name = "yeetr", extra = ["uvloop"], marker = "sys_platform != 'win32'" },
     { name = "zuban" },
 ]
 docs = [
@@ -1226,7 +1230,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'testing'", specifier = ">=9.0.2" },
     { name = "typing-extensions", specifier = ">=4.13.0" },
 ]
-provides-extras = ["msgspec", "pydantic", "testing"]
+provides-extras = ["pydantic", "msgspec", "testing"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1249,7 +1253,8 @@ dev = [
     { name = "trustme", specifier = ">=1.2.1" },
     { name = "ty", specifier = ">=0.0.74" },
     { name = "vulture", specifier = ">=2.16" },
-    { name = "yeetr", extras = ["uvloop"], specifier = ">=2026.8.14.post1" },
+    { name = "yeetr", marker = "sys_platform == 'win32'", specifier = ">=2026.8.14.post1" },
+    { name = "yeetr", extras = ["uvloop"], marker = "sys_platform != 'win32'", specifier = ">=2026.8.14.post1" },
     { name = "zuban", specifier = ">=0.9.1" },
 ]
 docs = [{ name = "zensical", specifier = ">=0.0.56" }]

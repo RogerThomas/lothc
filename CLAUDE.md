@@ -1,9 +1,10 @@
 # CLAUDE.md
 
-`lothc` ("Lord Of The Http Clients") is a typed HTTP client on
-[pyreqwest](https://github.com/MarkusSintonen/pyreqwest): `HTTPClient` (async) and
-`SyncHTTPClient` (sync), with pydantic and msgspec as optional extras (`lothc/_compat.py`) for
-decoding and encoding. lothc must work with neither, either or both installed.
+`lothc` ("Lord Of The Http Clients") is a typed HTTP client: `HTTPClient` (async) and
+`SyncHTTPClient` (sync), on [pyreqwest](https://github.com/MarkusSintonen/pyreqwest) by default or
+lothc's own native transport with `native=True`, with pydantic and msgspec as optional extras
+(`lothc/_compat.py`) for decoding and encoding. lothc must work with neither, either or both
+installed.
 
 This file records decisions and the *why*, tersely. Don't add narrative or anything the code,
 a docstring or a test already says.
@@ -14,8 +15,8 @@ a docstring or a test already says.
 - Lint / format / type-check: `task lint` / `task format` / `task typecheck`; everything CI
   runs: `task check`
 - Tests: `task test`, one test: `task test-one -- tests/test_foo.py::test_bar`, doctests:
-  `task test-doctests`. Pass `PYTEST_PROFILE=agent` for concise output; re-run a failure with
-  `PYTEST_PROFILE=dev`.
+  `task test-doctests`, every test on the native transport: `task test-native`. Pass
+  `PYTEST_PROFILE=agent` for concise output; re-run a failure with `PYTEST_PROFILE=dev`.
 - Pre-commit (`prek`, a drop-in for `pre-commit`): `task precommit-install`, `task precommit`
 - Benchmarks: `task bench-check` (working tree, before/after via `-- --against <hash>`),
   `task asv-*` (across git history), `task bench-codspeed` (the CI CodSpeed suite)
@@ -27,20 +28,29 @@ a docstring or a test already says.
 
 ## Releasing and CI
 
-- **Versions come from the git tag** (`hatch-vcs`), SemVer because other packages depend on
-  lothc. Pre-1.0, `feat` bumps the patch and a breaking change the minor.
+- **SemVer, a static `version` in `pyproject.toml` that release-please bumps**: maturin has no
+  VCS versioning. SemVer because other packages depend on lothc; pre-1.0, `feat` bumps the patch
+  and a breaking change the minor.
+- **Built by maturin**: `lothc._native` comes from the crate in `native/` (typed by
+  `lothc/_native.pyi`), so every environment needs a Rust toolchain, and `uv sync` rebuilds it
+  when `native/` changes (`[tool.uv] cache-keys`).
+- **Wheels per interpreter and platform, built with PGO** (`wheels.yml`, `scripts/build_wheel.sh`):
+  not abi3, which can't cover free-threaded builds. Each trains on its own architecture, and a
+  build fails if its profile went unused.
 - **release-please cuts releases**, so commit messages on `main` must be Conventional Commits.
-  Tags are the bare version (no `v`, no component), which hatch-vcs reads. Never add an
+  Tags are the bare version (no `v`, no component). Never add an
   `## [Unreleased]` section to `CHANGELOG.md`.
 - **Publishing is dispatched** (`gh workflow run release.yml --ref <tag>`), since a release made
   with `GITHUB_TOKEN` triggers no workflow. `release.yml` stays top-level for PyPI's Trusted
-  Publisher, runs all of CI against the tag, and refuses a non-tag ref.
+  Publisher, runs all of CI and `wheels.yml` against the tag, and refuses a non-tag ref.
 - **CI:** 3.13/3.14/3.15 plus free-threaded 3.14t/3.15t with `PYTHON_GIL=0` (lothc shares
   state across threads, and users share a client across threads), and `test-no-extras` with
   pydantic/msgspec uninstalled. The `perf` group's clients stay out of `dev`: one has no
-  free-threaded wheel.
+  free-threaded wheel. Each of those runs the suite on native too, and `test-platforms` adds
+  Linux Arm, macOS Arm and Intel, and Windows (pyreqwest only) on 3.14. macOS runners turn timer
+  coalescing off, or a 0.02s sleep takes ~0.08s.
 - **README.md uses absolute URLs only**, since it's the PyPI description.
-- **The sdist has an explicit `include` allowlist**; hatchling's default shipped the whole repo.
+- **Check the sdist's file list after a packaging change**: a default once shipped the whole repo.
 - **TODO (GitHub UI):** add a tag-pattern protection rule to the `pypi` environment.
 
 ## Scope
@@ -53,12 +63,18 @@ a docstring or a test already says.
 
 ## Architecture
 
-- **`lothc/_client.py` holds everything** until it earns a split; `lothc/_oauth.py` is separate
-  because it's built *on* the client (a short-lived `HTTPClient` per token request, plugged into
-  `bearer_auth`).
-- **pyreqwest stays** (2026-10-04): a direct reqwest binding gained only 5-12% and would mean
-  per-platform wheels plus reimplementing sync, streaming, multipart, TLS and the mocker.
-- **The two clients are near-mirrors**; implement every feature on both.
+- **`lothc/` is split by concern**, imports running one way: types, headers, response, decode,
+  errors, encode, then form/streaming/SSE/settings/retry, then the two transports, then
+  `_client.py` and `_sync_client.py`. `lothc/_oauth.py` is built *on* the client.
+- **Top-level names are unique across `lothc/`**: the parity test pairs twins by name across
+  modules.
+- **A `_` name is private to the package, not the module**: basedpyright's private-usage and
+  unused-function rules are off for `lothc/` only, and pylint's `duplicate-code` is off, since the
+  verbs' argument lists repeat by design.
+- **Clients over transports.** The clients keep the public API; a transport (pyreqwest or native)
+  does auth, sending, status checks, decoding and streaming. Each verb returns the transport's
+  call directly, with no wrapper coroutine.
+- **The two clients, and the two transports, are near-mirrors**; implement every feature on both.
   `tests/test_sync_async_parity.py` compares their signatures and bodies, with reasoned
   allowlists.
 - **Clients are context managers**, and the pyreqwest client exists only while one is open, so
@@ -85,13 +101,73 @@ or editing Python here.
 - **`tests/test_wire_format.py` is the wire contract** (request line, header order and casing,
   body). Regenerate a value only for a deliberate change.
 - **TLS tests use a real HTTPS server** (`trustme`), and pin the rustls failure in `match=`.
-  Wording differs between macOS and Linux, so check a new pin on Linux.
+  Wording differs between platforms; CI covers Linux, macOS and Windows.
 - **Mutation runs use `python -B`**: a same-size edit restored within a second leaves a stale
   `.pyc`.
-- **Speed (~20s):** test servers poll at 0.01s; scale a timing pair down together, never a lone
+- **`tests/test_transport_wire_parity.py` sends every case through both transports** and compares
+  what the server (or proxy) received, byte for byte. It unsets `LOTHC_TRANSPORT` first, since
+  that override would make both clients native.
+- **Under `task test-native`, only the `http2=` refusals may fail**: anything else is a native
+  bug. CI deselects them by name (`NATIVE_DESELECT` in `ci.yml`), so add any new one there.
+- **Speed (~45s):** test servers poll at 0.01s; scale a timing pair down together, never a lone
   margin; `backoff_base=0.001` where only *that* a retry happened matters; a test below a
   default asserts a bracket, not a floor. Rejected: pytest-xdist.
+- **Wait for evidence, never a sleep a stalled runner can outlast** (`arrived`, `release`,
+  `closed` in `tests/_helpers.py`): CI's macOS Intel and Windows runners stall for 100ms+.
+- **Test servers turn Nagle off**: on Linux every kept-alive response waited 42ms (delayed ACK),
+  which doubled the suite's time.
 - Prefer doctests for small algorithmic functions.
+
+## Native transport
+
+- **Why it exists:** async `get(into=Struct)` runs at about 2x pyreqwest's throughput. A
+  2026-10-04 reqwest binding gained only 5-12% because it kept tokio's cross-thread hop, so this
+  one has none.
+- **The design:** hyper 1.12's `client::conn::http1` over sockets the asyncio loop watches,
+  polled by a single-thread executor on the loop thread, with futures created in Python. Sync
+  drives the same futures on the calling thread in `poll(2)` with the GIL released; a sync
+  wrapper over a background loop measured 2x the CPU.
+- **Selected with `native=True`**, read once at construction. `LOTHC_TRANSPORT=native` is a
+  test-only override that wins over the argument (a `bool` can't tell an explicit `False` from
+  the default); user docs don't mention it.
+- **POSIX only, and pyreqwest stays as Windows' transport** (decided 2026-11-10): native needs
+  `poll(2)` and `loop.add_reader`, which Windows' default loop lacks, and an I/O thread there would
+  bring back the cross-thread hop native exists to avoid. So `native=True` raises on Windows,
+  where the crate is `cfg(unix)`-gated down to a stub module of the same names, so lothc's
+  imports don't change.
+- **It must match pyreqwest exactly**: the same wire bytes, results and exception classes. The
+  only accepted difference is that a transport error's `str()` is a flat cause chain. Crate pins
+  follow pyreqwest 0.15.0's lockfile, and each feature uses reqwest's own crates where they exist
+  (hyper-util's proxy matcher, compression-codecs), never a hand port.
+- **Anything unported raises `NotImplementedError`**, never a silent difference: HTTP/2.
+- **Known differences that don't raise:**
+  - `form=` files are read on the loop thread in reads of up to 64 KiB (pyreqwest reads them off
+    it), so a slow filesystem stalls the loop.
+  - A sync client's expired idle connections stay open until its next request (no thread to
+    reap on), and its DNS lookup isn't bounded by `connect_timeout`.
+  - A sync stream never times out a slow consumer under `read_timeout`: it reads only when
+    asked, where pyreqwest's read-ahead fills and then times out.
+  - A sync request in a blocking TCP connect sees a connection another thread freed only once
+    its connect returns.
+  - A request cancelled while waiting for a `max_connections` slot leaves the queue and is never
+    sent, deliberately (decided 2026-11-11): pyreqwest still sends it, so a caller who saw the
+    cancel and retried a POST would submit it twice.
+  - Addresses are tried in order (no happy eyeballs), and an async client is bound to the loop
+    that opened it.
+- **Redirects run in Rust; retries and re-auth in Python.** A hop's headers must be reqwest's,
+  in reqwest's order, which only the same Rust calls produce. Retries wrap the whole redirect
+  chain, as pyreqwest's middleware does.
+- **Streaming shares one Python implementation with pyreqwest**: a transport supplies only a
+  chunk source. Native reads at most two chunks ahead and stops reading the socket while nobody
+  reads, so a slow consumer never buffers a whole body.
+- **Measured choices:** one shared deadline timer and heap (a per-request `call_later` cost
+  ~1.3us); lazy headers; PGO is worth ~3% CPU per request.
+- **HTTP/2 is deferred** until someone asks (decided 2026-11-10): it's the largest port and rarely
+  used, so `http2=True` stays on pyreqwest.
+- **The mocker runs through native's own request code** (decided 2026-11-10), answering from
+  Python handlers instead of the network, so mocked tests still see the exact request sent.
+  The engine is lothc's own (`lothc/_mocking.py`, decided 2026-11-11), not a port of pyreqwest's
+  Apache-2.0 mocker; both transports check one hook, and nothing patches pyreqwest.
 
 ## Decisions
 
@@ -192,8 +268,8 @@ Each of these was a real bug or a lost hour once.
 - **Keep `_send_method` one async layer deep**: each extra layer is a frame on every resume.
 - **The async idle limit wraps each chunk read, never a `yield`**, or a slow consumer looks like
   a stalled server.
-- **The mocker validates before registering** (pyreqwest registers a mock as soon as the call
-  returns) **and applies `data=` before `headers=`** (`.body_json()` appends a Content-Type).
+- **The mocker validates before registering** (a rule matches from the moment it's added) **and
+  applies `data=` before `headers=`** (`.body_json()` appends a Content-Type).
 - **OAuth:** aliased pydantic token models need `ConfigDict(validate_by_name=True)`, and the
   token-request types are `Callable[..., JSONPayload]` because a `Protocol` fails 3 of 4
   checkers.

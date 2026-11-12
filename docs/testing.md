@@ -15,7 +15,8 @@ uv add 'lothc[testing]' pytest-asyncio --dev
 just pins a tested pytest version, it doesn't gate the fixture.
 
 `lothc_mocker` intercepts every request a `HTTPClient` or `SyncHTTPClient` sends during a test — no
-real network call happens, and no changes are needed to how the client under test is built. Every
+real network call happens, and no changes are needed to how the client under test is built (one
+built with `native=True` included, mocked exactly the same way). Every
 example on this page is a complete, runnable file — paste the setup block below into a
 `test_lothc_mocker.py` (or your `conftest.py` for just the fixtures), then any test function under
 it, and `pytest` will run it as-is. Nothing on this page ever imports from `pyreqwest` — every type
@@ -234,9 +235,9 @@ only place `match_request_with_response` can be used — calling it on a mock th
 canned response (any `add_*_response` call, or `with_status`/`with_headers`/`with_data`) raises a
 `ValueError`: a mock rule is either a canned response or a custom handler, never both.
 
-A custom handler has to either be an `async def` (for a `HTTPClient` test) or a plain function
-(for a `SyncHTTPClient` test) — the same reason `HTTPClient`/`SyncHTTPClient` themselves are two
-separate classes throughout lothc, not one. What the handler *returns* isn't split, though: a
+A custom handler (like a `match_request` predicate) can be a plain function, which answers either
+client, or an `async def`, which only a `HTTPClient` can await: a `SyncHTTPClient` request that
+reaches one raises `TypeError`. What the handler *returns* is the same either way: a
 plain `MockResponse` (`data`/`headers`/`status`, same fields and same encoding as
 `add_*_response`) either way, or `None` to decline and let a later mock try to match instead —
 lothc never hands you pyreqwest's own response types to build this, `MockResponse` is a plain
@@ -282,3 +283,36 @@ def test_sync_custom_handler_computes_response_from_the_request(
 
 `request` also exposes `.method`, `.query_string`, `.query` (`Mapping[str, str]`), and `.body`
 (`bytes | None`) — anything a real handler would need to branch on.
+
+## How a request finds its mock
+
+A request gets the response of the first mock, in the order they were registered, that matches
+it. `path=` matches the URL's path and `url=` the whole URL, query included: a `str` exactly, an
+`re.Pattern` anywhere in it (`re.search`). Every `match_*` call narrows the mock further, so a
+request must satisfy all of them. In `match_query`/`match_query_param`, a `str` or pattern value
+matches a key sent once, and a `list` every value of a repeated key, in order.
+`lothc_mocker.get_requests()` lists every request its mocks answered, in the order they were sent.
+
+When `assert_called` fails, it says what the mock is, how many requests it answered, and either
+the requests past the expected count or the closest request it didn't answer, with each part that
+didn't match:
+
+```
+The mock GET path='/items' answered 0 requests, expected exactly 1.
+The closest request it didn't answer, GET http://testserver/items?page=2:
+  query 'page': expected '1', got '2'
+```
+
+A strict mock's `AssertionError` for an unmatched request names the closest mock the same way.
+
+## What a mock sees, and what it skips
+
+A mock sees each request as the client built it: the full URL (`base_url` joined, `params=`
+encoded), `default_headers`, auth and your own `headers=` (in the order they go out), and a
+`json=`/`content=` body's bytes. It answers before the transport takes over, so the request has
+none of the headers the transport adds while sending (`Accept`, `User-Agent`, `Accept-Encoding`,
+cookies, `Host`), and `.body` is `None` for a `data=` or `form=` body, which the transport encodes
+itself (their `Content-Type`, and a `form=` body's `Content-Length`, are there). The response a mock
+gives comes back as is: a `3xx` isn't followed, a compressed body isn't decompressed, a
+`Set-Cookie` isn't stored, and neither the client's `timeout` nor `max_connections` applies to it.
+Retries and a `401`'s re-authentication do go through the mocks again, one request each.

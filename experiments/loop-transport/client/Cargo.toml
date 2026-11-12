@@ -1,0 +1,17 @@
+[package]
+name = "reqwest-bench"
+version = "0.1.0"
+edition = "2021"
+
+# Same pins and features as pyreqwest 0.15.0's Cargo.toml, so this measures the
+# exact HTTP stack pyreqwest wraps.
+[dependencies]
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "http2", "query", "multipart", "form", "cookies", "stream", "socks", "gzip", "zstd", "brotli", "deflate"] }
+tokio = { version = "=1.53.2", features = ["rt-multi-thread", "time", "sync", "macros"] }
+hyper = { version = "=1.12.0", features = ["client", "http1", "http2"] }
+serde_json = "=1.0.152"
+libc = "0.2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

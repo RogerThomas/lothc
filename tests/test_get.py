@@ -63,7 +63,7 @@ async def test_get_with_raw_dict_params(client: HTTPClient) -> None:
 
 async def test_get_with_repeated_query_param(client: HTTPClient) -> None:
     """A `list[...]` `params` value sends that key once per element, verbatim — see `Params`'s
-    own doc comment in `lothc/_client.py`."""
+    own doc comment in `lothc/_types.py`."""
     result = (
         await client.get("echo-query", params={"tag": ["a", "b"], "limit": 10}, into=dict)
     ).data

@@ -1,0 +1,5 @@
+# benchmarks/Dockerfile copies native/ and lothc/ whole: keep out cargo's build output (hundreds of
+# MB) and the host's own build of the extension.
+native/target
+lothc/_native.*.so
+**/__pycache__

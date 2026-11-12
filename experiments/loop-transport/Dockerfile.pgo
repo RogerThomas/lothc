@@ -1,0 +1,35 @@
+# PGO build of the POC (fastpg's recipe): instrumented wheel -> training run -> merged
+# profile -> optimised wheel. Training covers the benchmark paths AND correctness.py
+# (errors, timeouts, POST, reconnects, cancellation), since untrained paths get slower.
+FROM rust:1-slim AS instr
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN rustup component add llvm-tools && uv python install 3.14
+WORKDIR /build
+COPY poc/ ./
+RUN TARGET=$(rustc -vV | sed -n 's/^host: //p') && echo "$TARGET" > /target && \
+    RUSTFLAGS="-Cprofile-generate=/pgo/raw" uv tool run maturin build --release \
+      --target "$TARGET" -i "$(uv python find 3.14)" -o /wheels-instr
+
+FROM reqwest-floor-py-bench:latest AS train
+COPY --from=reqwest-floor-json-server:latest /usr/local/bin/json-server /usr/local/bin/json-server
+COPY --from=instr /wheels-instr /wheels-instr
+RUN uv pip install --python /app/.venv/bin/python /wheels-instr/*.whl
+COPY py_bench.py poc_client.py correctness.py correctness_sync.py sync_bench.py /bench/
+RUN mkdir -p /pgo/raw && (json-server >/dev/null 2>&1 &) && sleep 0.5 && cd /bench && \
+    for impl in poc-msgspec poc-msgspec-params poc-bytes; do for c in 10 100; do \
+      /app/.venv/bin/yeet py_bench.py "$impl" --url http://127.0.0.1:3000/ --concurrency $c \
+        --requests 30000 --warmup 1000 --runs 1 || exit 1; done; done && \
+    /app/.venv/bin/yeet correctness.py 2>/dev/null && /app/.venv/bin/yeet correctness_sync.py 2>/dev/null && \
+    /app/.venv/bin/yeet sync_bench.py poc-sync --url http://127.0.0.1:3000/ --threads 4 --requests 20000 --runs 1 && ls /pgo/raw
+
+FROM instr AS optimised
+COPY --from=train /pgo/raw /pgo/raw
+RUN TARGET=$(cat /target) && \
+    "$(rustc --print sysroot)/lib/rustlib/$TARGET/bin/llvm-profdata" merge -o /pgo/poc.profdata /pgo/raw && \
+    RUSTFLAGS="-Cprofile-use=/pgo/poc.profdata -Cllvm-args=-pgo-warn-missing-function" \
+      uv tool run maturin build --release --target "$TARGET" -i "$(uv python find 3.14)" -o /wheels 2>&1 \
+      | grep -c 'no profile data' || true
+
+FROM reqwest-floor-py-bench:latest
+COPY --from=optimised /wheels /wheels
+RUN uv pip install --python /app/.venv/bin/python /wheels/*.whl

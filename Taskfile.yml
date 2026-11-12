@@ -39,6 +39,15 @@ tasks:
     desc: Run the test suite
     cmd: '{{.PYTEST_RUN}} tests {{.CLI_ARGS}}'
 
+  test-native:
+    # The experimental native transport (lothc._native), selected per client by this env var.
+    # Only the tests that need `http2=True` fail, with NotImplementedError: native hasn't ported
+    # HTTP/2 (see CLAUDE.md). CI runs this minus those tests.
+    desc: Run the test suite with every client on the native transport (LOTHC_TRANSPORT=native)
+    env:
+      LOTHC_TRANSPORT: native
+    cmd: '{{.PYTEST_RUN}} tests {{.CLI_ARGS}}'
+
   test-doctests:
     desc: Run doctests
     cmd: '{{.PYTEST_RUN}} --doctest-modules lothc {{.CLI_ARGS}}'

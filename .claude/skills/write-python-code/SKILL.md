@@ -7,7 +7,7 @@ description: Python code-style conventions for this repo (lothc) — load before
 
 `./style-guide.md` is imported into `CLAUDE.md` (`@style-guide.md`), so it's already in context
 in a main session; a subagent without `CLAUDE.md` should read it in full before editing
-`lothc/_client.py`. Its rules are load-bearing: deviating from them silently reintroduces bugs this
+`lothc/`. Its rules are load-bearing: deviating from them silently reintroduces bugs this
 project has already paid to fix once.
 
 The rules below are the ones that come up everywhere in this repo, summarized so you don't have to

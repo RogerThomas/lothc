@@ -7,6 +7,18 @@ on:
   # Lets release.yml run this whole workflow as a gate before it publishes to PyPI, so a release
   # can't ship a commit whose tests never ran (or failed).
   workflow_call:
+env:
+  # Every job that runs the suite on the native transport (LOTHC_TRANSPORT=native, as
+  # `task test-native` does) leaves out these: the tests that need `http2=True`, which native
+  # refuses with NotImplementedError until HTTP/2 is ported (CLAUDE.md).
+  NATIVE_DESELECT: >-
+    --deselect tests/test_client_build.py::test_http2_falls_back_to_http1_against_an_http1_only_server
+    --deselect tests/test_client_build.py::test_sync_http2_falls_back_to_http1_against_an_http1_only_server
+    --deselect tests/test_tls.py::test_http2_over_tls_falls_back_to_http1_via_alpn
+    --deselect tests/test_tls.py::test_sync_http2_over_tls_falls_back_to_http1_via_alpn
+    --deselect tests/test_http2.py::test_http2_true_negotiates_http2_with_a_server_that_offers_it
+    --deselect tests/test_http2.py::test_sync_http2_true_negotiates_http2_with_a_server_that_offers_it
+    --deselect tests/test_http2.py::test_http2_carries_several_requests_on_one_client
 jobs:
   test:
     strategy:
@@ -19,6 +31,11 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
+      # The extension's dependencies, built once per job and Python version.
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: native
+          key: ${{ matrix.python-version }}
       - run: uv sync --all-extras --group dev --group perf
       - run: uv run ruff check .
       - run: uv run ruff format --check .
@@ -35,6 +52,10 @@ jobs:
       # imported, so their module-level code always showed as uncovered. Real coverage was 97%,
       # not ~79%.
       - run: uv run coverage run --rcfile=pyproject.toml -m pytest tests
+      # The suite again on the native transport, appended to the same coverage data.
+      - run: uv run coverage run --rcfile=pyproject.toml --append -m pytest tests $NATIVE_DESELECT
+        env:
+          LOTHC_TRANSPORT: native
       - run: uv run coverage xml
       # Uploaded from every matrix version so Codecov merges them into one accurate report,
       # rather than the last-finishing job's coverage silently overwriting the others'.
@@ -66,9 +87,50 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
+      # The extension's dependencies, built once per job and Python version.
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: native
+          key: ${{ matrix.python-version }}
       - run: uv sync --all-extras --no-default-groups --group dev
       - run: uv run --no-sync python -c "import sys; assert not sys._is_gil_enabled(), 'GIL is on'"
       - run: uv run --no-sync pytest tests
+      # The native transport shares its pools' state across threads, so a data race in it shows
+      # here.
+      - run: uv run --no-sync pytest tests $NATIVE_DESELECT
+        env:
+          LOTHC_TRANSPORT: native
+
+  # The suite on each other platform lothc will ship wheels for, one Python version each. Tests
+  # only: lint and type-checking don't vary by platform, and the `test` jobs run them. Windows
+  # runs the pyreqwest transport only, since native is POSIX only (CLAUDE.md) and
+  # `lothc._native` is a stub there. --no-default-groups leaves out the `perf` group, as above.
+  test-platforms:
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is Arm; macos-26-intel is GitHub's current Intel macOS runner.
+        os: [ubuntu-24.04-arm, macos-latest, macos-26-intel, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.14"
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: native
+      - run: uv sync --all-extras --no-default-groups --group dev
+      # GitHub's macOS runners coalesce a job's timers: a 0.02s sleep took about 0.08s, past the
+      # margins the timing tests keep (a developer's Mac doesn't, for a foreground process).
+      - if: runner.os == 'macOS'
+        run: sudo sysctl -w kern.timer.coalescing_enabled=0
+      - run: uv run --no-sync pytest tests
+      # Even after a failure on pyreqwest, so each transport's result shows.
+      - if: ${{ !cancelled() && runner.os != 'Windows' }}
+        run: uv run --no-sync pytest tests $NATIVE_DESELECT
+        env:
+          LOTHC_TRANSPORT: native
 
   # pydantic and msgspec are optional extras, but the `test` job above always has both installed,
   # so a stray unguarded import of either would pass CI and then crash `import lothc` for anyone
@@ -81,6 +143,9 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: "3.13"
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: native
       # The locked dev group minus the two extras, rather than a hand-picked `pytest ...` list,
       # so a new test-only dependency (e.g. trustme) can't silently break this job.
       - run: >-
