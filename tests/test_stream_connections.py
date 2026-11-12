@@ -70,6 +70,53 @@ def _sync_written_while_paused(client: SyncHTTPClient, key: str, timeout: float 
     return written["hits"]
 
 
+async def _settled(client: HTTPClient, key: str) -> None:
+    """Wait until the server has stopped writing `/large?key=`'s body, held back by a reader that
+    has read ahead all it will: the reading ahead, and the filling of the socket buffers, cost
+    CPU, on a slow machine as much as a busy loop's in the whole of the pause (0.1s of 0.2s)."""
+    written = -1
+    while written != (written := await _written(client, key)):
+        await asyncio.sleep(0.02)
+
+
+async def _written(client: HTTPClient, key: str) -> int:
+    return (await client.get("hits", params={"key": f"{key}-written"}, into=dict)).data["hits"]
+
+
+def _sync_settled(client: SyncHTTPClient, key: str) -> None:
+    written = -1
+    while written != (written := _sync_written(client, key)):
+        time.sleep(0.02)
+
+
+def _sync_written(client: SyncHTTPClient, key: str) -> int:
+    return client.get("hits", params={"key": f"{key}-written"}, into=dict).data["hits"]
+
+
+async def _cpu_while_paused(client: HTTPClient, key: str) -> float:
+    """The CPU this process spends in 0.1s of pausing a stream of a 128MB body, from when the
+    server can write no more of it (`_settled`)."""
+    stream = client.stream_get("large", params={"key": key, "size": 128 * 2**20})
+    await anext(stream)
+    await _settled(client, key)
+    started = time.process_time()
+    await asyncio.sleep(0.1)
+    spent = time.process_time() - started
+    await stream.aclose()
+    return spent
+
+
+def _sync_cpu_while_paused(client: SyncHTTPClient, key: str, timeout: float | None) -> float:
+    stream = client.stream_get("large", params={"key": key, "size": 128 * 2**20}, timeout=timeout)
+    next(stream)
+    _sync_settled(client, key)
+    started = time.process_time()
+    time.sleep(0.1)
+    spent = time.process_time() - started
+    stream.close()
+    return spent
+
+
 async def test_the_streaming_verbs_work_over_tls(https_base_url: str, tls_ca_pem: bytes) -> None:
     async with HTTPClient(base_url=https_base_url, root_certificates=[tls_ca_pem]) as client:
         lines = [line async for line in client.stream_get("ndjson", params={"count": 2}, into=dict)]
@@ -214,20 +261,14 @@ async def test_a_slow_consumer_costs_no_cpu_while_it_pauses(
     client: HTTPClient, server_key: str
 ) -> None:
     # Data waiting unread on the socket must not keep the client polling it.
-    started = time.process_time()
-    await _written_while_paused(client, server_key, None)
-
-    assert time.process_time() - started < 0.1
+    assert await _cpu_while_paused(client, server_key) < 0.05
 
 
 @pytest.mark.parametrize("timeout", [None, 5.0], ids=["idle-limit", "total-cap"])
 def test_sync_a_slow_consumer_costs_no_cpu_while_it_pauses(
     sync_client: SyncHTTPClient, server_key: str, timeout: float | None
 ) -> None:
-    started = time.process_time()
-    _sync_written_while_paused(sync_client, server_key, timeout)
-
-    assert time.process_time() - started < 0.1
+    assert _sync_cpu_while_paused(sync_client, server_key, timeout) < 0.05
 
 
 async def test_a_stream_given_up_waiting_for_its_head_leaves_the_client_working(
@@ -250,7 +291,10 @@ def test_sync_a_stream_given_up_waiting_for_its_head_leaves_the_client_working(
             next(stream)
         stream.close()
 
-        assert client.get("items/7", into=dict).data == {"id": 7, "name": "item-7"}
+        # Not held up until the abandoned request ends, 0.25s on: a new connection's connect and
+        # exchange had to fit in the client's 0.05s, which a stalled machine outlasted.
+        response = client.get("items/7", into=dict, timeout=0.2)
+        assert response.data == {"id": 7, "name": "item-7"}
 
 
 async def test_a_stream_given_up_mid_read_leaves_the_client_working(client: HTTPClient) -> None:
@@ -272,7 +316,9 @@ def test_sync_a_stream_given_up_mid_read_leaves_the_client_working(base_url: str
             next(stream)
         stream.close()
 
-        assert client.get("items/7", into=dict).data == {"id": 7, "name": "item-7"}
+        # As above: not held up until the parked read ends.
+        response = client.get("items/7", into=dict, timeout=0.2)
+        assert response.data == {"id": 7, "name": "item-7"}
 
 
 async def test_a_stream_with_a_revoked_token_is_retried_with_a_fresh_one(

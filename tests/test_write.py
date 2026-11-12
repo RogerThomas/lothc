@@ -7,11 +7,17 @@ from pathlib import Path
 from typing import Any, TypedDict, cast
 
 import pytest
-from _helpers import echoed_headers, make_unreadable, opens_but_fails_to_read, partial_body_seen
+from _helpers import (
+    echoed_headers,
+    make_unreadable,
+    opens_but_fails_to_read,
+    post_failing_form,
+    sync_post_failing_form,
+)
 from msgspec import Struct
 from pydantic import BaseModel, ConfigDict, Field
 
-from lothc import Form, HTTPClient, HTTPConnectionError, SyncHTTPClient
+from lothc import Form, HTTPClient, SyncHTTPClient
 
 
 class ItemModel(BaseModel):
@@ -1034,12 +1040,10 @@ async def test_a_form_file_that_cant_be_read_fails_the_request_after_the_parts_b
 ) -> None:
     unreadable = tmp_path / "unreadable"
 
-    with opens_but_fails_to_read(unreadable), pytest.raises(HTTPConnectionError):
-        await client.post(
-            "partial-body", params={"key": server_key}, form={"a": "b", "f": unreadable}
-        )
+    with opens_but_fails_to_read(unreadable):
+        seen = await post_failing_form(client, base_url, server_key, {"a": "b", "f": unreadable})
 
-    body = partial_body_seen(base_url, server_key)["body"]
+    body = seen["body"]
     assert 'name="a"\r\n\r\nb\r\n--' in body
     assert body.endswith(
         'name="f"; filename="unreadable"\r\nContent-Type: application/octet-stream\r\n\r\n'
@@ -1051,12 +1055,12 @@ def test_sync_a_form_file_that_cant_be_read_fails_the_request_after_the_parts_be
 ) -> None:
     unreadable = tmp_path / "unreadable"
 
-    with opens_but_fails_to_read(unreadable), pytest.raises(HTTPConnectionError):
-        sync_client.post(
-            "partial-body", params={"key": server_key}, form={"a": "b", "f": unreadable}
+    with opens_but_fails_to_read(unreadable):
+        seen = sync_post_failing_form(
+            sync_client, base_url, server_key, {"a": "b", "f": unreadable}
         )
 
-    body = partial_body_seen(base_url, server_key)["body"]
+    body = seen["body"]
     assert 'name="a"\r\n\r\nb\r\n--' in body
     assert body.endswith(
         'name="f"; filename="unreadable"\r\nContent-Type: application/octet-stream\r\n\r\n'

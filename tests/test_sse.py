@@ -209,22 +209,48 @@ def test_sync_sse_is_not_killed_by_the_client_level_total_timeout(base_url: str)
     assert len(events) == 6
 
 
-async def test_sse_read_timeout_bounds_the_idle_gap_between_events(base_url: str) -> None:
-    async with HTTPClient(base_url=base_url, read_timeout=0.03) as client:
+# `read_timeout` also bounds the connect and the wait for the response's head (reqwest's starts
+# with the request), which a stalled machine can outlast: a try that times out before its first
+# event shows nothing about the gap after it, so it is made again, for up to 2s (five tries in a
+# row once fell inside one stall).
+async def _first_event_before_a_timed_out_gap(client: HTTPClient) -> SSEEvent[str]:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
         stream = client.sse("events", params={"interval": 0.3, "count": 3}, max_reconnects=0)
-        first = await anext(stream)
+        try:
+            first = await anext(stream)
+        except HTTPTimeoutError:
+            continue
         with pytest.raises(HTTPTimeoutError):
             await anext(stream)
+        return first
+    raise AssertionError("no try's first event arrived within read_timeout")
+
+
+def _sync_first_event_before_a_timed_out_gap(client: SyncHTTPClient) -> SSEEvent[str]:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        stream = client.sse("events", params={"interval": 0.3, "count": 3}, max_reconnects=0)
+        try:
+            first = next(stream)
+        except HTTPTimeoutError:
+            continue
+        with pytest.raises(HTTPTimeoutError):
+            next(stream)
+        return first
+    raise AssertionError("no try's first event arrived within read_timeout")
+
+
+async def test_sse_read_timeout_bounds_the_idle_gap_between_events(base_url: str) -> None:
+    async with HTTPClient(base_url=base_url, read_timeout=0.03) as client:
+        first = await _first_event_before_a_timed_out_gap(client)
 
     assert first.id == "0"
 
 
 def test_sync_sse_read_timeout_bounds_the_idle_gap_between_events(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, read_timeout=0.03) as client:
-        stream = client.sse("events", params={"interval": 0.3, "count": 3}, max_reconnects=0)
-        first = next(stream)
-        with pytest.raises(HTTPTimeoutError):
-            next(stream)
+        first = _sync_first_event_before_a_timed_out_gap(client)
 
     assert first.id == "0"
 

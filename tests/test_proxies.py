@@ -2233,6 +2233,34 @@ def test_sync_a_stalled_https_proxy_handshake_times_out(
     assert time.monotonic() - started < 1.0
 
 
+# `connect_timeout` also covers the proxy's own TLS handshake, which a busy machine made outlast
+# it now and then (5 tries in 80): a try timed out before its `CONNECT` reached the proxy shows
+# nothing about the origin's handshake, so it is made again, for up to 2s. How long the try that
+# did reach it took to time out.
+async def _timed_out_inside_the_tunnel(client: HTTPClient, proxy: HTTPProxy, url: str) -> float:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        tunnels = len(proxy.requests)
+        started = time.monotonic()
+        with pytest.raises(HTTPTimeoutError):
+            await client.get(url)
+        if len(proxy.requests) > tunnels:
+            return time.monotonic() - started
+    raise AssertionError("no try's CONNECT reached the proxy within connect_timeout")
+
+
+def _sync_timed_out_inside_the_tunnel(client: SyncHTTPClient, proxy: HTTPProxy, url: str) -> float:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        tunnels = len(proxy.requests)
+        started = time.monotonic()
+        with pytest.raises(HTTPTimeoutError):
+            client.get(url)
+        if len(proxy.requests) > tunnels:
+            return time.monotonic() - started
+    raise AssertionError("no try's CONNECT reached the proxy within connect_timeout")
+
+
 async def test_connect_timeout_covers_the_origin_handshake_inside_an_https_proxy_tunnel(
     tls_ca: trustme.CA, tls_ca_pem: bytes
 ) -> None:
@@ -2249,12 +2277,10 @@ async def test_connect_timeout_covers_the_origin_handshake_inside_an_https_proxy
         async with HTTPClient(
             proxy=proxy.url, root_certificates=[tls_ca_pem], connect_timeout=0.05, timeout=5.0
         ) as client:
-            started = time.monotonic()
-            with pytest.raises(HTTPTimeoutError):
-                await client.get(f"{origin.url}/items/7")
+            waited = await _timed_out_inside_the_tunnel(client, proxy, f"{origin.url}/items/7")
 
-    assert time.monotonic() - started < 1.0
-    assert _lines(proxy) == [f"CONNECT localhost:{_port(origin.url)} HTTP/1.1"]
+    assert waited < 1.0
+    assert set(_lines(proxy)) == {f"CONNECT localhost:{_port(origin.url)} HTTP/1.1"}
 
 
 def test_sync_connect_timeout_covers_the_origin_handshake_inside_an_https_proxy_tunnel(
@@ -2271,12 +2297,10 @@ def test_sync_connect_timeout_covers_the_origin_handshake_inside_an_https_proxy_
             proxy=proxy.url, root_certificates=[tls_ca_pem], connect_timeout=0.05, timeout=5.0
         ) as client,
     ):
-        started = time.monotonic()
-        with pytest.raises(HTTPTimeoutError):
-            client.get(f"{origin.url}/items/7")
+        waited = _sync_timed_out_inside_the_tunnel(client, proxy, f"{origin.url}/items/7")
 
-    assert time.monotonic() - started < 1.0
-    assert _lines(proxy) == [f"CONNECT localhost:{_port(origin.url)} HTTP/1.1"]
+    assert waited < 1.0
+    assert set(_lines(proxy)) == {f"CONNECT localhost:{_port(origin.url)} HTTP/1.1"}
 
 
 @pytest.mark.parametrize(
