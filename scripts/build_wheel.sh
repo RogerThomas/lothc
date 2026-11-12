@@ -50,4 +50,10 @@ RUSTFLAGS="-Cprofile-use=$work/lothc.profdata -Cllvm-args=-pgo-warn-missing-func
 echo "::endgroup::"
 # The profile is used: a function it has no data for warns, so one that didn't match (another
 # LLVM, other sources) would warn for nearly every function it counted above.
-echo "Functions without profile data: $(grep -c 'no profile data' "$work/optimised.log" || true)"
+missing="$(grep -c 'no profile data' "$work/optimised.log" || true)"
+echo "Functions without profile data: $missing"
+# Matched profiles leave 0-50 (measured per platform); an unused one leaves over 1,000.
+if (( missing > 200 )); then
+  echo "::error::The PGO profile wasn't used: $missing functions without profile data"
+  exit 1
+fi
