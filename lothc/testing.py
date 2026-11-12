@@ -120,17 +120,20 @@ class LOTHCMock:
     def with_status(self, status: int) -> Self:
         self._commit("response")
         self._rule.response.status = status
+        self._rule.prepared = None
         return self
 
     def with_headers(self, headers: Headers) -> Self:
         self._commit("response")
         # Encoded now, into a copy, so changing the caller's own dict later changes nothing.
         self._rule.response.headers = _encode_headers(headers)
+        self._rule.prepared = None
         return self
 
     def with_data(self, data: Data) -> Self:
         self._commit("response")
         self._rule.response.data = _snapshot(data)
+        self._rule.prepared = None
         return self
 
     def match_query(self, query: QueryMatcher) -> Self:

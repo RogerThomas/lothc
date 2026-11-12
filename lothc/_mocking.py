@@ -14,7 +14,7 @@ import copy
 import inspect
 import json
 import threading
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from re import Pattern
@@ -96,6 +96,16 @@ type CustomHandler = (
 
 
 @dataclass(slots=True, eq=False)
+class _Prepared:
+    """A mock's response, encoded once however many requests it answers: as pyreqwest builds one
+    (`builder`, which each pyreqwest request is answered with a copy of) and, made from that the
+    first time a native pool needs it, as the native pools take one (`parts`)."""
+
+    builder: ResponseBuilder
+    parts: tuple[int, list[tuple[str, str]], bytes] | None = None
+
+
+@dataclass(slots=True, eq=False)
 class _Rule:
     """One mock: what a request must look like for it to answer, and its answer (`handler`'s, if
     it has one, else `response`). `LOTHCMock` (`lothc/testing.py`) fills it in. Compared and
@@ -115,6 +125,8 @@ class _Rule:
     matchers: list[CustomMatcher] = field(default_factory=list[CustomMatcher])
     response: MockResponse = field(default_factory=MockResponse)
     handler: CustomHandler | None = None
+    # `response`, encoded on its first answer; whatever changes `response` resets it.
+    prepared: _Prepared | None = None
 
 
 @dataclass(slots=True, eq=False)
@@ -123,11 +135,14 @@ class _Incoming:
 
     method: str
     url: Url
-    headers: list[tuple[str, str]]
+    # Native's as pairs; pyreqwest's as `HeaderMap.dict_multi_value()`, which takes a third as long
+    # as listing its pairs and fails on a value that isn't visible ASCII just the same.
+    headers: list[tuple[str, str]] | dict[str, str | list[str]]
     body: bytes | None
     answered_by: _Rule | None = None
     # Why a mock that matched the rest of it declined: a custom matcher or handler's verdict.
-    passed_on: dict[_Rule, str] = field(default_factory=dict[_Rule, str])
+    # Plain `dict`, made per request: calling `dict[_Rule, str]` costs 8x as much.
+    passed_on: dict[_Rule, str] = field(default_factory=dict)
 
 
 def _first_value_per_key(values: Mapping[str, str | list[str]]) -> dict[str, str]:
@@ -141,6 +156,18 @@ def _first_value_per_key(values: Mapping[str, str | list[str]]) -> dict[str, str
     return {name: value if isinstance(value, str) else value[0] for name, value in values.items()}
 
 
+def _request_headers(incoming: _Incoming) -> CaseInsensitiveDict:
+    """`incoming`'s headers, every value of a repeated name kept, in the order sent."""
+    headers = incoming.headers
+    if isinstance(headers, list):
+        return CaseInsensitiveDict(headers)
+    return CaseInsensitiveDict([
+        (name, value)
+        for name, values in headers.items()
+        for value in ([values] if isinstance(values, str) else values)
+    ])
+
+
 def _mock_request(incoming: _Incoming) -> MockRequest:
     url = incoming.url
     return MockRequest(
@@ -148,7 +175,7 @@ def _mock_request(incoming: _Incoming) -> MockRequest:
         url.path,
         url.query_string or "",
         _first_value_per_key(url.query_dict_multi_value),
-        CaseInsensitiveDict(incoming.headers),
+        _request_headers(incoming),
         incoming.body,
     )
 
@@ -207,7 +234,7 @@ def _mismatches(rule: _Rule, incoming: _Incoming) -> list[str]:
         name: [value] if isinstance(value, str) else value
         for name, value in url.query_dict_multi_value.items()
     }
-    headers = CaseInsensitiveDict(incoming.headers)
+    headers = _request_headers(incoming)
     found = [
         _text_mismatch("method", rule.method, incoming.method),
         _text_mismatch("path", rule.path, url.path),
@@ -224,6 +251,24 @@ def _mismatches(rule: _Rule, incoming: _Incoming) -> list[str]:
         *(_json_mismatch(expected, incoming.body) for expected in rule.json_bodies),
     ]
     return [mismatch for mismatch in found if mismatch is not None]
+
+
+def _matches(rule: _Rule, incoming: _Incoming) -> bool:
+    """Whether `_mismatches(rule, incoming)` is empty, working out only what `rule` checks: most
+    rules check only a method and a path, so the rest of a request is built only for a rule that
+    checks it."""
+    if rule.method is not None and not _text_matches(rule.method, incoming.method):
+        return False
+    url = incoming.url
+    if rule.path is not None and not _text_matches(rule.path, url.path):
+        return False
+    if rule.url is not None and not _text_matches(rule.url, str(url)):
+        return False
+    if rule.query is not None and not _text_matches(rule.query, url.query_string or ""):
+        return False
+    if rule.query_params or rule.headers or rule.json_bodies:
+        return not _mismatches(rule, incoming)
+    return True
 
 
 def _reasons(rule: _Rule, incoming: _Incoming) -> list[str]:
@@ -277,9 +322,11 @@ class _Engine:
     requests: list[_Incoming] = field(default_factory=list[_Incoming])
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
-    def candidates(self, incoming: _Incoming) -> Iterator[_Rule]:
-        """The mocks `incoming` matches short of their custom matchers and handlers, in order."""
-        return (rule for rule in tuple(self.rules) if not _mismatches(rule, incoming))
+    def candidates(self, incoming: _Incoming) -> list[_Rule]:
+        """The mocks `incoming` matches short of their custom matchers and handlers, in order: a
+        list rather than a generator, which costs more to resume than matching a test's few
+        mocks."""
+        return [rule for rule in tuple(self.rules) if _matches(rule, incoming)]
 
     def settle(self, incoming: _Incoming, rule: _Rule | None) -> None:
         """Record that `rule` answered `incoming`, or, with `None`, that no mock did: an
@@ -399,33 +446,6 @@ def _answer_sync(rule: _Rule, incoming: _Incoming) -> MockResponse | None:
     return response
 
 
-async def _dispatch(engine: _Engine, incoming: _Incoming) -> MockResponse | None:
-    """The first matching mock's response to `incoming`, or `None` to send it for real."""
-    for rule in engine.candidates(incoming):
-        response = await _answer(rule, incoming)
-        if response is not None:
-            engine.settle(incoming, rule)
-            return response
-    engine.settle(incoming, None)
-    return None
-
-
-def _dispatch_sync(engine: _Engine, incoming: _Incoming) -> MockResponse | None:
-    for rule in engine.candidates(incoming):
-        response = _answer_sync(rule, incoming)
-        if response is not None:
-            engine.settle(incoming, rule)
-            return response
-    engine.settle(incoming, None)
-    return None
-
-
-def _snapshot(data: Data) -> Data:
-    """`data` as it is now, for a canned response: changing the caller's own `dict` or model
-    later changes no mock."""
-    return data if isinstance(data, bytes) else copy.deepcopy(data)
-
-
 def _encode_json_payload(payload: JSONPayload) -> Any:  # noqa: ANN401
     """Any `JSONPayload` as plain JSON values, for `ResponseBuilder.body_json()`."""
     if isinstance(payload, BaseModel):
@@ -449,10 +469,49 @@ def _response_builder(response: MockResponse) -> ResponseBuilder:
     return builder
 
 
-def _response_parts(response: MockResponse) -> tuple[int, list[tuple[str, str]], bytes]:
+def _prepared(rule: _Rule, response: MockResponse) -> _Prepared:
+    """`response`, which `rule` answers with, encoded: once for a canned response, and each time
+    for a handler's, which is new each time."""
+    if rule.handler is not None:
+        return _Prepared(_response_builder(response))
+    if rule.prepared is None:
+        rule.prepared = _Prepared(_response_builder(response))
+    return rule.prepared
+
+
+async def _dispatch(engine: _Engine, incoming: _Incoming) -> _Prepared | None:
+    """The first matching mock's response to `incoming`, or `None` to send it for real."""
+    for rule in engine.candidates(incoming):
+        response = await _answer(rule, incoming)
+        if response is not None:
+            engine.settle(incoming, rule)
+            return _prepared(rule, response)
+    engine.settle(incoming, None)
+    return None
+
+
+def _dispatch_sync(engine: _Engine, incoming: _Incoming) -> _Prepared | None:
+    for rule in engine.candidates(incoming):
+        response = _answer_sync(rule, incoming)
+        if response is not None:
+            engine.settle(incoming, rule)
+            return _prepared(rule, response)
+    engine.settle(incoming, None)
+    return None
+
+
+def _snapshot(data: Data) -> Data:
+    """`data` as it is now, for a canned response: changing the caller's own `dict` or model
+    later changes no mock."""
+    return data if isinstance(data, bytes) else copy.deepcopy(data)
+
+
+def _response_parts(prepared: _Prepared) -> tuple[int, list[tuple[str, str]], bytes]:
     """A mock's response as the native pools take one: status, header pairs, body."""
-    built = _response_builder(response).build_sync()
-    return built.status, list(built.headers.items()), built.bytes().to_bytes()
+    if prepared.parts is None:
+        built = prepared.builder.copy().build_sync()
+        prepared.parts = built.status, list(built.headers.items()), built.bytes().to_bytes()
+    return prepared.parts
 
 
 def _incoming_from_pyreqwest(request: Request) -> _Incoming:
@@ -460,7 +519,7 @@ def _incoming_from_pyreqwest(request: Request) -> _Incoming:
     # `None` for a streamed body: lothc only streams `form=`, which pyreqwest hands reqwest unseen.
     raw = None if body is None else body.copy_bytes()
     body_bytes = None if raw is None else raw.to_bytes()
-    return _Incoming(request.method, request.url, list(request.headers.items()), body_bytes)
+    return _Incoming(request.method, request.url, request.headers.dict_multi_value(), body_bytes)
 
 
 @dataclass(slots=True)
@@ -470,10 +529,10 @@ class _MockMiddleware:
     _engine: _Engine
 
     async def __call__(self, request: Request, next: Next) -> RawResponse:  # noqa: A002 — matches pyreqwest's own middleware signature — pylint: disable=redefined-builtin,line-too-long
-        response = await _dispatch(self._engine, _incoming_from_pyreqwest(request))
-        if response is None:
+        prepared = await _dispatch(self._engine, _incoming_from_pyreqwest(request))
+        if prepared is None:
             return await next.run(request)
-        return await _response_builder(response).build()
+        return await prepared.builder.copy().build()
 
 
 @dataclass(slots=True)
@@ -483,10 +542,10 @@ class _SyncMockMiddleware:
     _engine: _Engine
 
     def __call__(self, request: Request, next: SyncNext) -> RawSyncResponse:  # noqa: A002 — matches pyreqwest's own middleware signature — pylint: disable=redefined-builtin,line-too-long
-        response = _dispatch_sync(self._engine, _incoming_from_pyreqwest(request))
-        if response is None:
+        prepared = _dispatch_sync(self._engine, _incoming_from_pyreqwest(request))
+        if prepared is None:
             return next.run(request)
-        return _response_builder(response).build_sync()
+        return prepared.builder.copy().build_sync()
 
 
 def _incoming_from_native(intercepted: Intercepted | SyncIntercepted) -> _Incoming:
@@ -498,22 +557,22 @@ def _incoming_from_native(intercepted: Intercepted | SyncIntercepted) -> _Incomi
 async def _native_answer(engine: _Engine, intercepted: Intercepted) -> Response[Any, Any]:
     """What a mocked request on the async native transport resolves to: a mock's response,
     through the pool's own response path, or the request sent for real."""
-    response = await _dispatch(engine, _incoming_from_native(intercepted))
-    if response is None:
+    prepared = await _dispatch(engine, _incoming_from_native(intercepted))
+    if prepared is None:
         fut = intercepted.send()
         try:
             return await fut
         except asyncio.CancelledError:
             intercepted.cancel(fut)
             raise
-    return intercepted.respond(*_response_parts(response))
+    return intercepted.respond(*_response_parts(prepared))
 
 
 def _native_answer_sync(engine: _Engine, intercepted: SyncIntercepted) -> Response[Any, Any]:
-    response = _dispatch_sync(engine, _incoming_from_native(intercepted))
-    if response is None:
+    prepared = _dispatch_sync(engine, _incoming_from_native(intercepted))
+    if prepared is None:
         return intercepted.send()
-    return intercepted.respond(*_response_parts(response))
+    return intercepted.respond(*_response_parts(prepared))
 
 
 @dataclass(slots=True, eq=False)
@@ -528,11 +587,11 @@ class _NativeMockStream:
     _body: bytes | None = None
 
     async def _open(self) -> tuple[int, RawHeaders, str]:
-        response = await _dispatch(self._engine, _incoming_from_native(self._intercepted))
-        if response is None:
+        prepared = await _dispatch(self._engine, _incoming_from_native(self._intercepted))
+        if prepared is None:
             stream = self._passed = self._intercepted.stream()
             return await stream.open()
-        status, headers, body = _response_parts(response)
+        status, headers, body = _response_parts(prepared)
         self._body = body or None
         return self._intercepted.head(status, headers)
 
@@ -566,11 +625,11 @@ class _SyncNativeMockStream:
     _body: bytes | None = None
 
     def _open(self) -> tuple[int, RawHeaders, str]:
-        response = _dispatch_sync(self._engine, _incoming_from_native(self._intercepted))
-        if response is None:
+        prepared = _dispatch_sync(self._engine, _incoming_from_native(self._intercepted))
+        if prepared is None:
             stream = self._passed = self._intercepted.stream()
             return stream.open()
-        status, headers, body = _response_parts(response)
+        status, headers, body = _response_parts(prepared)
         self._body = body or None
         return self._intercepted.head(status, headers)
 
