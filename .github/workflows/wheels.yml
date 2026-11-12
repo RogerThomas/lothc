@@ -72,6 +72,8 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: ${{ matrix.python }}
+      # setup-uv only points uv at the version, and no runner has a free-threaded one.
+      - run: uv python install ${{ matrix.python }}
       - run: rustup component add llvm-tools
       - name: Build
         run: scripts/build_wheel.sh ${{ matrix.python }} dist
@@ -101,6 +103,7 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: ${{ matrix.python }}
+      - run: uv python install ${{ matrix.python }}
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: native
