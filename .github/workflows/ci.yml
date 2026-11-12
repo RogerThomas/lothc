@@ -8,10 +8,11 @@ on:
   # can't ship a commit whose tests never ran (or failed).
   workflow_call:
 env:
-  # The extension as `[profile.ci]` builds it (native/Cargo.toml): release without fat LTO, which
-  # every job otherwise redoes in full, since no cache can hold it. The shipped binary is
-  # wheels.yml's, smoke-tested there.
-  MATURIN_PEP517_ARGS: --profile ci
+  # Builds release without fat LTO, which every job otherwise redoes in full, since no cache can
+  # hold it. Env, not a named profile: it reaches every sdist uv builds, and other packages'
+  # crates (pydantic-core, cryptography) have no `ci` profile. The shipped binary is wheels.yml's.
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
   # Every job that runs the suite on the native transport (LOTHC_TRANSPORT=native, as
   # `task test-native` does) leaves out these: the tests that need `http2=True`, which native
   # refuses with NotImplementedError until HTTP/2 is ported (CLAUDE.md).
