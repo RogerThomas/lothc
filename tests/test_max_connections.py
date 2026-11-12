@@ -19,6 +19,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import pytest
+from _helpers import arrived, sync_arrived
 
 from lothc import HTTPClient, HTTPTimeoutError, SyncHTTPClient
 
@@ -43,12 +44,18 @@ def _sync_one_slot_stream_client(base_url: str) -> Generator[SyncHTTPClient]:
         yield client
 
 
+def _sync_hold_the_slot(client: SyncHTTPClient, seconds: float, key: str) -> bytes:
+    return client.get("slow", params={"seconds": seconds, "key": key}).data
+
+
 async def test_max_connections_counts_the_requests_to_every_origin_together(
-    base_url: str, one_slot_client: HTTPClient
+    base_url: str, server_key: str, one_slot_client: HTTPClient
 ) -> None:
     other_origin = base_url.replace("127.0.0.1", "localhost")
-    holder = asyncio.create_task(one_slot_client.get("slow", params={"seconds": 0.12}))
-    await asyncio.sleep(0.02)
+    holder = asyncio.create_task(
+        one_slot_client.get("slow", params={"seconds": 0.12, "key": server_key})
+    )
+    await arrived(base_url, server_key)
 
     with pytest.raises(HTTPTimeoutError):
         await one_slot_client.get(f"{other_origin}items/7")
@@ -56,16 +63,16 @@ async def test_max_connections_counts_the_requests_to_every_origin_together(
 
 
 def test_sync_max_connections_counts_the_requests_to_every_origin_together(
-    base_url: str, sync_one_slot_client: SyncHTTPClient
+    base_url: str, server_key: str, sync_one_slot_client: SyncHTTPClient
 ) -> None:
     other_origin = base_url.replace("127.0.0.1", "localhost")
     with ThreadPoolExecutor(max_workers=1) as pool:
-        holder = pool.submit(sync_one_slot_client.get, "slow", params={"seconds": 0.12})
-        time.sleep(0.02)
+        holder = pool.submit(_sync_hold_the_slot, sync_one_slot_client, 0.12, server_key)
+        sync_arrived(base_url, server_key)
 
         with pytest.raises(HTTPTimeoutError):
             sync_one_slot_client.get(f"{other_origin}items/7")
-        assert holder.result().data == b'{"finally": true}'
+        assert holder.result() == b'{"finally": true}'
 
 
 async def test_pool_timeout_without_max_connections_never_times_a_request_out(
@@ -94,13 +101,15 @@ def test_sync_pool_timeout_without_max_connections_never_times_a_request_out(
 
 @pytest.mark.parametrize("pool_timeout", [None, 5.0], ids=["no-pool-timeout", "longer"])
 async def test_a_request_waits_for_a_slot_no_longer_than_its_own_timeout(
-    base_url: str, pool_timeout: float | None
+    base_url: str, server_key: str, pool_timeout: float | None
 ) -> None:
     async with HTTPClient(
         base_url=base_url, max_connections=1, pool_timeout=pool_timeout
     ) as client:
-        holder = asyncio.create_task(client.get("slow", params={"seconds": 0.15}))
-        await asyncio.sleep(0.02)
+        holder = asyncio.create_task(
+            client.get("slow", params={"seconds": 0.15, "key": server_key})
+        )
+        await arrived(base_url, server_key)
         started = time.monotonic()
         with pytest.raises(HTTPTimeoutError):
             await client.get("items/7", timeout=0.03)
@@ -112,14 +121,14 @@ async def test_a_request_waits_for_a_slot_no_longer_than_its_own_timeout(
 
 @pytest.mark.parametrize("pool_timeout", [None, 5.0], ids=["no-pool-timeout", "longer"])
 def test_sync_a_request_waits_for_a_slot_no_longer_than_its_own_timeout(
-    base_url: str, pool_timeout: float | None
+    base_url: str, server_key: str, pool_timeout: float | None
 ) -> None:
     with (
         SyncHTTPClient(base_url=base_url, max_connections=1, pool_timeout=pool_timeout) as client,
         ThreadPoolExecutor(max_workers=1) as pool,
     ):
-        holder = pool.submit(client.get, "slow", params={"seconds": 0.15})
-        time.sleep(0.02)
+        holder = pool.submit(_sync_hold_the_slot, client, 0.15, server_key)
+        sync_arrived(base_url, server_key)
         started = time.monotonic()
         with pytest.raises(HTTPTimeoutError):
             client.get("items/7", timeout=0.03)
@@ -130,11 +139,11 @@ def test_sync_a_request_waits_for_a_slot_no_longer_than_its_own_timeout(
 
 
 async def test_the_time_spent_waiting_for_a_slot_counts_against_the_requests_timeout(
-    base_url: str,
+    base_url: str, server_key: str
 ) -> None:
     async with HTTPClient(base_url=base_url, max_connections=1) as client:
-        holder = asyncio.create_task(client.get("slow", params={"seconds": 0.1}))
-        await asyncio.sleep(0.02)
+        holder = asyncio.create_task(client.get("slow", params={"seconds": 0.1, "key": server_key}))
+        await arrived(base_url, server_key)
         # Long enough for its own exchange, not for that and the wait before it.
         with pytest.raises(HTTPTimeoutError):
             await client.get("slow", params={"seconds": 0.1}, timeout=0.15)
@@ -142,14 +151,14 @@ async def test_the_time_spent_waiting_for_a_slot_counts_against_the_requests_tim
 
 
 def test_sync_the_time_spent_waiting_for_a_slot_counts_against_the_requests_timeout(
-    base_url: str,
+    base_url: str, server_key: str
 ) -> None:
     with (
         SyncHTTPClient(base_url=base_url, max_connections=1) as client,
         ThreadPoolExecutor(max_workers=1) as pool,
     ):
-        holder = pool.submit(client.get, "slow", params={"seconds": 0.1})
-        time.sleep(0.02)
+        holder = pool.submit(_sync_hold_the_slot, client, 0.1, server_key)
+        sync_arrived(base_url, server_key)
         with pytest.raises(HTTPTimeoutError):
             client.get("slow", params={"seconds": 0.1}, timeout=0.15)
         holder.result()
@@ -309,11 +318,11 @@ def test_sync_closing_a_stream_gives_its_slot_back(
 
 
 async def test_cancelling_a_request_waiting_for_a_slot_raises_cancelled_error(
-    base_url: str,
+    base_url: str, server_key: str
 ) -> None:
     async with HTTPClient(base_url=base_url, max_connections=1) as client:
-        holder = asyncio.create_task(client.get("slow", params={"seconds": 0.1}))
-        await asyncio.sleep(0.02)
+        holder = asyncio.create_task(client.get("slow", params={"seconds": 0.1, "key": server_key}))
+        await arrived(base_url, server_key)
         waiting = asyncio.create_task(client.get("items/7"))
         await asyncio.sleep(0.02)
         waiting.cancel()
@@ -338,8 +347,10 @@ async def test_a_request_cancelled_while_waiting_for_a_slot_is_never_sent(
     base_url: str, server_key: str
 ) -> None:
     async with HTTPClient(base_url=base_url, max_connections=1) as client:
-        holder = asyncio.create_task(client.get("slow", params={"seconds": 0.2}))
-        await asyncio.sleep(0.05)
+        holder = asyncio.create_task(
+            client.get("slow", params={"seconds": 0.2, "key": f"{server_key}-holder"})
+        )
+        await arrived(base_url, f"{server_key}-holder")
         waiting = asyncio.create_task(client.get("flaky", params={"key": server_key}))
         await asyncio.sleep(0.05)
         waiting.cancel()
@@ -353,10 +364,12 @@ async def test_a_request_cancelled_while_waiting_for_a_slot_is_never_sent(
 
 
 @_pyreqwest_runs_cancelled_requests
-async def test_a_request_cancelled_mid_response_gives_its_slot_back_at_once(base_url: str) -> None:
+async def test_a_request_cancelled_mid_response_gives_its_slot_back_at_once(
+    base_url: str, server_key: str
+) -> None:
     async with HTTPClient(base_url=base_url, max_connections=1) as client:
-        slow = asyncio.create_task(client.get("slow", params={"seconds": 1.0}))
-        await asyncio.sleep(0.1)
+        slow = asyncio.create_task(client.get("slow", params={"seconds": 1.0, "key": server_key}))
+        await arrived(base_url, server_key)
         slow.cancel()
         with pytest.raises(asyncio.CancelledError):
             await slow

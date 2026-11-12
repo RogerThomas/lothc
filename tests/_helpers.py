@@ -1,5 +1,6 @@
 """Small helpers shared by several test modules."""
 
+import asyncio
 import json
 import subprocess
 import sys
@@ -11,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from lothc import SyncHTTPClient
+from lothc import HTTPClient, SyncHTTPClient
 
 
 def _icacls(path: Path, *arguments: str) -> None:
@@ -105,3 +106,25 @@ def partial_body_seen(base_url: str, key: str) -> dict[str, Any]:
                 return json.loads(seen.data)
             time.sleep(0.01)
     raise AssertionError(f"/partial-body recorded nothing for {key}")
+
+
+async def arrived(base_url: str, key: str) -> None:
+    """Wait until the server has received a request counting `key` (`/slow?key=`), so one sent
+    in the background is in flight, and under `max_connections` holds its slot: a fixed sleep
+    can be outlasted by a stalled machine."""
+    async with HTTPClient(base_url=base_url) as client:
+        for _ in range(200):
+            if (await client.get("hits", params={"key": key}, into=dict)).data["hits"]:
+                return
+            await asyncio.sleep(0.01)
+    raise AssertionError(f"no request for {key} arrived")
+
+
+def sync_arrived(base_url: str, key: str) -> None:
+    """`arrived`, for a request sent on another thread."""
+    with SyncHTTPClient(base_url=base_url) as client:
+        for _ in range(200):
+            if client.get("hits", params={"key": key}, into=dict).data["hits"]:
+                return
+            time.sleep(0.01)
+    raise AssertionError(f"no request for {key} arrived")

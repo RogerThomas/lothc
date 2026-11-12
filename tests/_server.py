@@ -813,8 +813,12 @@ class TestAppHandler(BaseHTTPRequestHandler):
         # one shared number sized for the strictest case. A test that only needs the client to
         # time out never waits this out at all, so it can ask for a comfortably long sleep; the
         # two "a longer per-call timeout overrides the client's" tests deliberately run this to
-        # completion and pay every millisecond, so they ask for a short one.
-        sleep(float(parse_qs(query).get("seconds", ["0.5"])[0]))
+        # completion and pay every millisecond, so they ask for a short one. A `key` counts the
+        # request as it arrives (read back via `/hits`), so a test can wait until one is in flight.
+        params = parse_qs(query)
+        if "key" in params:
+            self._bump_counter(params["key"][0])
+        sleep(float(params.get("seconds", ["0.5"])[0]))
         self._write_json(200, {"finally": True})
 
     def _handle_peer(self, query: str) -> None:
