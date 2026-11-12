@@ -1,7 +1,8 @@
 """`lothc_mocker` sees the same request on both transports: every call below goes out through a
-pyreqwest client and a `native=True` one, async and sync, and what the mock was handed (method,
-path, query, every header in order, body) is compared, along with the `RequestInfo` of the
-response. A multipart body's boundary is random, so it's masked in its `Content-Type`.
+pyreqwest client (`native="off"`) and a native one (`native="on"`), async and sync, and what the
+mock was handed (method, path, query, every header in order, body) is compared, along with the
+`RequestInfo` of the response. A multipart body's boundary is random, so it's masked in its
+`Content-Type`.
 """
 
 import re
@@ -15,7 +16,7 @@ import pytest
 from msgspec import Struct
 from pydantic import BaseModel, Field
 
-from lothc import HTTPClient, RequestInfo, SyncHTTPClient
+from lothc import HTTPClient, NativeMode, RequestInfo, SyncHTTPClient
 from lothc.testing import LOTHCMocker, MockRequest
 
 # Every test here sends through the native transport, which is POSIX only.
@@ -188,10 +189,15 @@ def _request_info(result: object) -> RequestInfo | None:
     return request if isinstance(request, RequestInfo) else None
 
 
+def _transports() -> tuple[NativeMode, NativeMode]:
+    """pyreqwest, then native, the order the mock records their requests in."""
+    return ("off", "on")
+
+
 @pytest.fixture(name="answer_everything")
 def _answer_everything(lothc_mocker: LOTHCMocker, monkeypatch: pytest.MonkeyPatch) -> LOTHCMocker:
     """One mock for every request (an event stream, so `sse()` reads it too). `LOTHC_TRANSPORT`
-    is unset because it wins over `native=`: left set, both clients would be native."""
+    is unset because it wins over `native=`: left set, both clients would be on one transport."""
     monkeypatch.delenv("LOTHC_TRANSPORT", raising=False)
     lothc_mocker.mock().with_headers({"content-type": "text/event-stream"})
     return lothc_mocker
@@ -203,7 +209,7 @@ async def test_a_mock_sees_the_same_request_on_both_transports(
 ) -> None:
     path, call = _path(case, base_url), _call_kwargs(case, tmp_path)
     infos: list[RequestInfo | None] = []
-    for native in (False, True):
+    for native in _transports():
         client = HTTPClient(base_url=base_url + case.base_suffix, native=native, **case.client)
         infos.append(_request_info(await _async_request(client, case, path, call)))
 
@@ -217,7 +223,7 @@ def test_sync_a_mock_sees_the_same_request_on_both_transports(
 ) -> None:
     path, call = _path(case, base_url), _call_kwargs(case, tmp_path)
     infos: list[RequestInfo | None] = []
-    for native in (False, True):
+    for native in _transports():
         client = SyncHTTPClient(base_url=base_url + case.base_suffix, native=native, **case.client)
         infos.append(_request_info(_sync_request(client, case, path, call)))
 

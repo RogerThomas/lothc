@@ -15,9 +15,8 @@ uv add 'lothc[testing]' pytest-asyncio --dev
 just pins a tested pytest version, it doesn't gate the fixture.
 
 `lothc_mocker` intercepts every request a `HTTPClient` or `SyncHTTPClient` sends during a test — no
-real network call happens, and no changes are needed to how the client under test is built (one
-built with `native=True` included, mocked exactly the same way). Every
-example on this page is a complete, runnable file — paste the setup block below into a
+real network call happens, and no changes are needed to how the client under test is built
+(either transport is mocked exactly the same way). Every example on this page is a complete, runnable file — paste the setup block below into a
 `test_lothc_mocker.py` (or your `conftest.py` for just the fixtures), then any test function under
 it, and `pytest` will run it as-is. Nothing on this page ever imports from `pyreqwest` — every type
 you touch (`MockRequest`, `MockResponse`, `LOTHCMock`, `LOTHCMocker`) is lothc's own.

@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import time
@@ -20,6 +21,19 @@ type EventsParams = dict[str, str | float]
 def _icacls(path: Path, *arguments: str) -> None:
     """Edit `path`'s Windows ACL; `*S-1-1-0` is everyone."""
     subprocess.run(["icacls", str(path), *arguments], check=True, capture_output=True)
+
+
+def native_by_default() -> bool:
+    """Whether a client built without `native=` gets the native transport in this run:
+    `LOTHC_TRANSPORT` (`task test-native`/`task test-pyreqwest`) if set, else what `"auto"`
+    picks, native everywhere but Windows."""
+    match os.environ.get("LOTHC_TRANSPORT"):
+        case "native":
+            return True
+        case "pyreqwest":
+            return False
+        case _:
+            return sys.platform != "win32"
 
 
 def echoed_headers(result: dict[str, Any]) -> dict[str, str]:

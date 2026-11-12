@@ -13,14 +13,13 @@ idle limit reads it ahead on a worker thread instead).
 """
 
 import asyncio
-import os
 import time
 from collections.abc import AsyncGenerator, Generator
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 import pytest
-from _helpers import arrived, closed, release, sync_arrived, sync_release
+from _helpers import arrived, closed, native_by_default, release, sync_arrived, sync_release
 
 from lothc import HTTPClient, HTTPTimeoutError, SyncHTTPClient
 
@@ -352,7 +351,7 @@ async def test_cancelling_a_request_waiting_for_a_slot_raises_cancelled_error(
 # pyreqwest keeps running a request after its caller is cancelled: `spawn_handled` drops the task's
 # `JoinHandle`, which in tokio detaches the task instead of stopping it.
 _pyreqwest_runs_cancelled_requests = pytest.mark.xfail(
-    os.environ.get("LOTHC_TRANSPORT") != "native",
+    not native_by_default(),
     reason="pyreqwest keeps running a cancelled request in the background",
     strict=True,
 )

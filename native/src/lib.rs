@@ -1,4 +1,4 @@
-//! `lothc._native`: lothc's own HTTP/1.1 transport, selected with `native=True` (see
+//! `lothc._native`: lothc's own HTTP/1.1 transport, selected with `native=` (see
 //! `lothc/_transport_native.py`'s `_NativeTransport`). hyper's low-level `client::conn::http1`, after
 //! fastpg's design: no tokio and no I/O thread. The async `Pool` runs on the asyncio loop's thread
 //! over sockets the loop watches; the `SyncPool` drives the same futures on the calling thread.
@@ -25,7 +25,7 @@
 //! - `headers`: `RawHeaders`, a response's headers until `_LazyHeaders` reads them.
 //!
 //! All of that is POSIX only (`poll(2)`, raw fds, `loop.add_reader`). On Windows, where
-//! `native=True` raises, the module is `unsupported`: the same names, with nothing behind them.
+//! `native="on"` raises, the module is `unsupported`: the same names, with nothing behind them.
 #[cfg(unix)]
 mod body;
 #[cfg(unix)]
