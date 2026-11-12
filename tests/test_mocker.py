@@ -1163,3 +1163,29 @@ def test_sync_with_data_keeps_the_data_as_it_was_given(
 
     assert sync_client.get("items", into=dict).data == {"a": 1}
     assert sync_client.get("other", into=dict).data == {"a": 1}
+
+
+async def test_a_response_changed_after_it_answered_answers_the_next_request(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items", data={"a": 1})
+    first = await client.get("items", into=dict)
+    mock.with_data({"a": 2}).with_headers({"x-a": "b"}).with_status(201)
+
+    second = await client.get("items", into=dict)
+
+    assert (first.status, first.data, first.headers.get("x-a")) == (200, {"a": 1}, None)
+    assert (second.status, second.data, second.headers["x-a"]) == (201, {"a": 2}, "b")
+
+
+def test_sync_a_response_changed_after_it_answered_answers_the_next_request(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items", data={"a": 1})
+    first = sync_client.get("items", into=dict)
+    mock.with_data({"a": 2}).with_headers({"x-a": "b"}).with_status(201)
+
+    second = sync_client.get("items", into=dict)
+
+    assert (first.status, first.data, first.headers.get("x-a")) == (200, {"a": 1}, None)
+    assert (second.status, second.data, second.headers["x-a"]) == (201, {"a": 2}, "b")
