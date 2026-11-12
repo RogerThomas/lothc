@@ -8,7 +8,7 @@ bytes a proxy receives.
 
 import socket
 from base64 import b64encode
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from contextlib import ExitStack
 from dataclasses import dataclass
 from urllib.parse import urlsplit
@@ -59,6 +59,38 @@ def _socks_proxy_on_1080() -> Generator[SocksProxy]:
         except OSError:
             pytest.skip("port 1080, SOCKS's default, is in use")
         yield proxy
+
+
+@pytest.fixture(name="tunnel_client")
+async def _tunnel_client(
+    https_base_url: str, http_proxy: HTTPProxy, tls_ca_pem: bytes
+) -> AsyncGenerator[HTTPClient]:
+    async with HTTPClient(
+        base_url=https_base_url, proxy=http_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        yield client
+
+
+@pytest.fixture(name="sync_tunnel_client")
+def _sync_tunnel_client(
+    https_base_url: str, http_proxy: HTTPProxy, tls_ca_pem: bytes
+) -> Generator[SyncHTTPClient]:
+    with SyncHTTPClient(
+        base_url=https_base_url, proxy=http_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        yield client
+
+
+@pytest.fixture(name="socks_client")
+async def _socks_client(base_url: str, socks_proxy: SocksProxy) -> AsyncGenerator[HTTPClient]:
+    async with HTTPClient(base_url=base_url, proxy=f"socks5://{socks_proxy.address}") as client:
+        yield client
+
+
+@pytest.fixture(name="sync_socks_client")
+def _sync_socks_client(base_url: str, socks_proxy: SocksProxy) -> Generator[SyncHTTPClient]:
+    with SyncHTTPClient(base_url=base_url, proxy=f"socks5://{socks_proxy.address}") as client:
+        yield client
 
 
 def _port(url: str) -> int:
@@ -120,24 +152,18 @@ def test_sync_proxy_forwards_an_http_request_in_absolute_form(
 
 
 async def test_proxy_tunnels_an_https_request_with_connect(
-    https_base_url: str, tls_ca_pem: bytes, http_proxy: HTTPProxy
+    https_base_url: str, http_proxy: HTTPProxy, tunnel_client: HTTPClient
 ) -> None:
-    async with HTTPClient(
-        base_url=https_base_url, proxy=http_proxy.url, root_certificates=[tls_ca_pem]
-    ) as client:
-        result = await client.get("items/7", into=dict)
+    result = await tunnel_client.get("items/7", into=dict)
 
     assert result.data == {"id": 7, "name": "item-7"}
     assert _lines(http_proxy) == [f"CONNECT localhost:{_port(https_base_url)} HTTP/1.1"]
 
 
 def test_sync_proxy_tunnels_an_https_request_with_connect(
-    https_base_url: str, tls_ca_pem: bytes, http_proxy: HTTPProxy
+    https_base_url: str, http_proxy: HTTPProxy, sync_tunnel_client: SyncHTTPClient
 ) -> None:
-    with SyncHTTPClient(
-        base_url=https_base_url, proxy=http_proxy.url, root_certificates=[tls_ca_pem]
-    ) as client:
-        result = client.get("items/7", into=dict)
+    result = sync_tunnel_client.get("items/7", into=dict)
 
     assert result.data == {"id": 7, "name": "item-7"}
     assert _lines(http_proxy) == [f"CONNECT localhost:{_port(https_base_url)} HTTP/1.1"]
@@ -977,16 +1003,18 @@ def test_sync_socks5_resolves_the_host_itself(
     assert socks_proxy.handshakes[0].address_type in {1, 4}
 
 
-async def test_socks5_sends_an_ip_address_as_is(base_url: str, socks_proxy: SocksProxy) -> None:
-    async with HTTPClient(base_url=base_url, proxy=f"socks5://{socks_proxy.address}") as client:
-        await client.get("items/7")
+async def test_socks5_sends_an_ip_address_as_is(
+    socks_proxy: SocksProxy, socks_client: HTTPClient
+) -> None:
+    await socks_client.get("items/7")
 
     assert [(h.address_type, h.host) for h in socks_proxy.handshakes] == [(1, "127.0.0.1")]
 
 
-def test_sync_socks5_sends_an_ip_address_as_is(base_url: str, socks_proxy: SocksProxy) -> None:
-    with SyncHTTPClient(base_url=base_url, proxy=f"socks5://{socks_proxy.address}") as client:
-        client.get("items/7")
+def test_sync_socks5_sends_an_ip_address_as_is(
+    socks_proxy: SocksProxy, sync_socks_client: SyncHTTPClient
+) -> None:
+    sync_socks_client.get("items/7")
 
     assert [(h.address_type, h.host) for h in socks_proxy.handshakes] == [(1, "127.0.0.1")]
 
@@ -1029,19 +1057,17 @@ def test_sync_socks5_authenticates_with_the_proxy_credentials(base_url: str) -> 
 
 
 async def test_socks5_without_credentials_offers_no_authentication(
-    base_url: str, socks_proxy: SocksProxy
+    socks_proxy: SocksProxy, socks_client: HTTPClient
 ) -> None:
-    async with HTTPClient(base_url=base_url, proxy=f"socks5://{socks_proxy.address}") as client:
-        await client.get("items/7")
+    await socks_client.get("items/7")
 
     assert [(h.methods, h.credentials) for h in socks_proxy.handshakes] == [(b"\x00", None)]
 
 
 def test_sync_socks5_without_credentials_offers_no_authentication(
-    base_url: str, socks_proxy: SocksProxy
+    socks_proxy: SocksProxy, sync_socks_client: SyncHTTPClient
 ) -> None:
-    with SyncHTTPClient(base_url=base_url, proxy=f"socks5://{socks_proxy.address}") as client:
-        client.get("items/7")
+    sync_socks_client.get("items/7")
 
     assert [(h.methods, h.credentials) for h in socks_proxy.handshakes] == [(b"\x00", None)]
 
@@ -1310,25 +1336,19 @@ def test_sync_each_proxied_origin_reuses_its_own_connection(
 
 
 async def test_a_tunnel_is_reused_like_a_direct_connection(
-    https_base_url: str, tls_ca_pem: bytes, http_proxy: HTTPProxy
+    http_proxy: HTTPProxy, tunnel_client: HTTPClient
 ) -> None:
-    async with HTTPClient(
-        base_url=https_base_url, proxy=http_proxy.url, root_certificates=[tls_ca_pem]
-    ) as client:
-        await client.get("items/7")
-        await client.get("items/7")
+    await tunnel_client.get("items/7")
+    await tunnel_client.get("items/7")
 
     assert len(http_proxy.requests) == 1
 
 
 def test_sync_a_tunnel_is_reused_like_a_direct_connection(
-    https_base_url: str, tls_ca_pem: bytes, http_proxy: HTTPProxy
+    http_proxy: HTTPProxy, sync_tunnel_client: SyncHTTPClient
 ) -> None:
-    with SyncHTTPClient(
-        base_url=https_base_url, proxy=http_proxy.url, root_certificates=[tls_ca_pem]
-    ) as client:
-        client.get("items/7")
-        client.get("items/7")
+    sync_tunnel_client.get("items/7")
+    sync_tunnel_client.get("items/7")
 
     assert len(http_proxy.requests) == 1
 

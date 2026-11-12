@@ -103,6 +103,27 @@ async def test_get_writes_query_values_as_their_wire_strings(client: HTTPClient)
     }
 
 
+async def test_get_writes_an_int_outside_64_bits_as_its_exact_digits(client: HTTPClient) -> None:
+    # pyreqwest turns an int past the signed 64-bit range into a float (`9.223372036854776e18`),
+    # silently changing it; it goes out as its own digits, a repeat's elements included.
+    result = (
+        await client.get(
+            "echo-query",
+            params={"over": 2**63, "under": -(2**63) - 1, "max": 2**63 - 1, "tag": [2**64, 1]},
+            into=dict,
+        )
+    ).data
+
+    assert result == {
+        "query": {
+            "over": ["9223372036854775808"],
+            "under": ["-9223372036854775809"],
+            "max": ["9223372036854775807"],
+            "tag": ["18446744073709551616", "1"],
+        }
+    }
+
+
 async def test_get_with_pydantic_params_omits_none_fields(client: HTTPClient) -> None:
     result = (
         await client.get("echo-query", params=SearchParamsModel(q="pikachu", page=1), into=dict)
@@ -214,6 +235,25 @@ def test_sync_get_writes_query_values_as_their_wire_strings(sync_client: SyncHTT
             "count": ["3"],
             "ratio": ["1.5"],
             "text": ["a b&c=ü"],
+        }
+    }
+
+
+def test_sync_get_writes_an_int_outside_64_bits_as_its_exact_digits(
+    sync_client: SyncHTTPClient,
+) -> None:
+    result = sync_client.get(
+        "echo-query",
+        params={"over": 2**63, "under": -(2**63) - 1, "max": 2**63 - 1, "tag": [2**64, 1]},
+        into=dict,
+    ).data
+
+    assert result == {
+        "query": {
+            "over": ["9223372036854775808"],
+            "under": ["-9223372036854775809"],
+            "max": ["9223372036854775807"],
+            "tag": ["18446744073709551616", "1"],
         }
     }
 

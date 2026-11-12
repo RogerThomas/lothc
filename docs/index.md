@@ -10,7 +10,7 @@ icon: lucide/rocket
 # lothc
 
 **L**ord **O**f **T**he **H**ttp **C**lients — a typed HTTP client for Python, built on
-[pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (an awesome Rust-backed HTTP client),
+[pyreqwest](https://github.com/MarkusSintonen/pyreqwest) (an awesome Rust-backed HTTP client),
 with first-class optional support for **pydantic** and **msgspec** as both decode *and* encode
 targets.
 
@@ -121,7 +121,7 @@ there's demand for an httpx/aiohttp/niquests backend, the author is happy to con
 
 ## Performance
 
-lothc is built on top of the awesome [pyreqwest](https://github.com/mostafa-hussein/pyreqwest)
+lothc is built on top of the awesome [pyreqwest](https://github.com/MarkusSintonen/pyreqwest)
 package — a Rust-based HTTP client for Python. lothc then adds some nice abstractions on top of that
 (discussed in the other sections of these docs): typed decode targets, retries, SSE, streaming,
 and so on, adding a bit of Python-level overhead compared to calling pyreqwest directly. However, the

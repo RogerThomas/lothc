@@ -154,6 +154,44 @@ async def test_add_get_response_matches_on_a_repeated_query_param_as_tuple(
     assert item == {"ok": True}
 
 
+async def test_add_get_response_matches_an_int_outside_64_bits_exactly(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    """An int past the signed 64-bit range is matched by its exact digits, as a real request
+    sends it, not as the float pyreqwest's encoder would turn it into."""
+    mock = lothc_mocker.add_get_response(path="/items", params={"id": 2**64}, data={"ok": True})
+
+    item = (await client.get("items", params={"id": 2**64}, into=dict)).data
+
+    assert item == {"ok": True}
+    [seen] = mock.get_requests()
+    assert seen.query == {"id": "18446744073709551616"}
+
+
+def test_sync_add_get_response_matches_an_int_outside_64_bits_exactly(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items", params={"id": 2**64}, data={"ok": True})
+
+    item = sync_client.get("items", params={"id": 2**64}, into=dict).data
+
+    assert item == {"ok": True}
+    [seen] = mock.get_requests()
+    assert seen.query == {"id": "18446744073709551616"}
+
+
+async def test_add_get_response_does_not_match_a_neighbouring_int_outside_64_bits(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    # As floats, 2**64 and 2**64 + 1 are the same number, so a lossy encoding matched both.
+    mock = lothc_mocker.add_get_response(path="/items", params={"id": 2**64}, data={})
+
+    with pytest.raises(AssertionError, match="No mock rule matched"):
+        await client.get("items", params={"id": 2**64 + 1})
+
+    mock.assert_called(count=0)
+
+
 async def test_add_get_response_does_not_match_a_different_repeated_query_param_order(
     client: HTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:

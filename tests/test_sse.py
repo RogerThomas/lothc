@@ -238,8 +238,27 @@ async def test_sse_reconnects_after_a_dropped_connection_with_last_event_id(
     ]
 
     assert [event.id for event in events] == ["0", "1", "2", "3"]
-    # The server echoes the `Last-Event-ID` header it received on each connection.
-    assert [event.data["last"] for event in events] == [None, None, "1", "1"]
+    # The server echoes every `Last-Event-ID` value it received on each connection: none on the
+    # first, exactly the last id seen on the reconnect.
+    assert [event.data["last"] for event in events] == [[], [], ["1"], ["1"]]
+
+
+async def test_sse_reconnect_replaces_the_callers_own_last_event_id(
+    client: HTTPClient, server_key: str
+) -> None:
+    # A caller resuming from a stored id sends it on the first connection; a reconnect must send
+    # the id this stream has seen since in its place, not as a second value beside it.
+    events = [
+        event
+        async for event in client.sse(
+            "events-reconnect",
+            params={"key": server_key},
+            headers={"Last-Event-ID": "stale"},
+            into=dict,
+        )
+    ]
+
+    assert [event.data["last"] for event in events] == [["stale"], ["stale"], ["1"], ["1"]]
 
 
 @pytest.mark.parametrize("interruptible", [False, True], ids=["blocking", "interruptible"])
@@ -256,7 +275,24 @@ def test_sync_sse_reconnects_after_a_dropped_connection_with_last_event_id(
     )
 
     assert [event.id for event in events] == ["0", "1", "2", "3"]
-    assert [event.data["last"] for event in events] == [None, None, "1", "1"]
+    assert [event.data["last"] for event in events] == [[], [], ["1"], ["1"]]
+
+
+@pytest.mark.parametrize("interruptible", [False, True], ids=["blocking", "interruptible"])
+def test_sync_sse_reconnect_replaces_the_callers_own_last_event_id(
+    sync_client: SyncHTTPClient, server_key: str, *, interruptible: bool
+) -> None:
+    events = list(
+        sync_client.sse(
+            "events-reconnect",
+            params={"key": server_key},
+            headers={"Last-Event-ID": "stale"},
+            into=dict,
+            interruptible=interruptible,
+        )
+    )
+
+    assert [event.data["last"] for event in events] == [["stale"], ["stale"], ["1"], ["1"]]
 
 
 async def test_sse_honours_the_server_retry_field_for_the_reconnect_delay(
