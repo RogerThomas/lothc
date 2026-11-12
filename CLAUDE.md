@@ -34,13 +34,15 @@ a docstring or a test already says.
 - **Built by maturin**: `lothc._native` comes from the crate in `native/` (typed by
   `lothc/_native.pyi`), so every environment needs a Rust toolchain, and `uv sync` rebuilds it
   when `native/` changes (`[tool.uv] cache-keys`).
-- **TODO: releases are blocked** until `release.yml` builds a per-platform wheel matrix with PGO.
+- **Wheels per interpreter and platform, built with PGO** (`wheels.yml`, `scripts/build_wheel.sh`):
+  not abi3, which can't cover free-threaded builds. Each trains on its own architecture, and a
+  build fails if its profile went unused.
 - **release-please cuts releases**, so commit messages on `main` must be Conventional Commits.
-  Tags are the bare version (no `v`, no component), which hatch-vcs reads. Never add an
+  Tags are the bare version (no `v`, no component). Never add an
   `## [Unreleased]` section to `CHANGELOG.md`.
 - **Publishing is dispatched** (`gh workflow run release.yml --ref <tag>`), since a release made
   with `GITHUB_TOKEN` triggers no workflow. `release.yml` stays top-level for PyPI's Trusted
-  Publisher, runs all of CI against the tag, and refuses a non-tag ref.
+  Publisher, runs all of CI and `wheels.yml` against the tag, and refuses a non-tag ref.
 - **CI:** 3.13/3.14/3.15 plus free-threaded 3.14t/3.15t with `PYTHON_GIL=0` (lothc shares
   state across threads, and users share a client across threads), and `test-no-extras` with
   pydantic/msgspec uninstalled. The `perf` group's clients stay out of `dev`: one has no
@@ -155,14 +157,13 @@ or editing Python here.
   chunk source. Native reads at most two chunks ahead and stops reading the socket while nobody
   reads, so a slow consumer never buffers a whole body.
 - **Measured choices:** one shared deadline timer and heap (a per-request `call_later` cost
-  ~1.3us); lazy headers; PGO is worth ~6-7%.
+  ~1.3us); lazy headers; PGO is worth ~3% CPU per request.
 - **HTTP/2 is deferred** until someone asks (decided 2026-11-10): it's the largest port and rarely
   used, so `http2=True` stays on pyreqwest.
 - **The mocker runs through native's own request code** (decided 2026-11-10), answering from
   Python handlers instead of the network, so mocked tests still see the exact request sent.
   The engine is lothc's own (`lothc/_mocking.py`, decided 2026-11-11), not a port of pyreqwest's
   Apache-2.0 mocker; both transports check one hook, and nothing patches pyreqwest.
-- **Not built yet:** wheels.
 
 ## Decisions
 
