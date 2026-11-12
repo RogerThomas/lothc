@@ -1,0 +1,140 @@
+name: Wheels
+
+# Every wheel lothc publishes, plus the sdist, each tested on its own platform: called by
+# release.yml, whose `publish` job uploads what this builds. Also runs on a pull request that
+# touches the packaging, so a break shows before release day. Nothing here publishes.
+on:
+  workflow_call:
+  pull_request:
+    paths:
+      - native/**
+      - pyproject.toml
+      - uv.lock
+      - .github/workflows/wheels.yml
+      - scripts/build_wheel.sh
+      - scripts/pgo_certs.py
+      - scripts/pgo_train.py
+      - scripts/wheel_smoke.py
+
+permissions:
+  contents: read
+
+jobs:
+  # Built and trained inside the policy's own image, natively on each architecture, so the
+  # instrumented wheel's training (scripts/pgo_train.py) runs where the wheel will. manylinux2014
+  # (glibc 2.17) is the oldest glibc Rust supports, and aws-lc-sys builds there with the image's
+  # GCC 10. musllinux_1_2 is the only musllinux policy with a maintained image: 1_1's (Alpine
+  # 3.12) stopped before CPython 3.14, so it has none of the interpreters built here.
+  linux:
+    name: ${{ matrix.policy }} ${{ matrix.arch }} ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        policy: [manylinux2014, musllinux_1_2]
+        arch: [x86_64, aarch64]
+        python: ["3.13", "3.14", "3.15", "3.14t", "3.15t"]
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    env:
+      IMAGE: quay.io/pypa/${{ matrix.policy }}_${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Build
+        run: >-
+          docker run --rm --volume "$PWD:/io" --workdir /io "$IMAGE" bash -c '
+          curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs
+          | sh -s -- -y --profile minimal --component llvm-tools
+          && . "$HOME/.cargo/env"
+          && scripts/build_wheel.sh ${{ matrix.python }} dist --compatibility ${{ matrix.policy }}'
+      # A fresh container of the same image: the oldest glibc (or a musl) the wheel claims.
+      - name: Test
+        run: >-
+          docker run --rm --volume "$PWD:/io" --workdir /io "$IMAGE"
+          uv run --isolated --no-project --python ${{ matrix.python }}
+          --with dist/*.whl --with pytest --with yeetr yeet ./scripts/wheel_smoke.py
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: dist-${{ matrix.policy }}-${{ matrix.arch }}-${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # One wheel per architecture, not universal2: a PGO profile is per architecture.
+  macos:
+    name: macOS ${{ matrix.runner == 'macos-latest' && 'arm64' || 'x86_64' }} ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is Arm; macos-26-intel is GitHub's current Intel macOS runner.
+        runner: [macos-latest, macos-26-intel]
+        python: ["3.13", "3.14", "3.15", "3.14t", "3.15t"]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: ${{ matrix.python }}
+      - run: rustup component add llvm-tools
+      - name: Build
+        run: scripts/build_wheel.sh ${{ matrix.python }} dist
+      - name: Test
+        run: >-
+          uv run --isolated --no-project --python ${{ matrix.python }}
+          --with dist/*.whl --with pytest --with yeetr yeet ./scripts/wheel_smoke.py
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: dist-macos-${{ matrix.runner }}-${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # The stub module (native/src/unsupported.rs), since native is POSIX only: nothing to train.
+  windows:
+    name: Windows x86_64 ${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.14", "3.15", "3.14t", "3.15t"]
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: Swatinem/rust-cache@v2.9.3
+        with:
+          workspaces: native
+          key: ${{ matrix.python }}
+      - name: Build
+        run: scripts/build_wheel.sh ${{ matrix.python }} dist
+        env:
+          PGO: "0"
+      - name: Test
+        run: >-
+          uv run --isolated --no-project --python ${{ matrix.python }}
+          --with dist/*.whl --with pytest --with yeetr yeet ./scripts/wheel_smoke.py
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: dist-windows-${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # Then a wheel built from it, as an install with no wheel for its platform builds one.
+  sdist:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.14"
+      - run: uv build --sdist
+      - run: tar -tzf dist/*.tar.gz
+      - run: uv build --wheel --out-dir "$RUNNER_TEMP/from-sdist" dist/*.tar.gz
+      - run: >-
+          uv run --isolated --no-project --with "$RUNNER_TEMP"/from-sdist/*.whl
+          --with pytest --with yeetr yeet ./scripts/wheel_smoke.py
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: dist-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
