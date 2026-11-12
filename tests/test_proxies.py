@@ -2235,10 +2235,11 @@ def test_sync_a_stalled_https_proxy_handshake_times_out(
 
 # `connect_timeout` also covers the proxy's own TLS handshake, which a busy machine made outlast
 # it now and then (5 tries in 80): a try timed out before its `CONNECT` reached the proxy shows
-# nothing about the origin's handshake, so it is made again, up to five times. How long the try
-# that did reach it took to time out.
+# nothing about the origin's handshake, so it is made again, for up to 2s. How long the try that
+# did reach it took to time out.
 async def _timed_out_inside_the_tunnel(client: HTTPClient, proxy: HTTPProxy, url: str) -> float:
-    for _ in range(5):
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
         tunnels = len(proxy.requests)
         started = time.monotonic()
         with pytest.raises(HTTPTimeoutError):
@@ -2249,7 +2250,8 @@ async def _timed_out_inside_the_tunnel(client: HTTPClient, proxy: HTTPProxy, url
 
 
 def _sync_timed_out_inside_the_tunnel(client: SyncHTTPClient, proxy: HTTPProxy, url: str) -> float:
-    for _ in range(5):
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
         tunnels = len(proxy.requests)
         started = time.monotonic()
         with pytest.raises(HTTPTimeoutError):

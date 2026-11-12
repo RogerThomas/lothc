@@ -10,9 +10,6 @@ the server to have closed (`closed`), since a request racing the close of the ve
 reuses is lost by every client: on Linux, loopback buffers can hold all of `/large`, so the close
 needn't have arrived by the time its body has been read."""
 
-import asyncio
-import time
-
 import pytest
 from _helpers import closed
 
@@ -26,14 +23,15 @@ _item = b'{"id": 7, "name": "item-7"}'
     [("connection-close", {"closed": "announced"}), ("silent-close", {"closed": "silently"})],
 )
 async def test_requests_succeed_after_the_server_closes_the_connection(
-    client: HTTPClient, path: str, body: dict[str, str]
+    base_url: str, server_key: str, client: HTTPClient, path: str, body: dict[str, str]
 ) -> None:
     results: list[dict[str, str]] = []
-    for _ in range(3):
-        results.append((await client.get(path, into=dict)).data)
-        # Lets the server's close land first, as it would between real requests: a request
-        # racing the close of the very connection it reuses is lost by every client.
-        await asyncio.sleep(0.01)
+    for index in range(3):
+        key = f"{server_key}-{index}"
+        results.append((await client.get(path, params={"key": key}, into=dict)).data)
+        # The server's close lands first, as it would between real requests: a request racing
+        # the close of the very connection it reuses is lost by every client.
+        closed(base_url, key)
 
     assert results == [body, body, body]
 
@@ -43,12 +41,13 @@ async def test_requests_succeed_after_the_server_closes_the_connection(
     [("connection-close", {"closed": "announced"}), ("silent-close", {"closed": "silently"})],
 )
 def test_sync_requests_succeed_after_the_server_closes_the_connection(
-    sync_client: SyncHTTPClient, path: str, body: dict[str, str]
+    base_url: str, server_key: str, sync_client: SyncHTTPClient, path: str, body: dict[str, str]
 ) -> None:
     results: list[dict[str, str]] = []
-    for _ in range(3):
-        results.append(sync_client.get(path, into=dict).data)
-        time.sleep(0.01)
+    for index in range(3):
+        key = f"{server_key}-{index}"
+        results.append(sync_client.get(path, params={"key": key}, into=dict).data)
+        closed(base_url, key)
 
     assert results == [body, body, body]
 

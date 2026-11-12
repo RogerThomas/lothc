@@ -44,8 +44,8 @@ class _TLSServer(ThreadingHTTPServer):
     def __init__(self, context: ssl.SSLContext) -> None:
         super().__init__(("127.0.0.1", 0), TestAppHandler)
         self._context = context
-        # The client port of each connection whose handshake has completed, in order.
-        self.handshakes: list[int] = []
+        # The client address of each connection whose handshake has completed, in order.
+        self.handshakes: list[object] = []
 
     def finish_request(
         self, request: socket.socket | tuple[bytes, socket.socket], client_address: object
@@ -62,8 +62,7 @@ class _TLSServer(ThreadingHTTPServer):
             except (ssl.SSLError, ConnectionError):
                 finish_a_failed_handshake(tls_socket)
                 return
-            _, port = tls_socket.getpeername()
-            self.handshakes.append(port)
+            self.handshakes.append(client_address)
             super().finish_request(tls_socket, client_address)
 
     def handle_error(
@@ -93,10 +92,10 @@ def tls_server_context(
 @dataclass(slots=True)
 class TLSServer:
     """A running `serve_tls_server`: its `https://` base URL, as `serve_tls` gives, and the client
-    port of each connection whose handshake it has completed, in order."""
+    address of each connection whose handshake it has completed, in order."""
 
     url: str
-    handshakes: list[int]
+    handshakes: list[object]
 
 
 @contextmanager

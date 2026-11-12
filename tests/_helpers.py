@@ -161,10 +161,11 @@ def sync_arrived(base_url: str, key: str) -> None:
 
 
 def closed(base_url: str, key: str) -> None:
-    """Wait until `/large?key=` (or `/events-silent-close?key=`) has closed its connection behind
-    its body, as a fixed sleep would only guess. From a client of its own and blocking, even in
-    an async test: no turn of the event loop reports the close to the client under test before
-    its next request, as when its caller is busy, so it must notice the close on its own."""
+    """Wait until `/large?key=` (or `/silent-close`, `/connection-close`, `/events-silent-close`)
+    has closed its connection behind its response, as a fixed sleep would only guess. From a
+    client of its own and blocking, even in an async test: no turn of the event loop reports the
+    close to the client under test before its next request, as when its caller is busy, so it
+    must notice the close on its own."""
     with SyncHTTPClient(base_url=base_url) as client:
         for _ in range(200):
             if client.get("hits", params={"key": f"{key}-closed"}, into=dict).data["hits"]:

@@ -211,9 +211,11 @@ def test_sync_sse_is_not_killed_by_the_client_level_total_timeout(base_url: str)
 
 # `read_timeout` also bounds the connect and the wait for the response's head (reqwest's starts
 # with the request), which a stalled machine can outlast: a try that times out before its first
-# event shows nothing about the gap after it, so it is made again, up to five times.
+# event shows nothing about the gap after it, so it is made again, for up to 2s (five tries in a
+# row once fell inside one stall).
 async def _first_event_before_a_timed_out_gap(client: HTTPClient) -> SSEEvent[str]:
-    for _ in range(5):
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
         stream = client.sse("events", params={"interval": 0.3, "count": 3}, max_reconnects=0)
         try:
             first = await anext(stream)
@@ -226,7 +228,8 @@ async def _first_event_before_a_timed_out_gap(client: HTTPClient) -> SSEEvent[st
 
 
 def _sync_first_event_before_a_timed_out_gap(client: SyncHTTPClient) -> SSEEvent[str]:
-    for _ in range(5):
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
         stream = client.sse("events", params={"interval": 0.3, "count": 3}, max_reconnects=0)
         try:
             first = next(stream)

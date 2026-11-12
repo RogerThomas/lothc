@@ -816,16 +816,19 @@ class TestAppHandler(BaseHTTPRequestHandler):
                 # `trailing-later`: the trailing bytes arrive in a later read.
                 sleep(0.02)
 
-    def _handle_connection_close(self) -> None:
-        # Announces the close, so the client must open a new connection for its next request.
+    def _handle_connection_close(self, query: str) -> None:
+        # Announces the close, so the client must open a new connection for its next request
+        # (counted, with a `key`, as `/large` counts its close).
         self.close_connection = True
         self._write_json(200, {"closed": "announced"}, {"Connection": "close"})
+        self._close_counted(query)
 
-    def _handle_silent_close(self) -> None:
+    def _handle_silent_close(self, query: str) -> None:
         # Closes after responding without saying so, as a server dropping an idle keep-alive
         # connection does: a client reusing that connection unchecked writes into a dead socket.
         self._write_json(200, {"closed": "silently"})
         self.close_connection = True
+        self._close_counted(query)
 
     def _handle_slow(self, query: str) -> None:
         # `seconds` lets each caller buy exactly the delay its own assertion needs, rather than
@@ -1240,6 +1243,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/echo-request-sse": self._write_sse_echo_request,
             "/large": self._handle_large,
             "/events-silent-close": self._write_sse_silent_close,
+            "/connection-close": self._handle_connection_close,
+            "/silent-close": self._handle_silent_close,
             "/mixed-records": self._handle_mixed_records,
             "/compressed-zeros": self._handle_compressed_zeros,
             "/redirect-counted": self._handle_counted_redirect,
@@ -1278,8 +1283,6 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/json-array": self._handle_json_array,
             "/deeply-nested-error": self._handle_deeply_nested_error,
             "/crlf-text": self._handle_crlf_text,
-            "/connection-close": self._handle_connection_close,
-            "/silent-close": self._handle_silent_close,
         }
         route = plain_routes.get(parsed.path)
         if route is None:

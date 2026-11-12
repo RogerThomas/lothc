@@ -494,9 +494,10 @@ def test_sync_read_timeout_limits_each_gap_in_a_streamed_body_not_the_whole(
 
 # `read_timeout` also bounds the connect and the wait for the head, which a stalled machine can
 # outlast: a try that times out before its first chunk shows nothing about the stall after it, so
-# it is made again, up to five times.
+# it is made again, for up to 2s.
 async def _first_chunk_before_a_timed_out_stall(client: HTTPClient) -> bytes:
-    for _ in range(5):
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
         stream = client.stream_get("stall-after-first-chunk", params={"seconds": 2})
         try:
             first = await anext(stream)
@@ -510,7 +511,8 @@ async def _first_chunk_before_a_timed_out_stall(client: HTTPClient) -> bytes:
 
 
 def _sync_first_chunk_before_a_timed_out_stall(client: SyncHTTPClient) -> bytes:
-    for _ in range(5):
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
         stream = client.stream_get("stall-after-first-chunk", params={"seconds": 2})
         try:
             first = next(stream)

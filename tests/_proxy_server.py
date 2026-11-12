@@ -132,6 +132,7 @@ class _HTTPProxyServer(ThreadingHTTPServer):
         behaviour: ProxyBehaviour,
         upstream_port: int | None,
         hold_later_tunnels: threading.Event | None,
+        answer_at_most: int | None = None,
     ) -> None:
         super().__init__(("127.0.0.1", 0), _HTTPProxyHandler)
         self.expected_authorization = (
@@ -143,7 +144,9 @@ class _HTTPProxyServer(ThreadingHTTPServer):
         self.behaviour = behaviour
         self.upstream_port = upstream_port
         self.hold_later_tunnels = hold_later_tunnels
+        self.answer_at_most = answer_at_most
         self.requests: list[ProxiedRequest] = []
+        self.answered_tunnels: list[int] = []
         self.tunnels = 0
         self.tunnels_lock = threading.Lock()
 
@@ -257,6 +260,8 @@ class HTTPProxy:
     requests: list[ProxiedRequest] = field(default_factory=list[ProxiedRequest])
     # An `https://` proxy's TLS handshakes; always empty for an `http://` one.
     tls_handshakes: list[ProxyTLSHandshake] = field(default_factory=list[ProxyTLSHandshake])
+    # The client port of each `CONNECT` answered with a 200, once it has been.
+    answered_tunnels: list[int] = field(default_factory=list[int])
 
 
 @dataclass(slots=True)
@@ -394,14 +399,16 @@ class _HTTPProxyHandler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(data)
 
-    def _wait_if_held(self) -> None:
-        """With `hold_later_tunnels`, a `CONNECT` after the first waits for it to be set."""
+    def _wait_if_held(self) -> bool:
+        """With `hold_later_tunnels`, a `CONNECT` after the first waits for it to be set. Whether
+        to answer it at all: not one past `answer_at_most`."""
         server = self._server()
         with server.tunnels_lock:
             server.tunnels += 1
-            later = server.tunnels > 1
-        if later and server.hold_later_tunnels is not None:
+            tunnel = server.tunnels
+        if tunnel > 1 and server.hold_later_tunnels is not None:
             server.hold_later_tunnels.wait(timeout=10)
+        return server.answer_at_most is None or tunnel <= server.answer_at_most
 
     def _refuse(self, status: int) -> None:
         self.send_response_only(status)
@@ -433,7 +440,9 @@ class _HTTPProxyHandler(BaseHTTPRequestHandler):
         if server.connect_status != 200:
             self._refuse(server.connect_status)
             return
-        self._wait_if_held()
+        if not self._wait_if_held():
+            _drain(self.connection)
+            return
         _, _, port = self.path.rpartition(":")
         upstream = socket.create_connection(
             ("127.0.0.1", server.upstream_port or int(port)), timeout=10
@@ -446,6 +455,8 @@ class _HTTPProxyHandler(BaseHTTPRequestHandler):
         else:
             self.send_response_only(200, "Connection established")
             self.end_headers()
+        _, client_port = self.client_address
+        server.answered_tunnels.append(client_port)
         with upstream:
             _pipe(self.connection, upstream)
 
@@ -619,6 +630,7 @@ def serve_http_proxy(
     behaviour: ProxyBehaviour = ProxyBehaviour.TUNNEL,
     upstream_port: int | None = None,
     hold_later_tunnels: threading.Event | None = None,
+    answer_at_most: int | None = None,
 ) -> Generator[HTTPProxy]:
     """An HTTP proxy on `127.0.0.1` for the block: it forwards absolute-form requests and tunnels
     `CONNECT`, after checking `Proxy-Authorization` against `credentials` if given (a 407
@@ -626,12 +638,17 @@ def serve_http_proxy(
 
     `upstream_port` replaces the port of every request and tunnel. `hold_later_tunnels` keeps
     every `CONNECT` but the first unanswered until it is set (recorded on arrival as usual), so a
-    second connection stays mid-handshake for as long as a test needs."""
+    second connection stays mid-handshake for as long as a test needs. A `CONNECT` past
+    `answer_at_most` is recorded but never answered, so no request can be carried on it."""
     server = _HTTPProxyServer(
-        credentials, connect_status, behaviour, upstream_port, hold_later_tunnels
+        credentials, connect_status, behaviour, upstream_port, hold_later_tunnels, answer_at_most
     )
     with serve_in_background(server):
-        yield HTTPProxy(f"http://127.0.0.1:{server.server_port}", server.requests)
+        yield HTTPProxy(
+            f"http://127.0.0.1:{server.server_port}",
+            server.requests,
+            answered_tunnels=server.answered_tunnels,
+        )
 
 
 @contextmanager
@@ -660,7 +677,10 @@ def serve_https_proxy(
     )
     with serve_in_background(server):
         yield HTTPProxy(
-            f"https://{host}:{server.server_port}", server.requests, server.tls_handshakes
+            f"https://{host}:{server.server_port}",
+            server.requests,
+            server.tls_handshakes,
+            server.answered_tunnels,
         )
 
 
