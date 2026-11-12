@@ -7,6 +7,51 @@ messages; 0.0.17 to 0.0.19 were hand-written in the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. Releases up to and including
 0.0.16 predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/releases).
 
+## [0.2.3](https://github.com/RogerThomas/lothc/compare/0.2.2...0.2.3) (2026-11-12)
+
+
+### Features
+
+* add an opt-in native transport (native=True) and split lothc into modules ([9fcac82](https://github.com/RogerThomas/lothc/commit/9fcac82cb2bec4ed0a02c10bc66127c6c3c4bd0e))
+* add an opt-in native transport (native=True) and split lothc into modules ([359d21b](https://github.com/RogerThomas/lothc/commit/359d21bf58cd166ba78b7b74f8b167f940328fa7))
+* lothc's own mock engine, and the mocker on the native transport ([8647dc4](https://github.com/RogerThomas/lothc/commit/8647dc49ed211e8d80f2b1d5d49a8a5150421271))
+* native keeps a cookie jar for cookie_store=True as reqwest's does ([b0be814](https://github.com/RogerThomas/lothc/commit/b0be81457b8b48c533ce1c48bd80aa2e23a07f08))
+* native sends multipart form= bodies as pyreqwest does ([c831207](https://github.com/RogerThomas/lothc/commit/c8312071d9a2bcf0c997125187a22560aa8cf250))
+* native supports max_connections= and pool_timeout=, and the sync pool hands freed connections to waiting requests ([fabd836](https://github.com/RogerThomas/lothc/commit/fabd836ca11fb463ac15bd680bd76ae07a835561))
+* native supports resolve=, local_address=, tcp_keepalive=, connect_timeout= and read_timeout= ([d7818cd](https://github.com/RogerThomas/lothc/commit/d7818cdd89a74fb7cc0fe4d8767bdf1ad56528fc))
+* SOCKS4/4a and https:// proxies on the native transport ([ab61487](https://github.com/RogerThomas/lothc/commit/ab614870da19767ae88ae84e349e50f5f48e6c72))
+
+
+### Bug Fixes
+
+* build lothc._native on Windows, as a module of stubs ([bb5408d](https://github.com/RogerThomas/lothc/commit/bb5408dcdc4a974f73327d9b5cf7ceaf315085c6))
+* native matches pyreqwest for an open async stream after close and a per-call timeout near zero ([55f23fa](https://github.com/RogerThomas/lothc/commit/55f23fa5d242cd4d2bbe32ccc62cb7090ed18609))
+* native never reuses a connection the server has closed ([6bb5062](https://github.com/RogerThomas/lothc/commit/6bb50625c3b05259ca14e4e7fcc1448dfca52aca))
+* native TLS no longer overflows rustls's plaintext buffer on mixed record sizes ([b542d21](https://github.com/RogerThomas/lothc/commit/b542d2144d56d4467e615442b1f98d94c66f6f4b))
+* report public classes as lothc.&lt;Name&gt; in tracebacks and reprs ([007a39d](https://github.com/RogerThomas/lothc/commit/007a39d96b1e78a0072e99c38f9b28e9dea25fdf))
+* send one Last-Event-ID on SSE reconnect, exact ints past 64 bits, form= with retries, and no BuilderError on client entry ([31614db](https://github.com/RogerThomas/lothc/commit/31614db102c02331db905805928047e3b69f0281))
+* send one Last-Event-ID on SSE reconnect, exact ints past 64 bits, form= with retries, and no BuilderError on client entry ([81ff3c6](https://github.com/RogerThomas/lothc/commit/81ff3c62925a185c6a7d0fd287ef02c607830224))
+
+
+### Performance Improvements
+
+* answer a mocked request from a response encoded once, matching only what a mock checks ([942bf3d](https://github.com/RogerThomas/lothc/commit/942bf3d100f9d60c16e1e861e242159965b3d9c2))
+* benchmark lothc's native transport alongside the default one ([7e40622](https://github.com/RogerThomas/lothc/commit/7e40622fd5c91ba521fb9ce6edb115986a0765db))
+
+
+### Documentation
+
+* benchmark table for the native transport ([742cd75](https://github.com/RogerThomas/lothc/commit/742cd750bf5c7cd24d4235e4615ede6178518858))
+* CI's platform matrix and native runs, and the Windows stub module ([db1846a](https://github.com/RogerThomas/lothc/commit/db1846a4075584972ef6fa53437eb5a4be3abf32))
+* CLAUDE.md on the PGO wheels, and no more hatch-vcs ([c1e05ed](https://github.com/RogerThomas/lothc/commit/c1e05edfcfc278bbf00343a96e1ccefd1dfaa794))
+* CLAUDE.md on waiting for evidence in tests, and Nagle on the test servers ([23e744c](https://github.com/RogerThomas/lothc/commit/23e744cf22949b1f6b0ebc35ae3f559a3fb64ea7))
+* drop SOCKS4 and https:// proxies from native's unported list ([c8a1459](https://github.com/RogerThomas/lothc/commit/c8a14595057adbf277123e2c4877156704d57383))
+* link to pyreqwest's real repository ([4951bd1](https://github.com/RogerThomas/lothc/commit/4951bd10fad78e7b0ba21640f142a68972170c3a))
+* link to pyreqwest's real repository ([1cc53d1](https://github.com/RogerThomas/lothc/commit/1cc53d1c42a73b05ce5a82489a03a345a04bde42))
+* only http2= fails under task test-native ([15d6d1b](https://github.com/RogerThomas/lothc/commit/15d6d1bf98595d03a2ac916e797985f92568360c))
+* say which platforms have wheels, and that Windows has no native transport ([7c934ac](https://github.com/RogerThomas/lothc/commit/7c934ace189243d337357cff15da041be10b01da))
+* the mocker is built on native, on lothc's own engine ([130d09e](https://github.com/RogerThomas/lothc/commit/130d09eaad975643d8ad99892f774ce27252a723))
+
 ## [0.2.2](https://github.com/RogerThomas/lothc/compare/0.2.1...0.2.2) (2026-11-05)
 
 
