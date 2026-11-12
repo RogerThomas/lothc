@@ -31,6 +31,7 @@ from typing import override
 from urllib.parse import urlsplit
 
 from _server import serve_in_background
+from _tls_server import finish_a_failed_handshake
 
 
 class ProxyBehaviour(Enum):
@@ -193,11 +194,16 @@ class _HTTPSProxyServer(_HTTPProxyServer):
             request.sendall(self.stalled_handshake)
             _drain(request)
             return
-        try:
-            tls_socket = self.context.wrap_socket(request, server_side=True)
-        except (ssl.SSLError, ConnectionError):
-            return
+        # As `_tls_server.py`'s, so a failed handshake's alert reaches the client.
+        tls_socket = self.context.wrap_socket(
+            request, server_side=True, do_handshake_on_connect=False
+        )
         with tls_socket:
+            try:
+                tls_socket.do_handshake()
+            except (ssl.SSLError, ConnectionError):
+                finish_a_failed_handshake(tls_socket)
+                return
             self.tls_handshakes.append(
                 ProxyTLSHandshake(
                     self._names.server_name,
@@ -278,7 +284,10 @@ def _received(source: socket.socket) -> bytes:
 
 def _pipe(client: socket.socket, upstream: socket.socket) -> None:
     """Copy bytes both ways until both sides have closed (each EOF is passed on as a half-close,
-    except to a TLS socket, whose `shutdown` drops TLS: the pipe ends there instead)."""
+    except to a TLS socket, whose `shutdown` drops TLS: the pipe ends there instead). Without
+    Nagle either way (the handlers disable it on the client's side), as the test server, so a
+    piece passed on isn't held for the receiver's delayed ACK of the last."""
+    upstream.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     with selectors.DefaultSelector() as selector:
         selector.register(client, selectors.EVENT_READ, (client, upstream))
         selector.register(upstream, selectors.EVENT_READ, (upstream, client))
@@ -322,6 +331,9 @@ class _HTTPProxyHandler(BaseHTTPRequestHandler):
     # Unbuffered, so nothing the client sends after a `CONNECT` is stranded in a read buffer
     # instead of reaching the tunnel.
     rbufsize = 0
+    # As `TestAppHandler`: a forwarded response's head and body are separate writes, and the
+    # body otherwise waited 40ms on Linux for the client's delayed ACK of the head.
+    disable_nagle_algorithm = True
 
     def _server(self) -> _HTTPProxyServer:
         server = self.server
@@ -468,6 +480,7 @@ class _SocksHandler(socketserver.StreamRequestHandler):
     credentials: it picks username/password if it has credentials, no-auth otherwise."""
 
     rbufsize = 0
+    disable_nagle_algorithm = True  # as `_HTTPProxyHandler`
 
     def _server(self) -> _SocksServer:
         server = self.server
@@ -545,6 +558,7 @@ class _Socks4Handler(socketserver.StreamRequestHandler):
     nonzero) names the host after its user ID."""
 
     rbufsize = 0
+    disable_nagle_algorithm = True  # as `_HTTPProxyHandler`
 
     def _server(self) -> _Socks4Server:
         server = self.server

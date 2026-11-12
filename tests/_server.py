@@ -15,6 +15,7 @@ import gzip
 import json
 import socket
 import sys
+import threading
 import time
 import zlib
 from collections.abc import Generator
@@ -115,10 +116,16 @@ def _compressed_shape(complete: bytes, shape: str) -> tuple[list[bytes], int | N
 
 class TestAppHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # A response's head and body are separate writes, so with Nagle the body waits for the
+    # client's ACK of the head, which Linux delays by 40ms on a kept-alive connection: every
+    # request after a connection's first took 42ms there, against 0.2ms without.
+    disable_nagle_algorithm = True
 
     # Per-key hit counters for the flaky/retry-after endpoints below — shared
     # across request threads for the lifetime of the test server.
     _counters: ClassVar[dict[str, int]] = {}
+    # Per-key events `/release` sets, ending a `/slow?key=` wait early.
+    _releases: ClassVar[dict[str, threading.Event]] = {}
     # Per-key record of every request the /oauth/token* endpoints received (content type,
     # Authorization header, parsed body), read back via GET /oauth/token-requests so tests can
     # assert the wire shape of a token request through a public endpoint, never via provider
@@ -606,9 +613,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
         # `rounds` rounds of one 16KB write then 150 one-byte writes, all zeros. Over TLS each
         # write is a record of its own, so every full record is followed by tiny ones: read late,
         # from a socket already full, one read holds more plaintext than rustls buffers (16KB).
-        # No Nagle, so the tiny writes don't wait on the client's ACKs.
+        # The handler disables Nagle, so the tiny writes don't wait on the client's ACKs.
         rounds = int(parse_qs(query)["rounds"][0])
-        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(rounds * (16 * 1024 + 150)))
@@ -814,12 +820,22 @@ class TestAppHandler(BaseHTTPRequestHandler):
         # time out never waits this out at all, so it can ask for a comfortably long sleep; the
         # two "a longer per-call timeout overrides the client's" tests deliberately run this to
         # completion and pay every millisecond, so they ask for a short one. A `key` counts the
-        # request as it arrives (read back via `/hits`), so a test can wait until one is in flight.
+        # request as it arrives (read back via `/hits`), so a test can wait until one is in flight,
+        # and `/release?key=` answers it at once: a test holding a `max_connections` slot asks for
+        # a long sleep and releases it once done, rather than guessing how long it needs it for.
         params = parse_qs(query)
+        seconds = float(params.get("seconds", ["0.5"])[0])
         if "key" in params:
-            self._bump_counter(params["key"][0])
-        sleep(float(params.get("seconds", ["0.5"])[0]))
+            key = params["key"][0]
+            self._bump_counter(key)
+            self._releases.setdefault(key, threading.Event()).wait(seconds)
+        else:
+            sleep(seconds)
         self._write_json(200, {"finally": True})
+
+    def _handle_release(self, query: str) -> None:
+        self._releases.setdefault(parse_qs(query)["key"][0], threading.Event()).set()
+        self._write_json(200, {"released": True})
 
     def _handle_peer(self, query: str) -> None:
         # Which TCP connection served this request (its client port), for the connection-reuse
@@ -1196,6 +1212,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/oauth/token-requests": self._handle_oauth_token_requests,
             "/echo-query": self._handle_echo_query,
             "/slow": self._handle_slow,
+            "/release": self._handle_release,
             "/peer": self._handle_peer,
             "/peer-closed": self._handle_peer_closed,
             "/endless": self._handle_endless,

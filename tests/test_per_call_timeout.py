@@ -47,9 +47,13 @@ def _sync_download(client: SyncHTTPClient, path: str, params: _Params, timeout: 
 
 async def _succeeds_once(client: HTTPClient, call: _Call) -> bool:
     # Whether one try succeeds depends on where in its millisecond it starts, so this keeps trying
-    # for a while; a timeout that is expired on arrival never succeeds.
+    # for a while; a timeout that is expired on arrival never succeeds. Each try goes out on a
+    # connection a request without a timeout has just left open: one that times out takes its
+    # connection with it, and opening the next (connect, accept, the server's handler thread)
+    # outlasted the millisecond on every try on a slow machine.
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
+        await client.get("items/7")
         try:
             await call(client, "items/7", {}, 0.0)
         except HTTPTimeoutError:
@@ -61,6 +65,7 @@ async def _succeeds_once(client: HTTPClient, call: _Call) -> bool:
 def _sync_succeeds_once(client: SyncHTTPClient, call: _SyncCall) -> bool:
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline:
+        client.get("items/7")
         try:
             call(client, "items/7", {}, 0.0)
         except HTTPTimeoutError:

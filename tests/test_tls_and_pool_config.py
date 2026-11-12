@@ -11,9 +11,11 @@ against a real HTTPS server in `tests/test_tls.py`.
 """
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-from lothc import HTTPClient, HTTPTimeoutError, SyncHTTPClient
+from _helpers import release, sync_release
+
+from lothc import HTTPClient, HTTPTimeoutError, Response, SyncHTTPClient
 
 
 async def test_connect_timeout_and_pool_settings_still_allow_a_normal_request(
@@ -49,28 +51,37 @@ def test_sync_connect_timeout_and_pool_settings_still_allow_a_normal_request(
 
 
 async def test_request_past_pool_timeout_waiting_for_a_connection_slot_raises_timeout_error(
-    base_url: str,
+    base_url: str, server_key: str
 ) -> None:
     async with HTTPClient(base_url=base_url, max_connections=1, pool_timeout=0.01) as client:
-        outcomes = await asyncio.gather(
-            client.get("slow", params={"seconds": 0.05}),
-            client.get("slow", params={"seconds": 0.05}),
-            return_exceptions=True,
-        )
+        # Whichever takes the slot holds it until the other has given up waiting for it.
+        requests = [
+            asyncio.create_task(client.get("slow", params={"seconds": 5.0, "key": server_key}))
+            for _ in range(2)
+        ]
+        await asyncio.wait(requests, return_when=asyncio.FIRST_COMPLETED)
+        await release(base_url, server_key)
+        outcomes = await asyncio.gather(*requests, return_exceptions=True)
 
     assert [isinstance(outcome, HTTPTimeoutError) for outcome in outcomes].count(True) == 1
     bodies = [outcome.data for outcome in outcomes if not isinstance(outcome, BaseException)]
     assert bodies == [b'{"finally": true}']
 
 
+def _sync_hold_or_wait(client: SyncHTTPClient, key: str) -> Response[bytes]:
+    return client.get("slow", params={"seconds": 5.0, "key": key})
+
+
 def test_sync_request_past_pool_timeout_waiting_for_a_connection_slot_raises_timeout_error(
-    base_url: str,
+    base_url: str, server_key: str
 ) -> None:
     with (
         SyncHTTPClient(base_url=base_url, max_connections=1, pool_timeout=0.01) as client,
         ThreadPoolExecutor(max_workers=2) as pool,
     ):
-        futures = [pool.submit(client.get, "slow", params={"seconds": 0.05}) for _ in range(2)]
+        futures = [pool.submit(_sync_hold_or_wait, client, server_key) for _ in range(2)]
+        wait(futures, return_when=FIRST_COMPLETED)
+        sync_release(base_url, server_key)
         outcomes = [future.exception() or future.result() for future in futures]
 
     assert [isinstance(outcome, HTTPTimeoutError) for outcome in outcomes].count(True) == 1

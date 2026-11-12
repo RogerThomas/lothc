@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 
 import pytest
 import trustme
-from _helpers import clear_proxy_variables, partial_body_seen
+from _helpers import clear_proxy_variables, post_failing_form, sync_post_failing_form
 from _proxy_server import (
     HTTPProxy,
     ProxyTLSHandshake,
@@ -42,7 +42,7 @@ from _tls_server import tls_server_context
 from msgspec import Struct
 from pydantic import BaseModel, Field
 
-from lothc import HTTPClient, HTTPConnectionError, RequestInfo, SyncHTTPClient
+from lothc import HTTPClient, RequestInfo, SyncHTTPClient
 
 # Every test here sends through the native transport, which is POSIX only.
 pytestmark = pytest.mark.skipif(
@@ -1636,20 +1636,22 @@ def _unreadable_file_form(files: Path) -> dict[str, Any]:
     return {"a": "b", "f": files / "directory", "z": "y"}
 
 
-def _partial_seen(base_url: str, key: str) -> str:
-    seen = partial_body_seen(base_url, key)
+def _masked_partial(seen: dict[str, Any], key: str) -> str:
     return _boundaries_masked(json.dumps(seen).replace(key, "key"))
 
 
-async def _async_post_partial(client: HTTPClient, key: str, form: dict[str, Any]) -> None:
+async def _async_post_partial(
+    client: HTTPClient, base_url: str, key: str, form: dict[str, Any]
+) -> str:
     async with client:
-        with pytest.raises(HTTPConnectionError):
-            await client.post("partial-body", params={"key": key}, form=form)
+        return _masked_partial(await post_failing_form(client, base_url, key, form), key)
 
 
-def _sync_post_partial(client: SyncHTTPClient, key: str, form: dict[str, Any]) -> None:
-    with client, pytest.raises(HTTPConnectionError):
-        client.post("partial-body", params={"key": key}, form=form)
+def _sync_post_partial(
+    client: SyncHTTPClient, base_url: str, key: str, form: dict[str, Any]
+) -> str:
+    with client:
+        return _masked_partial(sync_post_failing_form(client, base_url, key, form), key)
 
 
 async def test_native_transport_sends_what_pyreqwest_sends_of_a_form_it_cant_finish(
@@ -1659,10 +1661,10 @@ async def test_native_transport_sends_what_pyreqwest_sends_of_a_form_it_cant_fin
     form = _unreadable_file_form(tmp_path)
     keys = f"{server_key}-pyreqwest", f"{server_key}-native"
 
-    await _async_post_partial(pyreqwest_client, keys[0], form)
-    await _async_post_partial(native_client, keys[1], form)
+    expected = await _async_post_partial(pyreqwest_client, base_url, keys[0], form)
+    actual = await _async_post_partial(native_client, base_url, keys[1], form)
 
-    assert _partial_seen(base_url, keys[1]) == _partial_seen(base_url, keys[0])
+    assert actual == expected
 
 
 def test_sync_native_transport_sends_what_pyreqwest_sends_of_a_form_it_cant_finish(
@@ -1672,10 +1674,10 @@ def test_sync_native_transport_sends_what_pyreqwest_sends_of_a_form_it_cant_fini
     form = _unreadable_file_form(tmp_path)
     keys = f"{server_key}-pyreqwest", f"{server_key}-native"
 
-    _sync_post_partial(pyreqwest_client, keys[0], form)
-    _sync_post_partial(native_client, keys[1], form)
+    expected = _sync_post_partial(pyreqwest_client, base_url, keys[0], form)
+    actual = _sync_post_partial(native_client, base_url, keys[1], form)
 
-    assert _partial_seen(base_url, keys[1]) == _partial_seen(base_url, keys[0])
+    assert actual == expected
 
 
 # --- cookie_store= --------------------------------------------------------------------------------

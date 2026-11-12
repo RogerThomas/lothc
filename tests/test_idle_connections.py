@@ -22,7 +22,9 @@ from collections.abc import AsyncGenerator, Generator
 from concurrent.futures import ThreadPoolExecutor, wait
 
 import pytest
+import trustme
 from _proxy_server import HTTPProxy, serve_http_proxy
+from _tls_server import TLSServer, serve_tls_server, tls_server_context
 
 from lothc import HTTPClient, SyncHTTPClient
 
@@ -61,6 +63,14 @@ def _sync_tunnels_opened(proxy: HTTPProxy, count: int) -> None:
         time.sleep(0.005)
 
 
+async def _handshakes_done(server: TLSServer, count: int) -> None:
+    """Wait up to 2s for `server` to have completed `count` handshakes: a client has finished its
+    own end by then, and pools the connection with no further trip over the network."""
+    deadline = time.monotonic() + 2.0
+    while len(server.handshakes) < count and time.monotonic() < deadline:
+        await asyncio.sleep(0.005)
+
+
 def _sync_closed_ports(observer: SyncHTTPClient, key: str) -> list[int]:
     deadline = time.monotonic() + 2.0
     while True:
@@ -69,6 +79,13 @@ def _sync_closed_ports(observer: SyncHTTPClient, key: str) -> list[int]:
         if ports or time.monotonic() > deadline:
             return ports
         time.sleep(0.01)
+
+
+@pytest.fixture(name="https_server")
+def _https_server(tls_ca: trustme.CA) -> Generator[TLSServer]:
+    """`https_base_url`'s server, for one test, so its handshakes are that test's."""
+    with serve_tls_server(tls_server_context(tls_ca)) as server:
+        yield server
 
 
 @pytest.fixture(name="idle_timeout_client")
@@ -322,7 +339,7 @@ def test_sync_a_request_waiting_for_a_connection_takes_one_freed_meanwhile(
 
 
 async def test_the_connection_a_request_was_opening_when_it_took_a_freed_one_is_still_pooled(
-    https_base_url: str, tls_ca_pem: bytes
+    https_server: TLSServer, tls_ca_pem: bytes
 ) -> None:
     # The second request takes the first's connection without waiting for its own, which is
     # finished anyway once its tunnel is let through, and pooled: the next two requests at once
@@ -330,7 +347,7 @@ async def test_the_connection_a_request_was_opening_when_it_took_a_freed_one_is_
     release = threading.Event()
     with serve_http_proxy(hold_later_tunnels=release) as proxy:
         async with HTTPClient(
-            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+            base_url=https_server.url, proxy=proxy.url, root_certificates=[tls_ca_pem]
         ) as client:
             first = asyncio.create_task(_port(client, seconds=0.1))
             await _tunnels_opened(proxy, 1)
@@ -340,7 +357,7 @@ async def test_the_connection_a_request_was_opening_when_it_took_a_freed_one_is_
             await asyncio.wait([second], timeout=0.5)
             finished_before_release = second.done()
             release.set()
-            await asyncio.sleep(0.05)
+            await _handshakes_done(https_server, 2)
             ports = set(
                 await asyncio.gather(_port(client, seconds=0.05), _port(client, seconds=0.05))
             )
@@ -371,6 +388,8 @@ def test_sync_the_connection_a_request_was_opening_when_it_took_a_freed_one_is_s
         wait([second], timeout=0.5)
         finished_before_release = second.done()
         release.set()
+        # Not `_handshakes_done`: native's sync pool pools the connection once the proxy has
+        # answered, leaving the origin's handshake to the request that takes it.
         time.sleep(0.05)
         pair = [pool.submit(_sync_port, client, 0.05) for _ in range(2)]
         ports = {future.result() for future in pair}

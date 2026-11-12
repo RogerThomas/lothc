@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from lothc import HTTPClient, SyncHTTPClient
+from lothc import Form, HTTPClient, HTTPConnectionError, SyncHTTPClient
 
 
 def _icacls(path: Path, *arguments: str) -> None:
@@ -95,16 +95,46 @@ def read_only_directory(path: Path) -> Generator[None]:
             path.chmod(0o700)
 
 
-def partial_body_seen(base_url: str, key: str) -> dict[str, Any]:
+def _partial_body_seen(base_url: str, key: str) -> dict[str, Any] | None:
     """What `/partial-body` recorded for `key` (request line, headers, as much body as arrived),
-    once it has: it records only after the client hangs up, which may be just after the client's
-    own call raised."""
+    once it has (it records only after the client hangs up, which may be just after the client's
+    own call raised), or `None` if nothing for `key` ever arrived."""
     with SyncHTTPClient(base_url=base_url) as client:
         for _ in range(200):
             seen = client.get("partial-body-seen", params={"key": key}, error_for_status=False)
             if seen.status == 200:
                 return json.loads(seen.data)
             time.sleep(0.01)
+    return None
+
+
+async def post_failing_form(
+    client: HTTPClient, base_url: str, key: str, form: Form
+) -> dict[str, Any]:
+    """What the server received of `form`, posted to `/partial-body`, whose file part opens but
+    fails to read (`opens_but_fails_to_read`): the request fails, sent as far as that read.
+
+    pyreqwest now and then sends nothing at all: when tokio's read of the file, on its blocking
+    thread, has failed before hyper polls it, hyper drops what it had buffered unwritten (2 tries
+    in 15,000 on a Mac held to its efficiency cores). So a try the server saw none of is made
+    again, twice at most; whatever does arrive is checked."""
+    for _ in range(3):
+        with pytest.raises(HTTPConnectionError):
+            await client.post("partial-body", params={"key": key}, form=form)
+        if (seen := _partial_body_seen(base_url, key)) is not None:
+            return seen
+    raise AssertionError(f"/partial-body recorded nothing for {key}")
+
+
+def sync_post_failing_form(
+    client: SyncHTTPClient, base_url: str, key: str, form: Form
+) -> dict[str, Any]:
+    """`post_failing_form`, from a sync client."""
+    for _ in range(3):
+        with pytest.raises(HTTPConnectionError):
+            client.post("partial-body", params={"key": key}, form=form)
+        if (seen := _partial_body_seen(base_url, key)) is not None:
+            return seen
     raise AssertionError(f"/partial-body recorded nothing for {key}")
 
 
@@ -128,3 +158,16 @@ def sync_arrived(base_url: str, key: str) -> None:
                 return
             time.sleep(0.01)
     raise AssertionError(f"no request for {key} arrived")
+
+
+async def release(base_url: str, key: str) -> None:
+    """Answer the `/slow?key=` request in flight now, however long it asked to wait: a slot held
+    until the test is done with it can't be outlasted by a stalled machine, as a fixed hold can."""
+    async with HTTPClient(base_url=base_url) as client:
+        await client.get("release", params={"key": key})
+
+
+def sync_release(base_url: str, key: str) -> None:
+    """`release`, from a sync test."""
+    with SyncHTTPClient(base_url=base_url) as client:
+        client.get("release", params={"key": key})
