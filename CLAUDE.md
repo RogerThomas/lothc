@@ -39,7 +39,8 @@ a docstring or a test already says.
   build fails if its profile went unused.
 - **Wheels run on a PR only for release-please or a `build-wheels` label**: CI already builds the
   extension on every OS, and the full matrix queues for an hour.
-- **CI tests a `[profile.ci]` build** (release without fat LTO): no cache can hold the LTO step,
+- **CI builds release without fat LTO** (`CARGO_PROFILE_RELEASE_*` in `ci.yml`, not a named
+  profile, which other packages' sdist builds don't have): no cache can hold the LTO step,
   and the shipped `release` binary is smoke-tested in Wheels. rust-cache is shared and saved from
   `main` only, since the repo's 10 GB was evicting.
 - **release-please cuts releases**, so commit messages on `main` must be Conventional Commits.
