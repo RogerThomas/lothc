@@ -115,29 +115,35 @@ chunks*, not the whole request. A body that keeps trickling never trips it; one 
 That makes it the one timeout that's actually meaningful for an open-ended `sse()` stream, which
 the total `timeout` deliberately doesn't apply to — see [SSE → Timeouts](sse.md#timeouts).
 
-## Native transport (experimental)
+## Native transport
 
 ```python
-async with HTTPClient(base_url="https://api.example.com/", native=True) as client:
+async with HTTPClient(base_url="https://api.example.com/", native="off") as client:
     ...
 ```
 
-`native=True` switches the client to lothc's experimental native transport, about twice as fast
-on `get(into=Struct)` in lothc's benchmarks. Not every setting is supported yet: an unsupported
-one raises `NotImplementedError` when the client is constructed. It isn't available on Windows.
-`lothc.testing`'s mocker intercepts its requests exactly as it does the default transport's.
+On Linux and macOS, a client uses lothc's own native transport by default, about twice as fast
+on `get(into=Struct)` in lothc's benchmarks. `native=` picks the transport:
+
+- `"auto"` (the default): native, except on Windows, where it isn't available, and with
+  `http2=True`, which it doesn't support yet; both use pyreqwest instead.
+- `"off"`: always pyreqwest.
+- `"on"`: always native; on Windows or with `http2=True`, constructing the client raises
+  `NotImplementedError`.
+
+`lothc.testing`'s mocker intercepts requests on either transport, the same way.
 
 Async `get()`, 100 requests in flight, decoding the full JSON body (`perf.py`, AWS
 `c8a.xlarge`, Python 3.14):
 
 | Client | req/s |
 |---|---|
-| lothc, `native=True`, msgspec | 97,501 |
-| lothc, `native=True`, `dict` | 71,356 |
-| lothc, `native=True`, pydantic | 56,738 |
+| lothc, `native="on"`, msgspec | 97,501 |
+| lothc, `native="on"`, `dict` | 71,356 |
+| lothc, `native="on"`, pydantic | 56,738 |
 | pyreqwest | 43,370 |
-| lothc, msgspec | 41,528 |
-| lothc, `dict` | 41,195 |
+| lothc, `native="off"`, msgspec | 41,528 |
+| lothc, `native="off"`, `dict` | 41,195 |
 | aiohttp | 21,653 |
 | aiosonic | 13,783 |
 | httpx2 | 3,247 |

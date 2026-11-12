@@ -372,10 +372,10 @@ def _build_client(
 def _build_client(lib: Lib, url: str, concurrency: int) -> AbstractAsyncContextManager[AnyClient]:
     """Return an async context manager yielding a ready-to-use client for `lib`."""
     if lib in ("lothc", "lothc-msgspec", "lothc-pydantic"):
-        return HTTPClient(base_url=url)
+        return HTTPClient(base_url=url, native="off")
 
     if lib in ("lothc-native", "lothc-native-msgspec", "lothc-native-pydantic"):
-        return HTTPClient(base_url=url, native=True)
+        return HTTPClient(base_url=url, native="on")
 
     if lib == "httpx":
         return httpx.AsyncClient(base_url=url)
@@ -445,10 +445,10 @@ def _build_sync_client(lib: Lib, url: str) -> AbstractContextManager[AnySyncClie
     names as `_build_client` (its async counterpart) — sync-vs-async is conveyed by which of the
     two you call, not by the name."""
     if lib in ("lothc", "lothc-msgspec", "lothc-pydantic"):
-        return SyncHTTPClient(base_url=url)
+        return SyncHTTPClient(base_url=url, native="off")
 
     if lib in ("lothc-native", "lothc-native-msgspec", "lothc-native-pydantic"):
-        return SyncHTTPClient(base_url=url, native=True)
+        return SyncHTTPClient(base_url=url, native="on")
 
     if lib == "httpx":
         return httpx.Client(base_url=url)

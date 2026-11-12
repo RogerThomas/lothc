@@ -2,7 +2,7 @@
 """Checks an installed lothc wheel in an environment without its optional extras (pydantic,
 msgspec): `lothc` and `lothc.testing` import from the wheel, not a checkout, and a real request
 goes through the native transport, async and sync. On Windows, where the native transport
-doesn't run, `native=True` must refuse instead.
+doesn't run, `native="on"` must refuse instead.
 
 `lothc.testing` is a pytest plugin, so the environment needs pytest.
 """
@@ -57,22 +57,22 @@ def _check_item(data: dict[str, object]) -> None:
 
 
 async def _async_request(base_url: str) -> None:
-    async with HTTPClient(base_url=base_url, native=True) as client:
+    async with HTTPClient(base_url=base_url, native="on") as client:
         _check_item((await client.get("items/1", into=dict)).data)
 
 
 def _sync_request(base_url: str) -> None:
-    with SyncHTTPClient(base_url=base_url, native=True) as client:
+    with SyncHTTPClient(base_url=base_url, native="on") as client:
         _check_item(client.get("items/1", into=dict).data)
 
 
 def _check_native_refused() -> None:
     for client_type in (HTTPClient, SyncHTTPClient):
         try:
-            client_type(native=True)
+            client_type(native="on")
         except NotImplementedError:
             continue
-        raise RuntimeError(f"{client_type.__name__}(native=True) didn't refuse")
+        raise RuntimeError(f"{client_type.__name__}(native='on') didn't refuse")
 
 
 async def main() -> None:
@@ -80,7 +80,7 @@ async def main() -> None:
     _check_installed()
     if sys.platform == "win32":
         _check_native_refused()
-        print("native=True refused, as on every Windows install")
+        print("native='on' refused, as on every Windows install")
         return
     module = _test_server_module()
     make_server = cast(Callable[[], ThreadingHTTPServer], module.make_server)
