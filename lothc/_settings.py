@@ -43,6 +43,11 @@ type TlsVersion = Literal["TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3"]
 """A TLS version for `min_tls_version`/`max_tls_version`. lothc's own alias rather than
 pyreqwest's identical one, so no pyreqwest name appears anywhere in lothc's public signatures."""
 
+type NativeMode = Literal["auto", "off", "on"]
+"""Which transport a client uses: `"auto"`, lothc's native transport where it runs (Linux, macOS)
+and supports the settings (not `http2=True`), pyreqwest otherwise; `"off"`, always pyreqwest;
+`"on"`, always native, refusing Windows and `http2=True` with `NotImplementedError`."""
+
 
 def _is_joinable_base_url(base_url: str) -> bool:
     """Whether pyreqwest accepts `base_url`: no query or fragment, and a path that's empty or
@@ -94,7 +99,7 @@ class _TransportSettings:  # pylint: disable=too-many-instance-attributes
     pool_idle_timeout: float | None
     pool_max_idle_per_host: int | None
     pool_timeout: float | None
-    native: bool
+    native: NativeMode
 
     def __post_init__(self) -> None:
         # pyreqwest's own rule, checked here so a bad `base_url` fails at construction rather than
@@ -104,6 +109,8 @@ class _TransportSettings:  # pylint: disable=too-many-instance-attributes
         # `no_proxy` is an exclusion list on `proxy`; with no proxy it would silently do nothing.
         if self.no_proxy is not None and self.proxy is None:
             raise ValueError("'no_proxy' needs a 'proxy' to exclude hosts from")
+        if self.native not in ("auto", "off", "on"):
+            raise ValueError(f"'native' must be 'auto', 'off' or 'on', not {self.native!r}")
 
 
 @cache
@@ -119,18 +126,30 @@ def _default_user_agent() -> str:
 
 
 def _uses_native_transport(settings: _TransportSettings) -> bool:
-    """Whether a client being constructed gets the native transport: `native=True`, or the
-    private, test-only override `LOTHC_TRANSPORT=native`, which wins over the argument. Read once
-    per client (never per request), pyreqwest otherwise.
+    """Whether a client being constructed gets the native transport, per its `native=` mode (see
+    `NativeMode`), unless the private, test-only override `LOTHC_TRANSPORT` is `native` (as if
+    `"on"`) or `pyreqwest` (as if `"off"`), which wins over the argument. Read once per client
+    (never per request); any other override value is ignored.
 
-    The override exists so `task test-native` runs every test on the native transport with none
-    changed, which is also why it wins: a `bool` argument can't tell an explicit `native=False`
-    from the default. Not documented for users. A test that needs pyreqwest under that run must
-    unset it. Either way, the native transport is refused on Windows: it waits on raw sockets
-    with `poll(2)` and `loop.add_reader`, which asyncio's default Windows loop doesn't have.
+    The override exists so `task test-native`/`task test-pyreqwest` run every test on one
+    transport with none changed, which is why it wins. Not documented for users. A test that
+    picks a transport itself must unset it. Native is never used on Windows: it waits on raw
+    sockets with `poll(2)` and `loop.add_reader`, which asyncio's default Windows loop doesn't
+    have, so `"auto"` falls back there and `"on"` raises.
     """
-    if not settings.native and os.environ.get("LOTHC_TRANSPORT") != "native":
+    mode = settings.native
+    match os.environ.get("LOTHC_TRANSPORT"):
+        case "native":
+            mode = "on"
+        case "pyreqwest":
+            mode = "off"
+        case _:
+            pass
+    if mode == "off":
         return False
     if sys.platform == "win32":
-        raise NotImplementedError("the native transport (native=True) is not supported on Windows")
-    return True
+        if mode == "auto":
+            return False
+        raise NotImplementedError('the native transport (native="on") is not supported on Windows')
+    # `"auto"` never raises for a supported configuration, so it leaves HTTP/2 to pyreqwest.
+    return mode == "on" or not settings.http2

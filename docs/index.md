@@ -24,8 +24,8 @@ Any subset of the extras works — the base package alone gets you `bytes`/`dict
 
 Wheels cover Linux (glibc and musl) and macOS on x86_64 and Arm, and Windows on x86_64, for
 CPython 3.13 to 3.15 and free-threaded 3.14t and 3.15t; anywhere else, installing builds from
-source, which needs a Rust toolchain. Windows doesn't support
-[`native=True`](networking.md#native-transport-experimental).
+source, which needs a Rust toolchain. Windows uses the pyreqwest transport, not the
+[native one](networking.md#native-transport).
 
 ## Quickstart
 
@@ -132,9 +132,9 @@ package — a Rust-based HTTP client for Python. lothc then adds some nice abstr
 and so on. On pyreqwest, lothc's throughput stays close to pyreqwest's own, and far ahead of
 pure-Python HTTP libraries.
 
-With `native=True`, lothc goes further: its own native transport (see
-[Networking](networking.md)) runs async `get(into=Struct)` at about **2.2x bare pyreqwest** under
-load, 97,501 requests a second decoding into a msgspec `Struct`.
+On Linux and macOS, lothc goes further: its own native transport, the default there (see
+[Networking](networking.md#native-transport)), runs async `get(into=Struct)` at about
+**2.2x bare pyreqwest** under load, 97,501 requests a second decoding into a msgspec `Struct`.
 
 ![HTTP client throughput race — lothc's native transport finishes first, at more than twice pyreqwest's throughput, and other libraries take much longer](assets/perf-race.svg){: .perf-race-img }
 

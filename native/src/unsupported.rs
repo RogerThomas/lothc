@@ -1,5 +1,5 @@
 //! `lothc._native` where the native transport can't run: Windows, which has neither `poll(2)` nor
-//! the `loop.add_reader` the pools wait on, so `native=True` raises there before any pool is built
+//! the `loop.add_reader` the pools wait on, so `native="on"` raises there before any pool is built
 //! (`lothc/_settings.py`). lothc imports these names on every platform (`_transport_native.py`,
 //! `_native_loop.py`, `_mocking.py`), so they exist here with nothing behind them: none of the
 //! classes can be constructed, and the mock hook has no pool to ask.

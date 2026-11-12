@@ -68,10 +68,3 @@ pyo3-build-config = "=0.29.3"
 [profile.release]
 lto = "fat"
 codegen-units = 1
-
-# ci.yml's test builds: release without fat LTO, which every CI job would redo in full (no cache
-# holds it), while hyper, rustls and aws-lc stay optimised. Wheels ship `release`.
-[profile.ci]
-inherits = "release"
-lto = false
-codegen-units = 16

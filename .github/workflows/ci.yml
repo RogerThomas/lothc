@@ -8,10 +8,11 @@ on:
   # can't ship a commit whose tests never ran (or failed).
   workflow_call:
 env:
-  # The extension as `[profile.ci]` builds it (native/Cargo.toml): release without fat LTO, which
-  # every job otherwise redoes in full, since no cache can hold it. The shipped binary is
-  # wheels.yml's, smoke-tested there.
-  MATURIN_PEP517_ARGS: --profile ci
+  # Builds release without fat LTO, which every job otherwise redoes in full, since no cache can
+  # hold it. Env, not a named profile: it reaches every sdist uv builds, and other packages'
+  # crates (pydantic-core, cryptography) have no `ci` profile. The shipped binary is wheels.yml's.
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
   # Every job that runs the suite on the native transport (LOTHC_TRANSPORT=native, as
   # `task test-native` does) leaves out these: the tests that need `http2=True`, which native
   # refuses with NotImplementedError until HTTP/2 is ported (CLAUDE.md).
@@ -58,8 +59,11 @@ jobs:
       # pytest's own plugins (incl. lothc.testing, an auto-loaded pytest11 plugin) already
       # imported, so their module-level code always showed as uncovered. Real coverage was 97%,
       # not ~79%.
+      # The suite on each transport, both forced, since `native="auto"` would put most clients on
+      # native; the second run is appended to the same coverage data.
       - run: uv run coverage run --rcfile=pyproject.toml -m pytest tests
-      # The suite again on the native transport, appended to the same coverage data.
+        env:
+          LOTHC_TRANSPORT: pyreqwest
       - run: uv run coverage run --rcfile=pyproject.toml --append -m pytest tests $NATIVE_DESELECT
         env:
           LOTHC_TRANSPORT: native
@@ -102,6 +106,8 @@ jobs:
       - run: uv sync --all-extras --no-default-groups --group dev
       - run: uv run --no-sync python -c "import sys; assert not sys._is_gil_enabled(), 'GIL is on'"
       - run: uv run --no-sync pytest tests
+        env:
+          LOTHC_TRANSPORT: pyreqwest
       # The native transport shares its pools' state across threads, so a data race in it shows
       # here.
       - run: uv run --no-sync pytest tests $NATIVE_DESELECT
@@ -134,7 +140,10 @@ jobs:
       # margins the timing tests keep (a developer's Mac doesn't, for a foreground process).
       - if: runner.os == 'macOS'
         run: sudo sysctl -w kern.timer.coalescing_enabled=0
+      # Forced, since `native="auto"` would put most clients on native off Windows.
       - run: uv run --no-sync pytest tests
+        env:
+          LOTHC_TRANSPORT: pyreqwest
       # Even after a failure on pyreqwest, so each transport's result shows.
       - if: ${{ !cancelled() && runner.os != 'Windows' }}
         run: uv run --no-sync pytest tests $NATIVE_DESELECT

@@ -9,12 +9,12 @@ Raw numbers behind the throughput race on the [home page](index.md#performance),
 Rust/axum JSON server, the server and client pinned to separate cores: 50,000 requests at
 concurrency 100, after a 1,000-request warm-up (untimed).
 
-`lothc`, `lothc-msgspec`, and `lothc-pydantic` are the same `HTTPClient`, differing only in
-`into`: `lothc` decodes into a plain `dict` (unvalidated),
+`lothc`, `lothc-msgspec`, and `lothc-pydantic` are the same `HTTPClient` on its pyreqwest
+transport (`native="off"`), differing only in `into`: `lothc` decodes into a plain `dict` (unvalidated),
 `lothc-msgspec` into a real nested msgspec `Struct`, and `lothc-pydantic` into a real nested
 pydantic `BaseModel` — both "typed" rows decode the exact same nested `user`/`data`/`pagination`
 response shape the server returns, fully parsed and constructed, not a shortcut subset of it.
-The `lothc-native` rows are the same three with `native=True`.
+The `lothc-native` rows are the same three with `native="on"`.
 
 Every other library in this table gets exactly one row, because none of them have an equivalent
 to `into` at all — `httpx`/`httpx2`/`aiohttp`/`niquests`/`aiosonic`/`pyreqwest`'s

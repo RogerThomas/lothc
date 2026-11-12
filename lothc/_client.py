@@ -22,7 +22,13 @@ from ._compat import (
 )
 from ._errors import HTTPResponseError, _error_body_decoding
 from ._response import Response
-from ._settings import TlsVersion, _retry_method_set, _TransportSettings, _uses_native_transport
+from ._settings import (
+    NativeMode,
+    TlsVersion,
+    _retry_method_set,
+    _TransportSettings,
+    _uses_native_transport,
+)
 from ._sse import SSEEvent
 from ._transport_native import _NativeTransport
 from ._transport_pyreqwest import _PyreqwestTransport
@@ -86,7 +92,7 @@ class HTTPClient:
         pool_idle_timeout: float | None = None,
         pool_max_idle_per_host: int | None = None,
         pool_timeout: float | None = None,
-        native: bool = False,
+        native: NativeMode = "auto",
         raises: type[HTTPResponseError[Any]] = HTTPResponseError,
     ) -> None:
         """The client's settings. Nothing opens until it's entered, as
@@ -122,10 +128,11 @@ class HTTPClient:
         DNS for them (the URL's port is still used); `local_address` is the source IP to connect
         from; `tcp_keepalive` (seconds) turns on TCP keepalive probes for idle connections.
 
-        `native=True` selects lothc's experimental native transport, about twice as fast on
-        `get(into=Struct)` in lothc's benchmarks. It doesn't support every setting yet (an
-        unsupported one raises `NotImplementedError` here), isn't available on Windows, and
-        `lothc.testing`'s mocker doesn't intercept it.
+        `native` picks the transport. `"auto"` (the default) uses lothc's native transport, about
+        twice as fast on `get(into=Struct)` in lothc's benchmarks, on Linux and macOS, and
+        pyreqwest on Windows or with `http2=True`, which native doesn't support yet. `"off"`
+        always uses pyreqwest; `"on"` always uses native, raising `NotImplementedError` here on
+        Windows or with `http2=True`. `lothc.testing`'s mocker intercepts either.
 
         `raises` is the `HTTPResponseError` class every 4xx/5xx is raised as (each verb's own
         `raises=` overrides it). A subclass that pins the error type,
@@ -170,7 +177,7 @@ class HTTPClient:
             native=native,
             retry_methods=_retry_method_set(retry_methods, self._default_retry_methods),
         )
-        # `native=True`, or the private test-only `LOTHC_TRANSPORT=native`, which wins over it.
+        # `native=`, or the private test-only `LOTHC_TRANSPORT`, which wins over it.
         transport = (
             _NativeTransport if _uses_native_transport(self._settings) else _PyreqwestTransport
         )

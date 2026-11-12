@@ -65,9 +65,10 @@ there's demand for an httpx/aiohttp/niquests backend, the author is happy to con
 
 ## Fast
 
-With `native=True`, lothc's own native transport runs async `get(into=Struct)` at about
-**2.2x bare pyreqwest** under load: 97,501 requests a second, each decoded into a validated msgspec
-`Struct`. On its default pyreqwest transport, lothc stays close to pyreqwest's own throughput.
+On Linux and macOS, lothc's own native transport (the default) runs async `get(into=Struct)` at
+about **2.2x bare pyreqwest** under load: 97,501 requests a second, each decoded into a validated
+msgspec `Struct`. On its pyreqwest transport (Windows, `http2=True`, or `native="off"`), lothc
+stays close to pyreqwest's own throughput.
 
 ![HTTP client throughput race — lothc's native transport finishes first, at more than twice pyreqwest's throughput, and other libraries take much longer](https://raw.githubusercontent.com/RogerThomas/lothc/main/assets/perf-race.svg)
 

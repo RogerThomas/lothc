@@ -1,7 +1,7 @@
 """The compiled `lothc._native` extension (native/src/): lothc's own HTTP/1.1 transport, hyper's
 client driven from the asyncio loop (`Pool`) or the calling thread (`SyncPool`). Used only by
 `_NativeTransport`/`_SyncNativeTransport` in `lothc/_transport_native.py`, selected by
-`native=True` on either client.
+`native=` on either client (`_uses_native_transport`).
 
 The pools build every result from `glue` (lothc's own classes and helpers), so what a request
 returns or raises is exactly what the pyreqwest transport does.
