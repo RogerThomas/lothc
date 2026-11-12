@@ -112,6 +112,10 @@ or editing Python here.
 - **Speed (~45s):** test servers poll at 0.01s; scale a timing pair down together, never a lone
   margin; `backoff_base=0.001` where only *that* a retry happened matters; a test below a
   default asserts a bracket, not a floor. Rejected: pytest-xdist.
+- **Wait for evidence, never a sleep a stalled runner can outlast** (`arrived`, `release`,
+  `closed` in `tests/_helpers.py`): CI's macOS Intel and Windows runners stall for 100ms+.
+- **Test servers turn Nagle off**: on Linux every kept-alive response waited 42ms (delayed ACK),
+  which doubled the suite's time.
 - Prefer doctests for small algorithmic functions.
 
 ## Native transport
