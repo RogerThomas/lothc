@@ -1,31 +1,41 @@
 name: Wheels
 
 # Every wheel lothc publishes, plus the sdist, each tested on its own platform: called by
-# release.yml, whose `publish` job uploads what this builds. Also runs on a pull request that
-# touches the packaging, so a break shows before release day. Nothing here publishes.
+# release.yml, whose `publish` job uploads what this builds. Nothing here publishes. On a pull
+# request it runs only for release-please's (the last check before the tag) or one labelled
+# `build-wheels`: about 40 jobs, 10 of them macOS, which queue behind each other for an hour, and
+# CI's `test-platforms` already builds the extension on every OS.
 on:
   workflow_call:
   pull_request:
-    paths:
-      - native/**
-      - pyproject.toml
-      - uv.lock
-      - .github/workflows/wheels.yml
-      - scripts/build_wheel.sh
-      - scripts/pgo_certs.py
-      - scripts/pgo_train.py
-      - scripts/wheel_smoke.py
+    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
 
+# setup-uv runs with `enable-cache: false` here: nothing in these jobs reuses uv's cache, and
+# each job saved one under its own key, filling the repo's 10 GB.
 jobs:
+  # Every other job needs this one, so skipping it skips the run. Adding some other label to a
+  # labelled pull request doesn't rebuild.
+  gate:
+    if: >-
+      github.event_name != 'pull_request'
+      || (startsWith(github.head_ref, 'release-please--')
+          && github.event.pull_request.head.repo.full_name == github.repository)
+      || (contains(github.event.pull_request.labels.*.name, 'build-wheels')
+          && (github.event.action != 'labeled' || github.event.label.name == 'build-wheels'))
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "Building wheels"
+
   # Built and trained inside the policy's own image, natively on each architecture, so the
   # instrumented wheel's training (scripts/pgo_train.py) runs where the wheel will. manylinux2014
   # (glibc 2.17) is the oldest glibc Rust supports, and aws-lc-sys builds there with the image's
   # GCC 10. musllinux_1_2 is the only musllinux policy with a maintained image: 1_1's (Alpine
   # 3.12) stopped before CPython 3.14, so it has none of the interpreters built here.
   linux:
+    needs: gate
     name: ${{ matrix.policy }} ${{ matrix.arch }} ${{ matrix.python }}
     strategy:
       fail-fast: false
@@ -59,6 +69,7 @@ jobs:
 
   # One wheel per architecture, not universal2: a PGO profile is per architecture.
   macos:
+    needs: gate
     name: macOS ${{ matrix.runner == 'macos-latest' && 'arm64' || 'x86_64' }} ${{ matrix.python }}
     strategy:
       fail-fast: false
@@ -71,6 +82,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - uses: astral-sh/setup-uv@v10.3.3
         with:
+          enable-cache: false
           python-version: ${{ matrix.python }}
       # setup-uv only points uv at the version, and no runner has a free-threaded one.
       - run: uv python install ${{ matrix.python }}
@@ -89,6 +101,7 @@ jobs:
 
   # The stub module (native/src/unsupported.rs), since native is POSIX only: nothing to train.
   windows:
+    needs: gate
     name: Windows x86_64 ${{ matrix.python }}
     strategy:
       fail-fast: false
@@ -102,6 +115,7 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - uses: astral-sh/setup-uv@v10.3.3
         with:
+          enable-cache: false
           python-version: ${{ matrix.python }}
       - run: uv python install ${{ matrix.python }}
       - uses: Swatinem/rust-cache@v2.9.3
@@ -124,11 +138,13 @@ jobs:
 
   # Then a wheel built from it, as an install with no wheel for its platform builds one.
   sdist:
+    needs: gate
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: astral-sh/setup-uv@v10.3.3
         with:
+          enable-cache: false
           python-version: "3.14"
       - run: uv build --sdist
       - run: tar -tzf dist/*.tar.gz
