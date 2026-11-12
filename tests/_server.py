@@ -12,6 +12,7 @@ cookie/redirect/retry/streaming/connection-close scenarios used by their own tes
 import contextlib
 import email.policy
 import gzip
+import itertools
 import json
 import socket
 import sys
@@ -126,6 +127,9 @@ class TestAppHandler(BaseHTTPRequestHandler):
     _counters: ClassVar[dict[str, int]] = {}
     # Per-key events `/release` sets, ending a `/slow?key=` wait early.
     _releases: ClassVar[dict[str, threading.Event]] = {}
+    # Per-key times `/events?key=` wrote (or tried to), for `/longest-gap`: its `sent`, then each
+    # write, then `None` once it has finished.
+    _write_times: ClassVar[dict[str, list[float | None]]] = {}
     # Per-key record of every request the /oauth/token* endpoints received (content type,
     # Authorization header, parsed body), read back via GET /oauth/token-requests so tests can
     # assert the wire shape of a token request through a public endpoint, never via provider
@@ -211,6 +215,10 @@ class TestAppHandler(BaseHTTPRequestHandler):
         # than all at once (see test_sse_events_arrive_incrementally in test_sse.py).
         interval = float(params.get("interval", ["0.001"])[0])
         count = int(params.get("count", ["10"])[0])
+        # With a `key`, when each write was made, from the client's `sent` (`/longest-gap`).
+        times = self._write_times.setdefault(params["key"][0], []) if "key" in params else []
+        times.extend(float(sent) for sent in params.get("sent", []))
+        times.append(time.monotonic())
         self._start_sse_response()
         # A client that gives up mid-stream (e.g. its `read_timeout` fired) makes the next write
         # here fail — that's the client's business, not a server error worth a traceback.
@@ -221,9 +229,11 @@ class TestAppHandler(BaseHTTPRequestHandler):
                 if not omit_id:
                     record += f"id: {index}\n"
                 record += f"data: {data}\n\n"
+                times.append(time.monotonic())
                 self.wfile.write(record.encode())
                 self.wfile.flush()
                 time.sleep(interval)
+        times.append(None)
 
     def _write_sse_truncated(self) -> None:
         self._start_sse_response(chunked=True)
@@ -849,6 +859,15 @@ class TestAppHandler(BaseHTTPRequestHandler):
             sleep(seconds)
         self._write_json(200, {"finally": True})
 
+    def _handle_longest_gap(self, query: str) -> None:
+        # How long `/events?key=` went at most between two writes (`sent` first), and whether it
+        # has finished, so the gap it last left a client waiting on is counted too.
+        times = self._write_times.get(parse_qs(query)["key"][0], [])
+        done = bool(times) and times[-1] is None
+        written = [moment for moment in times if moment is not None]
+        gaps = [later - earlier for earlier, later in itertools.pairwise(written)]
+        self._write_json(200, {"done": done, "seconds": max(gaps, default=0.0)})
+
     def _handle_release(self, query: str) -> None:
         self._releases.setdefault(parse_qs(query)["key"][0], threading.Event()).set()
         self._write_json(200, {"released": True})
@@ -1229,6 +1248,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/echo-query": self._handle_echo_query,
             "/slow": self._handle_slow,
             "/release": self._handle_release,
+            "/longest-gap": self._handle_longest_gap,
             "/peer": self._handle_peer,
             "/peer-closed": self._handle_peer_closed,
             "/endless": self._handle_endless,

@@ -13,11 +13,17 @@ import socket
 import sys
 import time
 from collections.abc import Generator
+from functools import partial
 from urllib.parse import urlsplit
 
 import pytest
 import trustme
-from _helpers import clear_proxy_variables
+from _helpers import (
+    EventsParams,
+    clear_proxy_variables,
+    sync_unless_the_server_stalled,
+    unless_the_server_stalled,
+)
 from _proxy_server import (
     ProxyBehaviour,
     SocksBehaviour,
@@ -456,38 +462,60 @@ def test_sync_read_timeout_bounds_a_stall_in_the_body(base_url: str) -> None:
     assert time.monotonic() - started < 1
 
 
-async def test_read_timeout_limits_each_gap_in_the_body_not_the_whole(base_url: str) -> None:
-    # Six events 0.03s apart: each gap well within `read_timeout`, the body as a whole not.
+# Six events 0.03s apart: each gap well within `read_timeout`, the body as a whole not, unless
+# the machine stalls (`unless_the_server_stalled`).
+async def _gapped(client: HTTPClient, params: EventsParams) -> bytes:
+    return (await client.get("events", params={"interval": 0.03, "count": 6, **params})).data
+
+
+def _sync_gapped(client: SyncHTTPClient, params: EventsParams) -> bytes:
+    return client.get("events", params={"interval": 0.03, "count": 6, **params}).data
+
+
+async def _streamed_gapped(client: HTTPClient, params: EventsParams) -> bytes:
+    stream = client.stream_get("events", params={"interval": 0.03, "count": 6, **params})
+    return b"".join([chunk async for chunk in stream])
+
+
+def _sync_streamed_gapped(client: SyncHTTPClient, params: EventsParams) -> bytes:
+    return b"".join(client.stream_get("events", params={"interval": 0.03, "count": 6, **params}))
+
+
+async def test_read_timeout_limits_each_gap_in_the_body_not_the_whole(
+    base_url: str, server_key: str
+) -> None:
     async with HTTPClient(base_url=base_url, read_timeout=0.1) as client:
-        result = await client.get("events", params={"interval": 0.03, "count": 6})
+        body = await unless_the_server_stalled(partial(_gapped, client), base_url, server_key, 0.1)
 
-    assert result.data.count(b"data: ") == 6
+    assert body.count(b"data: ") == 6
 
 
-def test_sync_read_timeout_limits_each_gap_in_the_body_not_the_whole(base_url: str) -> None:
+def test_sync_read_timeout_limits_each_gap_in_the_body_not_the_whole(
+    base_url: str, server_key: str
+) -> None:
     with SyncHTTPClient(base_url=base_url, read_timeout=0.1) as client:
-        result = client.get("events", params={"interval": 0.03, "count": 6})
+        fetch = partial(_sync_gapped, client)
+        body = sync_unless_the_server_stalled(fetch, base_url, server_key, 0.1)
 
-    assert result.data.count(b"data: ") == 6
+    assert body.count(b"data: ") == 6
 
 
 async def test_read_timeout_limits_each_gap_in_a_streamed_body_not_the_whole(
-    base_url: str,
+    base_url: str, server_key: str
 ) -> None:
     async with HTTPClient(base_url=base_url, read_timeout=0.1) as client:
-        body = b"".join([
-            chunk
-            async for chunk in client.stream_get("events", params={"interval": 0.03, "count": 6})
-        ])
+        fetch = partial(_streamed_gapped, client)
+        body = await unless_the_server_stalled(fetch, base_url, server_key, 0.1)
 
     assert body.count(b"data: ") == 6
 
 
 def test_sync_read_timeout_limits_each_gap_in_a_streamed_body_not_the_whole(
-    base_url: str,
+    base_url: str, server_key: str
 ) -> None:
     with SyncHTTPClient(base_url=base_url, read_timeout=0.1) as client:
-        body = b"".join(client.stream_get("events", params={"interval": 0.03, "count": 6}))
+        fetch = partial(_sync_streamed_gapped, client)
+        body = sync_unless_the_server_stalled(fetch, base_url, server_key, 0.1)
 
     assert body.count(b"data: ") == 6
 

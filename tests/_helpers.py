@@ -5,14 +5,16 @@ import json
 import subprocess
 import sys
 import time
-from collections.abc import Generator
+from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from lothc import Form, HTTPClient, HTTPConnectionError, SyncHTTPClient
+from lothc import Form, HTTPClient, HTTPConnectionError, HTTPTimeoutError, SyncHTTPClient
+
+type EventsParams = dict[str, str | float]
 
 
 def _icacls(path: Path, *arguments: str) -> None:
@@ -172,6 +174,56 @@ def closed(base_url: str, key: str) -> None:
                 return
             time.sleep(0.01)
     raise AssertionError(f"the server never closed the connection for {key}")
+
+
+def _longest_server_gap(base_url: str, key: str) -> float:
+    """The longest `/events?key=` went between two writes, from the client's `sent`, once it has
+    finished (after its client hung up, it finds out on its next write)."""
+    with SyncHTTPClient(base_url=base_url) as client:
+        for _ in range(200):
+            seen = client.get("longest-gap", params={"key": key}, into=dict).data
+            if seen["done"]:
+                return float(seen["seconds"])
+            time.sleep(0.01)
+    raise AssertionError(f"/events never finished for {key}")
+
+
+async def unless_the_server_stalled[T](
+    fetch: Callable[[EventsParams], Awaitable[T]], base_url: str, key: str, limit: float
+) -> T:
+    """`fetch` of `/events` (its `params` given, with a `key` and a `sent`), made again, for up to
+    2s, while it times out because the server itself went longer than `limit` between two writes
+    (most of it, so a gap the client's clock started on a little late counts), as a busy machine
+    makes it now and then: a gap limit is right to give up then, and the try shows nothing about
+    the shorter gaps under test. A timeout without such a gap fails the test."""
+    deadline = time.monotonic() + 2.0
+    attempt = 0
+    while True:
+        attempt_key = f"{key}-{attempt}"
+        try:
+            return await fetch({"key": attempt_key, "sent": time.monotonic()})
+        except HTTPTimeoutError:
+            stalled = _longest_server_gap(base_url, attempt_key) >= 0.8 * limit
+            if not stalled or time.monotonic() > deadline:
+                raise
+        attempt += 1
+
+
+def sync_unless_the_server_stalled[T](
+    fetch: Callable[[EventsParams], T], base_url: str, key: str, limit: float
+) -> T:
+    """`unless_the_server_stalled`, for a sync `fetch`."""
+    deadline = time.monotonic() + 2.0
+    attempt = 0
+    while True:
+        attempt_key = f"{key}-{attempt}"
+        try:
+            return fetch({"key": attempt_key, "sent": time.monotonic()})
+        except HTTPTimeoutError:
+            stalled = _longest_server_gap(base_url, attempt_key) >= 0.8 * limit
+            if not stalled or time.monotonic() > deadline:
+                raise
+        attempt += 1
 
 
 async def release(base_url: str, key: str) -> None:
