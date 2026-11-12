@@ -8,6 +8,10 @@ on:
   # can't ship a commit whose tests never ran (or failed).
   workflow_call:
 env:
+  # The extension as `[profile.ci]` builds it (native/Cargo.toml): release without fat LTO, which
+  # every job otherwise redoes in full, since no cache can hold it. The shipped binary is
+  # wheels.yml's, smoke-tested there.
+  MATURIN_PEP517_ARGS: --profile ci
   # Every job that runs the suite on the native transport (LOTHC_TRANSPORT=native, as
   # `task test-native` does) leaves out these: the tests that need `http2=True`, which native
   # refuses with NotImplementedError until HTTP/2 is ported (CLAUDE.md).
@@ -20,6 +24,9 @@ env:
     --deselect tests/test_http2.py::test_sync_http2_true_negotiates_http2_with_a_server_that_offers_it
     --deselect tests/test_http2.py::test_http2_carries_several_requests_on_one_client
 jobs:
+  # Every job's rust-cache step shares one cache per OS and architecture (only pyo3 rebuilds for
+  # another interpreter), saved from `main` only: a pull request's cache is invisible to every
+  # other pull request, and the repo's 10 GB was already evicting.
   test:
     strategy:
       fail-fast: false
@@ -31,11 +38,11 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
-      # The extension's dependencies, built once per job and Python version.
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: native
-          key: ${{ matrix.python-version }}
+          shared-key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: uv sync --all-extras --group dev --group perf
       - run: uv run ruff check .
       - run: uv run ruff format --check .
@@ -87,11 +94,11 @@ jobs:
       - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: ${{ matrix.python-version }}
-      # The extension's dependencies, built once per job and Python version.
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: native
-          key: ${{ matrix.python-version }}
+          shared-key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: uv sync --all-extras --no-default-groups --group dev
       - run: uv run --no-sync python -c "import sys; assert not sys._is_gil_enabled(), 'GIL is on'"
       - run: uv run --no-sync pytest tests
@@ -120,6 +127,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: native
+          shared-key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: uv sync --all-extras --no-default-groups --group dev
       # GitHub's macOS runners coalesce a job's timers: a 0.02s sleep took about 0.08s, past the
       # margins the timing tests keep (a developer's Mac doesn't, for a foreground process).
@@ -146,6 +155,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: native
+          shared-key: ci
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The locked dev group minus the two extras, rather than a hand-picked `pytest ...` list,
       # so a new test-only dependency (e.g. trustme) can't silently break this job.
       - run: >-
