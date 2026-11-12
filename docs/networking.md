@@ -126,3 +126,23 @@ async with HTTPClient(base_url="https://api.example.com/", native=True) as clien
 on `get(into=Struct)` in lothc's benchmarks. Not every setting is supported yet: an unsupported
 one raises `NotImplementedError` when the client is constructed. It isn't available on Windows.
 `lothc.testing`'s mocker intercepts its requests exactly as it does the default transport's.
+
+Async `get()`, 100 requests in flight, decoding the full JSON body (`perf.py`, AWS
+`c8a.xlarge`, Python 3.14):
+
+| Client | req/s |
+|---|---|
+| lothc, `native=True`, msgspec | 97,501 |
+| lothc, `native=True`, `dict` | 71,356 |
+| lothc, `native=True`, pydantic | 56,738 |
+| pyreqwest | 43,370 |
+| lothc, msgspec | 41,528 |
+| lothc, `dict` | 41,195 |
+| aiohttp | 21,653 |
+| aiosonic | 13,783 |
+| httpx2 | 3,247 |
+| niquests | 3,155 |
+| httpx | 1,004 |
+
+The server is local, so this measures each client's own cost; over a real network the gain
+shows up mostly as less CPU per request.
