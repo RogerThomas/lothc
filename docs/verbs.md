@@ -85,6 +85,9 @@ await client.get("items", params={"tag": ["ready", "pending"], "limit": 10})
 # -> ?tag=ready&tag=pending&limit=10
 ```
 
+An `int` goes out as its exact digits at any size, so a `uint64` id such as `2**64 - 1` is sent
+as `18446744073709551615` (in `params=` and `data=` alike), never rounded through a float.
+
 ### Top-level arrays and other shapes
 
 `into` takes any type expression, not just a class, so a top-level JSON array (or a union, an

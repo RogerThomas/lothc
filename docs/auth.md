@@ -298,8 +298,10 @@ A token the server rejects with a `401` before it expires (revoked, rotated) is 
 automatically. The client calls `provider.invalidate()` and, for an idempotent verb
 (`GET`/`PUT`/`DELETE`/`HEAD`/`OPTIONS`), retries the request once with a freshly obtained token. A `POST`
 or `PATCH` is never replayed, since it may not be safe to repeat: it raises the `401`, and the
-next call gets a fresh token. A second `401` on the retry is raised as-is, so a request that
-genuinely lacks access fails after one extra token fetch rather than looping.
+next call gets a fresh token. Neither is a multipart `form=` request on any verb, since its
+streamed body can't be sent twice (see [Retries](retries.md#multipart-form-requests-are-sent-once)).
+A second `401` on the retry is raised as-is, so a request that genuinely lacks access fails
+after one extra token fetch rather than looping.
 
 `invalidate()` is public too, and takes the rejected token optionally, becoming a no-op if a new
 one has been obtained since (so two concurrent 401s don't each discard the other's fresh token).

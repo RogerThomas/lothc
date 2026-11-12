@@ -83,6 +83,7 @@ from ._client import (
     _encode_headers,  # pyright: ignore[reportPrivateUsage]
     _encode_params,  # pyright: ignore[reportPrivateUsage]
     _pydantic_by_alias,  # pyright: ignore[reportPrivateUsage]
+    _query_pairs,  # pyright: ignore[reportPrivateUsage]
     _QueryValue,  # pyright: ignore[reportPrivateUsage]
 )
 from ._compat import BaseModel, Struct, msgspec
@@ -339,10 +340,10 @@ def _query_param_match_values(params: Mapping[str, _QueryValue]) -> dict[str, st
     a real call could never actually produce. Deliberately NOT collapsed through
     `_first_value_per_key` the way `MockRequest.query` is — collapsing here would silently narrow
     an exact multi-value match (e.g. `params={"tag": ["a", "b"]}`) down to matching only `tag`'s
-    first value, matching requests it shouldn't. `Url.parse_with_params` already accepts a
-    `Mapping` whose value is a list/tuple directly (confirmed live — unlike pyreqwest's own
-    `RequestBuilder.query()`, which rejects that shape; see `_client.py`'s `_query_pairs`), so no
-    pre-flattening is needed on this side.
+    first value, matching requests it shouldn't. The values go through the real request path's
+    own `_query_pairs` first, so its adjustments apply here too: an `int` outside the signed
+    64-bit range is matched by its exact digits, as a request sends it, rather than the float
+    `Url.parse_with_params` would make of it (which matched `2**64 + 1` against `2**64`).
 
     An empty `list`/`tuple` value is rejected explicitly, unlike every other value here — confirmed
     live that `Url.parse_with_params` silently drops a key entirely when its value is `[]`/`()`,
@@ -359,7 +360,9 @@ def _query_param_match_values(params: Mapping[str, _QueryValue]) -> dict[str, st
                 "representation to narrow a mock against — it would register a mock that matches "
                 "any query string at all instead of none. Omit the key from params= instead."
             )
-    return Url.parse_with_params("http://mock.invalid/", params).query_dict_multi_value
+    return Url.parse_with_params(
+        "http://mock.invalid/", _query_pairs(params)
+    ).query_dict_multi_value
 
 
 def _apply_mock_response(builder: ResponseBuilder, mock_response: MockResponse) -> ResponseBuilder:

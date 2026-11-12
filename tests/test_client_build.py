@@ -1,5 +1,6 @@
 import asyncio
 import time
+from collections.abc import AsyncGenerator, Generator
 from concurrent.futures import ThreadPoolExecutor
 from importlib.metadata import version
 from typing import Any
@@ -23,6 +24,18 @@ async def _async_bearer_auth() -> str:
 
 def _sync_bearer_auth() -> str:
     return "token-value"
+
+
+@pytest.fixture(name="user_agent_client")
+async def _user_agent_client(base_url: str) -> AsyncGenerator[HTTPClient]:
+    async with HTTPClient(base_url=base_url, user_agent="agent-name/1.0") as client:
+        yield client
+
+
+@pytest.fixture(name="sync_user_agent_client")
+def _sync_user_agent_client(base_url: str) -> Generator[SyncHTTPClient]:
+    with SyncHTTPClient(base_url=base_url, user_agent="agent-name/1.0") as client:
+        yield client
 
 
 async def test_build_rejects_both_bearer_token_and_bearer_auth(base_url: str) -> None:
@@ -188,27 +201,28 @@ def test_sync_exiting_a_client_that_is_not_open_is_harmless(base_url: str) -> No
     client.__exit__(None, None, None)
 
 
-async def test_user_agent_is_sent_on_every_request(base_url: str) -> None:
-    async with HTTPClient(base_url=base_url, user_agent="agent-name/1.0") as client:
-        result = (await client.get("echo-headers", into=dict)).data
+async def test_user_agent_is_sent_on_every_request(user_agent_client: HTTPClient) -> None:
+    result = (await user_agent_client.get("echo-headers", into=dict)).data
 
     headers = echoed_headers(result)
     assert headers["user-agent"] == "agent-name/1.0"
 
 
-def test_sync_user_agent_is_sent_on_every_request(base_url: str) -> None:
-    with SyncHTTPClient(base_url=base_url, user_agent="agent-name/1.0") as client:
-        result = client.get("echo-headers", into=dict).data
+def test_sync_user_agent_is_sent_on_every_request(sync_user_agent_client: SyncHTTPClient) -> None:
+    result = sync_user_agent_client.get("echo-headers", into=dict).data
 
     headers = echoed_headers(result)
     assert headers["user-agent"] == "agent-name/1.0"
 
 
-async def test_a_per_request_user_agent_header_overrides_user_agent(base_url: str) -> None:
-    async with HTTPClient(base_url=base_url, user_agent="agent-name/1.0") as client:
-        result = (
-            await client.get("echo-headers", headers={"user-agent": "override/2.0"}, into=dict)
-        ).data
+async def test_a_per_request_user_agent_header_overrides_user_agent(
+    user_agent_client: HTTPClient,
+) -> None:
+    result = (
+        await user_agent_client.get(
+            "echo-headers", headers={"user-agent": "override/2.0"}, into=dict
+        )
+    ).data
 
     values = [h["value"] for h in result["headers"] if h["name"].lower() == "user-agent"]
     assert values == ["override/2.0"]
@@ -374,8 +388,22 @@ def _open_and_close_sync(client: SyncHTTPClient) -> None:
         {"max_connections": 0},
         {"default_headers": {"bad name": "value"}},
         {"timeout": -1.0},
+        {"user_agent": "a\nb"},
+        {"identity_pem": b"identity-pem"},
+        {"max_tls_version": "TLSv1.1"},
+        {"min_tls_version": "TLSv1.3", "max_tls_version": "TLSv1.2"},
     ],
-    ids=["local_address", "resolve", "max_connections", "default_headers", "timeout"],
+    ids=[
+        "local_address",
+        "resolve",
+        "max_connections",
+        "default_headers",
+        "timeout",
+        "user_agent",
+        "identity_pem",
+        "max_tls_version",
+        "min_above_max_tls_version",
+    ],
 )
 async def test_unusable_settings_raise_value_error_by_the_time_the_client_opens(
     settings: dict[str, Any],
@@ -395,8 +423,22 @@ async def test_unusable_settings_raise_value_error_by_the_time_the_client_opens(
         {"max_connections": 0},
         {"default_headers": {"bad name": "value"}},
         {"timeout": -1.0},
+        {"user_agent": "a\nb"},
+        {"identity_pem": b"identity-pem"},
+        {"max_tls_version": "TLSv1.1"},
+        {"min_tls_version": "TLSv1.3", "max_tls_version": "TLSv1.2"},
     ],
-    ids=["local_address", "resolve", "max_connections", "default_headers", "timeout"],
+    ids=[
+        "local_address",
+        "resolve",
+        "max_connections",
+        "default_headers",
+        "timeout",
+        "user_agent",
+        "identity_pem",
+        "max_tls_version",
+        "min_above_max_tls_version",
+    ],
 )
 def test_sync_unusable_settings_raise_value_error_by_the_time_the_client_opens(
     settings: dict[str, Any],
@@ -405,6 +447,46 @@ def test_sync_unusable_settings_raise_value_error_by_the_time_the_client_opens(
         _open_and_close_sync(SyncHTTPClient(**settings))
 
     assert not type(exc_info.value).__module__.startswith("pyreqwest")
+
+
+# pyreqwest's `BuilderError` from building the client is re-raised as a plain `ValueError` with
+# its message and causes in one line, chained to the original.
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        ({"max_tls_version": "TLSv1.1"}, "builder error: empty supported tls versions"),
+        ({"user_agent": "a\nb"}, "builder error: failed to parse header value"),
+    ],
+    ids=["max_tls_version", "user_agent"],
+)
+async def test_a_client_build_error_is_a_plain_value_error_with_pyreqwests_message(
+    settings: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValueError, match="builder error") as exc_info:
+        await _open_and_close(HTTPClient(**settings))
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == message
+    assert exc_info.value.__cause__ is not None
+
+
+@pytest.mark.parametrize(
+    ("settings", "message"),
+    [
+        ({"max_tls_version": "TLSv1.1"}, "builder error: empty supported tls versions"),
+        ({"user_agent": "a\nb"}, "builder error: failed to parse header value"),
+    ],
+    ids=["max_tls_version", "user_agent"],
+)
+def test_sync_a_client_build_error_is_a_plain_value_error_with_pyreqwests_message(
+    settings: dict[str, Any], message: str
+) -> None:
+    with pytest.raises(ValueError, match="builder error") as exc_info:
+        _open_and_close_sync(SyncHTTPClient(**settings))
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == message
+    assert exc_info.value.__cause__ is not None
 
 
 def test_sync_local_address_is_the_address_connections_come_from(base_url: str) -> None:

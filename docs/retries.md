@@ -58,6 +58,19 @@ reconnect on one, since a redirect loop can be transient, but a plain verb raise
 Nor is a body that can never be decoded, such as a corrupt gzip body: it comes back the same on
 every attempt, so it raises `HTTPConnectionError` straight away.
 
+## Multipart `form=` requests are sent once
+
+A multipart `form=` body is streamed as it's sent, so it can't be replayed. A `form=` request is
+therefore sent exactly once, even on a verb in `retry_methods`: a `429`/`5xx` or a transport
+failure is raised straight away, the same as for a verb that isn't retried. This is how reqwest's
+own retry policy treats a body it can't copy. Every other body (`json=`, `data=`, `content=`) is
+held in memory and is replayed byte for byte.
+
+The same goes for re-authenticating on a `401` (see [Authentication](auth.md)): the rejected
+token is still discarded, so the next call gets a fresh one, but the `form=` request itself is
+raised rather than sent again. To retry an upload, catch the error and call the verb again; the
+form is rebuilt from your `dict` (a `Path` is reopened) on every call.
+
 ## A body cut off partway
 
 A connection that dies partway through the body is retried like any other transport failure,

@@ -213,21 +213,19 @@ class TestAppHandler(BaseHTTPRequestHandler):
 
     def _write_sse_reconnect(self, query: str) -> None:
         # First connection: a `retry:` hint, two events, then the connection dies mid-stream.
-        # Every later connection: two more events, each echoing the `Last-Event-ID` header the
-        # client sent, then a clean close.
+        # Every later connection: two more events, then a clean close. Every event's data echoes
+        # each `Last-Event-ID` value its connection carried (a list, so a duplicate shows).
         attempt = self._bump_counter(parse_qs(query)["key"][0])
-        last_event_id = self.headers.get("Last-Event-ID")
+        data = json.dumps({"last": self.headers.get_all("Last-Event-ID", [])})
         if attempt == 1:
             self._start_sse_response(chunked=True)
             self._write_sse_chunk("retry: 20\n\n")
             for index in range(2):
-                self._write_sse_chunk(f"id: {index}\ndata: {json.dumps({'last': None})}\n\n")
+                self._write_sse_chunk(f"id: {index}\ndata: {data}\n\n")
             return
         self._start_sse_response()
         for index in range(2, 4):
-            self.wfile.write(
-                f"id: {index}\ndata: {json.dumps({'last': last_event_id})}\n\n".encode()
-            )
+            self.wfile.write(f"id: {index}\ndata: {data}\n\n".encode())
         self.wfile.flush()
 
     def _write_sse_close_count(self, query: str) -> None:

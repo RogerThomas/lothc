@@ -18,8 +18,10 @@ says. Through a tunnel, `/peer` names the proxy's connection to the server, one 
 import asyncio
 import threading
 import time
+from collections.abc import AsyncGenerator, Generator
 from concurrent.futures import ThreadPoolExecutor, wait
 
+import pytest
 from _proxy_server import HTTPProxy, serve_http_proxy
 
 from lothc import HTTPClient, SyncHTTPClient
@@ -69,40 +71,47 @@ def _sync_closed_ports(observer: SyncHTTPClient, key: str) -> list[int]:
         time.sleep(0.01)
 
 
-async def test_a_connection_is_reused_within_pool_idle_timeout_and_replaced_after_it(
-    base_url: str,
-) -> None:
+@pytest.fixture(name="idle_timeout_client")
+async def _idle_timeout_client(base_url: str) -> AsyncGenerator[HTTPClient]:
     async with HTTPClient(base_url=base_url, pool_idle_timeout=0.05) as client:
-        first = await _port(client)
-        reused = await _port(client)
-        await asyncio.sleep(0.07)
-        replaced = await _port(client)
+        yield client
+
+
+@pytest.fixture(name="sync_idle_timeout_client")
+def _sync_idle_timeout_client(base_url: str) -> Generator[SyncHTTPClient]:
+    with SyncHTTPClient(base_url=base_url, pool_idle_timeout=0.05) as client:
+        yield client
+
+
+async def test_a_connection_is_reused_within_pool_idle_timeout_and_replaced_after_it(
+    idle_timeout_client: HTTPClient,
+) -> None:
+    first = await _port(idle_timeout_client)
+    reused = await _port(idle_timeout_client)
+    await asyncio.sleep(0.07)
+    replaced = await _port(idle_timeout_client)
 
     assert reused == first
     assert replaced != first
 
 
 def test_sync_a_connection_is_reused_within_pool_idle_timeout_and_replaced_after_it(
-    base_url: str,
+    sync_idle_timeout_client: SyncHTTPClient,
 ) -> None:
-    with SyncHTTPClient(base_url=base_url, pool_idle_timeout=0.05) as client:
-        first = _sync_port(client)
-        reused = _sync_port(client)
-        time.sleep(0.07)
-        replaced = _sync_port(client)
+    first = _sync_port(sync_idle_timeout_client)
+    reused = _sync_port(sync_idle_timeout_client)
+    time.sleep(0.07)
+    replaced = _sync_port(sync_idle_timeout_client)
 
     assert reused == first
     assert replaced != first
 
 
 async def test_an_idle_connection_is_closed_after_pool_idle_timeout_with_no_request_to_find_it(
-    base_url: str, server_key: str
+    base_url: str, server_key: str, idle_timeout_client: HTTPClient
 ) -> None:
-    async with (
-        HTTPClient(base_url=base_url, pool_idle_timeout=0.05) as client,
-        HTTPClient(base_url=base_url) as observer,
-    ):
-        response = await client.get("peer", params={"key": server_key}, into=dict)
+    async with HTTPClient(base_url=base_url) as observer:
+        response = await idle_timeout_client.get("peer", params={"key": server_key}, into=dict)
         closed = await _closed_ports(observer, server_key)
 
     assert closed == [int(response.data["port"])]
