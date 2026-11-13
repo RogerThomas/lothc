@@ -10,7 +10,7 @@ permissions: {}
 jobs:
   # Keeps a release PR open that bumps .release-please-manifest.json and CHANGELOG.md from the
   # Conventional Commit messages since the last release. Merging that PR tags the release (no "v"
-  # prefix; hatch-vcs derives the package version from the tag) and creates the GitHub Release.
+  # prefix) and creates the GitHub Release.
   release-please:
     runs-on: ubuntu-latest
     permissions:

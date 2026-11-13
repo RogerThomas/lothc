@@ -3,6 +3,8 @@ so no exported class, function, method, overload or type alias may mention one i
 """
 
 import inspect
+import subprocess
+import sys
 from collections.abc import Callable, Iterator
 from types import ModuleType
 from typing import Any, TypeAliasType, get_args, get_overloads
@@ -78,3 +80,29 @@ def test_no_pyreqwest_type_appears_in_the_public_api(module: ModuleType) -> None
             offenders[qualname] = sorted(set(found))
 
     assert offenders == {}
+
+
+@pytest.mark.parametrize("module", [lothc, lothc.testing], ids=["lothc", "lothc.testing"])
+def test_every_public_class_reports_the_module_it_is_imported_from(module: ModuleType) -> None:
+    wrong = {
+        name: exported.__module__
+        for name in module.__all__
+        if isinstance(exported := getattr(module, name), type)
+        and exported.__module__ != module.__name__
+    }
+
+    assert wrong == {}
+
+
+def test_import_lothc_imports_neither_pytest_nor_the_mock_engine() -> None:
+    # A fresh interpreter: this one already has both, loaded as lothc's pytest plugin.
+    script = (
+        "import sys\n"
+        "import lothc\n"
+        "print([m for m in ('pytest', 'lothc.testing', 'lothc._mocking') if m in sys.modules])\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=True
+    )
+
+    assert result.stdout == "[]\n"

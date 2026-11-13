@@ -1,11 +1,11 @@
+import re
 from typing import Any, cast
 
 import pytest
 from msgspec import Struct
 from pydantic import BaseModel, Field
-from pyreqwest.pytest_plugin.mock import ClientMocker
 
-from lothc import CaseInsensitiveDict, HTTPClient, HTTPResponseError, SyncHTTPClient
+from lothc import CaseInsensitiveDict, HTTPClient, HTTPResponseError, SSEEvent, SyncHTTPClient
 from lothc.testing import LOTHCMocker, MockRequest, MockResponse
 
 
@@ -153,12 +153,50 @@ async def test_add_get_response_matches_on_a_repeated_query_param_as_tuple(
     assert item == {"ok": True}
 
 
+async def test_add_get_response_matches_an_int_outside_64_bits_exactly(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    """An int past the signed 64-bit range is matched by its exact digits, as a real request
+    sends it, not as the float pyreqwest's encoder would turn it into."""
+    mock = lothc_mocker.add_get_response(path="/items", params={"id": 2**64}, data={"ok": True})
+
+    item = (await client.get("items", params={"id": 2**64}, into=dict)).data
+
+    assert item == {"ok": True}
+    [seen] = mock.get_requests()
+    assert seen.query == {"id": "18446744073709551616"}
+
+
+def test_sync_add_get_response_matches_an_int_outside_64_bits_exactly(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items", params={"id": 2**64}, data={"ok": True})
+
+    item = sync_client.get("items", params={"id": 2**64}, into=dict).data
+
+    assert item == {"ok": True}
+    [seen] = mock.get_requests()
+    assert seen.query == {"id": "18446744073709551616"}
+
+
+async def test_add_get_response_does_not_match_a_neighbouring_int_outside_64_bits(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    # As floats, 2**64 and 2**64 + 1 are the same number, so a lossy encoding matched both.
+    mock = lothc_mocker.add_get_response(path="/items", params={"id": 2**64}, data={})
+
+    with pytest.raises(AssertionError, match="No mock answered"):
+        await client.get("items", params={"id": 2**64 + 1})
+
+    mock.assert_called(count=0)
+
+
 async def test_add_get_response_does_not_match_a_different_repeated_query_param_order(
     client: HTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
     mock = lothc_mocker.add_get_response(path="/items", params={"tag": ["a", "b"]}, data={})
 
-    with pytest.raises(AssertionError, match="No mock rule matched"):
+    with pytest.raises(AssertionError, match="No mock answered"):
         await client.get("items", params={"tag": ["b", "a"]})
 
     mock.assert_called(count=0)
@@ -197,7 +235,7 @@ async def test_add_get_response_raising_does_not_register_an_orphaned_mock(
     with pytest.raises(ValueError, match="Invalid query value"):
         lothc_mocker.add_get_response(path="/items", params=cast(Any, {"flag": None}))
 
-    with pytest.raises(AssertionError, match="No mock rule matched"):
+    with pytest.raises(AssertionError, match="No mock answered"):
         await client.get("items")
 
 
@@ -555,63 +593,6 @@ async def test_clear_removes_all_registered_mocks(
         await client.get("items/7")
 
 
-# Every method `_MockTyping`/`_ClientMockerTyping` (lothc/testing.py) declare against pyreqwest's
-# real `Mock`/`ClientMocker`, kept in sync manually, so a pyreqwest rename/removal fails here
-# loudly instead of surfacing as a runtime AttributeError the first time a consumer hits the
-# changed method (the `cast` at the fixture boundary hides this from type checkers). Existence
-# only: a renamed or removed *parameter* isn't caught here, but the tests above call every one of
-# these methods through the real public API with real arguments, which is what catches that.
-@pytest.mark.parametrize(
-    "name",
-    [
-        "mock",
-        "get",
-        "post",
-        "put",
-        "patch",
-        "delete",
-        "head",
-        "strict",
-        "get_requests",
-        "get_call_count",
-        "clear",
-        "reset_requests",
-    ],
-)
-def test_pyreqwest_client_mocker_has_the_method_lothc_types(
-    client_mocker: ClientMocker, name: str
-) -> None:
-    assert callable(getattr(client_mocker, name))
-
-
-@pytest.mark.parametrize(
-    "name",
-    [
-        "with_status",
-        "with_headers",
-        "with_body_bytes",
-        "with_body_json",
-        "match_query",
-        "match_query_param",
-        "match_header",
-        "match_body_json",
-        "match_request",
-        "match_request_with_response",
-        "assert_called",
-        "get_requests",
-        "get_call_count",
-        "reset_requests",
-    ],
-)
-def test_pyreqwest_mock_has_the_method_lothc_types(client_mocker: ClientMocker, name: str) -> None:
-    # pyreqwest's own dirty_equals-related stub gap (see lothc/testing.py's module docstring)
-    # leaks an Unknown into `.get`'s own inferred signature here, since this calls pyreqwest's
-    # raw API directly rather than through lothc's re-typed Protocol wrapper.
-    mock = client_mocker.get(path="/items/7")  # pyright: ignore[reportUnknownMemberType]
-
-    assert callable(getattr(mock, name))
-
-
 async def test_get_requests_headers_are_case_insensitive(
     client: HTTPClient, lothc_mocker: LOTHCMocker
 ) -> None:
@@ -637,3 +618,574 @@ async def test_mock_response_data_encodes_aliases_like_a_real_request(
     result = (await client.get("items/7", into=dict)).data
 
     assert result == {"userId": 7}
+
+
+async def test_add_put_response_returns_its_data(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_put_response(path="/items/7", data={"id": 7, "name": "put"})
+
+    response = await client.put("items/7", json={"name": "put"}, into=dict)
+
+    assert response.data == {"id": 7, "name": "put"}
+
+
+async def test_add_patch_response_returns_its_data(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_patch_response(path="/items/7", data={"id": 7, "name": "patch"})
+
+    response = await client.patch("items/7", json={"name": "patch"}, into=dict)
+
+    assert response.data == {"id": 7, "name": "patch"}
+
+
+async def test_add_delete_response_returns_its_status(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_delete_response(path="/items/7", status=404)
+
+    with pytest.raises(HTTPResponseError) as exc_info:
+        await client.delete("items/7")
+
+    assert exc_info.value.status == 404
+
+
+def test_sync_add_put_patch_and_delete_responses(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_put_response(path="/items/7", data={"verb": "put"})
+    lothc_mocker.add_patch_response(path="/items/7", data={"verb": "patch"})
+    lothc_mocker.add_delete_response(path="/items/7", data={"verb": "delete"})
+
+    assert sync_client.put("items/7", into=dict).data == {"verb": "put"}
+    assert sync_client.patch("items/7", into=dict).data == {"verb": "patch"}
+    assert sync_client.delete("items/7", into=dict).data == {"verb": "delete"}
+
+
+async def test_url_matches_the_whole_url_exactly(
+    base_url: str, client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(url=f"{base_url}items/7", data={"matched": True})
+
+    response = await client.get("items/7", into=dict)
+    with pytest.raises(AssertionError):  # strict, and another path doesn't match
+        await client.get("items/8")
+
+    assert response.data == {"matched": True}
+
+
+async def test_url_matches_a_regular_expression(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(url=re.compile(r"/items/\d+$"), data={"matched": True})
+
+    response = await client.get("items/8", into=dict)
+
+    assert response.data == {"matched": True}
+
+
+async def test_mock_request_body_is_the_bytes_that_were_sent(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_post_response(path="/items")
+
+    await client.post("items", json={"a": 1})
+
+    [seen] = mock.get_requests()
+    assert seen.body == b'{"a":1}'
+
+
+async def test_get_requests_shows_no_body_for_a_bodyless_request(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items/7")
+
+    await client.get("items/7")
+
+    [seen] = mock.get_requests()
+    assert seen.body is None
+
+
+async def test_a_mocked_response_can_be_streamed(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/ndjson", data=b'{"i": 0}\n{"i": 1}\n')
+
+    lines = [line async for line in client.stream_get("ndjson", into=dict)]
+
+    assert lines == [{"i": 0}, {"i": 1}]
+
+
+async def test_a_mocked_response_can_be_downloaded(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/binary", data=b"content")
+
+    response = await client.download("binary")
+
+    assert response.data == b"content"
+
+
+async def test_a_mocked_event_stream_can_be_read_with_sse(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(
+        path="/events",
+        data=b"id: 1\ndata: first\n\n",
+        headers={"content-type": "text/event-stream"},
+    )
+
+    events = [event async for event in client.sse("events", max_reconnects=0)]
+
+    assert events == [SSEEvent(id="1", event="message", data="first")]
+
+
+def test_sync_a_mocked_response_can_be_streamed(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/ndjson", data=b'{"i": 0}\n{"i": 1}\n')
+
+    lines = list(sync_client.stream_get("ndjson", into=dict))
+
+    assert lines == [{"i": 0}, {"i": 1}]
+
+
+# --- How a request finds its mock, and what the failure messages say -----------------------------
+
+
+def _sync_matches_flag_header(request: MockRequest) -> bool:
+    return request.headers.get("x-flag") == "1"
+
+
+async def test_a_plain_function_matcher_and_handler_answer_an_async_client(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.mock("GET").match_request(_sync_matches_flag_header).match_request_with_response(
+        _sync_handler_computes_item_from_path
+    )
+
+    item = (await client.get("items/42", headers={"x-flag": "1"}, into=dict)).data
+
+    assert item == {"id": 42}
+
+
+def test_sync_a_plain_function_matcher_and_handler_answer_a_sync_client(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.mock("GET").match_request(_sync_matches_flag_header).match_request_with_response(
+        _sync_handler_computes_item_from_path
+    )
+
+    item = sync_client.get("items/42", headers={"x-flag": "1"}, into=dict).data
+
+    assert item == {"id": 42}
+
+
+@pytest.mark.parametrize("kind", ["matcher", "handler"])
+def test_sync_an_async_matcher_or_handler_is_a_type_error(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker, kind: str
+) -> None:
+    mock = lothc_mocker.mock("GET")
+    if kind == "matcher":
+        mock.match_request(_matches_flag_header)
+    else:
+        mock.match_request_with_response(_handler_computes_item_from_path)
+
+    with pytest.raises(TypeError, match="can't answer a SyncHTTPClient's request"):
+        sync_client.get("items/42")
+
+
+async def test_an_unmatched_request_names_the_closest_mock(
+    base_url: str, client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_post_response(path="/other")
+    lothc_mocker.add_get_response(path="/items").match_header("x-flag", "1")
+
+    with pytest.raises(AssertionError) as exc_info:
+        await client.get("items", headers={"x-flag": "2"})
+
+    assert str(exc_info.value) == (
+        f"No mock answered GET {base_url}items\n"
+        "The closest mock, GET path='/items':\n"
+        "  header 'x-flag': expected '1', got '2'\n"
+        "lothc_mocker is strict: mock the request, or let unmocked requests through with "
+        "@pytest.mark.lothc_mocker(strict=False)."
+    )
+
+
+def test_sync_an_unmatched_request_names_the_closest_mock(
+    base_url: str, sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_post_response(path="/other")
+    lothc_mocker.add_get_response(path="/items").match_header("x-flag", "1")
+
+    with pytest.raises(AssertionError) as exc_info:
+        sync_client.get("items", headers={"x-flag": "2"})
+
+    assert str(exc_info.value) == (
+        f"No mock answered GET {base_url}items\n"
+        "The closest mock, GET path='/items':\n"
+        "  header 'x-flag': expected '1', got '2'\n"
+        "lothc_mocker is strict: mock the request, or let unmocked requests through with "
+        "@pytest.mark.lothc_mocker(strict=False)."
+    )
+
+
+async def test_assert_called_lists_the_requests_past_the_expected_count(
+    base_url: str, client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(url=re.compile("items"))
+
+    await client.get("items/1")
+    await client.get("items/2")
+
+    with pytest.raises(AssertionError) as exc_info:
+        mock.assert_called()
+    assert str(exc_info.value) == (
+        "The mock GET url=re.compile('items') answered 2 requests, expected exactly 1.\n"
+        "It answered:\n"
+        f"  GET {base_url}items/1\n"
+        f"  GET {base_url}items/2"
+    )
+
+
+def test_sync_assert_called_lists_the_requests_past_the_expected_count(
+    base_url: str, sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(url=re.compile("items"))
+
+    sync_client.get("items/1")
+    sync_client.get("items/2")
+
+    with pytest.raises(AssertionError) as exc_info:
+        mock.assert_called()
+    assert str(exc_info.value) == (
+        "The mock GET url=re.compile('items') answered 2 requests, expected exactly 1.\n"
+        "It answered:\n"
+        f"  GET {base_url}items/1\n"
+        f"  GET {base_url}items/2"
+    )
+
+
+async def test_assert_called_shows_the_request_with_the_fewest_mismatches(
+    base_url: str, client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_post_response(path="/items").match_body_json({"a": 1})
+    lothc_mocker.mock()
+
+    await client.post("items", json={"a": 2})
+    await client.get("other")
+
+    with pytest.raises(AssertionError) as exc_info:
+        mock.assert_called()
+    assert str(exc_info.value) == (
+        "The mock POST path='/items' answered 0 requests, expected exactly 1.\n"
+        f"The closest request it didn't answer, POST {base_url}items:\n"
+        "  JSON body: expected {'a': 1}, got {'a': 2}"
+    )
+
+
+def test_sync_assert_called_shows_the_request_with_the_fewest_mismatches(
+    base_url: str, sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_post_response(path="/items").match_body_json({"a": 1})
+    lothc_mocker.mock()
+
+    sync_client.post("items", json={"a": 2})
+    sync_client.get("other")
+
+    with pytest.raises(AssertionError) as exc_info:
+        mock.assert_called()
+    assert str(exc_info.value) == (
+        "The mock POST path='/items' answered 0 requests, expected exactly 1.\n"
+        f"The closest request it didn't answer, POST {base_url}items:\n"
+        "  JSON body: expected {'a': 1}, got {'a': 2}"
+    )
+
+
+def _sync_handler_declines(_request: MockRequest) -> MockResponse | None:
+    return None
+
+
+async def test_assert_called_says_why_a_matching_request_went_elsewhere(
+    base_url: str, client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    declining = lothc_mocker.mock("GET").match_request_with_response(_handler_declines)
+    answering = lothc_mocker.add_get_response(path="/items")
+    shadowed = lothc_mocker.add_get_response(path="/items")
+
+    await client.get("items")
+
+    answering.assert_called()
+    with pytest.raises(AssertionError) as declined:
+        declining.assert_called()
+    with pytest.raises(AssertionError) as went_first:
+        shadowed.assert_called()
+    assert str(declined.value).endswith(
+        f"GET {base_url}items:\n  match_request_with_response(_handler_declines) returned None"
+    )
+    assert str(went_first.value).endswith(f"GET {base_url}items:\n  another mock answered it first")
+
+
+def test_sync_assert_called_says_why_a_matching_request_went_elsewhere(
+    base_url: str, sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    declining = lothc_mocker.mock("GET").match_request_with_response(_sync_handler_declines)
+    answering = lothc_mocker.add_get_response(path="/items")
+    shadowed = lothc_mocker.add_get_response(path="/items")
+
+    sync_client.get("items")
+
+    answering.assert_called()
+    with pytest.raises(AssertionError) as declined:
+        declining.assert_called()
+    with pytest.raises(AssertionError) as went_first:
+        shadowed.assert_called()
+    assert str(declined.value).endswith(
+        f"GET {base_url}items:\n  match_request_with_response(_sync_handler_declines) returned None"
+    )
+    assert str(went_first.value).endswith(f"GET {base_url}items:\n  another mock answered it first")
+
+
+@pytest.mark.lothc_mocker(strict=False)
+async def test_assert_called_says_a_request_came_before_the_mock(
+    base_url: str, client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    await client.get("items/7")
+    mock = lothc_mocker.add_get_response(path="/items/7")
+
+    with pytest.raises(AssertionError) as exc_info:
+        mock.assert_called()
+    assert str(exc_info.value).endswith(
+        f"GET {base_url}items/7:\n  it was sent before this mock was registered"
+    )
+
+
+@pytest.mark.lothc_mocker(strict=False)
+def test_sync_assert_called_says_a_request_came_before_the_mock(
+    base_url: str, sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    sync_client.get("items/7")
+    mock = lothc_mocker.add_get_response(path="/items/7")
+
+    with pytest.raises(AssertionError) as exc_info:
+        mock.assert_called()
+    assert str(exc_info.value).endswith(
+        f"GET {base_url}items/7:\n  it was sent before this mock was registered"
+    )
+
+
+def test_assert_called_says_when_no_request_was_sent(lothc_mocker: LOTHCMocker) -> None:
+    mock = lothc_mocker.mock()
+
+    with pytest.raises(AssertionError) as exc_info:
+        mock.assert_called(min_count=1)
+    assert str(exc_info.value) == (
+        "The mock for any request answered 0 requests, expected at least 1.\n"
+        "No other request was sent."
+    )
+
+
+async def test_assert_called_checks_every_bound_it_is_given(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items/7")
+
+    await client.get("items/7")
+    await client.get("items/7")
+
+    mock.assert_called(count=2, min_count=1, max_count=2)
+    with pytest.raises(AssertionError, match=r"expected at least 1 and at most 1\.\n"):
+        mock.assert_called(min_count=1, max_count=1)
+
+
+def test_sync_assert_called_checks_every_bound_it_is_given(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items/7")
+
+    sync_client.get("items/7")
+    sync_client.get("items/7")
+
+    mock.assert_called(count=2, min_count=1, max_count=2)
+    with pytest.raises(AssertionError, match=r"expected at least 1 and at most 1\.\n"):
+        mock.assert_called(min_count=1, max_count=1)
+
+
+async def test_get_requests_lists_every_mock_s_requests_in_the_order_sent(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/a")
+    lothc_mocker.add_get_response(path="/b")
+
+    await client.get("a")
+    await client.get("b")
+    await client.get("a")
+
+    assert [seen.path for seen in lothc_mocker.get_requests()] == ["/a", "/b", "/a"]
+
+
+def test_sync_get_requests_lists_every_mock_s_requests_in_the_order_sent(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/a")
+    lothc_mocker.add_get_response(path="/b")
+
+    sync_client.get("a")
+    sync_client.get("b")
+    sync_client.get("a")
+
+    assert [seen.path for seen in lothc_mocker.get_requests()] == ["/a", "/b", "/a"]
+
+
+async def test_clear_leaves_a_removed_mock_its_requests(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items/7")
+    await client.get("items/7")
+
+    lothc_mocker.clear()
+
+    assert (lothc_mocker.get_call_count(), mock.get_call_count()) == (0, 1)
+
+
+def test_sync_clear_leaves_a_removed_mock_its_requests(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items/7")
+    sync_client.get("items/7")
+
+    lothc_mocker.clear()
+
+    assert (lothc_mocker.get_call_count(), mock.get_call_count()) == (0, 1)
+
+
+async def test_match_query_narrows_a_params_mock_further(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    narrow = lothc_mocker.add_get_response(path="/items", params={"page": "2"})
+    narrow.match_query({"tag": "a"})
+    wide = lothc_mocker.add_get_response(path="/items")
+
+    await client.get("items", params={"page": 2, "tag": "a"})
+    await client.get("items", params={"tag": "a"})
+
+    narrow.assert_called(count=1)
+    wide.assert_called(count=1)
+
+
+def test_sync_match_query_narrows_a_params_mock_further(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    narrow = lothc_mocker.add_get_response(path="/items", params={"page": "2"})
+    narrow.match_query({"tag": "a"})
+    wide = lothc_mocker.add_get_response(path="/items")
+
+    sync_client.get("items", params={"page": 2, "tag": "a"})
+    sync_client.get("items", params={"tag": "a"})
+
+    narrow.assert_called(count=1)
+    wide.assert_called(count=1)
+
+
+async def test_match_body_json_twice_needs_both(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    both = lothc_mocker.add_post_response(path="/items")
+    both.match_body_json({"a": 1}).match_body_json({"a": 2})
+    rest = lothc_mocker.add_post_response(path="/items")
+
+    await client.post("items", json={"a": 2})
+
+    both.assert_called(count=0)
+    rest.assert_called(count=1)
+
+
+def test_sync_match_body_json_twice_needs_both(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    both = lothc_mocker.add_post_response(path="/items")
+    both.match_body_json({"a": 1}).match_body_json({"a": 2})
+    rest = lothc_mocker.add_post_response(path="/items")
+
+    sync_client.post("items", json={"a": 2})
+
+    both.assert_called(count=0)
+    rest.assert_called(count=1)
+
+
+async def test_a_query_pattern_matches_a_key_sent_once_and_a_list_every_value(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    pattern = lothc_mocker.add_get_response(path="/items").match_query_param("a", re.compile("2"))
+    listed = lothc_mocker.add_get_response(path="/items").match_query({"a": ["1"]})
+    rest = lothc_mocker.add_get_response(path="/items")
+
+    await client.get("items?a=1&a=2")
+    await client.get("items?a=1")
+
+    assert (pattern.get_call_count(), listed.get_call_count(), rest.get_call_count()) == (0, 1, 1)
+
+
+def test_sync_a_query_pattern_matches_a_key_sent_once_and_a_list_every_value(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    pattern = lothc_mocker.add_get_response(path="/items").match_query_param("a", re.compile("2"))
+    listed = lothc_mocker.add_get_response(path="/items").match_query({"a": ["1"]})
+    rest = lothc_mocker.add_get_response(path="/items")
+
+    sync_client.get("items?a=1&a=2")
+    sync_client.get("items?a=1")
+
+    assert (pattern.get_call_count(), listed.get_call_count(), rest.get_call_count()) == (0, 1, 1)
+
+
+async def test_with_data_keeps_the_data_as_it_was_given(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    data = {"a": 1}
+    lothc_mocker.add_get_response(path="/items", data=data)
+    lothc_mocker.mock("GET", path="/other").with_data(data)
+    data["a"] = 2
+
+    assert (await client.get("items", into=dict)).data == {"a": 1}
+    assert (await client.get("other", into=dict)).data == {"a": 1}
+
+
+def test_sync_with_data_keeps_the_data_as_it_was_given(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    data = {"a": 1}
+    lothc_mocker.add_get_response(path="/items", data=data)
+    lothc_mocker.mock("GET", path="/other").with_data(data)
+    data["a"] = 2
+
+    assert sync_client.get("items", into=dict).data == {"a": 1}
+    assert sync_client.get("other", into=dict).data == {"a": 1}
+
+
+async def test_a_response_changed_after_it_answered_answers_the_next_request(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items", data={"a": 1})
+    first = await client.get("items", into=dict)
+    mock.with_data({"a": 2}).with_headers({"x-a": "b"}).with_status(201)
+
+    second = await client.get("items", into=dict)
+
+    assert (first.status, first.data, first.headers.get("x-a")) == (200, {"a": 1}, None)
+    assert (second.status, second.data, second.headers["x-a"]) == (201, {"a": 2}, "b")
+
+
+def test_sync_a_response_changed_after_it_answered_answers_the_next_request(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items", data={"a": 1})
+    first = sync_client.get("items", into=dict)
+    mock.with_data({"a": 2}).with_headers({"x-a": "b"}).with_status(201)
+
+    second = sync_client.get("items", into=dict)
+
+    assert (first.status, first.data, first.headers.get("x-a")) == (200, {"a": 1}, None)
+    assert (second.status, second.data, second.headers["x-a"]) == (201, {"a": 2}, "b")

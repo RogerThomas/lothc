@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 import trustme
+from _h2_server import serve_http2
 from _oauth_server import TokenServer
 from _server import make_server, serve_in_background
 from _tls_server import serve_tls, tls_server_context
@@ -80,4 +81,11 @@ def _mtls_base_url(tls_ca: trustme.CA) -> Generator[str]:
     context.verify_mode = ssl.CERT_REQUIRED
     context.load_verify_locations(cadata=tls_ca.cert_pem.bytes().decode())
     with serve_tls(context) as url:
+        yield url
+
+
+@pytest.fixture(scope="session", name="http2_base_url")
+def _http2_base_url(tls_ca: trustme.CA) -> Generator[str]:
+    """An HTTPS server speaking HTTP/2 to clients that negotiate it, HTTP/1.1 to the rest."""
+    with serve_http2(tls_server_context(tls_ca)) as url:
         yield url

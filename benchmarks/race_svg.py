@@ -34,6 +34,8 @@ class ResultEntry(TypedDict):
 # decode-validation depths, so (per the skill's non-negotiables: "never a 9th
 # generated hue", "color follows the entity") they take a single green
 # one-hue ordinal ramp instead (plain lothc/dict is the lightest/least processing).
+# The three lothc-native rows are lothc too, so they continue the same ramp darker
+# (validated with --ordinal as one six-step light-mode ramp).
 # Verified via the skill's validate_palette.js validateOrdinal():
 # lightness-monotone, single-hue, and clears the light-surface 2:1 contrast
 # floor at its lightest step (#00c200 -> 2.35:1) — dark mode wasn't checked
@@ -50,13 +52,16 @@ _lib_colors = {
     "lothc": "#00c200",
     "lothc-msgspec": "#009e00",
     "lothc-pydantic": "#007a00",
+    "lothc-native": "#005a00",
+    "lothc-native-msgspec": "#003c00",
+    "lothc-native-pydantic": "#002000",
     "requests": "#e34948",
 }
 
 _lane_height = 36
 _lane_gap = 6
-_track_x = 150
-_track_width = 520
+_track_x = 190
+_track_width = 480
 _header_h = 58
 _footer_h = 24
 _hold_seconds = 3.0

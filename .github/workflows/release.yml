@@ -10,7 +10,7 @@ jobs:
   # extras) against the exact tagged commit. Publishing used to go straight from `uv build` to
   # `uv publish`, so a release could ship a commit CI had never passed.
   test:
-    # Only ever publish a tag: hatch-vcs would give a branch a `.devN` version.
+    # Only ever publish a tag: the release-please commit that set pyproject.toml's version.
     if: startsWith(github.ref, 'refs/tags/')
     uses: ./.github/workflows/ci.yml
     permissions:
@@ -18,8 +18,16 @@ jobs:
     # ci.yml's Codecov upload reads CODECOV_TOKEN, which a called workflow doesn't get otherwise.
     secrets: inherit
 
+  # Every platform's wheels (PGO-optimised where the native transport runs) and the sdist, each
+  # already installed into a clean environment on its own platform and smoke-tested there.
+  wheels:
+    if: startsWith(github.ref, 'refs/tags/')
+    uses: ./.github/workflows/wheels.yml
+    permissions:
+      contents: read
+
   publish:
-    needs: test
+    needs: [test, wheels]
     runs-on: ubuntu-latest
     # Trusted Publishing (OIDC) — no PyPI token/secret needed. The environment name here must
     # match the one configured as the trusted publisher on the PyPI project settings ("pypi").
@@ -29,22 +37,15 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8.0.2
         with:
-          # hatch-vcs derives the version from git tags — needs full history to see them,
-          # not just the single commit a shallow checkout would give it.
-          fetch-depth: 0
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
 
       - uses: astral-sh/setup-uv@v10.3.3
-        with:
-          python-version: "3.13"
 
-      - run: uv build
-
-      # Install the wheel just built, with no extras, into a clean env and import it: catches a
-      # packaging mistake (a module left out of the wheel) that the tests, which run against the
-      # source tree, can't see.
-      - run: uv run --isolated --no-project --with dist/*.whl python -c "import lothc"
+      - run: ls -l dist
 
       - run: uv publish
 

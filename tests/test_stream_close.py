@@ -52,11 +52,40 @@ async def test_closing_a_stream_post_early_releases_the_connection(
     assert await _hangups(client, server_key) == 1
 
 
+async def test_closing_a_stream_early_after_its_client_closes_releases_the_connection(
+    client: HTTPClient, base_url: str, server_key: str
+) -> None:
+    # Its head had arrived, so it outlived its client (`client` only counts the hang-ups).
+    closing = HTTPClient(base_url=base_url)
+    await closing.__aenter__()
+    chunks = closing.stream_get("endless", params={"key": server_key})
+    await anext(chunks)
+    await closing.__aexit__(None, None, None)
+
+    await chunks.aclose()
+
+    assert await _hangups(client, server_key) == 1
+
+
 def test_sync_closing_a_stream_get_early_releases_the_connection(
     sync_client: SyncHTTPClient, server_key: str
 ) -> None:
     chunks = sync_client.stream_get("endless", params={"key": server_key})
     next(chunks)
+
+    chunks.close()
+
+    assert _sync_hangups(sync_client, server_key) == 1
+
+
+def test_sync_closing_a_stream_early_after_its_client_closes_releases_the_connection(
+    sync_client: SyncHTTPClient, base_url: str, server_key: str
+) -> None:
+    closing = SyncHTTPClient(base_url=base_url)
+    closing.__enter__()
+    chunks = closing.stream_get("endless", params={"key": server_key})
+    next(chunks)
+    closing.__exit__(None, None, None)
 
     chunks.close()
 

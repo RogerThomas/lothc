@@ -18,26 +18,32 @@ COPY --from=server-builder /build/benchmarks/json_server/target/release/json-ser
 EXPOSE 3000
 ENTRYPOINT ["/usr/local/bin/json-server"]
 
+# `uv sync` builds lothc's Rust extension (`lothc._native`, from native/), so it runs in a stage
+# with a Rust toolchain and a C compiler (aws-lc-sys compiles C); the runtime stage gets the
+# finished /app, venv included. Same base image in both, so the venv's interpreter path holds.
+FROM python:3.14-slim AS runtime-builder
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=rust:1-slim /usr/local/cargo /usr/local/cargo
+COPY --from=rust:1-slim /usr/local/rustup /usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup PATH=/usr/local/cargo/bin:$PATH
+
+WORKDIR /app
+COPY pyproject.toml uv.lock README.md ./
+COPY native ./native
+COPY lothc ./lothc
+COPY perf.py ./perf.py
+# asv (regression-benchmark tracking of lothc's own history, unrelated to this cross-library
+# perf.py comparison) builds from source; excluded since perf.py never imports it and task perf
+# doesn't need it installed.
+RUN uv sync --frozen --group dev --group perf --no-install-package asv
+
 FROM python:3.14-slim AS runtime
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
 WORKDIR /app
-COPY pyproject.toml uv.lock README.md ./
-COPY lothc ./lothc
-COPY perf.py ./perf.py
-# lothc's version is dynamic (hatch-vcs, [tool.hatch.version] source = "vcs") — it normally reads
-# the version from git metadata, but this build context has no .git (and the base image has no
-# `git` binary either), so pin a pretend version instead of copying .git in just for this: the
-# version string is irrelevant here, this image only runs perf.py against lothc's code, and
-# copying .git would also bust the uv sync layer cache on every single commit. Must be the
-# generic SETUPTOOLS_SCM_PRETEND_VERSION, not the per-package _FOR_<NAME> variant — hatch-vcs
-# doesn't pass a dist name through to setuptools-scm, so the namespaced form is never matched
-# (verified locally: _FOR_LOTHC silently has no effect, the bare var works).
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.0.0
-# asv (regression-benchmark tracking of lothc's own history, unrelated to this cross-library
-# perf.py comparison) needs a C compiler to build from source and this slim image has none —
-# excluded here since perf.py never imports it; task perf doesn't need it installed.
-RUN uv sync --frozen --group dev --group perf --no-install-package asv
+COPY --from=runtime-builder /app /app
 
 COPY benchmarks/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

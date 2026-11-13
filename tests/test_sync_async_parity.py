@@ -18,10 +18,12 @@ import inspect
 import re
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import get_overloads, overload
 
 import pytest
 
+import lothc
 from lothc import (
     AuthProvider,
     HTTPClient,
@@ -55,10 +57,39 @@ def _differing_implementations() -> dict[str, str]:
         "async creates its `asyncio.Lock` lazily per running loop (a loop-bound lock breaks "
         "across `asyncio.run()` calls); sync just holds a `threading.Lock`"
     )
+    awaits_the_native_future = (
+        "async awaits the native pool's Future, cancelling its request if the caller is "
+        "cancelled; the sync pool's `request` blocks and returns the `Response` itself"
+    )
+    awaits_the_native_stream = (
+        "async awaits the native stream's Future, closing the stream if the caller is "
+        "cancelled; the sync stream's call blocks and returns the result itself"
+    )
+    hands_back_native_futures = (
+        "a mocked async native stream hands back Futures, as the pool's `Stream` does; the sync "
+        "one returns each result itself, as `SyncStream` does"
+    )
+    native_pool_lifecycle = (
+        "the async native pool is bound to the running loop and opens its sockets through "
+        "`_LoopConnections`, which closing also shuts down; the sync pool connects by itself"
+    )
     return {
-        "HTTPClient._download": reads_through_sync_stream_chunks,
-        "HTTPClient._line_stream": reads_through_sync_stream_chunks,
-        "HTTPClient._sse_connection": reads_through_sync_stream_chunks,
+        "_stream_lines": reads_through_sync_stream_chunks,
+        "_sse_connection": reads_through_sync_stream_chunks,
+        "_download_stream": reads_through_sync_stream_chunks,
+        "_NativeTransport._exchange": awaits_the_native_future,
+        "_NativeTransport.send": awaits_the_native_future,
+        "_NativeTransport.open": native_pool_lifecycle,
+        "_NativeTransport.close": native_pool_lifecycle,
+        "_NativeStreamSource._open_current": awaits_the_native_stream,
+        "_NativeStreamSource._read_chunk": awaits_the_native_stream,
+        "_native_answer": awaits_the_native_future,
+        "_resolved": (
+            "async awaits an `async def` matcher's or handler's result; a sync request can't, "
+            "so it raises `TypeError` for one instead"
+        ),
+        "_NativeMockStream.open": hands_back_native_futures,
+        "_NativeMockStream.read": hands_back_native_futures,
         "OAuthProvider.__init__": lazy_loop_lock,
         "OAuthProvider.__call__": lazy_loop_lock,
         "OAuthProvider.invalidate": (
@@ -224,26 +255,31 @@ def _methods(cls: ast.ClassDef) -> dict[str, list[ast.stmt]]:
     return methods
 
 
-def _definition_pairs(source: str) -> Iterator[tuple[str, ast.stmt, ast.stmt]]:
-    """Every top-level (async name, async node, sync node) whose sync name desyncs to the other."""
-    module = ast.parse(source)
-    definitions = {
-        node.name: node
-        for node in module.body
+def _definition_pairs(sources: list[str]) -> Iterator[tuple[str, ast.stmt, ast.stmt]]:
+    """Every top-level (async name, async node, sync node) whose sync name desyncs to the other,
+    across all of `sources`: a twin may live in another module than its pair."""
+    nodes = [
+        node
+        for source in sources
+        for node in ast.parse(source).body
         if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)
-    }
+    ]
+    definitions = {node.name: node for node in nodes}
+    # One namespace for the whole package, so a name defined in two modules would pair silently
+    # with whichever came last.
+    assert len(definitions) == len(nodes), "a top-level name is defined in two lothc modules"
     for name, node in definitions.items():
         twin = _desync(name)
         if twin != name and twin in definitions:
             yield twin, definitions[twin], node
 
 
-def _implementation_pairs(source: str) -> tuple[list[_ImplPair], list[str]]:
+def _implementation_pairs(sources: list[str]) -> tuple[list[_ImplPair], list[str]]:
     """Normalized (async, sync) source for every paired function and paired class method, plus
     the labels of methods that exist on only one side of a class pair."""
     pairs: list[_ImplPair] = []
     one_sided: list[str] = []
-    for name, async_node, sync_node in _definition_pairs(source):
+    for name, async_node, sync_node in _definition_pairs(sources):
         if isinstance(async_node, ast.ClassDef) and isinstance(sync_node, ast.ClassDef):
             async_methods, sync_methods = _methods(async_node), _methods(sync_node)
             one_sided += [f"{name}.{m}" for m in async_methods.keys() ^ sync_methods.keys()]
@@ -259,26 +295,17 @@ def _implementation_pairs(source: str) -> tuple[list[_ImplPair], list[str]]:
             pairs.append(
                 _ImplPair(name, _normalized_source([async_node]), _normalized_source([sync_node]))
             )
-    return pairs, one_sided
-
-
-def _lothc_sources() -> list[str]:
-    # A list, not a set: parametrize ids must come out in the same order on every run.
-    modules = [inspect.getmodule(HTTPClient), inspect.getmodule(OAuthProvider)]
-    return [inspect.getsource(module) for module in modules if module is not None]
-
-
-def _collect_lothc_implementation_pairs() -> tuple[list[_ImplPair], list[str]]:
-    pairs: list[_ImplPair] = []
-    one_sided: list[str] = []
-    for source in _lothc_sources():
-        module_pairs, module_one_sided = _implementation_pairs(source)
-        pairs += module_pairs
-        one_sided += module_one_sided
     return pairs, sorted(one_sided)
 
 
-lothc_implementation_pairs, lothc_one_sided_methods = _collect_lothc_implementation_pairs()
+def _lothc_sources() -> list[str]:
+    # Every module in the package, so a twin is compared wherever it is defined. Sorted:
+    # parametrize ids must come out in the same order on every run.
+    package = Path(inspect.getfile(lothc)).parent
+    return [path.read_text() for path in sorted(package.glob("*.py"))]
+
+
+lothc_implementation_pairs, lothc_one_sided_methods = _implementation_pairs(_lothc_sources())
 
 
 # --- Public API ---------------------------------------------------------------------------------
@@ -314,7 +341,10 @@ def test_implementation_pairs_were_discovered() -> None:
         "HTTPClient.get",
         "HTTPClient.__enter__",
         "HTTPClient.post",
-        "HTTPClient._send_method",
+        "_PyreqwestTransport.send",
+        "_PyreqwestTransport.open",
+        "_NativeTransport.send",
+        "_NativeTransport.send_headers_only",
         "_RetryMiddleware.__call__",
         "_ReauthMiddleware.__call__",
         "OAuthProvider._renew",
@@ -474,7 +504,7 @@ class SyncClient:
 
 
 def test_implementation_comparison_accepts_a_faithful_twin() -> None:
-    (pair,), one_sided = _implementation_pairs(_toy_async_source + _toy_sync_source)
+    (pair,), one_sided = _implementation_pairs([_toy_async_source, _toy_sync_source])
 
     assert one_sided == []
     assert pair.label == "Client.fetch"
@@ -484,7 +514,7 @@ def test_implementation_comparison_accepts_a_faithful_twin() -> None:
 def test_implementation_comparison_catches_a_drifted_body() -> None:
     drifted = _toy_sync_source.replace("time.sleep(0.1)", "time.sleep(0.2)")
 
-    (pair,), _ = _implementation_pairs(_toy_async_source + drifted)
+    (pair,), _ = _implementation_pairs([_toy_async_source, drifted])
 
     assert pair.async_source != pair.sync_source
 
@@ -492,6 +522,11 @@ def test_implementation_comparison_catches_a_drifted_body() -> None:
 def test_implementation_comparison_reports_a_method_missing_from_one_side() -> None:
     extra = "    def close(self):\n        pass\n"
 
-    _, one_sided = _implementation_pairs(_toy_async_source + _toy_sync_source + extra)
+    _, one_sided = _implementation_pairs([_toy_async_source, _toy_sync_source + extra])
 
     assert one_sided == ["Client.close"]
+
+
+def test_implementation_comparison_rejects_a_name_defined_in_two_modules() -> None:
+    with pytest.raises(AssertionError, match="defined in two lothc modules"):
+        _implementation_pairs([_toy_async_source, _toy_sync_source, _toy_sync_source])

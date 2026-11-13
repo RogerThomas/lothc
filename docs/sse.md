@@ -156,6 +156,9 @@ processing model — the caller's loop never sees the seam:
   caller's for the rest of the stream — the server knows its own restart time better than you do.
 - The reconnect request carries a `Last-Event-ID` header with the last id seen, so a
   spec-compliant server resumes from the right place instead of replaying (or skipping) events.
+  To resume a stream from an id you stored earlier, pass it yourself as
+  `headers={"Last-Event-ID": ...}`: the first connection sends it as is, and once the stream has
+  seen an id, a reconnect sends that one *in its place* (never both).
 - `max_reconnects` (default `5`) caps **consecutive reconnects that yield no event** — the "server
   is down" case. Every event received resets the count, so a flaky server that drops the
   connection every few minutes is reconnected to indefinitely, while a dead one fails after

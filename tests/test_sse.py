@@ -6,7 +6,15 @@ from msgspec import Struct
 from msgspec.json import Decoder
 from pydantic import BaseModel, TypeAdapter
 
-from lothc import HTTPClient, HTTPConnectionError, HTTPTimeoutError, SSEEvent, SyncHTTPClient
+from lothc import (
+    HTTPClient,
+    HTTPConnectionError,
+    HTTPResponseError,
+    HTTPTimeoutError,
+    HTTPTransportError,
+    SSEEvent,
+    SyncHTTPClient,
+)
 
 
 class TickEvent(Struct):
@@ -201,22 +209,48 @@ def test_sync_sse_is_not_killed_by_the_client_level_total_timeout(base_url: str)
     assert len(events) == 6
 
 
-async def test_sse_read_timeout_bounds_the_idle_gap_between_events(base_url: str) -> None:
-    async with HTTPClient(base_url=base_url, read_timeout=0.03) as client:
+# `read_timeout` also bounds the connect and the wait for the response's head (reqwest's starts
+# with the request), which a stalled machine can outlast: a try that times out before its first
+# event shows nothing about the gap after it, so it is made again, for up to 2s (five tries in a
+# row once fell inside one stall).
+async def _first_event_before_a_timed_out_gap(client: HTTPClient) -> SSEEvent[str]:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
         stream = client.sse("events", params={"interval": 0.3, "count": 3}, max_reconnects=0)
-        first = await anext(stream)
+        try:
+            first = await anext(stream)
+        except HTTPTimeoutError:
+            continue
         with pytest.raises(HTTPTimeoutError):
             await anext(stream)
+        return first
+    raise AssertionError("no try's first event arrived within read_timeout")
+
+
+def _sync_first_event_before_a_timed_out_gap(client: SyncHTTPClient) -> SSEEvent[str]:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        stream = client.sse("events", params={"interval": 0.3, "count": 3}, max_reconnects=0)
+        try:
+            first = next(stream)
+        except HTTPTimeoutError:
+            continue
+        with pytest.raises(HTTPTimeoutError):
+            next(stream)
+        return first
+    raise AssertionError("no try's first event arrived within read_timeout")
+
+
+async def test_sse_read_timeout_bounds_the_idle_gap_between_events(base_url: str) -> None:
+    async with HTTPClient(base_url=base_url, read_timeout=0.03) as client:
+        first = await _first_event_before_a_timed_out_gap(client)
 
     assert first.id == "0"
 
 
 def test_sync_sse_read_timeout_bounds_the_idle_gap_between_events(base_url: str) -> None:
     with SyncHTTPClient(base_url=base_url, read_timeout=0.03) as client:
-        stream = client.sse("events", params={"interval": 0.3, "count": 3}, max_reconnects=0)
-        first = next(stream)
-        with pytest.raises(HTTPTimeoutError):
-            next(stream)
+        first = _sync_first_event_before_a_timed_out_gap(client)
 
     assert first.id == "0"
 
@@ -230,8 +264,27 @@ async def test_sse_reconnects_after_a_dropped_connection_with_last_event_id(
     ]
 
     assert [event.id for event in events] == ["0", "1", "2", "3"]
-    # The server echoes the `Last-Event-ID` header it received on each connection.
-    assert [event.data["last"] for event in events] == [None, None, "1", "1"]
+    # The server echoes every `Last-Event-ID` value it received on each connection: none on the
+    # first, exactly the last id seen on the reconnect.
+    assert [event.data["last"] for event in events] == [[], [], ["1"], ["1"]]
+
+
+async def test_sse_reconnect_replaces_the_callers_own_last_event_id(
+    client: HTTPClient, server_key: str
+) -> None:
+    # A caller resuming from a stored id sends it on the first connection; a reconnect must send
+    # the id this stream has seen since in its place, not as a second value beside it.
+    events = [
+        event
+        async for event in client.sse(
+            "events-reconnect",
+            params={"key": server_key},
+            headers={"Last-Event-ID": "stale"},
+            into=dict,
+        )
+    ]
+
+    assert [event.data["last"] for event in events] == [["stale"], ["stale"], ["1"], ["1"]]
 
 
 @pytest.mark.parametrize("interruptible", [False, True], ids=["blocking", "interruptible"])
@@ -248,7 +301,24 @@ def test_sync_sse_reconnects_after_a_dropped_connection_with_last_event_id(
     )
 
     assert [event.id for event in events] == ["0", "1", "2", "3"]
-    assert [event.data["last"] for event in events] == [None, None, "1", "1"]
+    assert [event.data["last"] for event in events] == [[], [], ["1"], ["1"]]
+
+
+@pytest.mark.parametrize("interruptible", [False, True], ids=["blocking", "interruptible"])
+def test_sync_sse_reconnect_replaces_the_callers_own_last_event_id(
+    sync_client: SyncHTTPClient, server_key: str, *, interruptible: bool
+) -> None:
+    events = list(
+        sync_client.sse(
+            "events-reconnect",
+            params={"key": server_key},
+            headers={"Last-Event-ID": "stale"},
+            into=dict,
+            interruptible=interruptible,
+        )
+    )
+
+    assert [event.data["last"] for event in events] == [["stale"], ["stale"], ["1"], ["1"]]
 
 
 async def test_sse_honours_the_server_retry_field_for_the_reconnect_delay(
@@ -415,3 +485,256 @@ def test_sse_events_compare_and_print_by_value() -> None:
     assert event != SSEEvent(id="2", event="tick", data="payload")
     assert event != "not-an-event"
     assert repr(event) == "SSEEvent(id='1', event='tick', data='payload')"
+
+
+def _fields_events() -> list[SSEEvent[str]]:
+    # What `/events-fields` must parse to: see its comment in `_server.py`.
+    return [
+        SSEEvent(id="", event="message", data="line-1\nline-2"),
+        SSEEvent(id="", event="message", data="no-space"),
+        SSEEvent(id="", event="message", data=" two-spaces"),
+        SSEEvent(id="", event="message", data=""),
+        SSEEvent(id="", event="message", data="bad-retry"),
+        SSEEvent(id="", event="message", data="nul-id"),
+        SSEEvent(id="5", event="message", data="after-id"),
+    ]
+
+
+async def test_sse_parses_every_field_rule_of_the_event_stream_format(
+    client: HTTPClient,
+) -> None:
+    events = [event async for event in client.sse("events-fields", max_reconnects=0)]
+
+    assert events == _fields_events()
+
+
+def test_sync_sse_parses_every_field_rule_of_the_event_stream_format(
+    sync_client: SyncHTTPClient,
+) -> None:
+    events = list(sync_client.sse("events-fields", max_reconnects=0))
+
+    assert events == _fields_events()
+
+
+async def test_sse_asks_for_an_event_stream(client: HTTPClient) -> None:
+    events = [event async for event in client.sse("events-echo-accept", into=list[str])]
+
+    assert [event.data for event in events] == [["text/event-stream"]]
+
+
+def test_sync_sse_asks_for_an_event_stream(sync_client: SyncHTTPClient) -> None:
+    events = list(sync_client.sse("events-echo-accept", into=list[str]))
+
+    assert [event.data for event in events] == [["text/event-stream"]]
+
+
+async def test_sse_max_reconnects_none_never_gives_up(client: HTTPClient, server_key: str) -> None:
+    # Six event-less drops in a row, one more than the default budget of five.
+    events = [
+        event.data
+        async for event in client.sse(
+            "events-drops",
+            params={"key": server_key, "drops": 6},
+            max_reconnects=None,
+            reconnect_delay=0.001,
+        )
+    ]
+
+    assert events == ["done"]
+
+
+def test_sync_sse_max_reconnects_none_never_gives_up(
+    sync_client: SyncHTTPClient, server_key: str
+) -> None:
+    events = [
+        event.data
+        for event in sync_client.sse(
+            "events-drops",
+            params={"key": server_key, "drops": 6},
+            max_reconnects=None,
+            reconnect_delay=0.001,
+        )
+    ]
+
+    assert events == ["done"]
+
+
+async def test_sse_reconnect_budget_counts_only_consecutive_event_less_reconnects(
+    client: HTTPClient, server_key: str
+) -> None:
+    # Three drops against a budget of one: each connection delivered an event first, which
+    # resets the budget, so the stream gets through to the end.
+    events = [
+        event.data
+        async for event in client.sse(
+            "events-drops",
+            params={"key": server_key, "drops": 3, "with_event": 1},
+            max_reconnects=1,
+            reconnect_delay=0.001,
+        )
+    ]
+
+    assert events == ["dropped-1", "dropped-2", "dropped-3", "done"]
+
+
+def test_sync_sse_reconnect_budget_counts_only_consecutive_event_less_reconnects(
+    sync_client: SyncHTTPClient, server_key: str
+) -> None:
+    events = [
+        event.data
+        for event in sync_client.sse(
+            "events-drops",
+            params={"key": server_key, "drops": 3, "with_event": 1},
+            max_reconnects=1,
+            reconnect_delay=0.001,
+        )
+    ]
+
+    assert events == ["dropped-1", "dropped-2", "dropped-3", "done"]
+
+
+async def test_sse_gives_up_after_max_reconnects_event_less_reconnects(
+    client: HTTPClient, server_key: str
+) -> None:
+    with pytest.raises(HTTPConnectionError):
+        [
+            event
+            async for event in client.sse(
+                "events-drops",
+                params={"key": server_key, "drops": 2},
+                max_reconnects=1,
+                reconnect_delay=0.001,
+            )
+        ]
+
+
+def test_sync_sse_gives_up_after_max_reconnects_event_less_reconnects(
+    sync_client: SyncHTTPClient, server_key: str
+) -> None:
+    with pytest.raises(HTTPConnectionError):
+        list(
+            sync_client.sse(
+                "events-drops",
+                params={"key": server_key, "drops": 2},
+                max_reconnects=1,
+                reconnect_delay=0.001,
+            )
+        )
+
+
+async def _collect_events_then_status(
+    client: HTTPClient, server_key: str, events: list[str]
+) -> None:
+    async for event in client.sse(
+        "events-then-status", params={"key": server_key, "status": 503}, reconnect_delay=0.001
+    ):
+        events.append(event.data)
+
+
+def _collect_events_then_status_sync(
+    client: SyncHTTPClient, server_key: str, events: list[str]
+) -> None:
+    events.extend(
+        event.data
+        for event in client.sse(
+            "events-then-status", params={"key": server_key, "status": 503}, reconnect_delay=0.001
+        )
+    )
+
+
+async def test_sse_raises_an_error_status_on_a_reconnect_rather_than_reconnecting(
+    client: HTTPClient, server_key: str
+) -> None:
+    events: list[str] = []
+    with pytest.raises(HTTPResponseError) as exc_info:
+        await _collect_events_then_status(client, server_key, events)
+
+    assert events == ["first"]
+    assert exc_info.value.status == 503
+
+
+def test_sync_sse_raises_an_error_status_on_a_reconnect_rather_than_reconnecting(
+    sync_client: SyncHTTPClient, server_key: str
+) -> None:
+    events: list[str] = []
+    with pytest.raises(HTTPResponseError) as exc_info:
+        _collect_events_then_status_sync(sync_client, server_key, events)
+
+    assert events == ["first"]
+    assert exc_info.value.status == 503
+
+
+async def test_sse_reconnects_after_a_redirect_loop(base_url: str, server_key: str) -> None:
+    # Unlike a plain verb's retries, `sse()` treats a redirect loop as possibly transient: two
+    # whole chains (a request plus its two hops each) before the budget of one runs out.
+    async with HTTPClient(base_url=base_url, max_redirects=2) as client:
+        with pytest.raises(HTTPTransportError):
+            [
+                event
+                async for event in client.sse(
+                    "redirect-loop-counted",
+                    params={"key": server_key},
+                    max_reconnects=1,
+                    reconnect_delay=0.001,
+                )
+            ]
+        hits = (await client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert hits == {"hits": 6}
+
+
+def test_sync_sse_reconnects_after_a_redirect_loop(base_url: str, server_key: str) -> None:
+    with SyncHTTPClient(base_url=base_url, max_redirects=2) as client:
+        with pytest.raises(HTTPTransportError):
+            list(
+                client.sse(
+                    "redirect-loop-counted",
+                    params={"key": server_key},
+                    max_reconnects=1,
+                    reconnect_delay=0.001,
+                )
+            )
+        hits = client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert hits == {"hits": 6}
+
+
+def test_sync_sse_honours_the_server_retry_field_for_the_reconnect_delay(
+    sync_client: SyncHTTPClient, server_key: str
+) -> None:
+    start = time.perf_counter()
+    events = list(
+        sync_client.sse("events-reconnect", params={"key": server_key}, reconnect_delay=5.0)
+    )
+
+    assert len(events) == 4
+    assert time.perf_counter() - start < 2.0
+
+
+def test_sync_sse_max_reconnects_zero_raises_the_transport_error(
+    sync_client: SyncHTTPClient, server_key: str
+) -> None:
+    with pytest.raises(HTTPConnectionError):
+        list(sync_client.sse("events-reconnect", params={"key": server_key}, max_reconnects=0))
+
+
+def test_sync_sse_clean_close_ends_the_stream_by_default(
+    sync_client: SyncHTTPClient, server_key: str
+) -> None:
+    events = list(
+        sync_client.sse("events-close-count", params={"key": server_key}, reconnect_delay=0.01)
+    )
+
+    assert [event.id for event in events] == ["1"]
+
+
+def test_sync_sse_empty_event_field_dispatches_as_message(sync_client: SyncHTTPClient) -> None:
+    events = list(sync_client.sse("events-lenient", max_reconnects=0))
+
+    assert events[0].event == "message"
+
+
+def test_sync_sse_invalid_utf8_is_replaced_not_raised(sync_client: SyncHTTPClient) -> None:
+    events = list(sync_client.sse("events-lenient", max_reconnects=0))
+
+    assert events[1].data == "bad-�-byte"

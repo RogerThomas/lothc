@@ -6,9 +6,12 @@ cap used to kill every healthy stream or large download at the 30s mark.
 import json
 import threading
 import time
+from collections.abc import AsyncGenerator, Generator
+from functools import partial
 from pathlib import Path
 
 import pytest
+from _helpers import EventsParams, sync_unless_the_server_stalled, unless_the_server_stalled
 
 from lothc import HTTPClient, HTTPTimeoutError, SyncHTTPClient
 
@@ -17,105 +20,157 @@ def _stream_workers() -> list[threading.Thread]:
     return [t for t in threading.enumerate() if "_drain_stream_chunks" in t.name]
 
 
-async def test_stream_outlasting_the_client_timeout_is_not_killed(base_url: str) -> None:
-    # A 0.16s stream against a 0.08s `timeout`: every gap is 0.02s, so nothing actually stalls.
+@pytest.fixture(name="stall_timeout_client")
+async def _stall_timeout_client(base_url: str) -> AsyncGenerator[HTTPClient]:
+    async with HTTPClient(base_url=base_url, timeout=0.1) as client:
+        yield client
+
+
+@pytest.fixture(name="sync_stall_timeout_client")
+def _sync_stall_timeout_client(base_url: str) -> Generator[SyncHTTPClient]:
+    with SyncHTTPClient(base_url=base_url, timeout=0.1) as client:
+        yield client
+
+
+@pytest.fixture(name="short_timeout_client")
+async def _short_timeout_client(base_url: str) -> AsyncGenerator[HTTPClient]:
     async with HTTPClient(base_url=base_url, timeout=0.08) as client:
-        body = b"".join([
-            chunk
-            async for chunk in client.stream_get("events", params={"interval": 0.02, "count": 8})
-        ])
+        yield client
+
+
+@pytest.fixture(name="sync_short_timeout_client")
+def _sync_short_timeout_client(base_url: str) -> Generator[SyncHTTPClient]:
+    with SyncHTTPClient(base_url=base_url, timeout=0.08) as client:
+        yield client
+
+
+# A 0.16s stream against a 0.08s `timeout`: every gap is 0.02s, so nothing actually stalls,
+# unless the machine does (`unless_the_server_stalled`).
+async def _streamed(client: HTTPClient, params: EventsParams) -> bytes:
+    stream = client.stream_get("events", params={"interval": 0.02, "count": 8, **params})
+    return b"".join([chunk async for chunk in stream])
+
+
+def _sync_streamed(client: SyncHTTPClient, params: EventsParams) -> bytes:
+    return b"".join(client.stream_get("events", params={"interval": 0.02, "count": 8, **params}))
+
+
+async def _downloaded(client: HTTPClient, dest: Path, params: EventsParams) -> bytes:
+    await client.download("events", dest=dest, params={"interval": 0.02, "count": 8, **params})
+    return dest.read_bytes()
+
+
+def _sync_downloaded(client: SyncHTTPClient, params: EventsParams) -> bytes:
+    return client.download("events", params={"interval": 0.02, "count": 8, **params}).data
+
+
+async def test_stream_outlasting_the_client_timeout_is_not_killed(
+    base_url: str, server_key: str, short_timeout_client: HTTPClient
+) -> None:
+    fetch = partial(_streamed, short_timeout_client)
+    body = await unless_the_server_stalled(fetch, base_url, server_key, 0.08)
 
     assert body.count(b"data: ") == 8
 
 
-def test_sync_stream_outlasting_the_client_timeout_is_not_killed(base_url: str) -> None:
-    with SyncHTTPClient(base_url=base_url, timeout=0.08) as client:
-        body = b"".join(client.stream_get("events", params={"interval": 0.02, "count": 8}))
+def test_sync_stream_outlasting_the_client_timeout_is_not_killed(
+    base_url: str, server_key: str, sync_short_timeout_client: SyncHTTPClient
+) -> None:
+    fetch = partial(_sync_streamed, sync_short_timeout_client)
+    body = sync_unless_the_server_stalled(fetch, base_url, server_key, 0.08)
 
     assert body.count(b"data: ") == 8
 
 
 async def test_download_outlasting_the_client_timeout_is_not_killed(
-    base_url: str, tmp_path: Path
+    base_url: str, server_key: str, tmp_path: Path, short_timeout_client: HTTPClient
 ) -> None:
-    dest = tmp_path / "dest"
-    async with HTTPClient(base_url=base_url, timeout=0.08) as client:
-        await client.download("events", dest=dest, params={"interval": 0.02, "count": 8})
+    fetch = partial(_downloaded, short_timeout_client, tmp_path / "dest")
+    body = await unless_the_server_stalled(fetch, base_url, server_key, 0.08)
 
-    assert dest.read_bytes().count(b"data: ") == 8
-
-
-def test_sync_download_outlasting_the_client_timeout_is_not_killed(base_url: str) -> None:
-    with SyncHTTPClient(base_url=base_url, timeout=0.08) as client:
-        response = client.download("events", params={"interval": 0.02, "count": 8})
-
-    assert response.data.count(b"data: ") == 8
+    assert body.count(b"data: ") == 8
 
 
-async def test_a_stalled_stream_raises_within_the_client_timeout(base_url: str) -> None:
-    async with HTTPClient(base_url=base_url, timeout=0.1) as client:
-        started = time.monotonic()
-        with pytest.raises(HTTPTimeoutError, match="between chunks"):
-            async for _ in client.stream_get("stall-after-first-chunk", params={"seconds": 1}):
-                pass
-        elapsed = time.monotonic() - started
+def test_sync_download_outlasting_the_client_timeout_is_not_killed(
+    base_url: str, server_key: str, sync_short_timeout_client: SyncHTTPClient
+) -> None:
+    fetch = partial(_sync_downloaded, sync_short_timeout_client)
+    body = sync_unless_the_server_stalled(fetch, base_url, server_key, 0.08)
+
+    assert body.count(b"data: ") == 8
+
+
+async def test_a_stalled_stream_raises_within_the_client_timeout(
+    stall_timeout_client: HTTPClient,
+) -> None:
+    started = time.monotonic()
+    with pytest.raises(HTTPTimeoutError, match="between chunks"):
+        async for _ in stall_timeout_client.stream_get(
+            "stall-after-first-chunk", params={"seconds": 1}
+        ):
+            pass
+    elapsed = time.monotonic() - started
 
     assert elapsed < 0.6  # gave up during the 1s silence, rather than waiting it out
 
 
-def test_sync_a_stalled_stream_raises_within_the_client_timeout(base_url: str) -> None:
-    with SyncHTTPClient(base_url=base_url, timeout=0.1) as client:
-        started = time.monotonic()
-        with pytest.raises(HTTPTimeoutError, match="between chunks"):
-            for _ in client.stream_get("stall-after-first-chunk", params={"seconds": 1}):
-                pass
-        elapsed = time.monotonic() - started
+def test_sync_a_stalled_stream_raises_within_the_client_timeout(
+    sync_stall_timeout_client: SyncHTTPClient,
+) -> None:
+    started = time.monotonic()
+    with pytest.raises(HTTPTimeoutError, match="between chunks"):
+        for _ in sync_stall_timeout_client.stream_get(
+            "stall-after-first-chunk", params={"seconds": 1}
+        ):
+            pass
+    elapsed = time.monotonic() - started
 
     assert elapsed < 0.6
 
 
-async def test_a_stalled_download_raises_and_leaves_no_file(base_url: str, tmp_path: Path) -> None:
-    async with HTTPClient(base_url=base_url, timeout=0.1) as client:
-        with pytest.raises(HTTPTimeoutError):
-            await client.download(
-                "stall-after-first-chunk", dest=tmp_path / "dest", params={"seconds": 1}
-            )
+async def test_a_stalled_download_raises_and_leaves_no_file(
+    tmp_path: Path, stall_timeout_client: HTTPClient
+) -> None:
+    with pytest.raises(HTTPTimeoutError):
+        await stall_timeout_client.download(
+            "stall-after-first-chunk", dest=tmp_path / "dest", params={"seconds": 1}
+        )
 
     assert list(tmp_path.iterdir()) == []
 
 
-def test_sync_a_stalled_download_raises(base_url: str) -> None:
-    with (
-        SyncHTTPClient(base_url=base_url, timeout=0.1) as client,
-        pytest.raises(HTTPTimeoutError),
-    ):
-        client.download("stall-after-first-chunk", params={"seconds": 1})
+def test_sync_a_stalled_download_raises(sync_stall_timeout_client: SyncHTTPClient) -> None:
+    with pytest.raises(HTTPTimeoutError):
+        sync_stall_timeout_client.download("stall-after-first-chunk", params={"seconds": 1})
 
 
-async def test_waiting_for_response_headers_is_bounded_too(base_url: str) -> None:
+async def test_waiting_for_response_headers_is_bounded_too(
+    stall_timeout_client: HTTPClient,
+) -> None:
     # With the total cap gone, a server that never answers at all must still fail.
-    async with HTTPClient(base_url=base_url, timeout=0.1) as client:
-        with pytest.raises(HTTPTimeoutError):
-            async for _ in client.stream_get("slow", params={"seconds": 1}):
-                pass
+    with pytest.raises(HTTPTimeoutError):
+        async for _ in stall_timeout_client.stream_get("slow", params={"seconds": 1}):
+            pass
 
 
-def test_sync_waiting_for_response_headers_is_bounded_too(base_url: str) -> None:
-    with (
-        SyncHTTPClient(base_url=base_url, timeout=0.1) as client,
-        pytest.raises(HTTPTimeoutError),
-    ):
-        list(client.stream_get("slow", params={"seconds": 1}))
+def test_sync_waiting_for_response_headers_is_bounded_too(
+    sync_stall_timeout_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(HTTPTimeoutError):
+        list(sync_stall_timeout_client.stream_get("slow", params={"seconds": 1}))
 
 
-async def test_a_slow_consumer_is_not_mistaken_for_a_stalled_server(base_url: str) -> None:
+async def test_a_slow_consumer_is_not_mistaken_for_a_stalled_server(
+    stall_timeout_client: HTTPClient,
+) -> None:
     # The idle clock must only ever run while waiting on the server: here the caller takes longer
     # than `timeout` over every chunk, and the stream must still complete.
-    async with HTTPClient(base_url=base_url, timeout=0.1) as client:
-        chunks: list[bytes] = []
-        async for chunk in client.stream_get("events", params={"interval": 0.001, "count": 1}):
-            chunks.append(chunk)
-            time.sleep(0.25)
+    chunks: list[bytes] = []
+    async for chunk in stall_timeout_client.stream_get(
+        "events", params={"interval": 0.001, "count": 1}
+    ):
+        chunks.append(chunk)
+        time.sleep(0.25)
 
     assert b"".join(chunks) == b'event: tick\nid: 0\ndata: {"msg": "hello 0", "now": 0}\n\n'
 
@@ -209,3 +264,34 @@ def test_sync_stream_loses_nothing_when_the_consumer_falls_behind(base_url: str)
         if line.startswith(b"data: ")
     ]
     assert [event["msg"] for event in events] == [f"hello {i}" for i in range(400)]
+
+
+def test_sync_a_stalled_download_leaves_no_file(
+    tmp_path: Path, sync_stall_timeout_client: SyncHTTPClient
+) -> None:
+    with pytest.raises(HTTPTimeoutError):
+        sync_stall_timeout_client.download(
+            "stall-after-first-chunk", dest=tmp_path / "dest", params={"seconds": 1}
+        )
+
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_sync_an_explicit_per_call_timeout_still_caps_the_whole_stream(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url) as client, pytest.raises(HTTPTimeoutError):
+        for _ in client.stream_get("events", params={"interval": 0.05, "count": 6}, timeout=0.1):
+            pass
+
+
+def test_sync_read_timeout_replaces_the_idle_limit_when_set(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, timeout=0.05, read_timeout=1.0) as client:
+        body = b"".join(client.stream_get("events", params={"interval": 0.15, "count": 1}))
+
+    assert body.count(b"data: ") == 1
+
+
+def test_sync_sse_keeps_no_idle_limit(base_url: str) -> None:
+    with SyncHTTPClient(base_url=base_url, timeout=0.05) as client:
+        events = list(client.sse("events", params={"interval": 0.15, "count": 1}, max_reconnects=0))
+
+    assert len(events) == 1

@@ -12,7 +12,7 @@
 [![License](https://img.shields.io/pypi/l/lothc)](https://github.com/RogerThomas/lothc/blob/main/LICENSE)
 
 **L**ord **O**f **T**he **H**ttp **C**lients — a typed HTTP client for Python, built on
-[pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (an awesome Rust-backed HTTP client), with
+[pyreqwest](https://github.com/MarkusSintonen/pyreqwest) (an awesome Rust-backed HTTP client), with
 first-class optional support for **pydantic** and **msgspec** as both decode *and* encode targets.
 
 ## Installing
@@ -65,15 +65,20 @@ there's demand for an httpx/aiohttp/niquests backend, the author is happy to con
 
 ## Fast
 
-![HTTP client throughput race — lothc and pyreqwest finish in well under a fifth of a second, other libraries take much longer](https://raw.githubusercontent.com/RogerThomas/lothc/main/assets/perf-race.svg)
+On Linux and macOS, lothc's own native transport (the default) runs async `get(into=Struct)` at
+about **2.2x bare pyreqwest** under load: 97,501 requests a second, each decoded into a validated
+msgspec `Struct`. On its pyreqwest transport (Windows, `http2=True`, or `native="off"`), lothc
+stays close to pyreqwest's own throughput.
 
-Benchmarked with [`perf.py`](https://github.com/RogerThomas/lothc/blob/main/perf.py) against a tiny Rust-based static JSON server, 10,000 requests at
-concurrency 100 — including lothc's fully-typed decode targets (`into=` a msgspec
-`Struct` or a pydantic `BaseModel`), not just raw bytes or an untyped dict. The object handed back
-from those runs isn't just parsed JSON — it's a real, constructed, field-validated instance of
-your own type, and that validation cost is included in the numbers, not benchmarked around.
-Decoding into a real msgspec `Struct` even edged out the unvalidated dict path in this run. Full
-numbers: [docs/benchmarks.md](https://rogerthomas.github.io/lothc/benchmarks/).
+![HTTP client throughput race — lothc's native transport finishes first, at more than twice pyreqwest's throughput, and other libraries take much longer](https://raw.githubusercontent.com/RogerThomas/lothc/main/assets/perf-race.svg)
+
+Benchmarked with [`perf.py`](https://github.com/RogerThomas/lothc/blob/main/perf.py) on an AWS
+`c8a.xlarge`, 50,000 requests at concurrency 100 against a tiny Rust-based JSON server — including
+lothc's fully-typed decode targets (`into=` a msgspec `Struct` or a pydantic `BaseModel`), not
+just raw bytes or an untyped dict. The object handed back from those runs isn't just parsed JSON —
+it's a real, constructed, field-validated instance of your own type, and that validation cost is
+included in the numbers, not benchmarked around. Full numbers:
+[Benchmarks](https://rogerthomas.github.io/lothc/benchmarks/).
 
 ## Highlights
 
@@ -108,5 +113,5 @@ task check        # lint + format-check + typecheck (what CI runs)
 ## License
 
 lothc is [MIT](https://github.com/RogerThomas/lothc/blob/main/LICENSE). It's built on
-[pyreqwest](https://github.com/mostafa-hussein/pyreqwest) (Apache-2.0), which is built on the Rust
+[pyreqwest](https://github.com/MarkusSintonen/pyreqwest) (Apache-2.0), which is built on the Rust
 crate [reqwest](https://github.com/seanmonstar/reqwest) (MIT or Apache-2.0). Thanks to both.

@@ -1,6 +1,7 @@
 import json
 import socket
 import time
+from collections.abc import AsyncGenerator, Generator
 
 import pytest
 from pydantic import BaseModel
@@ -23,6 +24,18 @@ def _closed_port_url() -> str:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     return f"http://127.0.0.1:{port}/"
+
+
+@pytest.fixture(name="https_only_client")
+async def _https_only_client(base_url: str) -> AsyncGenerator[HTTPClient]:
+    async with HTTPClient(base_url=base_url, https_only=True) as client:
+        yield client
+
+
+@pytest.fixture(name="sync_https_only_client")
+def _sync_https_only_client(base_url: str) -> Generator[SyncHTTPClient]:
+    with SyncHTTPClient(base_url=base_url, https_only=True) as client:
+        yield client
 
 
 async def test_connecting_to_a_closed_port_raises_connection_error() -> None:
@@ -100,47 +113,45 @@ def test_sync_exceeding_max_redirects_raises_transport_error(base_url: str) -> N
         client.get("redirect-loop")
 
 
-async def test_https_only_against_plain_http_raises_transport_error(base_url: str) -> None:
-    async with HTTPClient(base_url=base_url, https_only=True) as client:
-        with pytest.raises(HTTPTransportError):
-            await client.get("anything")
+async def test_https_only_against_plain_http_raises_transport_error(
+    https_only_client: HTTPClient,
+) -> None:
+    with pytest.raises(HTTPTransportError):
+        await https_only_client.get("anything")
 
 
-def test_sync_https_only_against_plain_http_raises_transport_error(base_url: str) -> None:
-    with (
-        SyncHTTPClient(base_url=base_url, https_only=True) as client,
-        pytest.raises(HTTPTransportError),
-    ):
-        client.get("anything")
+def test_sync_https_only_against_plain_http_raises_transport_error(
+    sync_https_only_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(HTTPTransportError):
+        sync_https_only_client.get("anything")
 
 
 async def test_sse_does_not_reconnect_after_a_permanently_unbuildable_request(
-    base_url: str,
+    https_only_client: HTTPClient,
 ) -> None:
     # No `reconnect_delay=0` needed: an `https_only` rejection is a BuilderError, which can never
     # succeed on a reconnect. The real assertion is the elapsed time: with the default
     # max_reconnects=5 and reconnect_delay=3.0, retrying this at all would take ~15s. A permanent
     # BuilderError has to propagate on the first attempt instead.
-    async with HTTPClient(base_url=base_url, https_only=True) as client:
-        started = time.monotonic()
-        with pytest.raises(HTTPTransportError):
-            async for _ in client.sse("events"):
-                pass
-        elapsed = time.monotonic() - started
+    started = time.monotonic()
+    with pytest.raises(HTTPTransportError):
+        async for _ in https_only_client.sse("events"):
+            pass
+    elapsed = time.monotonic() - started
 
     assert elapsed < 1.0
 
 
 def test_sync_sse_does_not_reconnect_after_a_permanently_unbuildable_request(
-    base_url: str,
+    sync_https_only_client: SyncHTTPClient,
 ) -> None:
     # See the async twin above for why there's no `reconnect_delay` override.
-    with SyncHTTPClient(base_url=base_url, https_only=True) as client:
-        started = time.monotonic()
-        with pytest.raises(HTTPTransportError):
-            for _ in client.sse("events"):
-                pass
-        elapsed = time.monotonic() - started
+    started = time.monotonic()
+    with pytest.raises(HTTPTransportError):
+        for _ in sync_https_only_client.sse("events"):
+            pass
+    elapsed = time.monotonic() - started
 
     assert elapsed < 1.0
 
@@ -198,3 +209,15 @@ def test_sync_using_a_closed_client_raises_runtime_error(base_url: str) -> None:
 
     with pytest.raises(RuntimeError, match="client is closed"):
         client.get("items/7")
+
+
+def test_sync_download_cut_short_raises_connection_error(sync_client: SyncHTTPClient) -> None:
+    with pytest.raises(HTTPConnectionError):
+        sync_client.download("truncated-content-length")
+
+
+def test_sync_invalid_json_body_raises_the_stdlib_json_error(sync_client: SyncHTTPClient) -> None:
+    with pytest.raises(json.JSONDecodeError) as exc_info:
+        sync_client.get("invalid-json", into=dict)
+
+    assert type(exc_info.value) is json.JSONDecodeError

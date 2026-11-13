@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
+import msgspec
+import pydantic
 import pytest
 from msgspec import Struct
 from pydantic import BaseModel
@@ -496,3 +498,66 @@ def test_sync_response_headers_can_be_read_on_another_thread_after_the_client_cl
         set_cookies = pool.submit(result.headers.get_all, "set-cookie").result()
 
     assert len(set_cookies) == 3
+
+
+class ContentLengthHeaders(BaseModel):
+    content_length: int
+
+
+class ContentLengthHeadersStruct(Struct):
+    content_length: int
+
+
+class MissingHeaders(BaseModel):
+    x_not_sent: str
+
+
+class MissingHeadersStruct(Struct):
+    x_not_sent: str
+
+
+@pytest.mark.parametrize(
+    "headers_type", [ContentLengthHeaders, ContentLengthHeadersStruct], ids=["pydantic", "msgspec"]
+)
+async def test_typed_headers_are_converted_to_the_field_types(
+    client: HTTPClient, headers_type: type[ContentLengthHeaders | ContentLengthHeadersStruct]
+) -> None:
+    # Header values are strings on the wire; an `int` field gets an int.
+    result = await client.get("binary", response_headers_type=headers_type)
+
+    assert result.typed_headers == headers_type(content_length=12)
+
+
+@pytest.mark.parametrize(
+    "headers_type", [ContentLengthHeaders, ContentLengthHeadersStruct], ids=["pydantic", "msgspec"]
+)
+def test_sync_typed_headers_are_converted_to_the_field_types(
+    sync_client: SyncHTTPClient,
+    headers_type: type[ContentLengthHeaders | ContentLengthHeadersStruct],
+) -> None:
+    result = sync_client.get("binary", response_headers_type=headers_type)
+
+    assert result.typed_headers == headers_type(content_length=12)
+
+
+async def test_typed_headers_missing_a_required_header_raise_pydantics_error(
+    client: HTTPClient,
+) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        await client.get("binary", response_headers_type=MissingHeaders)
+
+
+async def test_typed_headers_missing_a_required_header_raise_msgspecs_error(
+    client: HTTPClient,
+) -> None:
+    with pytest.raises(msgspec.ValidationError):
+        await client.get("binary", response_headers_type=MissingHeadersStruct)
+
+
+def test_sync_typed_headers_missing_a_required_header_raise_the_libraries_error(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        sync_client.get("binary", response_headers_type=MissingHeaders)
+    with pytest.raises(msgspec.ValidationError):
+        sync_client.get("binary", response_headers_type=MissingHeadersStruct)

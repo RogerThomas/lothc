@@ -1,11 +1,11 @@
 [project]
 name = "lothc"
-# SemVer (e.g. `1.0.0`, no "v" prefix), derived from the git tag via hatch-vcs (see
-# [tool.hatch.version] below) — SemVer, not CalVer, because this is a library other packages
+# SemVer (e.g. `1.0.0`, no "v" prefix), not CalVer, because this is a library other packages
 # depend on: the major/minor/patch split is the signal pip's resolver, Dependabot, etc. rely on to
-# know whether an upgrade is safe, which a date can't communicate. An untagged checkout resolves
-# to a `0.1.dev0+gHASH`-style fallback version; release-please (see CLAUDE.md) creates the tag a release builds from.
-dynamic = ["version"]
+# know whether an upgrade is safe, which a date can't communicate. Static, not from the git tag:
+# release-please (`release-type: python`, see CLAUDE.md) bumps it on each release PR, and maturin
+# takes it over native/Cargo.toml's version.
+version = "0.3.0"
 description = "Lord Of The Http Clients — a typed HTTP client built on pyreqwest, with first-class pydantic and msgspec support"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -30,10 +30,10 @@ Issues = "https://github.com/RogerThomas/lothc/issues"
 [project.optional-dependencies]
 pydantic = ["pydantic>=2.12.5"]
 msgspec = ["msgspec>=0.19.0"]
-# Pins the pytest version lothc/testing.py's `lothc_mocker` fixture is tested against — pyreqwest
-# is already a hard dependency and ships its own `client_mocker` fixture that this one wraps, so
-# no extra transport-mocking dependency is needed here. NOTE: this extra does NOT gate whether the
-# fixture loads — see the [project.entry-points.pytest11] comment below.
+# Pins the pytest version lothc/testing.py's `lothc_mocker` fixture is tested against — its mock
+# engine is lothc's own (lothc/_mocking.py), so no extra transport-mocking dependency is needed
+# here. NOTE: this extra does NOT gate whether the fixture loads — see the
+# [project.entry-points.pytest11] comment below.
 testing = ["pytest>=9.0.2"]
 
 # Registers lothc/testing.py as a pytest plugin (the `lothc_mocker` fixture) — pytest discovers
@@ -52,7 +52,9 @@ dev = [
     "asv>=0.6.4",
     "basedpyright>=1.38.0",
     "coverage>=7.16.0",
+    "cryptography>=50.0.1", # imported directly by tests/test_tls.py (also comes in through trustme)
     "deptry>=0.25.1",
+    "h2>=4.4.1",
     "msgspec>=0.19.0",
     "mypy>=2.3.1",
     "prek>=0.4.14",
@@ -66,7 +68,9 @@ dev = [
     "trustme>=1.2.1",
     "ty>=0.0.74",
     "vulture>=2.16",
-    "yeetr[uvloop]>=2026.8.14.post1",
+    # uvloop doesn't support Windows.
+    "yeetr[uvloop]>=2026.8.14.post1; sys_platform != 'win32'",
+    "yeetr>=2026.8.14.post1; sys_platform == 'win32'",
     "zuban>=0.9.1",
 ]
 # The other HTTP clients perf.py races lothc against (plus requests' stubs, since `basedpyright .`
@@ -87,26 +91,30 @@ docs = ["zensical>=0.0.56"]
 # perf too, so a plain `uv run` (which syncs the default groups) keeps perf.py runnable and
 # type-checkable locally; jobs that must not install it pass --no-default-groups.
 default-groups = ["dev", "perf"]
+# Rebuild the `lothc._native` extension when the crate changes, not only pyproject.toml (uv's
+# default cache key for a local project).
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "native/Cargo.toml" },
+    { file = "native/Cargo.lock" },
+    { file = "native/build.rs" },
+    { file = "native/src/**/*.rs" },
+]
 
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
 
-[tool.hatch.version]
-source = "vcs"
-# setuptools_scm's default tag regex accepts a bare `\d+\.\d+.\d+` tag as-is (e.g. `1.0.0`, no "v"
-# prefix), so no tag_pattern override is needed — but verify once the first real tag is pushed.
-
-[tool.hatch.build.targets.wheel]
-packages = ["lothc"]
-
-[tool.hatch.build.targets.sdist]
-# hatchling's sdist default is "everything under version control" — verified live that this
-# shipped the ENTIRE repo to PyPI in the 0.0.1 release (perf.py, benchmarks/, asv_bench/, tests/,
-# docs/, CLAUDE.md, AGENTS.md, .github/workflows/, uv.lock, ...), none of which an installer needs
-# to build or run the package. An explicit allowlist here, mirroring the wheel's own scoping, is
-# the fix — checked the rebuilt sdist's real file list afterward, not just the config.
-include = ["/lothc", "/README.md", "/LICENSE"]
+[tool.maturin]
+# The compiled extension `lothc._native`, from the Rust crate in native/. The Python sources are
+# the top-level lothc/ package (python-source is the project root).
+manifest-path = "native/Cargo.toml"
+module-name = "lothc._native"
+python-source = "."
+# No sdist include/exclude: maturin's sdist is already an allowlist (the crate's files per
+# `cargo package --list`, the lothc/ package without __pycache__, pyproject.toml, README.md,
+# LICENSE), checked by listing a built one. hatchling's default, everything under version
+# control, shipped the whole repo in 0.0.1.
 
 #=====================================================================================
 # Tool configurations
@@ -117,15 +125,18 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 
 [tool.deptry]
-# examples/, perf.py, and asv_bench/ are dev-only utility/benchmark scripts, not part of the
+# examples/, perf.py, asv_bench/ and scripts/ are dev-only utility scripts, not part of the
 # installable package — they're expected to import dev-group dependencies directly. .asv/ holds
 # asv's own per-commit checkouts + venvs (a full copy of this repo, gitignored) — not our code,
 # and .claude/worktrees/ is the same category: agent git worktrees, each with its own .venv, so
-# without this deptry scans ~2800 files and reports on pytest's own internals.
+# without this deptry scans ~2800 files and reports on pytest's own internals. experiments/
+# holds measurement scripts kept verbatim, importing a POC module that isn't a dependency.
 exclude = [
     "examples",
+    "experiments",
     "perf\\.py",
     "asv_bench",
+    "scripts",
     "\\.venv",
     "\\.asv",
     "tests",
@@ -150,6 +161,11 @@ source = ["lothc"]
 target-version = "py313"
 line-length = 100
 fix = true
+# The loop-transport experiment's scripts are kept verbatim next to its measurements (see
+# CLAUDE.md), and native/target is cargo's build output.
+extend-exclude = ["experiments", "native/target"]
+# Pre-commit passes ruff each file by name, which skips the excludes above unless forced.
+force-exclude = true
 
 [tool.ruff.lint]
 select = [
@@ -233,14 +249,31 @@ preview = true
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
 include = ["lothc", "tests", "examples"]
+# `basedpyright .` (task check, CI) checks the whole tree, not just `include`. The experiment's
+# scripts are kept as they were measured; the rest are pyright's defaults, which this replaces.
+exclude = ["experiments", "**/node_modules", "**/__pycache__", "**/.*"]
 reportMissingTypeStubs = false
 
 [[tool.basedpyright.executionEnvironments]]
 root = "tests"
 reportUnusedFunction = "none"
 
+# lothc/'s modules share `_`-prefixed helpers with each other: the leading `_` keeps them out of
+# the public API, not out of sibling modules. Both rules below assume `_` means module-private (one
+# flags the import, the other a helper only a sibling module calls). tests/ keeps them, so a test
+# still can't reach a private name (style-guide.md §6).
+[[tool.basedpyright.executionEnvironments]]
+root = "lothc"
+reportPrivateUsage = "none"
+reportUnusedFunction = "none"
+reportUnusedClass = "none"
+
 [tool.pylint.main]
+# The compiled `lothc._native` (native/), which pylint only introspects when allowed to import it.
+extension-pkg-allow-list = ["lothc._native"]
 disable = [
+    "duplicate-code", # compares across files only: since the split it flags each verb's
+    # argument list, repeated by design in the client, its overloads and the transports
     "missing-module-docstring",
     "missing-class-docstring",
     "missing-function-docstring", # this project deliberately writes no comments/docstrings
@@ -278,17 +311,5 @@ max-branches = 15 # `_apply_form_value`/`_apply_sync_form_value`'s dispatch `mat
 # than pick an arbitrary number just past the current count
 
 [tool.pylint.format]
-max-module-lines = 7200 # _client.py is one deliberately unsplit file (see CLAUDE.md: "split it
-# once it earns a split") that's grown past its previous bump (3800) to 4038 lines after
-# threading a per-verb `skip_auth` override through every overload of every verb on both clients
-# (mirroring the earlier `timeout` override); bumped again rather than split, since no split has
-# actually been decided on. 5000 -> 5500 after `sse()` gained spec-compliant reconnect
-# (`max_reconnects`/`reconnect_delay`/`reconnect_on_close` on all 26 overload sites, plus the
-# shared reconnect/parsing helpers), landing at ~5200. 5500 -> 5700 after `CaseInsensitiveDict`
-# (case-insensitive, multi-value response headers) plus `backoff_base` on both `build`s, landing
-# at ~5520 — still no split decided on. 5700 -> 6000 after the `with_result` accessor classes, the
-# transport-error and body-read translation, atomic downloads and the linear NDJSON/SSE splitting,
-# landing at ~5850. 6000 -> 6300 after replacing the `build()` classmethods with a real
-# constructor + context manager (settings record, per-entry rebuild), landing at ~6170. 6300 -> 7200
-# after `TypeAdapter`/`Decoder` overloads on every body verb (30 of them), the re-auth middleware and
-# the read-only `SSEEvent`, landing at ~6940 (see finding #24 on generating the sync half)
+max-module-lines = 2500 # the clients (each verb a stack of `@overload`s) and the transports
+# run to ~1,600-1,700 lines; room to grow before a module needs splitting.

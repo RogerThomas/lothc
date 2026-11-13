@@ -1,0 +1,48 @@
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 0, "requests": 20000, "rps": 49234, "cpu_us_per_req": 20.29, "p50_us": 194.8, "p99_us": 339.3, "max_us": 625.3}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 1, "requests": 20000, "rps": 47373, "cpu_us_per_req": 21.1, "p50_us": 199.5, "p99_us": 357.8, "max_us": 611.0}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 2, "requests": 20000, "rps": 48675, "cpu_us_per_req": 20.54, "p50_us": 196.2, "p99_us": 340.3, "max_us": 672.0}
+{"impl": "poc:full", "concurrency": 10, "run": 0, "requests": 20000, "rps": 113316, "cpu_us_per_req": 8.82, "p50_us": 88.4, "p99_us": 140.0, "max_us": 404.5}
+{"impl": "poc:full", "concurrency": 10, "run": 1, "requests": 20000, "rps": 110937, "cpu_us_per_req": 8.99, "p50_us": 90.1, "p99_us": 165.0, "max_us": 381.0}
+{"impl": "poc:full", "concurrency": 10, "run": 2, "requests": 20000, "rps": 111855, "cpu_us_per_req": 8.93, "p50_us": 89.7, "p99_us": 145.7, "max_us": 325.2}
+{"impl": "poc:bare", "concurrency": 10, "run": 0, "requests": 20000, "rps": 127633, "cpu_us_per_req": 7.82, "p50_us": 78.5, "p99_us": 133.2, "max_us": 418.2}
+{"impl": "poc:bare", "concurrency": 10, "run": 1, "requests": 20000, "rps": 124543, "cpu_us_per_req": 8.02, "p50_us": 81.1, "p99_us": 127.5, "max_us": 243.4}
+{"impl": "poc:bare", "concurrency": 10, "run": 2, "requests": 20000, "rps": 128530, "cpu_us_per_req": 7.78, "p50_us": 77.3, "p99_us": 127.9, "max_us": 335.6}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":0,"requests":20000,"rps":82994,"cpu_us_per_req":11.94,"p50_us":117.1,"p99_us":189.0,"max_us":1871.5}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":1,"requests":20000,"rps":85040,"cpu_us_per_req":11.75,"p50_us":116.8,"p99_us":152.4,"max_us":298.8}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":2,"requests":20000,"rps":84680,"cpu_us_per_req":11.80,"p50_us":117.1,"p99_us":158.0,"max_us":322.3}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 0, "requests": 20000, "rps": 51593, "cpu_us_per_req": 19.38, "p50_us": 2107.0, "p99_us": 3023.8, "max_us": 3560.1}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 1, "requests": 20000, "rps": 49817, "cpu_us_per_req": 20.07, "p50_us": 2111.5, "p99_us": 3210.7, "max_us": 4595.0}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 2, "requests": 20000, "rps": 46016, "cpu_us_per_req": 21.73, "p50_us": 2208.5, "p99_us": 4139.7, "max_us": 5180.3}
+{"impl": "poc:full", "concurrency": 100, "run": 0, "requests": 20000, "rps": 89699, "cpu_us_per_req": 11.15, "p50_us": 972.3, "p99_us": 2349.4, "max_us": 4317.5}
+{"impl": "poc:full", "concurrency": 100, "run": 1, "requests": 20000, "rps": 94144, "cpu_us_per_req": 10.62, "p50_us": 954.6, "p99_us": 1966.4, "max_us": 3319.3}
+{"impl": "poc:full", "concurrency": 100, "run": 2, "requests": 20000, "rps": 95364, "cpu_us_per_req": 10.49, "p50_us": 920.6, "p99_us": 2011.7, "max_us": 3958.7}
+{"impl": "poc:bare", "concurrency": 100, "run": 0, "requests": 20000, "rps": 116381, "cpu_us_per_req": 8.59, "p50_us": 781.6, "p99_us": 1687.6, "max_us": 2548.8}
+{"impl": "poc:bare", "concurrency": 100, "run": 1, "requests": 20000, "rps": 134211, "cpu_us_per_req": 7.45, "p50_us": 684.1, "p99_us": 1464.6, "max_us": 2388.3}
+{"impl": "poc:bare", "concurrency": 100, "run": 2, "requests": 20000, "rps": 137772, "cpu_us_per_req": 7.26, "p50_us": 670.3, "p99_us": 1442.2, "max_us": 1871.5}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":0,"requests":20000,"rps":79632,"cpu_us_per_req":12.56,"p50_us":1171.6,"p99_us":2124.8,"max_us":2937.1}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":1,"requests":20000,"rps":91934,"cpu_us_per_req":10.88,"p50_us":1054.0,"p99_us":1815.0,"max_us":2179.2}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":2,"requests":20000,"rps":94277,"cpu_us_per_req":10.61,"p50_us":1037.7,"p99_us":1533.4,"max_us":2254.2}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 0, "requests": 20000, "rps": 48363, "cpu_us_per_req": 20.67, "p50_us": 197.7, "p99_us": 356.0, "max_us": 688.3}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 1, "requests": 20000, "rps": 48484, "cpu_us_per_req": 20.63, "p50_us": 196.7, "p99_us": 366.5, "max_us": 613.7}
+{"impl": "lothc-msgspec", "concurrency": 10, "run": 2, "requests": 20000, "rps": 49079, "cpu_us_per_req": 20.37, "p50_us": 195.9, "p99_us": 340.7, "max_us": 592.6}
+{"impl": "poc:full", "concurrency": 10, "run": 0, "requests": 20000, "rps": 111517, "cpu_us_per_req": 8.96, "p50_us": 89.4, "p99_us": 156.4, "max_us": 333.0}
+{"impl": "poc:full", "concurrency": 10, "run": 1, "requests": 20000, "rps": 106550, "cpu_us_per_req": 9.38, "p50_us": 92.8, "p99_us": 174.2, "max_us": 365.0}
+{"impl": "poc:full", "concurrency": 10, "run": 2, "requests": 20000, "rps": 113425, "cpu_us_per_req": 8.81, "p50_us": 88.0, "p99_us": 150.4, "max_us": 338.8}
+{"impl": "poc:bare", "concurrency": 10, "run": 0, "requests": 20000, "rps": 121923, "cpu_us_per_req": 8.2, "p50_us": 81.0, "p99_us": 151.4, "max_us": 376.5}
+{"impl": "poc:bare", "concurrency": 10, "run": 1, "requests": 20000, "rps": 122716, "cpu_us_per_req": 8.13, "p50_us": 80.5, "p99_us": 152.5, "max_us": 371.5}
+{"impl": "poc:bare", "concurrency": 10, "run": 2, "requests": 20000, "rps": 121150, "cpu_us_per_req": 8.24, "p50_us": 80.9, "p99_us": 157.1, "max_us": 316.6}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":0,"requests":20000,"rps":76436,"cpu_us_per_req":13.07,"p50_us":121.2,"p99_us":295.7,"max_us":448.1}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":1,"requests":20000,"rps":83924,"cpu_us_per_req":11.91,"p50_us":116.4,"p99_us":208.5,"max_us":364.7}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":10,"run":2,"requests":20000,"rps":81569,"cpu_us_per_req":12.25,"p50_us":118.2,"p99_us":227.9,"max_us":443.0}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 0, "requests": 20000, "rps": 48948, "cpu_us_per_req": 20.43, "p50_us": 2094.2, "p99_us": 4150.9, "max_us": 6102.1}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 1, "requests": 20000, "rps": 53319, "cpu_us_per_req": 18.76, "p50_us": 1993.4, "p99_us": 2927.0, "max_us": 4119.0}
+{"impl": "lothc-msgspec", "concurrency": 100, "run": 2, "requests": 20000, "rps": 52151, "cpu_us_per_req": 19.17, "p50_us": 2058.2, "p99_us": 2921.9, "max_us": 3787.0}
+{"impl": "poc:full", "concurrency": 100, "run": 0, "requests": 20000, "rps": 121810, "cpu_us_per_req": 8.21, "p50_us": 777.2, "p99_us": 1573.0, "max_us": 2696.7}
+{"impl": "poc:full", "concurrency": 100, "run": 1, "requests": 20000, "rps": 90944, "cpu_us_per_req": 11.0, "p50_us": 826.6, "p99_us": 3789.7, "max_us": 7144.5}
+{"impl": "poc:full", "concurrency": 100, "run": 2, "requests": 20000, "rps": 90795, "cpu_us_per_req": 11.01, "p50_us": 959.5, "p99_us": 2386.0, "max_us": 3418.9}
+{"impl": "poc:bare", "concurrency": 100, "run": 0, "requests": 20000, "rps": 108627, "cpu_us_per_req": 9.21, "p50_us": 848.8, "p99_us": 1864.3, "max_us": 2943.2}
+{"impl": "poc:bare", "concurrency": 100, "run": 1, "requests": 20000, "rps": 111431, "cpu_us_per_req": 8.97, "p50_us": 822.1, "p99_us": 1802.2, "max_us": 2665.7}
+{"impl": "poc:bare", "concurrency": 100, "run": 2, "requests": 20000, "rps": 136295, "cpu_us_per_req": 7.34, "p50_us": 669.9, "p99_us": 1463.0, "max_us": 2532.9}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":0,"requests":20000,"rps":93743,"cpu_us_per_req":10.67,"p50_us":1044.6,"p99_us":1673.3,"max_us":2057.9}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":1,"requests":20000,"rps":98172,"cpu_us_per_req":10.19,"p50_us":1019.0,"p99_us":1171.8,"max_us":1524.9}
+{"impl":"reqwest","runtime":"current","body":"json","concurrency":100,"run":2,"requests":20000,"rps":94271,"cpu_us_per_req":10.61,"p50_us":1039.6,"p99_us":1640.2,"max_us":2274.2}
