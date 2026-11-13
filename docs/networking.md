@@ -2,29 +2,23 @@
 icon: lucide/network
 ---
 
-# Cookies, redirects, proxy & TLS
+# Networking
 
 ```python
 async with HTTPClient(
     base_url="https://api.example.com/",
     cookie_store=True,  # in-memory cookie jar, sent automatically on subsequent requests
     follow_redirects=True,  # default
-    max_redirects=10,  # None (default) leaves pyreqwest's own limit in place
+    max_redirects=10,  # None (default) keeps the default
     proxy="http://localhost:8080",
     no_proxy=["localhost", "internal.example.com"],  # hosts that skip the proxy
 ) as client:
     ...
 ```
 
-Unlike `timeout` and auth (see [Authentication](auth.md)), none of these three take a per-call
-override — pyreqwest's `RequestBuilder` has no `.follow_redirects()`/`.max_redirects()`/`.proxy()`/
-`.default_cookie_store()` at all, only its `ClientBuilder` does. That's not a gap lothc could
-close: redirect policy, proxy, and the cookie jar are all client/connection-level constructs in
-the underlying Rust `reqwest` crate itself, not per-request ones — the proxy decides which TCP
-connection gets opened, the cookie jar is shared state, and the redirect policy governs the
-transport loop before a response ever reaches request-level code. If one call genuinely needs
-different redirect/proxy/cookie behavior than the rest, build a second client with that setting
-rather than looking for a per-verb kwarg.
+Every setting on this page is client-level, except `timeout`, which a verb can override for one
+call (see [Timeouts](#timeouts)). For different redirect, proxy or cookie behaviour on one call,
+use a second client.
 
 `no_proxy` entries use the same format as the `NO_PROXY` environment variable. It only
 narrows `proxy`, so passing it without `proxy` raises `ValueError`.
@@ -61,21 +55,15 @@ async with HTTPClient(
 ```
 
 `root_certificates` takes any number of PEM-encoded certificates — each one is trusted in
-addition to (not instead of) the system's own root store. `identity_pem` is a single PEM buffer
-containing both the client certificate and its private key concatenated, exactly as reqwest's own
-`Identity::from_pem` expects.
+addition to (not instead of) the system's own root store. `identity_pem` is one PEM buffer
+holding both the client certificate and its private key.
 
 There's also `danger_accept_invalid_certs: bool = False`, which disables certificate validation
 entirely — insecure, and only ever appropriate against a local/test endpoint you control, never
 in production.
 
-Like `timeout`, these are all client-level only — set once on the client, no per-call override,
-since a TLS/connection identity belongs to the underlying connection, not a single request.
-
-lothc uses rustls, which has no TLS 1.0 or 1.1. As a minimum they allow everything it has; as a
-maximum (or a minimum above the maximum) they leave no version at all, so opening the client
-raises `ValueError("builder error: empty supported tls versions")`. An unusable `identity_pem`
-or a `user_agent` that isn't a valid header value fails the same way, as a plain `ValueError`.
+lothc uses rustls: TLS 1.2/1.3 only. An empty version range raises `ValueError` when the client
+opens, as does an unusable `identity_pem` or a `user_agent` that isn't a valid header value.
 
 ## DNS overrides, source address and keepalive
 
@@ -96,24 +84,39 @@ editing `/etc/hosts`; TLS still validates the certificate against the hostname i
 ```python
 async with HTTPClient(
     base_url="https://api.example.com/",
-    connect_timeout=5.0,  # bounds only the TCP connect phase, separate from `timeout`
-    read_timeout=60.0,  # max idle gap between body chunks — the stall detector for `sse()`
     max_connections=50,
-    pool_idle_timeout=30.0,  # None (default) leaves pyreqwest's own 90s default in place
+    pool_idle_timeout=30.0,  # None (default) keeps the default
     pool_max_idle_per_host=10,
     pool_timeout=2.0,  # max wait for a free connection slot
 ) as client:
     ...
 ```
 
-`connect_timeout` is distinct from `timeout` — it only bounds the initial TCP connect, not the
-whole request, so it's useful for "fail fast on a dead host" without capping how long a slow
-(but alive) download is allowed to take.
+## Timeouts
 
-`read_timeout` is distinct from both — it bounds the *idle gap between two consecutive body
-chunks*, not the whole request. A body that keeps trickling never trips it; one that stalls does.
-That makes it the one timeout that's actually meaningful for an open-ended `sse()` stream, which
-the total `timeout` deliberately doesn't apply to — see [SSE → Timeouts](sse.md#timeouts).
+```python
+async with HTTPClient(
+    base_url="https://api.example.com/",
+    timeout=5.0,  # the whole request; default 30.0, None disables it
+    connect_timeout=5.0,  # only the TCP connect
+    read_timeout=60.0,  # the longest idle gap between two body chunks
+) as client:
+    await client.get("items/7")  # 5s
+    await client.get("exports/large-file.csv", timeout=60.0)  # this call gets 60s
+```
+
+- `timeout` caps the whole request, raising `HTTPTimeoutError` (see [Error handling](errors.md)).
+  A verb's own `timeout=` overrides it for that call, but can't remove it: for no limit, build the
+  client with `timeout=None`.
+- `connect_timeout` fails fast on a dead host without capping a slow download.
+- `read_timeout` trips on a body that stalls, never on one that keeps trickling.
+- On `stream_get`, `stream_post` and `download`, `timeout` is the longest wait **between chunks**,
+  not a cap on the whole transfer, and only time spent waiting on the server counts. A per-call
+  `timeout=` puts back a hard cap; `read_timeout` replaces the gap limit.
+- `sse()` ignores the client's `timeout`, since an event stream is open-ended, and has no gap
+  limit unless you set `read_timeout`, the way to detect a stalled stream. Its own `timeout=`
+  bounds one connection attempt. Either firing reconnects like any dropped connection (see
+  [SSE](sse.md#reconnecting-max_reconnects-reconnect_delay-reconnect_on_close)).
 
 ## Native transport
 
@@ -122,8 +125,8 @@ async with HTTPClient(base_url="https://api.example.com/", native="off") as clie
     ...
 ```
 
-On Linux and macOS, a client uses lothc's own native transport by default, about twice as fast
-on `get(into=Struct)` in lothc's benchmarks. `native=` picks the transport:
+On Linux and macOS, a client uses lothc's own native transport by default, about 2x faster on
+`get(into=Struct)`; see [Benchmarks](benchmarks.md). `native=` picks the transport:
 
 - `"auto"` (the default): native, except on Windows, where it isn't available, and with
   `http2=True`, which it doesn't support yet; both use pyreqwest instead.
@@ -132,23 +135,3 @@ on `get(into=Struct)` in lothc's benchmarks. `native=` picks the transport:
   `NotImplementedError`.
 
 `lothc.testing`'s mocker intercepts requests on either transport, the same way.
-
-Async `get()`, 100 requests in flight, decoding the full JSON body (`perf.py`, AWS
-`c8a.xlarge`, Python 3.14):
-
-| Client | req/s |
-|---|---|
-| lothc, `native="on"`, msgspec | 97,501 |
-| lothc, `native="on"`, `dict` | 71,356 |
-| lothc, `native="on"`, pydantic | 56,738 |
-| pyreqwest | 43,370 |
-| lothc, `native="off"`, msgspec | 41,528 |
-| lothc, `native="off"`, `dict` | 41,195 |
-| aiohttp | 21,653 |
-| aiosonic | 13,783 |
-| httpx2 | 3,247 |
-| niquests | 3,155 |
-| httpx | 1,004 |
-
-The server is local, so this measures each client's own cost; over a real network the gain
-shows up mostly as less CPU per request.

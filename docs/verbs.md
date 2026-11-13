@@ -40,8 +40,8 @@ response = await client.get(
 response.data  # ItemModel(id=7, name="item-7")
 ```
 
-Every verb returns a `Response`: the decoded body on `.data`, plus the status, headers and more
-(see [The `Response`](#the-response) below).
+Every non-streaming verb returns a `Response`: the decoded body on `.data`, plus the status,
+headers and more (see [The `Response`](#the-response) below).
 
 ### Typed params and headers
 
@@ -49,7 +49,6 @@ Every verb returns a `Response`: the decoded body on `.data`, plus the status, h
 `None` are omitted rather than sent as `"None"`:
 
 ```python
-from msgspec import Struct
 from pydantic import BaseModel
 
 
@@ -59,16 +58,7 @@ class SearchParams(BaseModel):
     limit: int | None = None  # omitted from the query string entirely, not sent as "None"
 
 
-class SearchStructParams(Struct):
-    q: str
-    page: int
-    cursor: str | None = None  # same omission behavior, msgspec Struct instead of BaseModel
-
-
 response = await client.get("items", params=SearchParams(q="pikachu", page=1), into=SearchResult)
-response = await client.get(
-    "items", params=SearchStructParams(q="pikachu", page=1), into=SearchResult
-)
 ```
 
 `headers` works the same way for outgoing request headers — pass a `BaseModel`/`Struct` instead
@@ -101,71 +91,25 @@ response.data  # list[ItemStruct]
 response = await client.get("items/7", into=ItemStruct | None)  # a `null` body gives None
 ```
 
-The library is picked from the models inside the type, including the fields of a `TypedDict`,
-dataclass or `NamedTuple`: a `Struct` anywhere means msgspec, a `BaseModel` anywhere means
-pydantic, and mixing the two in one type raises `TypeError`. Validation only pydantic enforces
-also means pydantic, since msgspec would silently skip it: `Annotated` metadata from pydantic
-(`Field(gt=0)`, `AfterValidator(...)`) or `annotated_types` (`Gt(0)`), a pydantic dataclass, or a
-pydantic type such as `HttpUrl`. Without pydantic installed, such a type raises `TypeError` rather
-than decoding unvalidated. Plain metadata (`Annotated[int, "doc"]`, `msgspec.Meta(gt=0)`) doesn't
-count. A type with none of these (`list[int]`) uses msgspec if it's installed, else pydantic,
-unless msgspec can't decode part of it from JSON (`Path`, `deque[int]`, `IPv4Address`, a plain
-class): that needs pydantic, and raises `TypeError` before sending without it.
+A `Struct` means msgspec; a `BaseModel` or any pydantic-only validation means pydantic; both is a
+`TypeError`. Otherwise msgspec, else pydantic; a type neither can decode raises `TypeError` before
+sending.
 
-lothc builds the decoder once per type and reuses it, so writing `into=list[ItemModel]` inline on
-every call costs nothing extra, and so does `Annotated[int, AfterValidator(check)]` with a
-module-level `check`. The exception is `Annotated` metadata that's only ever equal to itself,
-pydantic's `Field(...)` above all: written inline, each call makes a new, unequal type, so lothc
-rebuilds its decoder on every call rather than caching a new one per call forever. Hoist such a
-type into a module-level `type` alias to have it built once:
-
-```python
-from typing import Annotated
-
-from pydantic import Field
-
-type PositiveInts = list[Annotated[int, Field(gt=0)]]
-
-response = await client.get("counts", into=PositiveInts)  # built once, then reused
-```
-
-An inline `lambda` validator is likewise a new type per call: it decodes correctly but builds a
-new decoder every time. lothc stops caching new types once it holds 4096, so that can't grow
-memory without limit; use a module-level function (or a `type` alias) to have it built once.
+Decoders are cached per type. `Field(...)` or a `lambda` written inline is a new type each call, so
+hoist it into a module-level `type` alias.
 
 Without either extra only `bytes`, `str`, `dict`, `dict[str, Any]` (or `typing.Dict[str, Any]`),
 `Mapping[str, Any]` and bare `dict` subclasses work; anything else raises a `TypeError` naming the
 extra to install.
 
-`into=str` means the raw text, never JSON-parsed, just as `into=bytes` means the raw bytes:
-`get(into=str)` gives the body decoded as UTF-8 (invalid UTF-8 raises `UnicodeDecodeError`, a
-`ValueError`), `sse(into=str)` gives each event's `data` as is (the same as the default),
-`stream_get`/`stream_post` with `into=str` give each line as text (split on `\n`, with one
-trailing `\r` stripped so CRLF lines come out clean, and blank lines kept as `""`, unlike the
-NDJSON decode, which skips them), and a pinned `HTTPResponseError[str]` gets the error body's text
-on `.error`.
-
-A bare `dict` subclass (`OrderedDict`, `defaultdict`, your own) decodes a JSON object like
-`into=dict` and is built as that subclass (a `defaultdict` with no `default_factory`). A
-parametrized one (`OrderedDict[str, int]`, `Counter[str]`) also validates its keys and values, so
-it needs pydantic.
-
-A pre-built pydantic `TypeAdapter` or msgspec `Decoder` is still accepted, used as-is:
-
-```python
-from msgspec.json import Decoder
-from pydantic import TypeAdapter
-
-response = await client.get("items", into=TypeAdapter(list[ItemModel]))
-response = await client.get("items", into=Decoder(list[ItemStruct]))
-```
-
-`into=dict` is for a JSON *object*; decoding an array (or a string, number, `null`)
-into it raises a `ValueError` that says what the body actually was.
+`into=str` is the raw text (UTF-8), like `into=bytes`; on `stream_get`/`stream_post` it's each
+line. A bare `dict` subclass decodes like `into=dict` and is built as that subclass (a
+parametrized one needs pydantic). A pre-built pydantic `TypeAdapter` or msgspec `Decoder` is used
+as is. `into=dict` on anything but a JSON object raises `ValueError`.
 
 ## The `Response`
 
-`get`, `post`, `put`, `patch`, `delete`, `head` and `options` all return a `Response`:
+`get`, `post`, `put`, `patch`, `delete`, `head`, `options` and `download` all return a `Response`:
 
 ```python
 response = await client.get("items/7", into=ItemModel)
@@ -189,9 +133,7 @@ necessarily the one a final response came from if redirects were followed.
 `response.headers` is a `CaseInsensitiveDict`, so header names compare case-insensitively the way
 HTTP itself defines them (RFC 9110 §5.1) — `response.headers["Content-Type"]`,
 `response.headers["content-type"]` and `"CONTENT-TYPE" in response.headers` are all the same lookup.
-It's a `MutableMapping`, not a `dict` subclass (the same choice requests, niquests and httpx all
-make), so `isinstance(response.headers, dict)` is `False`; iterating it yields keys with the casing
-they arrived in, and only lookups, `in` and `==` ignore case.
+It's a `MutableMapping`, not a `dict`; iterating it yields keys with the casing they arrived in.
 
 A header sent more than once — `Set-Cookie`, most often — keeps every value. Indexing gives the
 first, as it always has; `get_all` gives all of them, in arrival order, and `[]` for a header that
@@ -211,14 +153,9 @@ response.headers.get_all("never-sent")
 Iteration, `.items()` and `dict(response.headers)` stay single-valued (one entry per header name,
 its first value), so `get_all` is the only way to see a repeated header's extra values.
 
-Equality follows the same split. Two header maps compare every value, so two responses that differ
-only in a dropped `Set-Cookie` aren't equal. Against a plain `dict`, which can only hold one
-value per name, only the first value of each is compared. So with repeated headers, equality isn't
-transitive: two maps can each equal the same `dict` without equalling each other (requests'
-`CaseInsensitiveDict` behaves the same way).
-
-Pass `response_headers_type` (a `BaseModel`/`Struct`) to get the *response* headers validated and parsed
-too, via `response.typed_headers`. Header names are lowercased and `-` becomes `_` before matching
+On every verb returning a `Response` except `download`, pass `response_headers_type` (a
+`BaseModel`/`Struct`) to get the *response* headers validated and parsed too, via
+`response.typed_headers`. Header names are lowercased and `-` becomes `_` before matching
 against your type's field names, so a `Content-Type` response header maps onto a `content_type`
 field:
 
@@ -230,8 +167,6 @@ class ItemHeaders(BaseModel):
 response = await client.get("items/7", into=ItemModel, response_headers_type=ItemHeaders)
 response.typed_headers.content_type  # "application/json"
 ```
-
-`response_headers_type` works the same way on `head()` — see below.
 
 ## POST, PUT, PATCH
 
@@ -269,14 +204,6 @@ server needs one:
 await client.post("render", content="# Title", headers={"content-type": "text/markdown"})
 ```
 
-Each returns a `Response` like `get`'s, including the same `response_headers_type` option:
-
-```python
-response = await client.post("items", json={"name": "new-item"}, into=ItemModel)
-response.data  # ItemModel(...)
-response.status  # 201
-```
-
 ### Multipart forms — `form`
 
 `form` builds a real `multipart/form-data` body from a `dict`, one part per key. Each value's
@@ -296,17 +223,8 @@ type decides how it's sent:
     content-type.
   - An already-opened binary file object (anything `io.BufferedIOBase`, e.g. `open(path, "rb")` or
     a `BytesIO`) also works directly, filename taken from `.name` if the object has one.
-- **A `tuple` of any of the above** repeats that field name once per element — multiple parts,
-  all sharing the same name (a real `multipart/form-data` capability, not something most HTTP
-  client libraries expose). Note this is a `tuple` specifically, not a `list` — a `list` value
-  always means "JSON-encode me as one part," never "repeat" and never a file, whatever it holds.
-  Every element must be the same kind of value — all fields, all raw binary, all files, or all
-  JSON. A mixed tuple is a type error, and raises `TypeError` if you reach it at runtime anyway;
-  an empty tuple raises `ValueError` rather than quietly contributing no parts at all. In
-  particular `(b"...", "image/png")`
-  is **not** a file paired with its content-type: only a `Path` carries a filename of its own
-  (hence the `(Path, content_type)` shape above), so `bytes` always needs the explicit
-  `(filename, content, content_type)` spelling instead.
+- **A `tuple` of one kind** repeats the field (a `list` is always one JSON part). Mixed or empty
+  raises. Bytes with a content type need `(filename, content, content_type)`.
 
 By default, a file part's content-type is guessed from its filename's extension (via the stdlib
 `mimetypes` module) unless you gave one explicitly. Pass `infer_mime_type_from_file_extension=False`
@@ -355,8 +273,6 @@ response.headers
 response.data  # always None
 ```
 
-It takes the same `response_headers_type` option as `get`, via `response.typed_headers`.
-
 ## OPTIONS
 
 Same shape as `head`: status and headers only, any body is discarded. The usual use is a CORS
@@ -379,7 +295,7 @@ around, but for something genuinely large (a presigned S3 GET URL, a big export)
 memory copies internally. `download()` is a `get`-shaped verb built to avoid that:
 
 ```python
-response = await client.download("exports/large-file.csv")  # ~2/3 the peak memory of get()
+response = await client.download("exports/large-file.csv")  # less peak memory than get()
 body = response.data  # bytes
 
 response = await client.download("exports/large-file.csv", dest="large-file.csv")
@@ -390,18 +306,15 @@ Like `get()`, it returns a `Response`, so `.status`, `.headers` (say, `ETag` or
 `Content-Disposition`), `.request`, `.http_version` and `.elapsed` are all there. `.elapsed`
 runs until the whole body has been read or written.
 
-With no `dest`, the body still ends up fully in memory as `bytes`, just streamed into one buffer
-instead of copied several times along the way: measured on a 50MB body, `download()` peaks at
-about 105MB against `get()`'s 154MB. Pass `dest` (a `str` or any path-like) to stream straight to
-disk instead — memory then stays O(chunk size) regardless of how large the body is, and `.data` is
-`dest` as a `Path` rather than the body. The client's `timeout` is the longest allowed gap between
-chunks here, not a cap on the whole download, so a long download of a big file isn't cut off at
-30s; see [Streaming → Timeouts](streaming.md#timeouts).
+With no `dest`, the body still ends up fully in memory as `bytes`, streamed into one buffer
+instead of copied along the way. Pass `dest` (a `str` or any path-like) to stream straight to disk
+instead: memory then stays O(chunk size), and `.data` is `dest` as a `Path`. The client's `timeout`
+is a gap limit between chunks here, not a cap on the whole download; see
+[Timeouts](networking.md#timeouts).
 
 The file only appears at `dest` once the whole body has arrived. It's written to a hidden sibling
-first and renamed into place on success, so a download that fails partway (a dropped connection,
-a cancelled task) never leaves a truncated file behind, and an existing file at `dest` is left
-exactly as it was. Writes happen on the calling thread even for the async client: each chunk
-write takes microseconds, and moving them to a thread measured 2.5-3.8x slower. `download()` only ever does a `GET`; there's no
-`json`/`data`/`form`/`content` body option and no `into` — the response is always raw
-bytes, on disk or in memory. Same `params`/`headers`/`error_for_status` as every other verb.
+first and renamed into place on success, so a download that fails partway never leaves a
+truncated file behind, and an existing file at `dest` is left exactly as it was. `download()` only
+ever does a `GET`; there's no `json`/`data`/`form`/`content` body option and no `into` — the
+response is always raw bytes, on disk or in memory. Same `params`/`headers`/`error_for_status` as
+every other verb.

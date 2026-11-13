@@ -11,9 +11,9 @@
 [![Python versions](https://img.shields.io/pypi/pyversions/lothc)](https://pypi.org/project/lothc/)
 [![License](https://img.shields.io/pypi/l/lothc)](https://github.com/RogerThomas/lothc/blob/main/LICENSE)
 
-**L**ord **O**f **T**he **H**ttp **C**lients — a typed HTTP client for Python, built on
-[pyreqwest](https://github.com/MarkusSintonen/pyreqwest) (an awesome Rust-backed HTTP client), with
-first-class optional support for **pydantic** and **msgspec** as both decode *and* encode targets.
+**L**ord **O**f **T**he **H**ttp **C**lients — a fast, Rust-backed, typed HTTP client for Python,
+with first-class optional support for **pydantic** and **msgspec** as both decode *and* encode
+targets.
 
 ## Installing
 
@@ -26,6 +26,7 @@ uv add 'lothc[pydantic,msgspec]'
 ## Quickstart
 
 ```python
+import asyncio
 from lothc import HTTPClient
 from pydantic import BaseModel
 
@@ -35,33 +36,20 @@ class Pokemon(BaseModel):
     name: str
 
 
-async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
-    response = await client.get("pokemon/pikachu", into=Pokemon)
-    print(response.status, response.data)  # 200 id=25 name='pikachu'
+async def main() -> None:
+    async with HTTPClient(base_url="https://pokeapi.co/api/v2/") as client:
+        response = await client.get("pokemon/pikachu", into=Pokemon)
+        print(response.status, response.data)  # 200 id=25 name='pikachu'
+
+
+asyncio.run(main())
 ```
 
 ## Why?
 
-Why was lothc built, and why should you use it?
-
-pyreqwest is a genuinely excellent HTTP client for Python, fast because the heavy lifting happens
-in Rust, not pure Python. But its API is a builder pattern (`client.get(path).build()` before you
-can even `.send()` it), unfamiliar to anyone coming from `requests`/`httpx`/`niquests`, where a
-call is just `client.get(url, params=..., headers=...)`. lothc wraps pyreqwest with exactly that
-familiar shape, so you get pyreqwest's speed without giving up the ergonomics Python HTTP users
-already expect.
-
-The other reason: Python's most popular third-party HTTP clients (httpx, aiohttp, niquests) all
-have first-class JSON support: call `.json()` and get back a `dict`. But in order for a Python
-project to be end-to-end type-safe, data crossing I/O boundaries must be validated, and if
-invalid, handled accordingly (raise an error) — a plain `dict` does neither. Closing that gap is
-exactly what lothc is designed for.
-
-The original idea was to make lothc backend-agnostic: httpx, aiohttp, niquests, and pyreqwest all
-interchangeable underneath the same typed lothc interface, so switching backends never meant
-switching your call sites. However, in the author's opinion there's currently no compelling
-reason not to just use pyreqwest, so pyreqwest is the only backend implemented today, but, if
-there's demand for an httpx/aiohttp/niquests backend, the author is happy to consider adding one.
+pyreqwest is fast but has a builder API; lothc gives it the `requests`/`httpx` call shape, and adds
+its own native transport that's faster still. Where other clients' `.json()` returns an
+unvalidated `dict`, lothc decodes straight into a validated pydantic or msgspec type.
 
 ## Fast
 
@@ -72,43 +60,27 @@ stays close to pyreqwest's own throughput.
 
 ![HTTP client throughput race — lothc's native transport finishes first, at more than twice pyreqwest's throughput, and other libraries take much longer](https://raw.githubusercontent.com/RogerThomas/lothc/main/assets/perf-race.svg)
 
-Benchmarked with [`perf.py`](https://github.com/RogerThomas/lothc/blob/main/perf.py) on an AWS
-`c8a.xlarge`, 50,000 requests at concurrency 100 against a tiny Rust-based JSON server — including
-lothc's fully-typed decode targets (`into=` a msgspec `Struct` or a pydantic `BaseModel`), not
-just raw bytes or an untyped dict. The object handed back from those runs isn't just parsed JSON —
-it's a real, constructed, field-validated instance of your own type, and that validation cost is
-included in the numbers, not benchmarked around. Full numbers:
-[Benchmarks](https://rogerthomas.github.io/lothc/benchmarks/).
+50,000 requests at concurrency 100 on an AWS `c8a.xlarge`, validation included.
+[Full numbers](https://rogerthomas.github.io/lothc/benchmarks/).
 
 ## Highlights
 
-Pass `into` to any lothc call and get back a real, constructed, field-validated
-pydantic `BaseModel` or msgspec `Struct`, instead of the plain `dict` `.json()` leaves you to
-validate yourself. Any type expression works, so `into=list[Pokemon]` decodes a top-level array. See [Benchmarks](https://rogerthomas.github.io/lothc/benchmarks/) for what that costs (usually nothing).
-
 | | |
 |---|---|
-| **Two clients, one API** | `HTTPClient` (async) and `SyncHTTPClient` (sync) — identical surface, both backed by pyreqwest. |
+| **Typed decoding** | `into=` any type expression (`Pokemon`, `list[Pokemon]`, ...) gives back a validated pydantic `BaseModel` or msgspec `Struct`, not a `dict`. |
+| **Two clients, one API** | `HTTPClient` (async) and `SyncHTTPClient` (sync) — identical surface. |
 | **Every verb** | `get`, `post`, `put`, `patch`, `delete`, `head`, `options`, `download` (each returning a `Response`: `.data`, `.status`, `.headers`) — see [Verbs](https://rogerthomas.github.io/lothc/verbs/). |
 | **Typed params, headers & forms** | A `BaseModel`/`Struct` for query params or headers (with `None`-field omission), or a body sent urlencoded (`data=`) or as a real multipart form (`form=`). |
 | **Precise static types** | Every verb is paired `@overload`s, not a cast-laden generic — your editor knows the exact return type. |
 | **SSE & streaming** | Spec-compliant SSE — automatic reconnect with `Last-Event-ID`, server `retry:` honored, typed decode (discriminated unions included) — plus raw or NDJSON-typed `stream_get`/`stream_post` — see [SSE](https://rogerthomas.github.io/lothc/sse/) / [Streaming](https://rogerthomas.github.io/lothc/streaming/). |
-| **Retries with real backoff** | `max_retries`/`retry_methods`, a genuine pyreqwest middleware hook, `Retry-After`-aware — see [Retries](https://rogerthomas.github.io/lothc/retries/). |
+| **Retries with real backoff** | `max_retries`/`retry_methods`, `Retry-After`-aware — see [Retries](https://rogerthomas.github.io/lothc/retries/). |
 | **Authentication** | Static `bearer_token`, a per-request-refreshed `bearer_auth`, `basic_auth`, or `default_headers` for anything else — plus a ready-made OAuth 2 client-credentials provider (`OAuthProvider`: mint, leeway-based renewal, refresh-then-mint fallback, optional on-disk token cache) — see [Authentication](https://rogerthomas.github.io/lothc/auth/). |
 | **Cookies, redirects, proxy** | `cookie_store`, `follow_redirects`/`max_redirects`, `proxy=` — see [Networking](https://rogerthomas.github.io/lothc/networking/). |
 | **A real error hierarchy** | `HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError` for no response, `HTTPResponseError` for 4xx/5xx — see [Error handling](https://rogerthomas.github.io/lothc/errors/). |
-| **Everything optional** | pydantic, msgspec — works with neither, either, or both installed. |
 
 ## Development
 
-See `CLAUDE.md` and `style-guide.md` for architecture notes and the (non-obvious in places) design
-conventions this codebase relies on.
-
-```
-task deps-sync    # install
-task test         # run tests
-task check        # lint + format-check + typecheck (what CI runs)
-```
+See [Development](https://rogerthomas.github.io/lothc/development/).
 
 ## License
 
