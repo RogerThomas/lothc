@@ -103,40 +103,21 @@ async with HTTPClient(base_url="https://api.example.com/", raises=MyAPIError) as
         print(e.error)  # LoginFailed | dict[str, Any] | None
 ```
 
-Why a subclass rather than `raises=HTTPResponseError[APIError]`: Python can't `except` a
-parametrized generic (`except HTTPResponseError[APIError]` is a `TypeError`), so the type has to
-live on a real class for the `except` clause to both catch it and tell your type checker what
-`.error` is. lothc reads the pinned type back off the class at runtime, so it's written exactly
-once. A subclass of your subclass inherits it, `except HTTPResponseError` still catches all of
-them, and they pickle as themselves (define them at module level, as pickle needs). The pinned
-type can be anything `into=` takes, including a `type` alias, a union, or a pydantic model. A
-`raises=` lothc can't use (not an `HTTPResponseError` subclass, or a type no installed library can
-decode) raises `TypeError` when the client is constructed, or, passed to a verb, before that
-request is sent, never only once a real error comes back.
+It's a subclass because Python can't `except` a parametrized generic. lothc reads the pinned type
+back off the class; subclasses inherit it and pickle as themselves (define them at module level).
+An unusable `raises=` raises `TypeError` at construction, or before sending when passed to a verb.
 
-Decoding an error body is best-effort because an error body is where a server is least likely to
-honour its own contract (the classic case: a proxy in front of a JSON API answers 502 with an HTML
-page). You always get the `raises=` error, with its real status, headers and body; a body that
-doesn't match only means `.error` is a `dict` or `None` and `.parse_error` holds the decode
-library's own exception. `.parse_error` is always a `ValueError`: anything else decoding raises
-(a `RecursionError` for a body nested too deeply to parse, a `TypeError` from a pinned `dict`
-subclass's own constructor) is wrapped in one, with the original as its `__cause__`.
-
-On the success path it's the opposite: an `into` body that doesn't match raises the
-decode library's own error (`pydantic.ValidationError`, `msgspec.ValidationError`), unwrapped,
-since choosing that library is opting into its exception too. An error body is where a server is
-least likely to honour its own contract, so failing to decode one must never hide the error
-itself.
+Decoding an error body is best-effort, since that's where a server is least likely to honour its
+contract (a proxy's HTML 502): a mismatch only leaves `.error` a `dict` or `None`, with the reason
+on `.parse_error` (always a `ValueError`). On the success path an `into` mismatch raises the decode
+library's own error (`pydantic.ValidationError`, `msgspec.ValidationError`), unwrapped.
 
 ## `OAuthTokenError`
 
-The one exception to the rule above. `OAuthProvider`/`SyncOAuthProvider` (see
-[Authentication](auth.md#oauth-2-client-credentials)) run *inside* whatever request needed the
-token, so a failure at the token endpoint would otherwise surface as a failure of that unrelated
-call — an `HTTPResponseError` whose `.status` is really the auth server's, a
-`pydantic.ValidationError` from a token response you never asked that call to decode. Every
-failure to obtain a token is therefore raised as `OAuthTokenError`, with the original exception as
-`__cause__` and the endpoint in `.token_url`:
+`OAuthProvider`/`SyncOAuthProvider` (see [Authentication](auth.md#oauth-2-client-credentials)) run
+*inside* whatever request needed the token, so every failure to obtain one is wrapped in
+`OAuthTokenError`, with the original exception as `__cause__` and the endpoint in `.token_url`,
+rather than surfacing as a failure of that unrelated call:
 
 ```python
 from lothc import HTTPClient, HTTPResponseError, OAuthProvider, OAuthTokenError
@@ -151,6 +132,3 @@ async with HTTPClient(base_url=..., bearer_auth=OAuthProvider(...)) as client:
     except HTTPResponseError as e:
         print(e.status)  # an error from "items/7" itself
 ```
-
-A `into` decode error is never wrapped because it already belongs to the call that
-raised it; a token decode error is wrapped because it doesn't.
