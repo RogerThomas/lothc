@@ -7,6 +7,24 @@ messages; 0.0.17 to 0.0.19 were hand-written in the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. Releases up to and including
 0.0.16 predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/releases).
 
+## [0.3.0](https://github.com/RogerThomas/lothc/compare/0.2.3...0.3.0) (2026-11-13)
+
+
+### ⚠ BREAKING CHANGES
+
+* `native` is no longer a bool, and clients on Linux and macOS now use the native transport unless built with native="off".
+
+### Features
+
+* make the native transport the default, with native="auto"|"off"|"on" ([368b248](https://github.com/RogerThomas/lothc/commit/368b24816602901fb2c2ddff063cc6be217425cd))
+
+
+### Documentation
+
+* record why lothc's wheels use neither BOLT nor target-cpu ([dff8db2](https://github.com/RogerThomas/lothc/commit/dff8db2a8cca01c2c04409c7ba34795e4416050c))
+* record why lothc's wheels use neither BOLT nor target-cpu ([c449676](https://github.com/RogerThomas/lothc/commit/c449676d96328ca6479ee88452958c734fc0c601))
+* show the native transport's benchmark results on the home page, README and Benchmarks page ([848201d](https://github.com/RogerThomas/lothc/commit/848201dd9c49661a4f796de1556f7b681b1b928f))
+
 ## [0.2.3](https://github.com/RogerThomas/lothc/compare/0.2.2...0.2.3) (2026-11-12)
 
 
