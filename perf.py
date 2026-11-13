@@ -51,6 +51,9 @@ type Lib = Literal[
     "lothc",
     "lothc-msgspec",
     "lothc-pydantic",
+    "lothc-native",
+    "lothc-native-msgspec",
+    "lothc-native-pydantic",
 ]
 
 type Tag = Literal["rust", "async", "web", "performance"]
@@ -327,7 +330,14 @@ async def _fetch_one_aiosonic(client: AiosonicClient, path: str) -> None:
 
 @overload
 def _build_client(
-    lib: Literal["lothc", "lothc-msgspec", "lothc-pydantic"],
+    lib: Literal[
+        "lothc",
+        "lothc-msgspec",
+        "lothc-pydantic",
+        "lothc-native",
+        "lothc-native-msgspec",
+        "lothc-native-pydantic",
+    ],
     url: str,
     concurrency: int,
 ) -> AbstractAsyncContextManager[HTTPClient]: ...
@@ -362,7 +372,10 @@ def _build_client(
 def _build_client(lib: Lib, url: str, concurrency: int) -> AbstractAsyncContextManager[AnyClient]:
     """Return an async context manager yielding a ready-to-use client for `lib`."""
     if lib in ("lothc", "lothc-msgspec", "lothc-pydantic"):
-        return HTTPClient(base_url=url)
+        return HTTPClient(base_url=url, native="off")
+
+    if lib in ("lothc-native", "lothc-native-msgspec", "lothc-native-pydantic"):
+        return HTTPClient(base_url=url, native="on")
 
     if lib == "httpx":
         return httpx.AsyncClient(base_url=url)
@@ -399,7 +412,15 @@ def _build_client(lib: Lib, url: str, concurrency: int) -> AbstractAsyncContextM
 
 @overload
 def _build_sync_client(
-    lib: Literal["lothc", "lothc-msgspec", "lothc-pydantic"], url: str
+    lib: Literal[
+        "lothc",
+        "lothc-msgspec",
+        "lothc-pydantic",
+        "lothc-native",
+        "lothc-native-msgspec",
+        "lothc-native-pydantic",
+    ],
+    url: str,
 ) -> AbstractContextManager[SyncHTTPClient]: ...
 @overload
 def _build_sync_client(lib: Literal["httpx"], url: str) -> AbstractContextManager[httpx.Client]: ...
@@ -424,7 +445,10 @@ def _build_sync_client(lib: Lib, url: str) -> AbstractContextManager[AnySyncClie
     names as `_build_client` (its async counterpart) — sync-vs-async is conveyed by which of the
     two you call, not by the name."""
     if lib in ("lothc", "lothc-msgspec", "lothc-pydantic"):
-        return SyncHTTPClient(base_url=url)
+        return SyncHTTPClient(base_url=url, native="off")
+
+    if lib in ("lothc-native", "lothc-native-msgspec", "lothc-native-pydantic"):
+        return SyncHTTPClient(base_url=url, native="on")
 
     if lib == "httpx":
         return httpx.Client(base_url=url)
@@ -601,6 +625,9 @@ def _parse_sync_libs(libs: str) -> list[Lib]:
         "lothc",
         "lothc-msgspec",
         "lothc-pydantic",
+        "lothc-native",
+        "lothc-native-msgspec",
+        "lothc-native-pydantic",
     )
     result: list[Lib] = []
     for name in libs.split():
@@ -615,6 +642,7 @@ async def single_call(
     *,
     libs: str = (
         "httpx httpx2 pyreqwest aiohttp niquests aiosonic lothc lothc-msgspec lothc-pydantic"
+        " lothc-native lothc-native-msgspec lothc-native-pydantic"
     ),
     concurrency: int = 1,
     total_requests: int = 1000,
@@ -647,7 +675,10 @@ async def single_call(
 async def single_call_sync(
     url: str = "http://127.0.0.1:3000",
     *,
-    libs: str = ("httpx httpx2 niquests requests pyreqwest lothc lothc-msgspec lothc-pydantic"),
+    libs: str = (
+        "httpx httpx2 niquests requests pyreqwest lothc lothc-msgspec lothc-pydantic"
+        " lothc-native lothc-native-msgspec lothc-native-pydantic"
+    ),
     concurrency: int = 1,
     total_requests: int = 1000,
     warmup: int = 100,
@@ -685,11 +716,21 @@ def _run_sync_lib(
     """The sync half of `_run_one`'s dispatch, split out to keep both under the project's mccabe
     complexity ceiling — see `_run_one` for why sync-vs-async is a flag, not a separate lib name.
     Returns (timings, total_time, cpu_time, peak_mem_mb)."""
-    if lib in ("lothc", "lothc-msgspec", "lothc-pydantic"):
+    if lib in (
+        "lothc",
+        "lothc-msgspec",
+        "lothc-pydantic",
+        "lothc-native",
+        "lothc-native-msgspec",
+        "lothc-native-pydantic",
+    ):
         fetcher = {
             "lothc": _fetch_one_lothc_sync,
             "lothc-msgspec": _fetch_one_lothc_msgspec_sync,
             "lothc-pydantic": _fetch_one_lothc_pydantic_sync,
+            "lothc-native": _fetch_one_lothc_sync,
+            "lothc-native-msgspec": _fetch_one_lothc_msgspec_sync,
+            "lothc-native-pydantic": _fetch_one_lothc_pydantic_sync,
         }[lib]
         with _build_sync_client(lib, url) as client:
             timings, total_time, cpu_time = _time_run_sequential_sync(
@@ -764,7 +805,7 @@ async def _run_one(
             timings, total_time, cpu_time, peak_mem_mb = _run_sync_lib(
                 lib, url, total_requests, warmup
             )
-        elif lib == "lothc":
+        elif lib == "lothc" or lib == "lothc-native":
             async with _build_client(lib, url, concurrency) as client:
                 timings, total_time, cpu_time = await _time_run(
                     _fetch_one_lothc, client, total_requests, concurrency, warmup
@@ -772,7 +813,7 @@ async def _run_one(
                 peak_mem_mb = await _measure_peak_memory(
                     _fetch_one_lothc, client, total_requests, concurrency
                 )
-        elif lib == "lothc-msgspec":
+        elif lib == "lothc-msgspec" or lib == "lothc-native-msgspec":
             async with _build_client(lib, url, concurrency) as client:
                 timings, total_time, cpu_time = await _time_run(
                     _fetch_one_lothc_msgspec, client, total_requests, concurrency, warmup
@@ -780,7 +821,7 @@ async def _run_one(
                 peak_mem_mb = await _measure_peak_memory(
                     _fetch_one_lothc_msgspec, client, total_requests, concurrency
                 )
-        elif lib == "lothc-pydantic":
+        elif lib == "lothc-pydantic" or lib == "lothc-native-pydantic":
             async with _build_client(lib, url, concurrency) as client:
                 timings, total_time, cpu_time = await _time_run(
                     _fetch_one_lothc_pydantic, client, total_requests, concurrency, warmup
@@ -952,6 +993,7 @@ async def main(
     *,
     libs: str = (
         "httpx httpx2 pyreqwest aiohttp niquests aiosonic lothc lothc-msgspec lothc-pydantic"
+        " lothc-native lothc-native-msgspec lothc-native-pydantic"
     ),
     concurrency: int = 50,
     total_requests: int = 1000,

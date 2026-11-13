@@ -12,9 +12,11 @@ cookie/redirect/retry/streaming/connection-close scenarios used by their own tes
 import contextlib
 import email.policy
 import gzip
+import itertools
 import json
 import socket
 import sys
+import threading
 import time
 import zlib
 from collections.abc import Generator
@@ -115,10 +117,19 @@ def _compressed_shape(complete: bytes, shape: str) -> tuple[list[bytes], int | N
 
 class TestAppHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # A response's head and body are separate writes, so with Nagle the body waits for the
+    # client's ACK of the head, which Linux delays by 40ms on a kept-alive connection: every
+    # request after a connection's first took 42ms there, against 0.2ms without.
+    disable_nagle_algorithm = True
 
     # Per-key hit counters for the flaky/retry-after endpoints below — shared
     # across request threads for the lifetime of the test server.
     _counters: ClassVar[dict[str, int]] = {}
+    # Per-key events `/release` sets, ending a `/slow?key=` wait early.
+    _releases: ClassVar[dict[str, threading.Event]] = {}
+    # Per-key times `/events?key=` wrote (or tried to), for `/longest-gap`: its `sent`, then each
+    # write, then `None` once it has finished.
+    _write_times: ClassVar[dict[str, list[float | None]]] = {}
     # Per-key record of every request the /oauth/token* endpoints received (content type,
     # Authorization header, parsed body), read back via GET /oauth/token-requests so tests can
     # assert the wire shape of a token request through a public endpoint, never via provider
@@ -130,6 +141,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
     _closed_peers: ClassVar[dict[str, list[int]]] = {}
     # The key this connection's last `/peer?key=` request gave (a handler serves one connection).
     _peer_key: str | None = None
+    # Per-key `Authorization` of every request `/rejects-first-token-then-flaky` got, in order.
+    _seen_authorizations: ClassVar[dict[str, list[str]]] = {}
 
     def _client_port(self) -> int:
         _, port = self.client_address
@@ -169,6 +182,15 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self._counters[key] = self._counters.get(key, 0) + 1
         return self._counters[key]
 
+    def _close_counted(self, query: str) -> None:
+        # Close the connection now, rather than once the handler returns, then count the close
+        # (`<key>-closed`, read back via `/hits`) once it's on its way, so a test can wait for it
+        # rather than guess how long it takes.
+        with contextlib.suppress(OSError):
+            self.connection.shutdown(socket.SHUT_WR)
+        if "key" in (params := parse_qs(query)):
+            self._bump_counter(f"{params['key'][0]}-closed")
+
     def _start_sse_response(self, *, chunked: bool = False) -> None:
         self.close_connection = True
         self.send_response(200)
@@ -193,6 +215,10 @@ class TestAppHandler(BaseHTTPRequestHandler):
         # than all at once (see test_sse_events_arrive_incrementally in test_sse.py).
         interval = float(params.get("interval", ["0.001"])[0])
         count = int(params.get("count", ["10"])[0])
+        # With a `key`, when each write was made, from the client's `sent` (`/longest-gap`).
+        times = self._write_times.setdefault(params["key"][0], []) if "key" in params else []
+        times.extend(float(sent) for sent in params.get("sent", []))
+        times.append(time.monotonic())
         self._start_sse_response()
         # A client that gives up mid-stream (e.g. its `read_timeout` fired) makes the next write
         # here fail — that's the client's business, not a server error worth a traceback.
@@ -203,9 +229,11 @@ class TestAppHandler(BaseHTTPRequestHandler):
                 if not omit_id:
                     record += f"id: {index}\n"
                 record += f"data: {data}\n\n"
+                times.append(time.monotonic())
                 self.wfile.write(record.encode())
                 self.wfile.flush()
                 time.sleep(interval)
+        times.append(None)
 
     def _write_sse_truncated(self) -> None:
         self._start_sse_response(chunked=True)
@@ -242,6 +270,19 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self.wfile.write(record.encode())
             self.wfile.flush()
 
+    def _write_sse_silent_close(self, query: str) -> None:
+        # One event in a body of known length, then the connection closes with no
+        # `Connection: close` to say it will, as `/silent-close` does: counted, with a `key`,
+        # as `/large` counts its close.
+        body = b"id: 0\ndata: only\n\n"
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        self._close_counted(query)
+
     def _write_sse_no_content(self) -> None:
         self.close_connection = True
         self.send_response(204)
@@ -267,6 +308,23 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"data: a\r\n\r\n")
         self.wfile.write(b"data: b\n\n")
         self.wfile.write(b"id\ndata: c\n\n")
+        self.wfile.flush()
+
+    def _write_sse_echo_request(self, query: str) -> None:
+        # `/echo-request` (request line and headers) as an SSE event, for comparing what two
+        # transports send for `sse()`. The first connection (per `key`) then dies mid-stream, so
+        # the client reconnects with `Last-Event-ID`, which is echoed too before a clean close.
+        attempt = self._bump_counter(parse_qs(query)["key"][0])
+        headers = [[name, value] for name, value in self.headers.items()]
+        record = (
+            f"id: {attempt}\ndata: {json.dumps({'line': self.requestline, 'headers': headers})}\n\n"
+        )
+        if attempt == 1:
+            self._start_sse_response(chunked=True)
+            self._write_sse_chunk(record)
+            return
+        self._start_sse_response()
+        self.wfile.write(record.encode())
         self.wfile.flush()
 
     def _handle_read_item(self, item_id: str) -> None:
@@ -522,6 +580,19 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.wfile.flush()
         time.sleep(seconds)
 
+    def _handle_stall_unframed(self, query: str) -> None:
+        # `_handle_stall_after_first_chunk` with no Content-Length and no chunking, so the body
+        # ends where the connection does: a client that sees its socket closed during the
+        # silence has what looks like a whole body, and must not take it for one.
+        seconds = float(parse_qs(query).get("seconds", ["1"])[0])
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.end_headers()
+        self.wfile.write(b"first")
+        self.wfile.flush()
+        time.sleep(seconds)
+
     def _handle_endless(self, query: str) -> None:
         # Streams chunks until the client hangs up, then counts the hang-up (per `key`), so a
         # test can assert that closing a stream early really releases its connection.
@@ -538,6 +609,80 @@ class TestAppHandler(BaseHTTPRequestHandler):
                 time.sleep(0.005)
         except ConnectionError:
             self._bump_counter(f"{key}-hangups")
+
+    def _handle_large(self, query: str) -> None:
+        # `size` bytes in 64KB writes, counting how many it has written so far (per `key`, read
+        # back from `/hits` as `<key>-written`): a client reading slower than this holds it back
+        # once the socket buffers fill, rather than reading the body into memory ahead of its
+        # caller. Ends when the client hangs up. Then closes its connection without saying it
+        # will (`_close_counted`).
+        params = parse_qs(query)
+        written = f"{params['key'][0]}-written"
+        size = int(params["size"][0])
+        block = bytes(64 * 1024)
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        self._counters[written] = 0
+        with contextlib.suppress(ConnectionError):
+            for _ in range(size // len(block)):
+                self.wfile.write(block)
+                self._counters[written] += len(block)
+        self._close_counted(query)
+
+    def _handle_mixed_records(self, query: str) -> None:
+        # `rounds` rounds of one 16KB write then 150 one-byte writes, all zeros. Over TLS each
+        # write is a record of its own, so every full record is followed by tiny ones: read late,
+        # from a socket already full, one read holds more plaintext than rustls buffers (16KB).
+        # The handler disables Nagle, so the tiny writes don't wait on the client's ACKs.
+        rounds = int(parse_qs(query)["rounds"][0])
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(rounds * (16 * 1024 + 150)))
+        self.end_headers()
+        for _ in range(rounds):
+            self.wfile.write(bytes(16 * 1024))
+            for _ in range(150):
+                self.wfile.write(b"\x00")
+
+    def _handle_counted_redirect(self, query: str) -> None:
+        # A 302 to `to`, counting every request it gets (per `key`, read back via `/hits`), so a
+        # test can tell how many times the whole chain was started over.
+        params = parse_qs(query)
+        self._bump_counter(params["key"][0])
+        self._write_bodyless(302, {"Location": params["to"][0]})
+
+    def _handle_slow_redirect(self, query: str) -> None:
+        # `/redirect-to`'s 302 to `to`, sent `seconds` late: a hop that takes time of its own.
+        params = parse_qs(query)
+        sleep(float(params["seconds"][0]))
+        self._write_bodyless(302, {"Location": params["to"][0]})
+
+    def _handle_rejects_first_token_then_flaky(self, query: str) -> None:
+        # `/rejects-first-token`'s 401 for `token-1`; any other token gets a 503 for the key's
+        # first `fail_times` requests, then a 200 with every `Authorization` the key has seen.
+        params = parse_qs(query)
+        key = params["key"][0]
+        seen = self._seen_authorizations.setdefault(key, [])
+        seen.append(self.headers.get("Authorization", ""))
+        if seen[-1] == "Bearer token-1":
+            self._write_json(401, {"error": "invalid_token"})
+        elif self._bump_counter(key) <= int(params["fail_times"][0]):
+            self._write_json(503, {"authorizations": seen})
+        else:
+            self._write_json(200, {"authorizations": seen})
+
+    def _handle_compressed_zeros(self, query: str) -> None:
+        # `size` zero bytes, gzipped: a body that compresses so well that decoding a frame of it
+        # in one go would hold all of it at once, where a stream takes it in 4KB pieces.
+        body = gzip.compress(bytes(int(parse_qs(query)["size"][0])), mtime=0)
+        self.send_response(200)
+        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _handle_hits(self, query: str) -> None:
         # Reads back any per-key counter, for routes whose own response can't carry it.
@@ -681,25 +826,51 @@ class TestAppHandler(BaseHTTPRequestHandler):
                 # `trailing-later`: the trailing bytes arrive in a later read.
                 sleep(0.02)
 
-    def _handle_connection_close(self) -> None:
-        # Announces the close, so the client must open a new connection for its next request.
+    def _handle_connection_close(self, query: str) -> None:
+        # Announces the close, so the client must open a new connection for its next request
+        # (counted, with a `key`, as `/large` counts its close).
         self.close_connection = True
         self._write_json(200, {"closed": "announced"}, {"Connection": "close"})
+        self._close_counted(query)
 
-    def _handle_silent_close(self) -> None:
+    def _handle_silent_close(self, query: str) -> None:
         # Closes after responding without saying so, as a server dropping an idle keep-alive
         # connection does: a client reusing that connection unchecked writes into a dead socket.
         self._write_json(200, {"closed": "silently"})
         self.close_connection = True
+        self._close_counted(query)
 
     def _handle_slow(self, query: str) -> None:
         # `seconds` lets each caller buy exactly the delay its own assertion needs, rather than
         # one shared number sized for the strictest case. A test that only needs the client to
         # time out never waits this out at all, so it can ask for a comfortably long sleep; the
         # two "a longer per-call timeout overrides the client's" tests deliberately run this to
-        # completion and pay every millisecond, so they ask for a short one.
-        sleep(float(parse_qs(query).get("seconds", ["0.5"])[0]))
+        # completion and pay every millisecond, so they ask for a short one. A `key` counts the
+        # request as it arrives (read back via `/hits`), so a test can wait until one is in flight,
+        # and `/release?key=` answers it at once: a test holding a `max_connections` slot asks for
+        # a long sleep and releases it once done, rather than guessing how long it needs it for.
+        params = parse_qs(query)
+        seconds = float(params.get("seconds", ["0.5"])[0])
+        if "key" in params:
+            key = params["key"][0]
+            self._bump_counter(key)
+            self._releases.setdefault(key, threading.Event()).wait(seconds)
+        else:
+            sleep(seconds)
         self._write_json(200, {"finally": True})
+
+    def _handle_longest_gap(self, query: str) -> None:
+        # How long `/events?key=` went at most between two writes (`sent` first), and whether it
+        # has finished, so the gap it last left a client waiting on is counted too.
+        times = self._write_times.get(parse_qs(query)["key"][0], [])
+        done = bool(times) and times[-1] is None
+        written = [moment for moment in times if moment is not None]
+        gaps = [later - earlier for earlier, later in itertools.pairwise(written)]
+        self._write_json(200, {"done": done, "seconds": max(gaps, default=0.0)})
+
+    def _handle_release(self, query: str) -> None:
+        self._releases.setdefault(parse_qs(query)["key"][0], threading.Event()).set()
+        self._write_json(200, {"released": True})
 
     def _handle_peer(self, query: str) -> None:
         # Which TCP connection served this request (its client port), for the connection-reuse
@@ -753,6 +924,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
 
     # Per-key record of every request body `/status-then-ok` received, oldest first.
     _received_bodies: ClassVar[dict[str, list[str]]] = {}
+    # Per-key record of what `/partial-body` received, read back via `/partial-body-seen`.
+    _partial_requests: ClassVar[dict[str, dict[str, object]]] = {}
 
     def _drain_body(self) -> bytes:
         # Read any request body, so a kept-alive connection's next request isn't misread.
@@ -782,6 +955,40 @@ class TestAppHandler(BaseHTTPRequestHandler):
         else:
             self._write_json(200, {"attempts": attempt, "bodies": self._received_bodies[key]})
 
+    def _handle_partial_body(self, query: str) -> None:
+        # The request line, its headers and as much of its body as arrived before its
+        # `Content-Length` or the client going away, whichever came first: for a request a client
+        # abandons partway through its body.
+        length = int(self.headers.get("Content-Length", "0"))
+        body = bytearray()
+        with contextlib.suppress(ConnectionError):
+            while len(body) < length and (chunk := self.rfile.read1(length - len(body))):
+                body += chunk
+        self._partial_requests[parse_qs(query)["key"][0]] = {
+            "line": self.requestline,
+            "headers": [[name, value] for name, value in self.headers.items()],
+            "body": body.decode("latin-1"),
+        }
+        self._write_json(200, {"received": len(body)})
+
+    def _handle_partial_body_seen(self, query: str) -> None:
+        # What `/partial-body` recorded for the key, or a 404 until it has.
+        seen = self._partial_requests.get(parse_qs(query)["key"][0])
+        if seen is None:
+            self._write_json(404, _not_found_body)
+        else:
+            self._write_json(200, seen)
+
+    def _handle_count_body(self) -> None:
+        # How many bytes the request body has, read in chunks and kept nowhere: for an upload too
+        # large to echo back.
+        remaining = int(self.headers.get("Content-Length", "0"))
+        received = 0
+        while remaining and (chunk := self.rfile.read1(min(remaining, 1 << 16))):
+            received += len(chunk)
+            remaining -= len(chunk)
+        self._write_json(200, {"received": received})
+
     def _handle_redirect_to(self, query: str) -> None:
         # A `status` redirect (302 by default) to `to`, which may be another host.
         # `cookie=name=value` also sets that cookie on the redirect response itself.
@@ -791,6 +998,31 @@ class TestAppHandler(BaseHTTPRequestHandler):
         if "cookie" in params:
             headers["Set-Cookie"] = f"{params['cookie'][0]}; Path=/"
         self._write_bodyless(int(params.get("status", ["302"])[0]), headers)
+
+    def _handle_cookies(self, query: str) -> None:
+        # Any path under `/cookies/`, any method: a `Set-Cookie` for each `set=` value, the
+        # `status` (200 by default), a `Location` if `to=` is given, and the `Cookie` the request
+        # came with (`null` without one). With `key=`, only the key's first `fail_times` requests
+        # get `status` (503 by default) and the cookies; later ones a plain 200.
+        params = parse_qs(query)
+        self._drain_body()
+        status = int(params.get("status", ["200"])[0])
+        set_cookies = params.get("set", [])
+        if "key" in params:
+            failed = self._bump_counter(params["key"][0]) <= int(params["fail_times"][0])
+            status = int(params.get("status", ["503"])[0]) if failed else 200
+            set_cookies = set_cookies if failed else []
+        body = json.dumps({"cookie": self.headers.get("Cookie")}).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for value in set_cookies:
+            self.send_header("Set-Cookie", value)
+        if "to" in params:
+            self.send_header("Location", params["to"][0])
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
 
     def _handle_redirect_chain(self, query: str) -> None:
         # `hops` redirects in a row, then a 200.
@@ -895,8 +1127,11 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/events-drops": self._write_sse_drops,
             "/events-then-status": self._write_sse_then_status,
             "/oauth/token-broken": self._handle_oauth_token_broken,
+            "/partial-body": self._handle_partial_body,
+            "/partial-body-seen": self._handle_partial_body_seen,
         }
         plain_routes = {
+            "/count-body": self._handle_count_body,
             "/echo-method": self._handle_echo_method,
             "/events-fields": self._write_sse_fields,
             "/events-echo-accept": self._write_sse_echo_accept,
@@ -906,6 +1141,9 @@ class TestAppHandler(BaseHTTPRequestHandler):
             return True
         if parsed.path in plain_routes:
             plain_routes[parsed.path]()
+            return True
+        if parsed.path.startswith("/cookies/"):
+            self._handle_cookies(parsed.query)
             return True
         return False
 
@@ -1009,6 +1247,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/oauth/token-requests": self._handle_oauth_token_requests,
             "/echo-query": self._handle_echo_query,
             "/slow": self._handle_slow,
+            "/release": self._handle_release,
+            "/longest-gap": self._handle_longest_gap,
             "/peer": self._handle_peer,
             "/peer-closed": self._handle_peer_closed,
             "/endless": self._handle_endless,
@@ -1019,6 +1259,17 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/always-unauthorized": self._handle_always_unauthorized,
             "/json-literal": self._handle_json_literal,
             "/stall-after-first-chunk": self._handle_stall_after_first_chunk,
+            "/stall-unframed": self._handle_stall_unframed,
+            "/echo-request-sse": self._write_sse_echo_request,
+            "/large": self._handle_large,
+            "/events-silent-close": self._write_sse_silent_close,
+            "/connection-close": self._handle_connection_close,
+            "/silent-close": self._handle_silent_close,
+            "/mixed-records": self._handle_mixed_records,
+            "/compressed-zeros": self._handle_compressed_zeros,
+            "/redirect-counted": self._handle_counted_redirect,
+            "/slow-redirect": self._handle_slow_redirect,
+            "/rejects-first-token-then-flaky": self._handle_rejects_first_token_then_flaky,
         }
         if parsed.path in query_routes:
             query_routes[parsed.path](parsed.query)
@@ -1052,8 +1303,6 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/json-array": self._handle_json_array,
             "/deeply-nested-error": self._handle_deeply_nested_error,
             "/crlf-text": self._handle_crlf_text,
-            "/connection-close": self._handle_connection_close,
-            "/silent-close": self._handle_silent_close,
         }
         route = plain_routes.get(parsed.path)
         if route is None:

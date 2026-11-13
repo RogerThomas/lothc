@@ -1,29 +1,43 @@
 """Proxies: `proxy=`/`no_proxy=`, the proxy environment variables, proxy credentials, `CONNECT`
-tunnels and SOCKS5, against `_proxy_server.py`'s stdlib proxies, which record what reached them.
+tunnels, `https://` proxies (TLS to the proxy itself), SOCKS5 and SOCKS4/4a, against
+`_proxy_server.py`'s stdlib proxies, which record what reached them.
 
 Every test starts with no proxy variables set (`_no_proxy_variables`), and `monkeypatch` restores
 the caller's afterwards, so none leaks into another test. `test_wire_format.py` pins the exact
 bytes a proxy receives.
 """
 
+import asyncio
 import socket
+import ssl
+import sys
+import time
 from base64 import b64encode
 from collections.abc import AsyncGenerator, Generator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import urlsplit
 
 import pytest
+import trustme
 from _helpers import clear_proxy_variables, echoed_headers
 from _proxy_server import (
     HTTPProxy,
     ProxiedRequest,
     ProxyBehaviour,
+    ProxyTLSHandshake,
+    Socks4Behaviour,
+    Socks4Proxy,
     SocksBehaviour,
     SocksProxy,
     serve_http_proxy,
+    serve_https_proxy,
+    serve_socks4_proxy,
     serve_socks5_proxy,
 )
+from _tls_server import tls_server_context
 
 from lothc import (
     HTTPClient,
@@ -58,6 +72,30 @@ def _socks_proxy_on_1080() -> Generator[SocksProxy]:
             proxy = stack.enter_context(serve_socks5_proxy(port=1080))
         except OSError:
             pytest.skip("port 1080, SOCKS's default, is in use")
+        yield proxy
+
+
+@pytest.fixture(name="socks4_proxy")
+def _socks4_proxy() -> Generator[Socks4Proxy]:
+    with serve_socks4_proxy() as proxy:
+        yield proxy
+
+
+@pytest.fixture(name="socks4_proxy_on_1080")
+def _socks4_proxy_on_1080() -> Generator[Socks4Proxy]:
+    with ExitStack() as stack:
+        try:
+            proxy = stack.enter_context(serve_socks4_proxy(port=1080))
+        except OSError:
+            pytest.skip("port 1080, SOCKS's default, is in use")
+        yield proxy
+
+
+@pytest.fixture(name="https_proxy")
+def _https_proxy(tls_ca: trustme.CA) -> Generator[HTTPProxy]:
+    """An `https://localhost:<port>` proxy, its certificate (for `localhost` and `127.0.0.1`)
+    issued by the session's CA, as the HTTPS test server's is."""
+    with serve_https_proxy(tls_server_context(tls_ca)) as proxy:
         yield proxy
 
 
@@ -585,6 +623,45 @@ def test_sync_a_stalled_connect_is_bound_by_the_request_timeout(
         client.get("items/7")
 
 
+async def test_a_connect_still_waiting_on_its_proxy_when_the_client_closes_raises_runtime_error(
+    https_base_url: str, tls_ca_pem: bytes
+) -> None:
+    with serve_http_proxy(behaviour=ProxyBehaviour.SILENT) as proxy:
+        client = HTTPClient(
+            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        )
+        await client.__aenter__()
+        request = asyncio.create_task(client.get("items/7"))
+        await asyncio.sleep(0.1)
+        await client.__aexit__(None, None, None)
+        closed_at = time.monotonic()
+
+        with pytest.raises(RuntimeError, match="client is closed"):
+            await request
+        assert time.monotonic() - closed_at < 0.5
+
+
+def test_sync_a_connect_still_waiting_on_its_proxy_when_the_client_closes_raises_runtime_error(
+    https_base_url: str, tls_ca_pem: bytes
+) -> None:
+    with (
+        serve_http_proxy(behaviour=ProxyBehaviour.SILENT) as proxy,
+        ThreadPoolExecutor(max_workers=1) as pool,
+    ):
+        client = SyncHTTPClient(
+            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        )
+        client.__enter__()
+        request = pool.submit(client.get, "items/7")
+        time.sleep(0.1)
+        client.__exit__(None, None, None)
+        closed_at = time.monotonic()
+
+        with pytest.raises(RuntimeError, match="client is closed"):
+            request.result()
+        assert time.monotonic() - closed_at < 0.5
+
+
 # --- The proxy environment variables ----------------------------------------------------------
 
 
@@ -646,6 +723,13 @@ def test_sync_a_proxy_variable_proxies_its_own_scheme(
     assert _proxied_schemes(http_proxy) == proxied
 
 
+# Both variables at once: on Windows, whose environment ignores a name's case, they're one.
+_case_sensitive_environment = pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows environment variable names ignore case"
+)
+
+
+@_case_sensitive_environment
 @pytest.mark.parametrize(
     ("uppercase", "lowercase", "server_url_fixture"),
     [
@@ -674,6 +758,7 @@ async def test_an_uppercase_proxy_variable_wins_over_the_lowercase_one(
     assert len(http_proxy.requests) == 1
 
 
+@_case_sensitive_environment
 @pytest.mark.parametrize(
     ("uppercase", "lowercase", "server_url_fixture"),
     [
@@ -702,6 +787,7 @@ def test_sync_an_uppercase_proxy_variable_wins_over_the_lowercase_one(
     assert len(http_proxy.requests) == 1
 
 
+@_case_sensitive_environment
 async def test_an_uppercase_no_proxy_wins_over_the_lowercase_one(
     base_url: str, http_proxy: HTTPProxy, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -715,6 +801,7 @@ async def test_an_uppercase_no_proxy_wins_over_the_lowercase_one(
     assert _lines(http_proxy) == [f"GET {base_url}items/7 HTTP/1.1"]
 
 
+@_case_sensitive_environment
 def test_sync_an_uppercase_no_proxy_wins_over_the_lowercase_one(
     base_url: str, http_proxy: HTTPProxy, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1306,6 +1393,1051 @@ def test_sync_a_stalled_socks5_handshake_is_bound_by_the_request_timeout(base_ur
         client.get("items/7")
 
 
+# --- SOCKS4 and SOCKS4a -----------------------------------------------------------------------
+
+
+def _socks4_request(port: int) -> bytes:
+    """A SOCKS4 `CONNECT` to `127.0.0.1:<port>` as reqwest writes it: its user ID always empty."""
+    return b"\x04\x01" + port.to_bytes(2) + b"\x7f\x00\x00\x01" + b"\x00"
+
+
+def _socks4a_request(port: int, domain: str) -> bytes:
+    """A SOCKS4a `CONNECT` to `<domain>:<port>`: the address `0.0.0.255`, the empty user ID, then
+    the name."""
+    return (
+        b"\x04\x01" + port.to_bytes(2) + b"\x00\x00\x00\xff" + b"\x00" + domain.encode() + b"\x00"
+    )
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_socks4_sends_the_address_it_resolved_the_host_to(
+    tls_ca_pem: bytes,
+    socks4_proxy: Socks4Proxy,
+    server_url_fixture: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    # `resolve=` decides the address, as it does wherever reqwest resolves a name (`localhost`
+    # alone may resolve to `::1` first, which SOCKS4 can't carry). TLS still checks the name.
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    target = server_url.replace("127.0.0.1", "localhost")
+
+    async with HTTPClient(
+        proxy=f"socks4://{socks4_proxy.address}",
+        root_certificates=[tls_ca_pem],
+        resolve={"localhost": "127.0.0.1"},
+    ) as client:
+        result = await client.get(f"{target}items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert [r.raw for r in socks4_proxy.requests] == [_socks4_request(_port(server_url))]
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_socks4_sends_the_address_it_resolved_the_host_to(
+    tls_ca_pem: bytes,
+    socks4_proxy: Socks4Proxy,
+    server_url_fixture: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    target = server_url.replace("127.0.0.1", "localhost")
+
+    with SyncHTTPClient(
+        proxy=f"socks4://{socks4_proxy.address}",
+        root_certificates=[tls_ca_pem],
+        resolve={"localhost": "127.0.0.1"},
+    ) as client:
+        result = client.get(f"{target}items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert [r.raw for r in socks4_proxy.requests] == [_socks4_request(_port(server_url))]
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_socks4a_leaves_resolving_the_host_to_the_proxy(
+    tls_ca_pem: bytes,
+    socks4_proxy: Socks4Proxy,
+    server_url_fixture: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    # `resolve=` names an address for the host, which the proxy is never told.
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    target = server_url.replace("127.0.0.1", "localhost")
+
+    async with HTTPClient(
+        proxy=f"socks4a://{socks4_proxy.address}",
+        root_certificates=[tls_ca_pem],
+        resolve={"localhost": "127.0.0.2"},
+    ) as client:
+        result = await client.get(f"{target}items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert [r.raw for r in socks4_proxy.requests] == [
+        _socks4a_request(_port(server_url), "localhost")
+    ]
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_socks4a_leaves_resolving_the_host_to_the_proxy(
+    tls_ca_pem: bytes,
+    socks4_proxy: Socks4Proxy,
+    server_url_fixture: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    target = server_url.replace("127.0.0.1", "localhost")
+
+    with SyncHTTPClient(
+        proxy=f"socks4a://{socks4_proxy.address}",
+        root_certificates=[tls_ca_pem],
+        resolve={"localhost": "127.0.0.2"},
+    ) as client:
+        result = client.get(f"{target}items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert [r.raw for r in socks4_proxy.requests] == [
+        _socks4a_request(_port(server_url), "localhost")
+    ]
+
+
+@pytest.mark.parametrize("scheme", ["socks4", "socks4a"])
+async def test_socks4_sends_an_ip_address_as_is(
+    base_url: str, socks4_proxy: Socks4Proxy, scheme: str
+) -> None:
+    async with HTTPClient(base_url=base_url, proxy=f"{scheme}://{socks4_proxy.address}") as client:
+        await client.get("items/7")
+
+    assert [r.raw for r in socks4_proxy.requests] == [_socks4_request(_port(base_url))]
+
+
+@pytest.mark.parametrize("scheme", ["socks4", "socks4a"])
+def test_sync_socks4_sends_an_ip_address_as_is(
+    base_url: str, socks4_proxy: Socks4Proxy, scheme: str
+) -> None:
+    with SyncHTTPClient(base_url=base_url, proxy=f"{scheme}://{socks4_proxy.address}") as client:
+        client.get("items/7")
+
+    assert [r.raw for r in socks4_proxy.requests] == [_socks4_request(_port(base_url))]
+
+
+@pytest.mark.parametrize("scheme", ["socks4", "socks4a"])
+async def test_socks4_never_sends_the_proxy_credentials(
+    base_url: str, socks4_proxy: Socks4Proxy, scheme: str
+) -> None:
+    # hyper-util's SOCKS4 always sends an empty user ID, and nothing else carries them.
+    async with HTTPClient(
+        base_url=base_url, proxy=f"{scheme}://user:pass@{socks4_proxy.address}"
+    ) as client:
+        result = await client.get("echo-headers", into=dict)
+
+    assert [r.user_id for r in socks4_proxy.requests] == [b""]
+    assert "proxy-authorization" not in echoed_headers(result.data)
+
+
+@pytest.mark.parametrize("scheme", ["socks4", "socks4a"])
+def test_sync_socks4_never_sends_the_proxy_credentials(
+    base_url: str, socks4_proxy: Socks4Proxy, scheme: str
+) -> None:
+    with SyncHTTPClient(
+        base_url=base_url, proxy=f"{scheme}://user:pass@{socks4_proxy.address}"
+    ) as client:
+        result = client.get("echo-headers", into=dict)
+
+    assert [r.user_id for r in socks4_proxy.requests] == [b""]
+    assert "proxy-authorization" not in echoed_headers(result.data)
+
+
+async def test_a_socks4_proxy_variable_is_used(
+    base_url: str, socks4_proxy: Socks4Proxy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ALL_PROXY", f"socks4a://{socks4_proxy.address}")
+
+    async with HTTPClient(base_url=base_url.replace("127.0.0.1", "localhost")) as client:
+        result = await client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert [r.domain for r in socks4_proxy.requests] == ["localhost"]
+
+
+def test_sync_a_socks4_proxy_variable_is_used(
+    base_url: str, socks4_proxy: Socks4Proxy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ALL_PROXY", f"socks4a://{socks4_proxy.address}")
+
+    with SyncHTTPClient(base_url=base_url.replace("127.0.0.1", "localhost")) as client:
+        result = client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert [r.domain for r in socks4_proxy.requests] == ["localhost"]
+
+
+@pytest.mark.parametrize("scheme", ["socks4", "socks4a"])
+async def test_a_socks4_proxy_without_a_port_is_on_1080(
+    base_url: str, socks4_proxy_on_1080: Socks4Proxy, scheme: str
+) -> None:
+    async with HTTPClient(base_url=base_url, proxy=f"{scheme}://127.0.0.1") as client:
+        await client.get("items/7")
+
+    assert len(socks4_proxy_on_1080.requests) == 1
+
+
+@pytest.mark.parametrize("scheme", ["socks4", "socks4a"])
+def test_sync_a_socks4_proxy_without_a_port_is_on_1080(
+    base_url: str, socks4_proxy_on_1080: Socks4Proxy, scheme: str
+) -> None:
+    with SyncHTTPClient(base_url=base_url, proxy=f"{scheme}://127.0.0.1") as client:
+        client.get("items/7")
+
+    assert len(socks4_proxy_on_1080.requests) == 1
+
+
+@dataclass(slots=True)
+class _Socks4Failure:
+    id: str
+    message: str
+    scheme: str = "socks4"
+    # `{port}` is the test server's.
+    target: str = "http://127.0.0.1:{port}/items/7"
+    resolve: dict[str, str] = field(default_factory=dict[str, str])
+    behaviour: Socks4Behaviour = Socks4Behaviour.SERVE
+    connect_reply: list[bytes] | None = None
+
+
+def _socks4_failures() -> list[_Socks4Failure]:
+    unparsable = "failed parsing server response"
+    return [
+        _Socks4Failure(
+            "rejected", "server failed to execute command", connect_reply=[b"\x00\x5b" + bytes(6)]
+        ),
+        _Socks4Failure(
+            "ident-failed", "server ident service failed", connect_reply=[b"\x00\x5c" + bytes(6)]
+        ),
+        _Socks4Failure(
+            "ident-mismatch",
+            "server ident service did not recognise client identifier",
+            connect_reply=[b"\x00\x5d" + bytes(6)],
+        ),
+        _Socks4Failure("unknown-status", unparsable, connect_reply=[b"\x00\x5e" + bytes(6)]),
+        _Socks4Failure("wrong-version", unparsable, connect_reply=[b"\x04\x5a" + bytes(6)]),
+        _Socks4Failure(
+            "hang-up", "io error during SOCKS handshake", behaviour=Socks4Behaviour.HANG_UP
+        ),
+        _Socks4Failure(
+            "target-refused", "server failed to execute command", target="http://127.0.0.1:1/"
+        ),
+        _Socks4Failure(
+            "resolved-to-ipv6",
+            "IPV6 is not supported",
+            target="http://ipv6-only.test:{port}/",
+            resolve={"ipv6-only.test": "::1"},
+        ),
+        _Socks4Failure(
+            "ipv6-address", "IPV6 is not supported", scheme="socks4a", target="http://[::1]:{port}/"
+        ),
+        _Socks4Failure(
+            "unresolvable-host",
+            "error resolving for socks proxy",
+            target="http://nonexistent.invalid:{port}/",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("case", _socks4_failures(), ids=lambda case: case.id)
+async def test_a_failed_socks4_handshake_fails_the_request(
+    base_url: str, case: _Socks4Failure
+) -> None:
+    with serve_socks4_proxy(behaviour=case.behaviour, connect_reply=case.connect_reply) as proxy:
+        async with HTTPClient(
+            proxy=f"{case.scheme}://{proxy.address}", resolve=case.resolve, timeout=5.0
+        ) as client:
+            with pytest.raises(HTTPConnectionError, match=case.message):
+                await client.get(case.target.format(port=_port(base_url)))
+
+
+@pytest.mark.parametrize("case", _socks4_failures(), ids=lambda case: case.id)
+def test_sync_a_failed_socks4_handshake_fails_the_request(
+    base_url: str, case: _Socks4Failure
+) -> None:
+    with (
+        serve_socks4_proxy(behaviour=case.behaviour, connect_reply=case.connect_reply) as proxy,
+        SyncHTTPClient(
+            proxy=f"{case.scheme}://{proxy.address}", resolve=case.resolve, timeout=5.0
+        ) as client,
+        pytest.raises(HTTPConnectionError, match=case.message),
+    ):
+        client.get(case.target.format(port=_port(base_url)))
+
+
+async def test_a_socks4_reply_arriving_in_parts_opens_the_connection(base_url: str) -> None:
+    with serve_socks4_proxy(connect_reply=[b"\x00\x5a\x00", b"\x00" * 5]) as proxy:
+        async with HTTPClient(base_url=base_url, proxy=f"socks4://{proxy.address}") as client:
+            result = await client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+
+
+def test_sync_a_socks4_reply_arriving_in_parts_opens_the_connection(base_url: str) -> None:
+    with (
+        serve_socks4_proxy(connect_reply=[b"\x00\x5a\x00", b"\x00" * 5]) as proxy,
+        SyncHTTPClient(base_url=base_url, proxy=f"socks4://{proxy.address}") as client,
+    ):
+        result = client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+
+
+async def test_a_stalled_socks4_handshake_is_bound_by_the_request_timeout(base_url: str) -> None:
+    with serve_socks4_proxy(behaviour=Socks4Behaviour.SILENT) as proxy:
+        async with HTTPClient(
+            base_url=base_url, proxy=f"socks4://{proxy.address}", timeout=0.05
+        ) as client:
+            with pytest.raises(HTTPTimeoutError):
+                await client.get("items/7")
+
+
+def test_sync_a_stalled_socks4_handshake_is_bound_by_the_request_timeout(base_url: str) -> None:
+    with (
+        serve_socks4_proxy(behaviour=Socks4Behaviour.SILENT) as proxy,
+        SyncHTTPClient(
+            base_url=base_url, proxy=f"socks4://{proxy.address}", timeout=0.05
+        ) as client,
+        pytest.raises(HTTPTimeoutError),
+    ):
+        client.get("items/7")
+
+
+# --- https:// proxies: TLS to the proxy itself ------------------------------------------------
+
+
+def _client_certificate_context(tls_ca: trustme.CA) -> ssl.SSLContext:
+    """A server context refusing any client without a certificate issued by `tls_ca`."""
+    context = tls_server_context(tls_ca)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.load_verify_locations(cadata=tls_ca.cert_pem.bytes().decode())
+    return context
+
+
+async def test_an_https_proxy_forwards_an_http_request_over_tls(
+    base_url: str, https_proxy: HTTPProxy, tls_ca_pem: bytes
+) -> None:
+    async with HTTPClient(
+        base_url=base_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        result = await client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert _lines(https_proxy) == [f"GET {base_url}items/7 HTTP/1.1"]
+    # ALPN offers the client's own protocols, as to any https server.
+    assert https_proxy.tls_handshakes == [
+        ProxyTLSHandshake("localhost", "http/1.1", client_certificate=False)
+    ]
+
+
+def test_sync_an_https_proxy_forwards_an_http_request_over_tls(
+    base_url: str, https_proxy: HTTPProxy, tls_ca_pem: bytes
+) -> None:
+    with SyncHTTPClient(
+        base_url=base_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        result = client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert _lines(https_proxy) == [f"GET {base_url}items/7 HTTP/1.1"]
+    assert https_proxy.tls_handshakes == [
+        ProxyTLSHandshake("localhost", "http/1.1", client_certificate=False)
+    ]
+
+
+async def test_an_https_proxy_tunnels_an_https_request_inside_its_tls(
+    https_base_url: str, https_proxy: HTTPProxy, tls_ca_pem: bytes
+) -> None:
+    async with HTTPClient(
+        base_url=https_base_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        result = await client.get("echo-headers", into=dict)
+
+    assert echoed_headers(result.data)["host"] == f"localhost:{_port(https_base_url)}"
+    assert _lines(https_proxy) == [f"CONNECT localhost:{_port(https_base_url)} HTTP/1.1"]
+    # reqwest clears ALPN for the TLS that carries a tunnel; the origin's own TLS still offers it.
+    assert https_proxy.tls_handshakes == [
+        ProxyTLSHandshake("localhost", None, client_certificate=False)
+    ]
+
+
+def test_sync_an_https_proxy_tunnels_an_https_request_inside_its_tls(
+    https_base_url: str, https_proxy: HTTPProxy, tls_ca_pem: bytes
+) -> None:
+    with SyncHTTPClient(
+        base_url=https_base_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        result = client.get("echo-headers", into=dict)
+
+    assert echoed_headers(result.data)["host"] == f"localhost:{_port(https_base_url)}"
+    assert _lines(https_proxy) == [f"CONNECT localhost:{_port(https_base_url)} HTTP/1.1"]
+    assert https_proxy.tls_handshakes == [
+        ProxyTLSHandshake("localhost", None, client_certificate=False)
+    ]
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_a_large_body_crosses_an_https_proxy_both_ways(
+    tls_ca_pem: bytes,
+    https_proxy: HTTPProxy,
+    server_url_fixture: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+
+    async with HTTPClient(
+        base_url=server_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        result = await client.post("echo-request", content=b"x" * 300_000, into=dict)
+
+    assert result.data["body"] == "x" * 300_000
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_a_large_body_crosses_an_https_proxy_both_ways(
+    tls_ca_pem: bytes,
+    https_proxy: HTTPProxy,
+    server_url_fixture: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+
+    with SyncHTTPClient(
+        base_url=server_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        result = client.post("echo-request", content=b"x" * 300_000, into=dict)
+
+    assert result.data["body"] == "x" * 300_000
+
+
+async def test_a_body_read_late_in_tls_records_of_mixed_sizes_crosses_an_https_proxy(
+    https_base_url: str, https_proxy: HTTPProxy, tls_ca_pem: bytes
+) -> None:
+    # `test_tls.py`'s case inside a tunnel: the origin's TLS records reach the tunnel's TLS as the
+    # origin wrote them, while the proxy's TLS carries them in records of its own sizes.
+    async with HTTPClient(
+        base_url=https_base_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        stream = client.stream_get("mixed-records", params={"rounds": 12})
+        received = len(await anext(stream))
+        await asyncio.sleep(0.1)
+        received += sum([len(chunk) async for chunk in stream])
+
+    assert received == 12 * (16 * 1024 + 150)
+
+
+def test_sync_a_body_read_late_in_tls_records_of_mixed_sizes_crosses_an_https_proxy(
+    https_base_url: str, https_proxy: HTTPProxy, tls_ca_pem: bytes
+) -> None:
+    with SyncHTTPClient(
+        base_url=https_base_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        stream = client.stream_get("mixed-records", params={"rounds": 12})
+        received = len(next(stream))
+        time.sleep(0.1)
+        received += sum(len(chunk) for chunk in stream)
+
+    assert received == 12 * (16 * 1024 + 150)
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_an_https_proxy_gets_its_credentials_as_proxy_authorization(
+    tls_ca: trustme.CA, tls_ca_pem: bytes, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    # On the forwarded request, or on the `CONNECT`.
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    with serve_https_proxy(tls_server_context(tls_ca), credentials=("user", "pass")) as proxy:
+        async with HTTPClient(
+            base_url=server_url,
+            proxy=_with_userinfo(proxy.url, "user:pass@"),
+            root_certificates=[tls_ca_pem],
+        ) as client:
+            result = await client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert _headers_named(proxy.requests[0], "Proxy-Authorization") == [_basic("user", "pass")]
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_an_https_proxy_gets_its_credentials_as_proxy_authorization(
+    tls_ca: trustme.CA, tls_ca_pem: bytes, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    with (
+        serve_https_proxy(tls_server_context(tls_ca), credentials=("user", "pass")) as proxy,
+        SyncHTTPClient(
+            base_url=server_url,
+            proxy=_with_userinfo(proxy.url, "user:pass@"),
+            root_certificates=[tls_ca_pem],
+        ) as client,
+    ):
+        result = client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert _headers_named(proxy.requests[0], "Proxy-Authorization") == [_basic("user", "pass")]
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_an_https_proxy_certificate_must_be_trusted(
+    https_proxy: HTTPProxy, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+
+    async with HTTPClient(base_url=server_url, proxy=https_proxy.url) as client:
+        with pytest.raises(HTTPConnectionError, match="UnknownIssuer"):
+            await client.get("items/7")
+
+    assert https_proxy.requests == []
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_an_https_proxy_certificate_must_be_trusted(
+    https_proxy: HTTPProxy, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+
+    with (
+        SyncHTTPClient(base_url=server_url, proxy=https_proxy.url) as client,
+        pytest.raises(HTTPConnectionError, match="UnknownIssuer"),
+    ):
+        client.get("items/7")
+
+    assert https_proxy.requests == []
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_an_https_proxy_certificate_must_name_the_proxy(
+    tls_ca: trustme.CA, tls_ca_pem: bytes, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    with serve_https_proxy(tls_server_context(tls_ca, ("other-name.test",))) as proxy:
+        async with HTTPClient(
+            base_url=server_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        ) as client:
+            with pytest.raises(HTTPConnectionError, match=r"NotValidForName|not valid for name"):
+                await client.get("items/7")
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_an_https_proxy_certificate_must_name_the_proxy(
+    tls_ca: trustme.CA, tls_ca_pem: bytes, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    with (
+        serve_https_proxy(tls_server_context(tls_ca, ("other-name.test",))) as proxy,
+        SyncHTTPClient(
+            base_url=server_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        ) as client,
+        pytest.raises(HTTPConnectionError, match=r"NotValidForName|not valid for name"),
+    ):
+        client.get("items/7")
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_an_https_proxy_named_by_its_address_is_sent_no_server_name(
+    tls_ca: trustme.CA, tls_ca_pem: bytes, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    # Its certificate is checked against the address instead.
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    with serve_https_proxy(tls_server_context(tls_ca), host="127.0.0.1") as proxy:
+        async with HTTPClient(
+            base_url=server_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        ) as client:
+            result = await client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert [handshake.server_name for handshake in proxy.tls_handshakes] == [None]
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_an_https_proxy_named_by_its_address_is_sent_no_server_name(
+    tls_ca: trustme.CA, tls_ca_pem: bytes, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    with (
+        serve_https_proxy(tls_server_context(tls_ca), host="127.0.0.1") as proxy,
+        SyncHTTPClient(
+            base_url=server_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        ) as client,
+    ):
+        result = client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert [handshake.server_name for handshake in proxy.tls_handshakes] == [None]
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_resolve_overrides_an_https_proxy_host_whose_name_tls_still_checks(
+    tls_ca: trustme.CA, tls_ca_pem: bytes, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    context = tls_server_context(tls_ca, ("proxy.test",))
+    with serve_https_proxy(context, host="proxy.test") as proxy:
+        async with HTTPClient(
+            base_url=server_url,
+            proxy=proxy.url,
+            root_certificates=[tls_ca_pem],
+            resolve={"proxy.test": "127.0.0.1"},
+        ) as client:
+            result = await client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert [handshake.server_name for handshake in proxy.tls_handshakes] == ["proxy.test"]
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_resolve_overrides_an_https_proxy_host_whose_name_tls_still_checks(
+    tls_ca: trustme.CA, tls_ca_pem: bytes, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    context = tls_server_context(tls_ca, ("proxy.test",))
+    with (
+        serve_https_proxy(context, host="proxy.test") as proxy,
+        SyncHTTPClient(
+            base_url=server_url,
+            proxy=proxy.url,
+            root_certificates=[tls_ca_pem],
+            resolve={"proxy.test": "127.0.0.1"},
+        ) as client,
+    ):
+        result = client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert [handshake.server_name for handshake in proxy.tls_handshakes] == ["proxy.test"]
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_danger_accept_invalid_certs_accepts_an_untrusted_https_proxy(
+    https_proxy: HTTPProxy, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+
+    async with HTTPClient(
+        base_url=server_url, proxy=https_proxy.url, danger_accept_invalid_certs=True
+    ) as client:
+        result = await client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_danger_accept_invalid_certs_accepts_an_untrusted_https_proxy(
+    https_proxy: HTTPProxy, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+
+    with SyncHTTPClient(
+        base_url=server_url, proxy=https_proxy.url, danger_accept_invalid_certs=True
+    ) as client:
+        result = client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_identity_pem_is_presented_to_an_https_proxy_asking_for_one(
+    tls_ca: trustme.CA,
+    tls_ca_pem: bytes,
+    tls_client_identity_pem: bytes,
+    server_url_fixture: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    with serve_https_proxy(_client_certificate_context(tls_ca)) as proxy:
+        async with HTTPClient(
+            base_url=server_url,
+            proxy=proxy.url,
+            root_certificates=[tls_ca_pem],
+            identity_pem=tls_client_identity_pem,
+        ) as client:
+            result = await client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert [handshake.client_certificate for handshake in proxy.tls_handshakes] == [True]
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_identity_pem_is_presented_to_an_https_proxy_asking_for_one(
+    tls_ca: trustme.CA,
+    tls_ca_pem: bytes,
+    tls_client_identity_pem: bytes,
+    server_url_fixture: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    with (
+        serve_https_proxy(_client_certificate_context(tls_ca)) as proxy,
+        SyncHTTPClient(
+            base_url=server_url,
+            proxy=proxy.url,
+            root_certificates=[tls_ca_pem],
+            identity_pem=tls_client_identity_pem,
+        ) as client,
+    ):
+        result = client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert [handshake.client_certificate for handshake in proxy.tls_handshakes] == [True]
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_an_https_proxy_asking_for_a_client_certificate_refuses_a_client_without_one(
+    tls_ca: trustme.CA, tls_ca_pem: bytes, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    with serve_https_proxy(_client_certificate_context(tls_ca)) as proxy:
+        async with HTTPClient(
+            base_url=server_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        ) as client:
+            with pytest.raises(HTTPConnectionError, match="CertificateRequired"):
+                await client.get("items/7")
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_an_https_proxy_asking_for_a_client_certificate_refuses_a_client_without_one(
+    tls_ca: trustme.CA, tls_ca_pem: bytes, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    with (
+        serve_https_proxy(_client_certificate_context(tls_ca)) as proxy,
+        SyncHTTPClient(
+            base_url=server_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        ) as client,
+        pytest.raises(HTTPConnectionError, match="CertificateRequired"),
+    ):
+        client.get("items/7")
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_tls_versions_apply_to_an_https_proxy(
+    tls_ca: trustme.CA, tls_ca_pem: bytes, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    context = tls_server_context(tls_ca)
+    context.maximum_version = ssl.TLSVersion.TLSv1_2
+    with serve_https_proxy(context) as proxy:
+        async with HTTPClient(
+            base_url=server_url,
+            proxy=proxy.url,
+            root_certificates=[tls_ca_pem],
+            min_tls_version="TLSv1.3",
+        ) as client:
+            with pytest.raises(HTTPConnectionError, match="ProtocolVersion"):
+                await client.get("items/7")
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_tls_versions_apply_to_an_https_proxy(
+    tls_ca: trustme.CA, tls_ca_pem: bytes, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    context = tls_server_context(tls_ca)
+    context.maximum_version = ssl.TLSVersion.TLSv1_2
+    with (
+        serve_https_proxy(context) as proxy,
+        SyncHTTPClient(
+            base_url=server_url,
+            proxy=proxy.url,
+            root_certificates=[tls_ca_pem],
+            min_tls_version="TLSv1.3",
+        ) as client,
+        pytest.raises(HTTPConnectionError, match="ProtocolVersion"),
+    ):
+        client.get("items/7")
+
+
+@pytest.mark.parametrize(
+    ("connect_status", "message"),
+    [(403, "tunnel error: unsuccessful"), (407, "tunnel error: proxy authorization required")],
+    ids=["refused", "needs-credentials"],
+)
+async def test_a_connect_an_https_proxy_refuses_fails_the_request(
+    https_base_url: str, tls_ca: trustme.CA, tls_ca_pem: bytes, connect_status: int, message: str
+) -> None:
+    with serve_https_proxy(tls_server_context(tls_ca), connect_status=connect_status) as proxy:
+        async with HTTPClient(
+            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        ) as client:
+            with pytest.raises(HTTPConnectionError, match=message):
+                await client.get("items/7")
+
+
+@pytest.mark.parametrize(
+    ("connect_status", "message"),
+    [(403, "tunnel error: unsuccessful"), (407, "tunnel error: proxy authorization required")],
+    ids=["refused", "needs-credentials"],
+)
+def test_sync_a_connect_an_https_proxy_refuses_fails_the_request(
+    https_base_url: str, tls_ca: trustme.CA, tls_ca_pem: bytes, connect_status: int, message: str
+) -> None:
+    with (
+        serve_https_proxy(tls_server_context(tls_ca), connect_status=connect_status) as proxy,
+        SyncHTTPClient(
+            base_url=https_base_url, proxy=proxy.url, root_certificates=[tls_ca_pem]
+        ) as client,
+        pytest.raises(HTTPConnectionError, match=message),
+    ):
+        client.get("items/7")
+
+
+def _stalled_handshake_timeouts() -> list[dict[str, Any]]:
+    """The request's total timeout, or `connect_timeout` under a total one far longer than the
+    test lets it take."""
+    return [{"timeout": 0.05}, {"connect_timeout": 0.05, "timeout": 5.0}]
+
+
+@pytest.mark.parametrize("timeouts", _stalled_handshake_timeouts(), ids=["timeout", "connect"])
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_a_stalled_https_proxy_handshake_times_out(
+    tls_ca: trustme.CA,
+    tls_ca_pem: bytes,
+    server_url_fixture: str,
+    timeouts: dict[str, Any],
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    with serve_https_proxy(tls_server_context(tls_ca), stalled_handshake=b"") as proxy:
+        async with HTTPClient(
+            base_url=server_url, proxy=proxy.url, root_certificates=[tls_ca_pem], **timeouts
+        ) as client:
+            started = time.monotonic()
+            with pytest.raises(HTTPTimeoutError):
+                await client.get("items/7")
+
+    assert time.monotonic() - started < 1.0
+
+
+@pytest.mark.parametrize("timeouts", _stalled_handshake_timeouts(), ids=["timeout", "connect"])
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_a_stalled_https_proxy_handshake_times_out(
+    tls_ca: trustme.CA,
+    tls_ca_pem: bytes,
+    server_url_fixture: str,
+    timeouts: dict[str, Any],
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    with (
+        serve_https_proxy(tls_server_context(tls_ca), stalled_handshake=b"") as proxy,
+        SyncHTTPClient(
+            base_url=server_url, proxy=proxy.url, root_certificates=[tls_ca_pem], **timeouts
+        ) as client,
+    ):
+        started = time.monotonic()
+        with pytest.raises(HTTPTimeoutError):
+            client.get("items/7")
+
+    assert time.monotonic() - started < 1.0
+
+
+# `connect_timeout` also covers the proxy's own TLS handshake, which a busy machine made outlast
+# it now and then (5 tries in 80): a try timed out before its `CONNECT` reached the proxy shows
+# nothing about the origin's handshake, so it is made again, for up to 2s. How long the try that
+# did reach it took to time out.
+async def _timed_out_inside_the_tunnel(client: HTTPClient, proxy: HTTPProxy, url: str) -> float:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        tunnels = len(proxy.requests)
+        started = time.monotonic()
+        with pytest.raises(HTTPTimeoutError):
+            await client.get(url)
+        if len(proxy.requests) > tunnels:
+            return time.monotonic() - started
+    raise AssertionError("no try's CONNECT reached the proxy within connect_timeout")
+
+
+def _sync_timed_out_inside_the_tunnel(client: SyncHTTPClient, proxy: HTTPProxy, url: str) -> float:
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        tunnels = len(proxy.requests)
+        started = time.monotonic()
+        with pytest.raises(HTTPTimeoutError):
+            client.get(url)
+        if len(proxy.requests) > tunnels:
+            return time.monotonic() - started
+    raise AssertionError("no try's CONNECT reached the proxy within connect_timeout")
+
+
+async def test_connect_timeout_covers_the_origin_handshake_inside_an_https_proxy_tunnel(
+    tls_ca: trustme.CA, tls_ca_pem: bytes
+) -> None:
+    # The proxy tunnels to a server that starts a TLS handshake but never finishes it: what
+    # arrives through the proxy's TLS mustn't count as the origin's handshake finishing.
+    with (
+        serve_https_proxy(tls_server_context(tls_ca), stalled_handshake=b"\x16\x03\x03") as origin,
+        # The proxy as `127.0.0.1`, not `localhost`, which also resolves to `::1`: Windows takes
+        # about a second to refuse that, more than the `connect_timeout`.
+        serve_https_proxy(
+            tls_server_context(tls_ca), host="127.0.0.1", upstream_port=_port(origin.url)
+        ) as proxy,
+    ):
+        async with HTTPClient(
+            proxy=proxy.url, root_certificates=[tls_ca_pem], connect_timeout=0.05, timeout=5.0
+        ) as client:
+            waited = await _timed_out_inside_the_tunnel(client, proxy, f"{origin.url}/items/7")
+
+    assert waited < 1.0
+    assert set(_lines(proxy)) == {f"CONNECT localhost:{_port(origin.url)} HTTP/1.1"}
+
+
+def test_sync_connect_timeout_covers_the_origin_handshake_inside_an_https_proxy_tunnel(
+    tls_ca: trustme.CA, tls_ca_pem: bytes
+) -> None:
+    with (
+        serve_https_proxy(tls_server_context(tls_ca), stalled_handshake=b"\x16\x03\x03") as origin,
+        # The proxy as `127.0.0.1`, not `localhost`, which also resolves to `::1`: Windows takes
+        # about a second to refuse that, more than the `connect_timeout`.
+        serve_https_proxy(
+            tls_server_context(tls_ca), host="127.0.0.1", upstream_port=_port(origin.url)
+        ) as proxy,
+        SyncHTTPClient(
+            proxy=proxy.url, root_certificates=[tls_ca_pem], connect_timeout=0.05, timeout=5.0
+        ) as client,
+    ):
+        waited = _sync_timed_out_inside_the_tunnel(client, proxy, f"{origin.url}/items/7")
+
+    assert waited < 1.0
+    assert set(_lines(proxy)) == {f"CONNECT localhost:{_port(origin.url)} HTTP/1.1"}
+
+
+@pytest.mark.parametrize(
+    ("variable", "server_url_fixture"),
+    [("HTTP_PROXY", "base_url"), ("HTTPS_PROXY", "https_base_url"), ("ALL_PROXY", "base_url")],
+)
+async def test_an_https_proxy_variable_is_used(
+    tls_ca_pem: bytes,
+    https_proxy: HTTPProxy,
+    variable: str,
+    server_url_fixture: str,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    monkeypatch.setenv(variable, https_proxy.url)
+
+    async with HTTPClient(base_url=server_url, root_certificates=[tls_ca_pem]) as client:
+        result = await client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert len(https_proxy.requests) == 1
+
+
+@pytest.mark.parametrize(
+    ("variable", "server_url_fixture"),
+    [("HTTP_PROXY", "base_url"), ("HTTPS_PROXY", "https_base_url"), ("ALL_PROXY", "base_url")],
+)
+def test_sync_an_https_proxy_variable_is_used(
+    tls_ca_pem: bytes,
+    https_proxy: HTTPProxy,
+    variable: str,
+    server_url_fixture: str,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+    monkeypatch.setenv(variable, https_proxy.url)
+
+    with SyncHTTPClient(base_url=server_url, root_certificates=[tls_ca_pem]) as client:
+        result = client.get("items/7", into=dict)
+
+    assert result.data == {"id": 7, "name": "item-7"}
+    assert len(https_proxy.requests) == 1
+
+
+# --- Either kind: no_proxy=, and an unreachable proxy -----------------------------------------
+
+
+async def test_no_proxy_hosts_bypass_an_https_proxy(
+    base_url: str, https_proxy: HTTPProxy, tls_ca_pem: bytes
+) -> None:
+    other_origin = base_url.replace("127.0.0.1", "localhost")
+    async with HTTPClient(
+        proxy=https_proxy.url, no_proxy=["127.0.0.1"], root_certificates=[tls_ca_pem]
+    ) as client:
+        await client.get(f"{base_url}items/7")
+        await client.get(f"{other_origin}items/7")
+
+    assert _lines(https_proxy) == [f"GET {other_origin}items/7 HTTP/1.1"]
+
+
+def test_sync_no_proxy_hosts_bypass_an_https_proxy(
+    base_url: str, https_proxy: HTTPProxy, tls_ca_pem: bytes
+) -> None:
+    other_origin = base_url.replace("127.0.0.1", "localhost")
+    with SyncHTTPClient(
+        proxy=https_proxy.url, no_proxy=["127.0.0.1"], root_certificates=[tls_ca_pem]
+    ) as client:
+        client.get(f"{base_url}items/7")
+        client.get(f"{other_origin}items/7")
+
+    assert _lines(https_proxy) == [f"GET {other_origin}items/7 HTTP/1.1"]
+
+
+async def test_no_proxy_hosts_bypass_a_socks4_proxy(
+    base_url: str, socks4_proxy: Socks4Proxy
+) -> None:
+    other_origin = base_url.replace("127.0.0.1", "localhost")
+    async with HTTPClient(
+        proxy=f"socks4a://{socks4_proxy.address}", no_proxy=["127.0.0.1"]
+    ) as client:
+        await client.get(f"{base_url}items/7")
+        await client.get(f"{other_origin}items/7")
+
+    assert [r.domain for r in socks4_proxy.requests] == ["localhost"]
+
+
+def test_sync_no_proxy_hosts_bypass_a_socks4_proxy(
+    base_url: str, socks4_proxy: Socks4Proxy
+) -> None:
+    other_origin = base_url.replace("127.0.0.1", "localhost")
+    with SyncHTTPClient(
+        proxy=f"socks4a://{socks4_proxy.address}", no_proxy=["127.0.0.1"]
+    ) as client:
+        client.get(f"{base_url}items/7")
+        client.get(f"{other_origin}items/7")
+
+    assert [r.domain for r in socks4_proxy.requests] == ["localhost"]
+
+
+def _unreachable_proxies() -> list[str]:
+    """A proxy of each kind on a port nothing listens on."""
+    return [
+        f"{scheme}://127.0.0.1:1"
+        for scheme in ("http", "https", "socks4", "socks4a", "socks5", "socks5h")
+    ]
+
+
+@pytest.mark.parametrize("proxy", _unreachable_proxies())
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_an_unreachable_proxy_fails_the_request(
+    tls_ca_pem: bytes, proxy: str, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+
+    async with HTTPClient(
+        base_url=server_url, proxy=proxy, root_certificates=[tls_ca_pem]
+    ) as client:
+        with pytest.raises(HTTPConnectionError):
+            await client.get("items/7")
+
+
+@pytest.mark.parametrize("proxy", _unreachable_proxies())
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_an_unreachable_proxy_fails_the_request(
+    tls_ca_pem: bytes, proxy: str, server_url_fixture: str, request: pytest.FixtureRequest
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+
+    with (
+        SyncHTTPClient(base_url=server_url, proxy=proxy, root_certificates=[tls_ca_pem]) as client,
+        pytest.raises(HTTPConnectionError),
+    ):
+        client.get("items/7")
+
+
 # --- Pooling ----------------------------------------------------------------------------------
 
 
@@ -1335,22 +2467,23 @@ def test_sync_each_proxied_origin_reuses_its_own_connection(
     assert first != second
 
 
-async def test_a_tunnel_is_reused_like_a_direct_connection(
-    http_proxy: HTTPProxy, tunnel_client: HTTPClient
-) -> None:
-    await tunnel_client.get("items/7")
-    await tunnel_client.get("items/7")
+async def test_a_tunnel_is_reused_like_a_direct_connection(tunnel_client: HTTPClient) -> None:
+    first = await tunnel_client.get("peer", into=dict)
+    second = await tunnel_client.get("peer", into=dict)
 
-    assert len(http_proxy.requests) == 1
+    # The server's peer is the proxy's end of the tunnel. Not a count of the proxy's CONNECTs: a
+    # request that finds no idle connection yet also starts a new one, so a second CONNECT can
+    # race the first tunnel's return to the pool, and lose to it.
+    assert first.data["port"] == second.data["port"]
 
 
 def test_sync_a_tunnel_is_reused_like_a_direct_connection(
-    http_proxy: HTTPProxy, sync_tunnel_client: SyncHTTPClient
+    sync_tunnel_client: SyncHTTPClient,
 ) -> None:
-    sync_tunnel_client.get("items/7")
-    sync_tunnel_client.get("items/7")
+    first = sync_tunnel_client.get("peer", into=dict)
+    second = sync_tunnel_client.get("peer", into=dict)
 
-    assert len(http_proxy.requests) == 1
+    assert first.data["port"] == second.data["port"]
 
 
 async def test_direct_and_proxied_origins_keep_separate_connections(
@@ -1381,3 +2514,62 @@ def test_sync_direct_and_proxied_origins_keep_separate_connections(
     assert _lines(http_proxy) == [f"GET {base_url}items/7 HTTP/1.1"] * 2
     assert len({request.client_port for request in http_proxy.requests}) == 1
     assert direct_ports[0] == direct_ports[1]
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+async def test_a_connection_through_an_https_proxy_is_reused(
+    tls_ca_pem: bytes,
+    https_proxy: HTTPProxy,
+    server_url_fixture: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+
+    async with HTTPClient(
+        base_url=server_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        await client.get("items/7")
+        await client.get("items/7")
+
+    assert len(https_proxy.tls_handshakes) == 1
+    # Two forwarded requests on the one connection, or the one `CONNECT`.
+    assert len({r.client_port for r in https_proxy.requests}) == 1
+
+
+@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
+def test_sync_a_connection_through_an_https_proxy_is_reused(
+    tls_ca_pem: bytes,
+    https_proxy: HTTPProxy,
+    server_url_fixture: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    server_url: str = request.getfixturevalue(server_url_fixture)
+
+    with SyncHTTPClient(
+        base_url=server_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        client.get("items/7")
+        client.get("items/7")
+
+    assert len(https_proxy.tls_handshakes) == 1
+    assert len({r.client_port for r in https_proxy.requests}) == 1
+
+
+async def test_a_connection_through_a_socks4_proxy_is_reused(
+    base_url: str, socks4_proxy: Socks4Proxy
+) -> None:
+    async with HTTPClient(base_url=base_url, proxy=f"socks4://{socks4_proxy.address}") as client:
+        await client.get("items/7")
+        await client.get("items/7")
+
+    assert len(socks4_proxy.requests) == 1
+
+
+def test_sync_a_connection_through_a_socks4_proxy_is_reused(
+    base_url: str, socks4_proxy: Socks4Proxy
+) -> None:
+    with SyncHTTPClient(base_url=base_url, proxy=f"socks4://{socks4_proxy.address}") as client:
+        client.get("items/7")
+        client.get("items/7")
+
+    assert len(socks4_proxy.requests) == 1

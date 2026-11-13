@@ -7,7 +7,9 @@ TLS alert/verification failure pyreqwest (rustls) reports, so it can't pass for 
 reason like a refused connection.
 """
 
+import asyncio
 import ssl
+import time
 from collections.abc import Generator
 
 import pytest
@@ -577,3 +579,31 @@ def test_sync_http2_over_tls_falls_back_to_http1_via_alpn(
         result = client.get("items/7", into=dict).data
 
     assert result == {"id": 7, "name": "item-7"}
+
+
+async def test_a_body_read_late_in_tls_records_of_mixed_sizes_arrives_whole(
+    https_base_url: str, tls_ca_pem: bytes
+) -> None:
+    # Full 16KB records each followed by tiny ones, read only once they're waiting in the socket:
+    # one read from it then holds more plaintext than rustls buffers, which must be handed on
+    # before the rest of that read goes in. 12 rounds give more full reads than any alignment of
+    # reads to records needs to hit that.
+    async with HTTPClient(base_url=https_base_url, root_certificates=[tls_ca_pem]) as client:
+        stream = client.stream_get("mixed-records", params={"rounds": 12})
+        received = len(await anext(stream))
+        await asyncio.sleep(0.1)
+        received += sum([len(chunk) async for chunk in stream])
+
+    assert received == 12 * (16 * 1024 + 150)
+
+
+def test_sync_a_body_read_late_in_tls_records_of_mixed_sizes_arrives_whole(
+    https_base_url: str, tls_ca_pem: bytes
+) -> None:
+    with SyncHTTPClient(base_url=https_base_url, root_certificates=[tls_ca_pem]) as client:
+        stream = client.stream_get("mixed-records", params={"rounds": 12})
+        received = len(next(stream))
+        time.sleep(0.1)
+        received += sum(len(chunk) for chunk in stream)
+
+    assert received == 12 * (16 * 1024 + 150)

@@ -278,3 +278,36 @@ def test_sync_a_401_on_a_form_put_invalidates_the_token_without_a_replay(
     assert exc_info.value.status == 401
     assert follow_up["attempts"] == 2
     assert len(token_server.requests()) == 2
+
+
+# An empty form is an empty body, which can be replayed, so a 401 on one is retried as any PUT.
+async def test_a_401_on_an_empty_form_put_is_replayed_with_a_fresh_token(
+    token_server: TokenServer, reauth_client: HTTPClient
+) -> None:
+    api_key = f"{token_server.key}-api"
+    result = (
+        await reauth_client.put(
+            "status-then-ok",
+            params={"key": api_key, "status": 401, "fail_times": 1},
+            form={},
+            into=dict,
+        )
+    ).data
+
+    assert result == {"attempts": 2, "bodies": ["", ""]}
+    assert len(token_server.requests()) == 2
+
+
+def test_sync_a_401_on_an_empty_form_put_is_replayed_with_a_fresh_token(
+    token_server: TokenServer, sync_reauth_client: SyncHTTPClient
+) -> None:
+    api_key = f"{token_server.key}-api"
+    result = sync_reauth_client.put(
+        "status-then-ok",
+        params={"key": api_key, "status": 401, "fail_times": 1},
+        form={},
+        into=dict,
+    ).data
+
+    assert result == {"attempts": 2, "bodies": ["", ""]}
+    assert len(token_server.requests()) == 2

@@ -3,6 +3,7 @@ import base64
 import json
 import re
 import socket
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -12,7 +13,7 @@ from urllib.parse import quote
 
 import msgspec
 import pytest
-from _helpers import echoed_headers
+from _helpers import echoed_headers, make_unreadable, read_only_directory
 from _oauth_server import TokenEndpoint, TokenServer
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -495,6 +496,7 @@ def test_sync_custom_models_without_token_refresh_request_mint_again(
     assert "refreshToken" not in renewal["body"]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows files have no POSIX mode bits")
 async def test_token_cache_dir_writes_token_file_with_owner_only_permissions(
     base_url: str, token_server: TokenServer
 ) -> None:
@@ -509,6 +511,7 @@ async def test_token_cache_dir_writes_token_file_with_owner_only_permissions(
     assert cached["client_id"] == "client-id"
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows files have no POSIX mode bits")
 def test_sync_token_cache_dir_writes_token_file_with_owner_only_permissions(
     base_url: str, token_server: TokenServer
 ) -> None:
@@ -1199,13 +1202,11 @@ async def test_failing_to_write_the_token_cache_warns_but_still_uses_the_token(
     # The token was obtained; only persisting it failed, and the cache "adds persistence only",
     # so the caller's own request must still go through rather than fail on a full disk.
     provider = token_server.provider(cached=True)
-    token_server.cache_dir.chmod(0o500)  # no longer writable, but it still existed at construction
-    try:
+    # No longer writable, but it still existed at construction.
+    with read_only_directory(token_server.cache_dir):
         async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
             with pytest.warns(RuntimeWarning, match="Could not write the OAuth token cache"):
                 authorization = await _bearer(api)
-    finally:
-        token_server.cache_dir.chmod(0o700)
 
     assert authorization == "Bearer token-1"
     assert list(token_server.cache_dir.iterdir()) == []
@@ -1242,7 +1243,7 @@ def _damage_cache_file(cache_file: Path, damage: str) -> None:
         case "corrupt":
             cache_file.write_bytes(b"not json")
         case "unreadable":
-            cache_file.chmod(0o000)
+            make_unreadable(cache_file)
         case _:
             cache_file.unlink()
 
@@ -1442,12 +1443,11 @@ async def test_failing_to_mark_the_token_cache_expired_warns_rather_than_raises(
 ) -> None:
     provider = token_server.provider(TokenEndpoint(expires_in=3600), cached=True)
     assert await provider() == "token-1"
-    token_server.cache_dir.chmod(0o500)  # the file can't be replaced any more
-    try:
-        with pytest.warns(RuntimeWarning, match="Could not mark the OAuth token cache"):
-            provider.invalidate()
-    finally:
-        token_server.cache_dir.chmod(0o700)
+    with (
+        read_only_directory(token_server.cache_dir),  # the file can't be replaced any more
+        pytest.warns(RuntimeWarning, match="Could not mark the OAuth token cache"),
+    ):
+        provider.invalidate()
 
     assert await provider() == "token-2"
 

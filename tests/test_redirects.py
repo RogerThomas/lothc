@@ -228,6 +228,106 @@ def test_sync_a_put_becomes_a_get_only_on_a_303(
     assert result["body"] == ("" if method == "GET" else "content")
 
 
+# A multipart form with parts is streamed, so a redirect that would have to send it again isn't
+# followed (tower-http can't copy the body): its 307 or 308, or a PUT's 301 or 302, is the response.
+@pytest.mark.parametrize("status", [307, 308])
+async def test_a_form_post_redirected_by_307_or_308_is_not_followed(
+    client: HTTPClient, status: int
+) -> None:
+    response = await client.post(
+        "redirect-to", params={"to": "/echo-method", "status": status}, form={"a": "b"}
+    )
+
+    assert response.status == status
+
+
+@pytest.mark.parametrize("status", [307, 308])
+def test_sync_a_form_post_redirected_by_307_or_308_is_not_followed(
+    sync_client: SyncHTTPClient, status: int
+) -> None:
+    response = sync_client.post(
+        "redirect-to", params={"to": "/echo-method", "status": status}, form={"a": "b"}
+    )
+
+    assert response.status == status
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+async def test_a_form_put_redirected_other_than_by_303_is_not_followed(
+    client: HTTPClient, status: int
+) -> None:
+    response = await client.put(
+        "redirect-to", params={"to": "/echo-method", "status": status}, form={"a": "b"}
+    )
+
+    assert response.status == status
+
+
+@pytest.mark.parametrize("status", [301, 302, 307, 308])
+def test_sync_a_form_put_redirected_other_than_by_303_is_not_followed(
+    sync_client: SyncHTTPClient, status: int
+) -> None:
+    response = sync_client.put(
+        "redirect-to", params={"to": "/echo-method", "status": status}, form={"a": "b"}
+    )
+
+    assert response.status == status
+
+
+@pytest.mark.parametrize("status", [301, 302, 303])
+async def test_a_form_post_redirected_by_301_302_or_303_becomes_a_get_without_it(
+    client: HTTPClient, status: int
+) -> None:
+    result = (
+        await client.post(
+            "redirect-to",
+            params={"to": "/echo-method", "status": status},
+            form={"a": "b"},
+            into=dict,
+        )
+    ).data
+
+    assert result == {"method": "GET", "body": "", "content_type": None}
+
+
+@pytest.mark.parametrize("status", [301, 302, 303])
+def test_sync_a_form_post_redirected_by_301_302_or_303_becomes_a_get_without_it(
+    sync_client: SyncHTTPClient, status: int
+) -> None:
+    result = sync_client.post(
+        "redirect-to", params={"to": "/echo-method", "status": status}, form={"a": "b"}, into=dict
+    ).data
+
+    assert result == {"method": "GET", "body": "", "content_type": None}
+
+
+# An empty form is an empty body, which can be sent again.
+@pytest.mark.parametrize("status", [307, 308])
+async def test_an_empty_form_post_redirected_by_307_or_308_is_followed(
+    client: HTTPClient, status: int
+) -> None:
+    result = (
+        await client.post(
+            "redirect-to", params={"to": "/echo-method", "status": status}, form={}, into=dict
+        )
+    ).data
+
+    assert (result["method"], result["body"]) == ("POST", "")
+    assert result["content_type"].startswith("multipart/form-data; boundary=")
+
+
+@pytest.mark.parametrize("status", [307, 308])
+def test_sync_an_empty_form_post_redirected_by_307_or_308_is_followed(
+    sync_client: SyncHTTPClient, status: int
+) -> None:
+    result = sync_client.post(
+        "redirect-to", params={"to": "/echo-method", "status": status}, form={}, into=dict
+    ).data
+
+    assert (result["method"], result["body"]) == ("POST", "")
+    assert result["content_type"].startswith("multipart/form-data; boundary=")
+
+
 async def test_max_redirects_stops_a_longer_chain(base_url: str) -> None:
     # A finite two-hop chain, so reqwest's own default limit (10) can't be what stops it.
     async with HTTPClient(base_url=base_url, max_redirects=1) as client:

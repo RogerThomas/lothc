@@ -1,5 +1,5 @@
 """`lothc` without its optional extras: each test runs a fresh interpreter in which importing
-pydantic and/or msgspec raises, since `lothc._client` binds the real libraries once at import and
+pydantic and/or msgspec raises, since lothc's modules bind the real libraries once at import and
 can't be re-imported in this process. CI's `test-no-extras` job (`task test-no-extras`) covers
 the rest of the suite with neither extra installed at all.
 """
@@ -28,14 +28,14 @@ def _run_with_imports_blocked(
 
 
 def test_import_lothc_succeeds_without_msgspec_or_pydantic() -> None:
-    # `lothc._client` has plenty of unquoted `Decoder[Any]`/`TypeAdapter[Any]` annotations,
+    # lothc's modules have plenty of unquoted `Decoder[Any]`/`TypeAdapter[Any]` annotations,
     # evaluated eagerly at import time, which `_compat.py`'s fallback stubs must survive.
     result = _run_with_imports_blocked({"msgspec", "pydantic"}, "import lothc\n")
     assert result.returncode == 0, result.stderr
 
 
 def test_into_without_either_extra(base_url: str) -> None:
-    # A fresh subprocess, for the same reason as the test above: `lothc._client` binds the real
+    # A fresh subprocess, for the same reason as the test above: lothc's modules bind the real
     # libraries at import. It talks to this session's test server, which keeps serving on its
     # own thread while this one waits.
     script = (

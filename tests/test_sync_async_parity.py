@@ -57,10 +57,39 @@ def _differing_implementations() -> dict[str, str]:
         "async creates its `asyncio.Lock` lazily per running loop (a loop-bound lock breaks "
         "across `asyncio.run()` calls); sync just holds a `threading.Lock`"
     )
+    awaits_the_native_future = (
+        "async awaits the native pool's Future, cancelling its request if the caller is "
+        "cancelled; the sync pool's `request` blocks and returns the `Response` itself"
+    )
+    awaits_the_native_stream = (
+        "async awaits the native stream's Future, closing the stream if the caller is "
+        "cancelled; the sync stream's call blocks and returns the result itself"
+    )
+    hands_back_native_futures = (
+        "a mocked async native stream hands back Futures, as the pool's `Stream` does; the sync "
+        "one returns each result itself, as `SyncStream` does"
+    )
+    native_pool_lifecycle = (
+        "the async native pool is bound to the running loop and opens its sockets through "
+        "`_LoopConnections`, which closing also shuts down; the sync pool connects by itself"
+    )
     return {
-        "HTTPClient._download": reads_through_sync_stream_chunks,
-        "HTTPClient._line_stream": reads_through_sync_stream_chunks,
-        "HTTPClient._sse_connection": reads_through_sync_stream_chunks,
+        "_stream_lines": reads_through_sync_stream_chunks,
+        "_sse_connection": reads_through_sync_stream_chunks,
+        "_download_stream": reads_through_sync_stream_chunks,
+        "_NativeTransport._exchange": awaits_the_native_future,
+        "_NativeTransport.send": awaits_the_native_future,
+        "_NativeTransport.open": native_pool_lifecycle,
+        "_NativeTransport.close": native_pool_lifecycle,
+        "_NativeStreamSource._open_current": awaits_the_native_stream,
+        "_NativeStreamSource._read_chunk": awaits_the_native_stream,
+        "_native_answer": awaits_the_native_future,
+        "_resolved": (
+            "async awaits an `async def` matcher's or handler's result; a sync request can't, "
+            "so it raises `TypeError` for one instead"
+        ),
+        "_NativeMockStream.open": hands_back_native_futures,
+        "_NativeMockStream.read": hands_back_native_futures,
         "OAuthProvider.__init__": lazy_loop_lock,
         "OAuthProvider.__call__": lazy_loop_lock,
         "OAuthProvider.invalidate": (
@@ -312,7 +341,10 @@ def test_implementation_pairs_were_discovered() -> None:
         "HTTPClient.get",
         "HTTPClient.__enter__",
         "HTTPClient.post",
-        "HTTPClient._send_method",
+        "_PyreqwestTransport.send",
+        "_PyreqwestTransport.open",
+        "_NativeTransport.send",
+        "_NativeTransport.send_headers_only",
         "_RetryMiddleware.__call__",
         "_ReauthMiddleware.__call__",
         "OAuthProvider._renew",

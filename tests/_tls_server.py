@@ -11,11 +11,25 @@ import socket
 import ssl
 import sys
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from http.server import ThreadingHTTPServer
 
 import trustme
 from _server import TestAppHandler, serve_in_background
+
+
+def finish_a_failed_handshake(connection: ssl.SSLSocket) -> None:
+    """Close `connection`, whose handshake has just failed, once the client has. Its alert is on
+    its way, but the client may have sent more behind it (its `Finished`, and in TLS 1.3 its
+    first request), and a socket closed with that unread sends a reset, which Windows lets
+    overtake the alert, discarding it: the client saw "forcibly closed" instead of the alert. So
+    stop writing, and read until the client hangs up."""
+    connection.settimeout(2.0)
+    with suppress(OSError):
+        connection.shutdown(socket.SHUT_WR)
+        while connection.recv(65536):
+            pass
 
 
 class _TLSServer(ThreadingHTTPServer):
@@ -30,17 +44,25 @@ class _TLSServer(ThreadingHTTPServer):
     def __init__(self, context: ssl.SSLContext) -> None:
         super().__init__(("127.0.0.1", 0), TestAppHandler)
         self._context = context
+        # The client address of each connection whose handshake has completed, in order.
+        self.handshakes: list[object] = []
 
     def finish_request(
         self, request: socket.socket | tuple[bytes, socket.socket], client_address: object
     ) -> None:
         if not isinstance(request, socket.socket):
             raise TypeError(f"Expected a stream socket, got {type(request)!r}")
-        try:
-            tls_socket = self._context.wrap_socket(request, server_side=True)
-        except (ssl.SSLError, ConnectionError):
-            return
+        # Not `wrap_socket`'s own handshake, which closes the socket at once when it fails.
+        tls_socket = self._context.wrap_socket(
+            request, server_side=True, do_handshake_on_connect=False
+        )
         with tls_socket:
+            try:
+                tls_socket.do_handshake()
+            except (ssl.SSLError, ConnectionError):
+                finish_a_failed_handshake(tls_socket)
+                return
+            self.handshakes.append(client_address)
             super().finish_request(tls_socket, client_address)
 
     def handle_error(
@@ -67,6 +89,23 @@ def tls_server_context(
     return context
 
 
+@dataclass(slots=True)
+class TLSServer:
+    """A running `serve_tls_server`: its `https://` base URL, as `serve_tls` gives, and the client
+    address of each connection whose handshake it has completed, in order."""
+
+    url: str
+    handshakes: list[object]
+
+
+@contextmanager
+def serve_tls_server(context: ssl.SSLContext) -> Generator[TLSServer]:
+    """`serve_tls`, also giving the handshakes it completes."""
+    server = _TLSServer(context)
+    with serve_in_background(server):
+        yield TLSServer(f"https://localhost:{server.server_port}/", server.handshakes)
+
+
 @contextmanager
 def serve_tls(context: ssl.SSLContext) -> Generator[str]:
     """Serve `TestAppHandler` over TLS with `context`, yielding the `https://` base URL.
@@ -74,5 +113,5 @@ def serve_tls(context: ssl.SSLContext) -> Generator[str]:
     `localhost`, not `127.0.0.1`, in the URL: that's the name the certificate is verified against
     here, so hostname verification is exercised too rather than only IP-SAN matching.
     """
-    with serve_in_background(_TLSServer(context)) as server:
-        yield f"https://localhost:{server.server_port}/"
+    with serve_tls_server(context) as server:
+        yield server.url

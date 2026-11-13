@@ -1,0 +1,74 @@
+# Run from experiments/loop-transport. Project name pinned so image names (reqwest-floor-*)
+# stay what Dockerfile.poc/Dockerfile.pgo build FROM.
+name: reqwest-floor
+
+# One core each: json-server on SERVER_CPUSET, the client under test on CLIENT_CPUSET.
+services:
+  json-server:
+    build:
+      context: ../..
+      dockerfile: benchmarks/Dockerfile
+      target: server-runtime
+    cpuset: "${SERVER_CPUSET:-2}"
+
+  reqwest-bench:
+    build: .
+    cpuset: "${CLIENT_CPUSET:-4}"
+    depends_on: [json-server]
+
+  py-bench:
+    build:
+      context: ../..
+      dockerfile: benchmarks/Dockerfile
+      target: runtime
+    cpuset: "${CLIENT_CPUSET:-4}"
+    depends_on: [json-server]
+    entrypoint: ["uv", "run", "--no-sync", "yeet", "/bench/py_bench.py"]
+    volumes:
+      - ./py_bench.py:/bench/py_bench.py:ro
+      - ./poc_client.py:/bench/poc_client.py:ro
+      - ./correctness_sync.py:/bench/correctness_sync.py:ro
+      - ./sync_bench.py:/bench/sync_bench.py:ro
+      - ./correctness.py:/bench/correctness.py:ro
+
+  poc-bench:
+    build:
+      context: .
+      dockerfile: Dockerfile.poc
+    cpuset: "${CLIENT_CPUSET:-4}"
+    depends_on: [json-server]
+    environment:
+      POC_BARE: "${POC_BARE:-0}"
+      POC_NO_TIMEOUT: "${POC_NO_TIMEOUT:-0}"
+    entrypoint: ["uv", "run", "--no-sync", "yeet", "/bench/py_bench.py"]
+    volumes:
+      - ./py_bench.py:/bench/py_bench.py:ro
+      - ./poc_client.py:/bench/poc_client.py:ro
+      - ./correctness_sync.py:/bench/correctness_sync.py:ro
+      - ./sync_bench.py:/bench/sync_bench.py:ro
+      - ./correctness.py:/bench/correctness.py:ro
+      - ./correctness.py:/bench/correctness.py:ro
+      - ./correctness_tls.py:/bench/correctness_tls.py:ro
+      - ./pieces.py:/bench/pieces.py:ro
+      - ./pieces2.py:/bench/pieces2.py:ro
+
+  poc-pgo:
+    build:
+      context: .
+      dockerfile: Dockerfile.pgo
+    cpuset: "${CLIENT_CPUSET:-4}"
+    depends_on: [json-server]
+    environment:
+      POC_BARE: "${POC_BARE:-0}"
+      POC_NO_TIMEOUT: "${POC_NO_TIMEOUT:-0}"
+    entrypoint: ["uv", "run", "--no-sync", "yeet", "/bench/py_bench.py"]
+    volumes:
+      - ./py_bench.py:/bench/py_bench.py:ro
+      - ./poc_client.py:/bench/poc_client.py:ro
+      - ./correctness_sync.py:/bench/correctness_sync.py:ro
+      - ./sync_bench.py:/bench/sync_bench.py:ro
+      - ./correctness.py:/bench/correctness.py:ro
+      - ./correctness.py:/bench/correctness.py:ro
+      - ./correctness_tls.py:/bench/correctness_tls.py:ro
+      - ./pieces.py:/bench/pieces.py:ro
+      - ./pieces2.py:/bench/pieces2.py:ro

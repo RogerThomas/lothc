@@ -25,8 +25,11 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 from urllib.parse import quote, urlsplit
 
-from ._client import HTTPClient, HTTPResponseError, JSONPayload, SyncHTTPClient
+from ._client import HTTPClient
 from ._compat import BaseModelTyping, StructTyping
+from ._errors import HTTPResponseError
+from ._sync_client import SyncHTTPClient
+from ._types import JSONPayload
 
 # `token_request=`/`token_refresh_request=` accept a *class* — a pydantic `BaseModel` or msgspec
 # `Struct` subclass — that lothc constructs as `Cls(client_id=..., client_secret=...)` /
