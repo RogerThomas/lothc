@@ -2467,22 +2467,23 @@ def test_sync_each_proxied_origin_reuses_its_own_connection(
     assert first != second
 
 
-async def test_a_tunnel_is_reused_like_a_direct_connection(
-    http_proxy: HTTPProxy, tunnel_client: HTTPClient
-) -> None:
-    await tunnel_client.get("items/7")
-    await tunnel_client.get("items/7")
+async def test_a_tunnel_is_reused_like_a_direct_connection(tunnel_client: HTTPClient) -> None:
+    first = await tunnel_client.get("peer", into=dict)
+    second = await tunnel_client.get("peer", into=dict)
 
-    assert len(http_proxy.requests) == 1
+    # The server's peer is the proxy's end of the tunnel. Not a count of the proxy's CONNECTs: a
+    # request that finds no idle connection yet also starts a new one, so a second CONNECT can
+    # race the first tunnel's return to the pool, and lose to it.
+    assert first.data["port"] == second.data["port"]
 
 
 def test_sync_a_tunnel_is_reused_like_a_direct_connection(
-    http_proxy: HTTPProxy, sync_tunnel_client: SyncHTTPClient
+    sync_tunnel_client: SyncHTTPClient,
 ) -> None:
-    sync_tunnel_client.get("items/7")
-    sync_tunnel_client.get("items/7")
+    first = sync_tunnel_client.get("peer", into=dict)
+    second = sync_tunnel_client.get("peer", into=dict)
 
-    assert len(http_proxy.requests) == 1
+    assert first.data["port"] == second.data["port"]
 
 
 async def test_direct_and_proxied_origins_keep_separate_connections(
