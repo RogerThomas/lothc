@@ -9,8 +9,7 @@ icon: lucide/rocket
 
 # lothc
 
-**L**ord **O**f **T**he **H**ttp **C**lients — a typed HTTP client for Python, built on
-[pyreqwest](https://github.com/MarkusSintonen/pyreqwest) (an awesome Rust-backed HTTP client),
+**L**ord **O**f **T**he **H**ttp **C**lients — a fast, Rust-backed, typed HTTP client for Python,
 with first-class optional support for **pydantic** and **msgspec** as both decode *and* encode
 targets.
 
@@ -94,73 +93,41 @@ top-right corner to copy a one-liner that runs it via `uv run`, no local install
 
     !!! warning
 
-        `into=dict` gets you a plain `dict[str, Any]` — no schema, no extra
-        dependency, just parsed JSON. There's no validation at all: the shape is fully trusted,
-        on your say-so alone.
+        `into=dict` is parsed JSON, unvalidated.
 
 `SyncHTTPClient` mirrors every method in these docs one-for-one — swap `async with` for `with`,
 drop the `await`s, and everything still applies.
 
 ## Why?
 
-Why was lothc built, and why should you use it?
+[pyreqwest](https://github.com/MarkusSintonen/pyreqwest) is a genuinely great Rust-backed HTTP
+client, and the inspiration for lothc. Its API is a builder (`client.get(url).build()` before you
+can `.send()`), so lothc gives it the `requests`/`httpx` call shape, and adds its own native
+transport, faster still. pyreqwest stays lothc's transport on Windows, for HTTP/2 and with
+`native="off"`.
 
-pyreqwest is a genuinely excellent HTTP client for Python, fast because the heavy lifting happens
-in Rust, not pure Python. But its API is a builder pattern (`client.get(path).build()` before you
-can even `.send()` it), unfamiliar to anyone coming from `requests`/`httpx`/`niquests`, where a
-call is just `client.get(url, params=..., headers=...)`. lothc wraps pyreqwest with exactly that
-familiar shape, so you get pyreqwest's speed without giving up the ergonomics Python HTTP users
-already expect.
-
-The other reason: Python's most popular third-party HTTP clients (httpx, aiohttp, niquests) all
-have first-class JSON support: call `.json()` and get back a `dict`. But in order for a Python
-project to be end-to-end type-safe, data crossing I/O boundaries must be validated, and if
-invalid, handled accordingly (raise an error) — a plain `dict` does neither. Closing that gap is
-exactly what lothc is designed for.
-
-The original idea was to make lothc backend-agnostic: httpx, aiohttp, niquests, and pyreqwest all
-interchangeable underneath the same typed lothc interface, so switching backends never meant
-switching your call sites. However, in the author's opinion there's currently no compelling
-reason not to just use pyreqwest, so pyreqwest is the only backend implemented today, but, if
-there's demand for an httpx/aiohttp/niquests backend, the author is happy to consider adding one.
+Where other clients' `.json()` returns an unvalidated `dict`, lothc decodes straight into a
+validated pydantic or msgspec type.
 
 ## Performance
 
-lothc is built on top of the awesome [pyreqwest](https://github.com/MarkusSintonen/pyreqwest)
-package — a Rust-based HTTP client for Python. lothc then adds some nice abstractions on top of that
-(discussed in the other sections of these docs): typed decode targets, retries, SSE, streaming,
-and so on. On pyreqwest, lothc's throughput stays close to pyreqwest's own, and far ahead of
-pure-Python HTTP libraries.
-
-On Linux and macOS, lothc goes further: its own native transport, the default there (see
-[Networking](networking.md#native-transport)), runs async `get(into=Struct)` at about
-**2.2x bare pyreqwest** under load, 97,501 requests a second decoding into a msgspec `Struct`.
+On Linux and macOS, lothc's [native transport](networking.md#native-transport) (the default there)
+runs async `get(into=Struct)` at about **2.2x bare pyreqwest**, validation included.
 
 ![HTTP client throughput race — lothc's native transport finishes first, at more than twice pyreqwest's throughput, and other libraries take much longer](assets/perf-race.svg){: .perf-race-img }
 
-Benchmarked with `perf.py` on an AWS `c8a.xlarge`, 50,000 requests at concurrency 100 against a
-tiny Rust-based JSON server — including lothc's fully-typed decode targets (`into=` a msgspec
-`Struct` or a pydantic `BaseModel`), not just raw bytes or an untyped dict. The object handed back
-from those runs isn't just parsed JSON — it's a real, constructed, field-validated instance of
-your own type, and that validation cost is included in the numbers, not benchmarked around.
-See [Benchmarks](benchmarks.md) for the full numbers behind the chart above.
+See [Benchmarks](benchmarks.md) for the full numbers.
 
 ## Highlights
 
 <div class="grid cards" markdown>
 
--   **Type-safe I/O boundaries, not bolted on**
+-   **Type-safe I/O boundaries**
 
-    `into` gets you a real, constructed, field-validated pydantic `BaseModel` or
-    msgspec `Struct` straight from the client, instead of the plain `dict` a `.json()` call
-    leaves you to validate yourself. See [Benchmarks](benchmarks.md) for what that actually costs
-    (usually nothing).
-
--   **Typed decode targets**
-
-    Pick a pydantic `BaseModel`, a msgspec `Struct`, plain `dict`, raw `bytes` (the default), or
-    any type built from them (`list[Item]`, `Item | None`) per call. No cast-laden internals — every verb is built from paired `@overload`s, so every
-    call site gets a precise static type.
+    `into` takes a pydantic `BaseModel`, a msgspec `Struct`, plain `dict`, raw `bytes` (the
+    default), or any type built from them (`list[Item]`, `Item | None`), and hands back a
+    validated instance instead of a `dict` to check yourself. Every verb is paired `@overload`s,
+    so every call site gets a precise static type.
 
 -   **Typed request bodies too**
 
@@ -173,11 +140,6 @@ See [Benchmarks](benchmarks.md) for the full numbers behind the chart above.
     `get`, `post`, `put`, `patch`, `delete`, `head`, `options`, `download` (each returning a `Response`: `.data`, `.status`, `.headers`) — plus `sse`,
     `stream_get`, and `stream_post` for streaming responses. See [Verbs](verbs.md).
 
--   **Typed *and* raw params/headers**
-
-    Pass a plain `dict`/`Mapping`, or a `BaseModel`/`Struct` for free per-field validation and
-    `None`-field omission.
-
 -   **Streaming, both ways**
 
     Raw chunks by default (unbuffered, safe for large binary bodies), or switch to newline-
@@ -185,14 +147,14 @@ See [Benchmarks](benchmarks.md) for the full numbers behind the chart above.
 
 -   **SSE support**
 
-    Decode targets accept any type expression (`ItemCreated | ItemDeleted`, `list[Item]`), or a
-    pre-built pydantic `TypeAdapter`/msgspec `Decoder` — so even discriminated-union event streams
-    decode natively. See [SSE](sse.md).
+    Spec-compliant `sse()`: automatic reconnect with `Last-Event-ID`, the server's `retry:`
+    honored, and each event decoded into your type, discriminated unions included. See
+    [SSE](sse.md).
 
 -   **Retries with real backoff**
 
-    Implemented as a real pyreqwest `with_middleware` hook. Honors `Retry-After`, defaults to the
-    idempotent verbs. See [Retries](retries.md).
+    Exponential backoff that honors `Retry-After`, on the idempotent verbs by default. See
+    [Retries](retries.md).
 
 -   **Authentication**
 
@@ -203,8 +165,7 @@ See [Benchmarks](benchmarks.md) for the full numbers behind the chart above.
 
 -   **Cookies, redirects, proxy**
 
-    An in-memory cookie jar, redirect control, and proxying. See
-    [Cookies, redirects & proxy](networking.md).
+    An in-memory cookie jar, redirect control, proxying and TLS. See [Networking](networking.md).
 
 -   **A real error hierarchy**
 
@@ -212,6 +173,3 @@ See [Benchmarks](benchmarks.md) for the full numbers behind the chart above.
     and a separate `HTTPResponseError` for 4xx/5xx. See [Error handling](errors.md).
 
 </div>
-
-pydantic and msgspec are both optional — the library works with neither, either, or both
-installed.

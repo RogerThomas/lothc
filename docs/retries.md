@@ -9,9 +9,8 @@ async with HTTPClient(base_url="https://api.example.com/", max_retries=3) as cli
     await client.get("items/7")
 ```
 
-Implemented as a real pyreqwest `with_middleware` hook — retries on a transport failure
-(including a body cut off partway) or a `429`/`500`/`502`/`503`/`504` response, with exponential
-backoff, honoring a `Retry-After` header when the server sends one.
+Retries a transport failure (including a body cut off partway) or a `429`/`500`/`502`/`503`/`504`,
+with exponential backoff, honouring `Retry-After`.
 
 By default, only the idempotent verbs retry: `get`, `put`, `delete`, `head`, `options`. `post`/`patch` need
 an explicit opt-in, since retrying a non-idempotent request can duplicate side effects:
@@ -45,39 +44,22 @@ async with HTTPClient(
 
 ## What is never retried
 
-A request that could never be *built* — a non-`https` URL under `https_only=True`, a malformed
-URL — fails immediately rather than being retried, since no amount of waiting changes the
-outcome. It still raises the same `HTTPTransportError` as any other transport failure.
-
-This applies to `sse()`'s reconnect loop too: a permanently unbuildable request raises on the
-first attempt instead of working through `max_reconnects` × `reconnect_delay` first.
-
-A **redirect loop** (past `max_redirects`) isn't retried either. `sse()`'s reconnect loop does
-reconnect on one, since a redirect loop can be transient, but a plain verb raises it straight away.
-
-Nor is a body that can never be decoded, such as a corrupt gzip body: it comes back the same on
-every attempt, so it raises `HTTPConnectionError` straight away.
+- A request that can't be built (a non-`https` URL under `https_only=True`, a malformed URL); it
+  raises `HTTPTransportError` at once, and `sse()` doesn't reconnect it either.
+- A redirect loop past `max_redirects` (though `sse()` reconnects on one).
+- A body that can never be decoded, such as a corrupt gzip body (`HTTPConnectionError`).
 
 ## Multipart `form=` requests are sent once
 
 A multipart `form=` body is streamed as it's sent, so it can't be replayed. A `form=` request is
 therefore sent exactly once, even on a verb in `retry_methods`: a `429`/`5xx` or a transport
-failure is raised straight away, the same as for a verb that isn't retried. This is how reqwest's
-own retry policy treats a body it can't copy. Every other body (`json=`, `data=`, `content=`) is
-held in memory and is replayed byte for byte.
+failure is raised straight away, the same as for a verb that isn't retried. Every other body
+(`json=`, `data=`, `content=`) is held in memory and is replayed byte for byte.
 
 The same goes for re-authenticating on a `401` (see [Authentication](auth.md)): the rejected
 token is still discarded, so the next call gets a fresh one, but the `form=` request itself is
 raised rather than sent again. To retry an upload, catch the error and call the verb again; the
 form is rebuilt from your `dict` (a `Path` is reopened) on every call.
-
-## A body cut off partway
-
-A connection that dies partway through the body is retried like any other transport failure,
-including when the body is shorter than its `Content-Length` promised (what a server or pod
-dying mid-response usually looks like). pyreqwest reports that case as a decode error, the same
-type as a corrupt gzip body, so lothc tells the two apart by its cause: only a failed read from
-the connection is retried.
 
 `retry_methods` is case-insensitive (`{"get"}` works), and an empty collection means "retry
 nothing": with `max_retries` set, pass `retry_methods=set()` to switch retries off per client.
