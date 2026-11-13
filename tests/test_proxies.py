@@ -2516,60 +2516,73 @@ def test_sync_direct_and_proxied_origins_keep_separate_connections(
     assert direct_ports[0] == direct_ports[1]
 
 
-@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
-async def test_a_connection_through_an_https_proxy_is_reused(
-    tls_ca_pem: bytes,
-    https_proxy: HTTPProxy,
-    server_url_fixture: str,
-    request: pytest.FixtureRequest,
+async def test_requests_forwarded_by_an_https_proxy_share_a_connection(
+    base_url: str, tls_ca_pem: bytes, https_proxy: HTTPProxy
 ) -> None:
-    server_url: str = request.getfixturevalue(server_url_fixture)
-
     async with HTTPClient(
-        base_url=server_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+        base_url=base_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
     ) as client:
         await client.get("items/7")
         await client.get("items/7")
 
-    assert len(https_proxy.tls_handshakes) == 1
-    # Two forwarded requests on the one connection, or the one `CONNECT`.
-    assert len({r.client_port for r in https_proxy.requests}) == 1
+    # The proxy's requests, not its TLS handshakes: a spare connection that loses the race in
+    # `test_a_tunnel_is_reused_like_a_direct_connection` is handshaken but carries no request.
+    assert len({request.client_port for request in https_proxy.requests}) == 1
 
 
-@pytest.mark.parametrize("server_url_fixture", ["base_url", "https_base_url"])
-def test_sync_a_connection_through_an_https_proxy_is_reused(
-    tls_ca_pem: bytes,
-    https_proxy: HTTPProxy,
-    server_url_fixture: str,
-    request: pytest.FixtureRequest,
+def test_sync_requests_forwarded_by_an_https_proxy_share_a_connection(
+    base_url: str, tls_ca_pem: bytes, https_proxy: HTTPProxy
 ) -> None:
-    server_url: str = request.getfixturevalue(server_url_fixture)
-
     with SyncHTTPClient(
-        base_url=server_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+        base_url=base_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
     ) as client:
         client.get("items/7")
         client.get("items/7")
 
-    assert len(https_proxy.tls_handshakes) == 1
-    assert len({r.client_port for r in https_proxy.requests}) == 1
+    assert len({request.client_port for request in https_proxy.requests}) == 1
+
+
+async def test_a_tunnel_through_an_https_proxy_is_reused(
+    https_base_url: str, tls_ca_pem: bytes, https_proxy: HTTPProxy
+) -> None:
+    async with HTTPClient(
+        base_url=https_base_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        first = await client.get("peer", into=dict)
+        second = await client.get("peer", into=dict)
+
+    # As `test_a_tunnel_is_reused_like_a_direct_connection`.
+    assert first.data["port"] == second.data["port"]
+
+
+def test_sync_a_tunnel_through_an_https_proxy_is_reused(
+    https_base_url: str, tls_ca_pem: bytes, https_proxy: HTTPProxy
+) -> None:
+    with SyncHTTPClient(
+        base_url=https_base_url, proxy=https_proxy.url, root_certificates=[tls_ca_pem]
+    ) as client:
+        first = client.get("peer", into=dict)
+        second = client.get("peer", into=dict)
+
+    assert first.data["port"] == second.data["port"]
 
 
 async def test_a_connection_through_a_socks4_proxy_is_reused(
     base_url: str, socks4_proxy: Socks4Proxy
 ) -> None:
     async with HTTPClient(base_url=base_url, proxy=f"socks4://{socks4_proxy.address}") as client:
-        await client.get("items/7")
-        await client.get("items/7")
+        first = await client.get("peer", into=dict)
+        second = await client.get("peer", into=dict)
 
-    assert len(socks4_proxy.requests) == 1
+    # As `test_a_tunnel_is_reused_like_a_direct_connection`.
+    assert first.data["port"] == second.data["port"]
 
 
 def test_sync_a_connection_through_a_socks4_proxy_is_reused(
     base_url: str, socks4_proxy: Socks4Proxy
 ) -> None:
     with SyncHTTPClient(base_url=base_url, proxy=f"socks4://{socks4_proxy.address}") as client:
-        client.get("items/7")
-        client.get("items/7")
+        first = client.get("peer", into=dict)
+        second = client.get("peer", into=dict)
 
-    assert len(socks4_proxy.requests) == 1
+    assert first.data["port"] == second.data["port"]
