@@ -51,19 +51,45 @@ Pass `into` to decode `.data` into a typed object instead of leaving it as `str`
 msgspec `Struct`, a pydantic `BaseModel`, `dict`, or any type expression (`list[ItemModel]` for
 array payloads):
 
-```python
-from msgspec import Struct
+=== "msgspec"
+
+    ```python
+    from msgspec import Struct
 
 
-class ItemModel(Struct):
-    id: int
-    name: str
+    class ItemModel(Struct):
+        id: int
+        name: str
 
 
-async for event in client.sse("events", into=ItemModel):
-    print(event.data)  # e.g. ItemModel(id=25, name='pikachu')
-    print(event.event)  # still populated, e.g. 'tick'
-```
+    async for event in client.sse("events", into=ItemModel):
+        print(event.data)  # e.g. ItemModel(id=25, name='pikachu')
+        print(event.event)  # still populated, e.g. 'tick'
+    ```
+
+=== "pydantic"
+
+    ```python
+    from pydantic import BaseModel
+
+
+    class ItemModel(BaseModel):
+        id: int
+        name: str
+
+
+    async for event in client.sse("events", into=ItemModel):
+        print(event.data)  # e.g. id=25 name='pikachu'
+        print(event.event)  # still populated, e.g. 'tick'
+    ```
+
+=== "dict"
+
+    ```python
+    async for event in client.sse("events", into=dict):
+        print(event.data)  # e.g. {'id': 25, 'name': 'pikachu', ...}
+        print(event.event)  # still populated, e.g. 'tick'
+    ```
 
 ## Discriminated-union event streams
 
@@ -139,4 +165,9 @@ propagate. See [Error handling](errors.md).
 ## Ctrl-C-interruptible streaming (sync only) — `interruptible`
 
 On `SyncHTTPClient`, `interruptible=True` lets Ctrl-C stop the wait, with the
-[same caveat](streaming.md#ctrl-c-interruptible-streaming-sync-only-interruptible).
+[same caveat](streaming.md#ctrl-c-interruptible-streaming-sync-only-interruptible):
+
+```python
+for event in sync_client.sse("events", interruptible=True):
+    ...  # Ctrl-C now works while waiting for the next event
+```

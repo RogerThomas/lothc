@@ -71,6 +71,11 @@ async for item in client.stream_post("stream/search", json={"q": "pikachu"}, int
 The client's `timeout` is the longest wait between chunks here, not a cap on the whole transfer;
 see [Timeouts](networking.md#timeouts).
 
+```python
+async with HTTPClient(base_url="https://api.example.com/", timeout=30) as client:
+    await client.download("exports/huge.csv", dest="huge.csv")  # fine at 2 hours, if data flows
+```
+
 ## Errors
 
 `error_for_status` (default `True`) is checked once, before the first chunk is yielded — a

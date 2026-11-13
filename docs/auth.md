@@ -8,6 +8,13 @@ Provide at most one of `bearer_token` (static), `bearer_auth` (a callable, async
 called per request) or `basic_auth` (`(user, password | None)`):
 
 ```python
+async with HTTPClient(
+    base_url="https://api.example.com/", bearer_token="my-static-token"
+) as client:
+    await client.get("items/7")
+```
+
+```python
 async def get_current_token() -> str:
     return await token_store.get_access_token()  # e.g. refreshed from a cache or auth server
 
@@ -15,6 +22,13 @@ async def get_current_token() -> str:
 async with HTTPClient(base_url="https://api.example.com/", bearer_auth=get_current_token) as client:
     await client.get("items/7")  # calls get_current_token() for this request
     await client.get("items/8")  # calls it again — always the latest token
+```
+
+```python
+async with HTTPClient(
+    base_url="https://api.example.com/", basic_auth=("my-username", "my-password")
+) as client:
+    await client.get("items/7")
 ```
 
 Every verb also takes `skip_auth`, which omits the `Authorization` header for that one call —
@@ -178,33 +192,61 @@ them. The contract is on the *attribute* names, never the *wire* names:
 Provide `token_request` and `token_response` together, or neither. `client_auth` is ignored on
 this path: the request model carries the credentials, so nothing is sent as HTTP Basic.
 
-```python
-from pydantic import BaseModel, ConfigDict, Field
+=== "pydantic"
+
+    ```python
+    from pydantic import BaseModel, ConfigDict, Field
 
 
-class TokenRequest(BaseModel):
-    model_config = ConfigDict(validate_by_name=True)
+    class TokenRequest(BaseModel):
+        model_config = ConfigDict(validate_by_name=True)
 
-    client_id: str = Field(alias="clientID")
-    client_secret: str = Field(alias="clientSecret")
-    grant_type: str = Field(default="client_credentials", alias="grantType")
-
-
-class TokenResponse(BaseModel):
-    access_token: str = Field(alias="accessToken")
-    expires_in: int = Field(alias="expiresIn")
-    # This API never returns a refresh token, so there's no field for it at all — leave
-    # `token_refresh_request` out too, and renewal simply mints a fresh token every time.
+        client_id: str = Field(alias="clientID")
+        client_secret: str = Field(alias="clientSecret")
+        grant_type: str = Field(default="client_credentials", alias="grantType")
 
 
-OAuthProvider(
-    token_url="https://auth.example.com/v2/token",
-    client_id="my-client-id",
-    client_secret="my-client-secret",
-    token_request=TokenRequest,
-    token_response=TokenResponse,
-)
-```
+    class TokenResponse(BaseModel):
+        access_token: str = Field(alias="accessToken")
+        expires_in: int = Field(alias="expiresIn")
+        # This API never returns a refresh token, so there's no field for it at all — leave
+        # `token_refresh_request` out too, and renewal simply mints a fresh token every time.
+
+
+    OAuthProvider(
+        token_url="https://auth.example.com/v2/token",
+        client_id="my-client-id",
+        client_secret="my-client-secret",
+        token_request=TokenRequest,
+        token_response=TokenResponse,
+    )
+    ```
+
+=== "msgspec"
+
+    ```python
+    import msgspec
+
+
+    class TokenRequest(msgspec.Struct):
+        client_id: str = msgspec.field(name="clientID")
+        client_secret: str = msgspec.field(name="clientSecret")
+        grant_type: str = msgspec.field(default="client_credentials", name="grantType")
+
+
+    class TokenResponse(msgspec.Struct):
+        access_token: str = msgspec.field(name="accessToken")
+        expires_in: int = msgspec.field(name="expiresIn")
+
+
+    OAuthProvider(
+        token_url="https://auth.example.com/v2/token",
+        client_id="my-client-id",
+        client_secret="my-client-secret",
+        token_request=TokenRequest,
+        token_response=TokenResponse,
+    )
+    ```
 
 lothc constructs the request model by attribute name, so an aliased pydantic model needs
 `validate_by_name=True`. msgspec: `msgspec.field(name=...)`, no config needed.
@@ -215,7 +257,8 @@ present, see above), add a model for the refresh call, and pass it as
 
 ```python
 class TokenResponse(BaseModel):
-    ...  # as above, plus:
+    access_token: str = Field(alias="accessToken")
+    expires_in: int = Field(alias="expiresIn")
     refresh_token: str | None = Field(default=None, alias="refreshToken")
 
 
@@ -224,6 +267,16 @@ class TokenRefreshRequest(BaseModel):
 
     refresh_token: str = Field(alias="refreshToken")
     grant_type: str = Field(default="refresh_token", alias="grantType")
+
+
+OAuthProvider(
+    token_url="https://auth.example.com/v2/token",
+    client_id="my-client-id",
+    client_secret="my-client-secret",
+    token_request=TokenRequest,
+    token_refresh_request=TokenRefreshRequest,
+    token_response=TokenResponse,
+)
 ```
 
 ### Revoked tokens
@@ -246,6 +299,20 @@ The client knows nothing about OAuth here: any `bearer_auth` callable with an
 
 `SyncOAuthProvider`: same constructor, for `SyncHTTPClient` (default
 `client_factory=SyncHTTPClient`).
+
+```python
+from lothc import SyncHTTPClient, SyncOAuthProvider
+
+with SyncHTTPClient(
+    base_url="https://api.example.com/",
+    bearer_auth=SyncOAuthProvider(
+        token_url="https://auth.example.com/oauth/token",
+        client_id="my-client-id",
+        client_secret="my-client-secret",
+    ),
+) as client:
+    client.get("items/7")
+```
 
 ## Default headers
 

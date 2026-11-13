@@ -49,6 +49,7 @@ headers and more (see [The `Response`](#the-response) below).
 `None` are omitted rather than sent as `"None"`:
 
 ```python
+from msgspec import Struct
 from pydantic import BaseModel
 
 
@@ -58,7 +59,16 @@ class SearchParams(BaseModel):
     limit: int | None = None  # omitted from the query string entirely, not sent as "None"
 
 
+class SearchStructParams(Struct):
+    q: str
+    page: int
+    cursor: str | None = None  # same omission behavior, msgspec Struct instead of BaseModel
+
+
 response = await client.get("items", params=SearchParams(q="pikachu", page=1), into=SearchResult)
+response = await client.get(
+    "items", params=SearchStructParams(q="pikachu", page=1), into=SearchResult
+)
 ```
 
 `headers` works the same way for outgoing request headers — pass a `BaseModel`/`Struct` instead
@@ -96,7 +106,17 @@ A `Struct` means msgspec; a `BaseModel` or any pydantic-only validation means py
 sending.
 
 Decoders are cached per type. `Field(...)` or a `lambda` written inline is a new type each call, so
-hoist it into a module-level `type` alias.
+hoist it into a module-level `type` alias:
+
+```python
+from typing import Annotated
+
+from pydantic import Field
+
+type PositiveInts = list[Annotated[int, Field(gt=0)]]
+
+response = await client.get("counts", into=PositiveInts)  # built once, then reused
+```
 
 Without either extra only `bytes`, `str`, `dict`, `dict[str, Any]` (or `typing.Dict[str, Any]`),
 `Mapping[str, Any]` and bare `dict` subclasses work; anything else raises a `TypeError` naming the
@@ -104,8 +124,16 @@ extra to install.
 
 `into=str` is the raw text (UTF-8), like `into=bytes`; on `stream_get`/`stream_post` it's each
 line. A bare `dict` subclass decodes like `into=dict` and is built as that subclass (a
-parametrized one needs pydantic). A pre-built pydantic `TypeAdapter` or msgspec `Decoder` is used
-as is. `into=dict` on anything but a JSON object raises `ValueError`.
+parametrized one needs pydantic). `into=dict` on anything but a JSON object raises `ValueError`. A
+pre-built pydantic `TypeAdapter` or msgspec `Decoder` is used as is:
+
+```python
+from msgspec.json import Decoder
+from pydantic import TypeAdapter
+
+response = await client.get("items", into=TypeAdapter(list[ItemModel]))
+response = await client.get("items", into=Decoder(list[ItemStruct]))
+```
 
 ## The `Response`
 
@@ -202,6 +230,14 @@ server needs one:
 
 ```python
 await client.post("render", content="# Title", headers={"content-type": "text/markdown"})
+```
+
+Each returns a `Response` like `get`'s, with the same `into` and `response_headers_type`:
+
+```python
+response = await client.post("items", json={"name": "new-item"}, into=ItemModel)
+response.data  # ItemModel(...)
+response.status  # 201
 ```
 
 ### Multipart forms — `form`

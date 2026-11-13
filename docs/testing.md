@@ -23,7 +23,7 @@ import pytest
 import pytest_asyncio
 from pydantic import BaseModel
 
-from lothc import HTTPClient, HTTPResponseError, SyncHTTPClient
+from lothc import HTTPClient, HTTPConnectionError, HTTPResponseError, SyncHTTPClient
 from lothc.testing import LOTHCMocker, MockRequest, MockResponse
 
 
@@ -115,6 +115,17 @@ async def test_add_get_response_matches_on_params(
     response = await client.get("items", params={"page": "2"}, into=dict)
 
     assert response.data == {"page": 2}
+
+
+@pytest.mark.asyncio
+async def test_add_get_response_matches_on_a_repeated_query_param(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/items", params={"tag": ["a", "b"]}, data={"ok": True})
+
+    response = await client.get("items", params={"tag": ["a", "b"]}, into=dict)
+
+    assert response.data == {"ok": True}
 ```
 
 `params=` — same `Params` type a real call's `params=` takes — narrows a rule to requests that
@@ -134,8 +145,7 @@ For anything `params=` can't express (a regex, "any value", a custom predicate, 
 returns a `LOTHCMock` that can be narrowed further with
 `match_query`/`match_query_param`/`match_header`/`match_body_json`/`match_request` (a matcher only
 narrows which requests a rule applies to — it never changes the response), and asserted on
-afterwards with `assert_called`/`get_requests`/`get_call_count`. `get_requests()` returns
-`MockRequest` snapshots (`method`/`path`/`query_string`/`query`/`headers`/`body`):
+afterwards with `assert_called`/`get_requests`/`get_call_count`:
 
 ```python
 @pytest.mark.asyncio
@@ -147,8 +157,24 @@ async def test_match_header_narrows_a_mock(client: HTTPClient, lothc_mocker: LOT
 
     assert response.data == {"ok": True}
     mock.assert_called(count=1)
+```
+
+`get_requests()` returns `MockRequest` snapshots (`method`/`path`/`query_string`/`query`/`headers`/
+`body`):
+
+```python
+@pytest.mark.asyncio
+async def test_get_requests_returns_mock_request_snapshots(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items/7", data={"ok": True})
+
+    await client.get("items/7", headers={"x-flag": "1"})
+
     [seen] = mock.get_requests()
-    assert seen.headers["x-request-id"] == "req-1"
+    assert seen.method == "GET"
+    assert seen.path == "/items/7"
+    assert seen.headers["x-flag"] == "1"
 ```
 
 `lothc_mocker` is **strict by default** — any request that matches no registered mock raises
@@ -164,7 +190,18 @@ async def test_strict_by_default_raises_for_unmatched_request(
 ```
 
 Opt out with `@pytest.mark.lothc_mocker(strict=False)`, or mid-test with
-`lothc_mocker.strict(enabled=False)`.
+`lothc_mocker.strict(enabled=False)`. With `client`'s fake `base_url`, an unmatched request then
+fails on the real network:
+
+```python
+@pytest.mark.lothc_mocker(strict=False)
+@pytest.mark.asyncio
+async def test_lothc_mocker_marker_disables_strict(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    with pytest.raises(HTTPConnectionError):
+        await client.get("items/7")
+```
 
 ## Custom responses
 
@@ -176,11 +213,16 @@ canned response (any `add_*_response` call, or `with_status`/`with_headers`/`wit
 `ValueError`: a mock rule is either a canned response or a custom handler, never both.
 
 A handler (sync, or async for `HTTPClient` only) takes a `MockRequest` and returns a
-`MockResponse`, or `None` to defer to a later mock. A sync handler serves both clients:
+`MockResponse`, or `None` to defer to a later mock. A sync handler serves both clients; a
+`SyncHTTPClient` request that reaches an async one raises `TypeError`:
 
 ```python
-def _handler(request: MockRequest) -> MockResponse:
-    return MockResponse(status=200, data={"id": int(request.path.removeprefix("/items/"))})
+def _item_id_from_request(request: MockRequest) -> int:
+    return int(request.path.removeprefix("/items/"))
+
+
+async def _handler(request: MockRequest) -> MockResponse:
+    return MockResponse(status=200, data={"id": _item_id_from_request(request)})
 
 
 @pytest.mark.asyncio
@@ -190,6 +232,20 @@ async def test_custom_handler_computes_response_from_the_request(
     lothc_mocker.mock("GET").match_request_with_response(_handler)
 
     response = await client.get("items/42", into=dict)
+
+    assert response.data == {"id": 42}
+
+
+def _sync_handler(request: MockRequest) -> MockResponse:
+    return MockResponse(status=200, data={"id": _item_id_from_request(request)})
+
+
+def test_sync_custom_handler_computes_response_from_the_request(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.mock("GET").match_request_with_response(_sync_handler)
+
+    response = sync_client.get("items/42", into=dict)
 
     assert response.data == {"id": 42}
 ```
