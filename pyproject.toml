@@ -5,7 +5,7 @@ name = "lothc"
 # know whether an upgrade is safe, which a date can't communicate. Static, not from the git tag:
 # release-please (`release-type: python`, see CLAUDE.md) bumps it on each release PR, and maturin
 # takes it over native/Cargo.toml's version.
-version = "0.3.0"
+version = "0.3.1"
 description = "Lord Of The Http Clients — a typed HTTP client built on pyreqwest, with first-class pydantic and msgspec support"
 readme = "README.md"
 requires-python = ">=3.13"

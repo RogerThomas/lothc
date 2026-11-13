@@ -7,6 +7,17 @@ messages; 0.0.17 to 0.0.19 were hand-written in the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. Releases up to and including
 0.0.16 predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/releases).
 
+## [0.3.1](https://github.com/RogerThomas/lothc/compare/0.3.0...0.3.1) (2026-11-13)
+
+
+### Documentation
+
+* bring back the code examples the trim cut ([7c9ae2e](https://github.com/RogerThomas/lothc/commit/7c9ae2e71f2dc3be24893c720ba18818cf73abd5))
+* credit pyreqwest as lothc's inspiration in Why ([fbad61a](https://github.com/RogerThomas/lothc/commit/fbad61ac79c70419e62298fdc2669795a8514b2b))
+* cut repetition and fix stale claims across the docs and README ([3232dc6](https://github.com/RogerThomas/lothc/commit/3232dc653a319e051e4ed4cd0ffd287fb4b0ec6f))
+* cut repetition and fix stale claims across the docs and README ([bcbbe39](https://github.com/RogerThomas/lothc/commit/bcbbe394fbfb611e935b45cdf9aa0e475a41f52c))
+* restore the lothc_mocker intro, pool and redirect defaults, and download's write thread ([821b7bf](https://github.com/RogerThomas/lothc/commit/821b7bf0eeae9f987205b474f5645d4ebb4b12c0))
+
 ## [0.3.0](https://github.com/RogerThomas/lothc/compare/0.2.3...0.3.0) (2026-11-13)
 
 
