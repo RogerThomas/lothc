@@ -102,7 +102,7 @@ response = await client.get("items/7", into=ItemStruct | None)  # a `null` body 
 ```
 
 A `Struct` means msgspec; a `BaseModel` or any pydantic-only validation means pydantic; both is a
-`TypeError`. Otherwise msgspec, else pydantic; a type neither can decode raises `TypeError` before
+`TypeError`. Otherwise msgspec if it can decode the type, else pydantic; a type neither can decode raises `TypeError` before
 sending.
 
 Decoders are cached per type. `Field(...)` or a `lambda` written inline is a new type each call, so
@@ -337,6 +337,9 @@ body = response.data  # bytes
 response = await client.download("exports/large-file.csv", dest="large-file.csv")
 response.data  # Path("large-file.csv")
 ```
+
+Writes to `dest` happen on the calling thread, even on `HTTPClient`, so a slow filesystem
+stalls the event loop.
 
 Like `get()`, it returns a `Response`, so `.status`, `.headers` (say, `ETag` or
 `Content-Disposition`), `.request`, `.http_version` and `.elapsed` are all there. `.elapsed`

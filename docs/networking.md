@@ -9,7 +9,7 @@ async with HTTPClient(
     base_url="https://api.example.com/",
     cookie_store=True,  # in-memory cookie jar, sent automatically on subsequent requests
     follow_redirects=True,  # default
-    max_redirects=10,  # None (default) keeps the default
+    max_redirects=10,  # None (default) is 10
     proxy="http://localhost:8080",
     no_proxy=["localhost", "internal.example.com"],  # hosts that skip the proxy
 ) as client:
@@ -85,7 +85,7 @@ editing `/etc/hosts`; TLS still validates the certificate against the hostname i
 async with HTTPClient(
     base_url="https://api.example.com/",
     max_connections=50,
-    pool_idle_timeout=30.0,  # None (default) keeps the default
+    pool_idle_timeout=30.0,  # None (default) is 90s
     pool_max_idle_per_host=10,
     pool_timeout=2.0,  # max wait for a free connection slot
 ) as client:

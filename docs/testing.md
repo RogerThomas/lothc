@@ -11,6 +11,9 @@ examples below:
 uv add 'lothc[testing]' pytest-asyncio --dev
 ```
 
+`lothc_mocker` is a pytest fixture lothc registers itself (nothing to import or enable); it
+intercepts every request an `HTTPClient` or `SyncHTTPClient` sends during the test.
+
 ## Setup
 
 `base_url` doesn't need to point at a real server — `lothc_mocker` intercepts every request before
