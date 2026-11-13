@@ -47,9 +47,14 @@ asyncio.run(main())
 
 ## Why?
 
-pyreqwest is fast but has a builder API; lothc gives it the `requests`/`httpx` call shape, and adds
-its own native transport that's faster still. Where other clients' `.json()` returns an
-unvalidated `dict`, lothc decodes straight into a validated pydantic or msgspec type.
+[pyreqwest](https://github.com/MarkusSintonen/pyreqwest) is a genuinely great Rust-backed HTTP
+client, and the inspiration for lothc. Its API is a builder (`client.get(url).build()` before you
+can `.send()`), so lothc gives it the `requests`/`httpx` call shape, and adds its own native
+transport, faster still. pyreqwest stays lothc's transport on Windows, for HTTP/2 and with
+`native="off"`.
+
+Where other clients' `.json()` returns an unvalidated `dict`, lothc decodes straight into a
+validated pydantic or msgspec type.
 
 ## Fast
 
