@@ -21,18 +21,38 @@ async def test_download_writes_to_file_when_dest_given(client: HTTPClient, tmp_p
     assert dest.read_bytes() == b"AAA\nBBB\x00\nCCC"
 
 
-async def test_download_raises_response_error_for_status(client: HTTPClient) -> None:
+async def test_download_raises_response_error_on_an_error_status(client: HTTPClient) -> None:
     with pytest.raises(HTTPResponseError) as exc_info:
         await client.download("boom")
 
     assert exc_info.value.status == 500
 
 
-async def test_download_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
-    response = await client.download("boom", error_for_status=False)
+async def test_download_raise_for_status_false_returns_the_error_response(
+    client: HTTPClient,
+) -> None:
+    response = await client.download("boom", raise_for_status=False)
 
     assert response.status == 500
-    assert b"internal-server-error" in response.data
+    assert response.error == {
+        "type": "internal-server-error",
+        "title": "Internal server error",
+        "status": 500,
+    }
+    with pytest.raises(HTTPResponseError) as exc_info:
+        _ = response.data
+    assert exc_info.value.body == response.raw_error
+
+
+async def test_download_raise_for_status_false_writes_nothing_to_dest(
+    client: HTTPClient, tmp_path: Path
+) -> None:
+    response = await client.download("boom", tmp_path / "out.bin", raise_for_status=False)
+
+    assert response.status == 500
+    assert response.raw_error is not None
+    assert b"internal-server-error" in response.raw_error
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_sync_download_returns_raw_bytes_by_default(sync_client: SyncHTTPClient) -> None:
@@ -52,20 +72,49 @@ def test_sync_download_writes_to_file_when_dest_given(
     assert dest.read_bytes() == b"AAA\nBBB\x00\nCCC"
 
 
-def test_sync_download_raises_response_error_for_status(sync_client: SyncHTTPClient) -> None:
+def test_sync_download_raises_response_error_on_an_error_status(
+    sync_client: SyncHTTPClient,
+) -> None:
     with pytest.raises(HTTPResponseError) as exc_info:
         sync_client.download("boom")
 
     assert exc_info.value.status == 500
 
 
-def test_sync_download_error_for_status_false_suppresses_raise(
+def test_sync_download_raise_for_status_false_returns_the_error_response(
     sync_client: SyncHTTPClient,
 ) -> None:
-    response = sync_client.download("boom", error_for_status=False)
+    response = sync_client.download("boom", raise_for_status=False)
 
     assert response.status == 500
-    assert b"internal-server-error" in response.data
+    with pytest.raises(HTTPResponseError) as exc_info:
+        _ = response.data
+    assert exc_info.value.body == response.raw_error
+
+
+def test_sync_download_raise_for_status_false_writes_nothing_to_dest(
+    sync_client: SyncHTTPClient, tmp_path: Path
+) -> None:
+    response = sync_client.download("boom", tmp_path / "out.bin", raise_for_status=False)
+
+    assert response.status == 500
+    assert response.error == {
+        "type": "internal-server-error",
+        "title": "Internal server error",
+        "status": 500,
+    }
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_sync_download_without_an_idle_limit_raise_for_status_false_writes_nothing_to_dest(
+    base_url: str, tmp_path: Path
+) -> None:
+    # With no `timeout`, the body is read on the calling thread rather than a worker's.
+    with SyncHTTPClient(base_url=base_url, timeout=None, raise_for_status=False) as client:
+        response = client.download("boom", tmp_path / "out.bin")
+
+    assert response.status == 500
+    assert list(tmp_path.iterdir()) == []
 
 
 async def test_download_transport_error_mid_stream_raises_connection_error(

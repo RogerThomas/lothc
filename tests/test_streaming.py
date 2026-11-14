@@ -1,4 +1,3 @@
-import json
 import time
 from collections.abc import AsyncGenerator, Generator
 from concurrent.futures import ThreadPoolExecutor
@@ -11,7 +10,7 @@ from msgspec.json import Decoder
 from pydantic import BaseModel, TypeAdapter
 from typing_extensions import TypeForm
 
-from lothc import HTTPClient, HTTPConnectionError, SyncHTTPClient
+from lothc import HTTPClient, HTTPConnectionError, HTTPResponseError, SyncHTTPClient
 
 
 class Line(Struct):
@@ -101,12 +100,14 @@ async def test_stream_get_decodes_via_pydantic_type_adapter(client: HTTPClient) 
     assert lines == [LineModel(i=0), LineModel(i=1), LineModel(i=2)]
 
 
-async def test_stream_get_raw_bytes_mode_error_for_status_false_suppresses_raise(
-    client: HTTPClient,
+async def test_stream_get_raw_bytes_mode_raises_even_with_raise_for_status_false(
+    base_url: str,
 ) -> None:
-    chunks = [chunk async for chunk in client.stream_get("boom", error_for_status=False)]
+    async with HTTPClient(base_url=base_url, raise_for_status=False) as client:
+        with pytest.raises(HTTPResponseError) as exc_info:
+            _ = [chunk async for chunk in client.stream_get("boom")]
 
-    assert json.loads(b"".join(chunks)) == {
+    assert exc_info.value.error == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,
@@ -155,12 +156,16 @@ def test_sync_stream_post_interruptible_decodes_typed_lines(sync_client: SyncHTT
     assert lines == [Line(i=0), Line(i=1), Line(i=2)]
 
 
-def test_sync_stream_get_raw_bytes_mode_error_for_status_false_suppresses_raise(
-    sync_client: SyncHTTPClient,
+def test_sync_stream_get_raw_bytes_mode_raises_even_with_raise_for_status_false(
+    base_url: str,
 ) -> None:
-    chunks = list(sync_client.stream_get("boom", error_for_status=False))
+    with (
+        SyncHTTPClient(base_url=base_url, raise_for_status=False) as client,
+        pytest.raises(HTTPResponseError) as exc_info,
+    ):
+        _ = list(client.stream_get("boom"))
 
-    assert json.loads(b"".join(chunks)) == {
+    assert exc_info.value.error == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,

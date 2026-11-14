@@ -91,6 +91,9 @@ pub(crate) struct Exchange {
     pub(crate) url: Url,
     pub(crate) decode: Option<Py<PyAny>>,
     pub(crate) raises: Option<Py<PyAny>>,
+    /// With `raises`, a 4xx/5xx comes back as a deferred error response (`raise_for_status=False`)
+    /// instead of raising; without `raises` nothing is checked either way.
+    pub(crate) defer_error: bool,
     pub(crate) typed_headers: Option<Py<PyAny>>,
     pub(crate) headers_only: bool,
     pub(crate) started: Instant,
@@ -103,6 +106,7 @@ pub(crate) struct Glue {
     lazy_headers: Py<PyAny>,
     eager_headers: Py<PyAny>,
     status_error: Py<PyAny>,
+    error_response: Py<PyAny>,
     parse_typed_headers: Py<PyAny>,
     connection_error: Py<PyAny>,
     timeout_error: Py<PyAny>,
@@ -122,6 +126,7 @@ impl Glue {
             lazy_headers: get("lazy_headers")?,
             eager_headers: get("eager_headers")?,
             status_error: get("status_error")?,
+            error_response: get("error_response")?,
             parse_typed_headers: get("parse_typed_headers")?,
             connection_error: get("connection_error")?,
             timeout_error: get("timeout_error")?,
@@ -196,7 +201,8 @@ impl Glue {
         PyTuple::new(py, [status.into_pyobject(py)?.into_any(), headers.into_any(), version.bind(py).clone().into_any()])
     }
 
-    /// What lothc's pyreqwest path returns (a `Response`) or raises for this exchange.
+    /// What lothc's pyreqwest path returns (a `Response`, or a deferred error response for a
+    /// 4xx/5xx with `defer_error`) or raises for this exchange.
     pub(crate) fn outcome<'py>(
         &self,
         py: Python<'py>,
@@ -210,8 +216,21 @@ impl Glue {
         let elapsed = exchange.started.elapsed().as_secs_f64();
         let request_info = self.request_info(py, exchange)?;
         let body = PyBytes::new(py, &head.body);
+        let version = if head.version == Version::HTTP_10 { &self.http_10 } else { &self.http_11 };
         if head.status >= 400 {
             if let Some(raises) = &exchange.raises {
+                if exchange.defer_error {
+                    let headers = self.lazy_headers.bind(py).call1((RawHeaders::new(head.headers),))?;
+                    return self.error_response.bind(py).call1((
+                        raises.bind(py),
+                        head.status,
+                        headers,
+                        request_info,
+                        version.bind(py),
+                        elapsed,
+                        body,
+                    ));
+                }
                 let headers = self.eager_headers.bind(py).call1((RawHeaders::new(head.headers),))?;
                 let error = self.status_error.bind(py).call1((raises.bind(py), head.status, body, request_info, headers))?;
                 return Err(PyErr::from_value(error));
@@ -230,7 +249,6 @@ impl Glue {
             Some(header_type) => self.parse_typed_headers.bind(py).call1((&headers, header_type.bind(py)))?,
             None => py.None().into_bound(py),
         };
-        let version = if head.version == Version::HTTP_10 { &self.http_10 } else { &self.http_11 };
         self.response
             .bind(py)
             .call1((data, head.status, headers, typed_headers, request_info, version.bind(py), elapsed))

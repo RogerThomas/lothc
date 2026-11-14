@@ -128,23 +128,29 @@ Every body verb returns a `Response[TData]`: `.data` (the body decoded as `into`
 `.status`, `.headers`, `.typed_headers` (set with `response_headers_type=`), `.request`,
 `.http_version` (e.g. `"HTTP/1.1"`) and `.elapsed` (seconds, including retries).
 
-- `get(path, *, params=None, headers=None, into=None, response_headers_type=None, error_for_status=True, raises=None) -> Response[Data]`
-- `post/put/patch(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, into=None, response_headers_type=None, error_for_status=True, raises=None) -> Response[Data]` —
+- `get(path, *, params=None, headers=None, into=None, response_headers_type=None, raise_for_status=None, raises=None) -> Response[Data]`
+- `post/put/patch(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, into=None, response_headers_type=None, raise_for_status=None, raises=None) -> Response[Data]` —
   at most one of `json`/`data`/`form`/`content`, else `ValueError`
 - `delete(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, into=None, ...) -> Response[Data]` — a body is optional
-- `head(path, *, params=None, headers=None, response_headers_type=None, error_for_status=True) -> Response[None]`
-- `sse(path, *, params=None, headers=None, into=None, error_for_status=True) -> Generator[SSEEvent[TData]]` —
+- `head(path, *, params=None, headers=None, response_headers_type=None, raise_for_status=None) -> Response[None]`
+- `sse(path, *, params=None, headers=None, into=None) -> Generator[SSEEvent[TData]]` —
   yields `SSEEvent(id=, event=, data=)` (kw-only dataclass, `SSEEvent[TData]`).
   `into` controls `.data` only (default `str`); any type expression | `TypeAdapter` | `Decoder`.
   `.event` and `.id` are always `str`, defaulting to `"message"` and `""` as the spec does.
-- `stream_get(path, *, params=None, headers=None, into=None, error_for_status=True) -> Generator[bytes | TLine]` —
+- `stream_get(path, *, params=None, headers=None, into=None) -> Generator[bytes | TLine]` —
   raw unbuffered bytes by default; `into` switches to newline-buffered per-line decode
 - `stream_post(path, *, ..., json=None, data=None, form=None, content=None, into=None, ...) -> Generator[bytes | TLine]`
   (async: `AsyncGenerator`). Generators so a caller can `close()`/`aclose()` one it stops reading early.
-- `download(path, dest=None, *, params=None, headers=None, error_for_status=True) -> bytes | None` —
+- `download(path, dest=None, *, params=None, headers=None, raise_for_status=None) -> bytes | None` —
   large bodies: no `dest` returns `bytes` (~2/3 the peak memory of `get()`), `dest` (`str` or
   path-like) streams to a file (O(chunk size) memory), written to a hidden sibling and renamed on
   success, so a failed download never leaves a truncated file or clobbers an existing one
+
+`raise_for_status` (client, default `True`; a verb's `None` keeps the client's): `False` returns a
+4xx/5xx as a `Response` whose `.data`/`.typed_headers` raise the `HTTPResponseError`, with
+`.raw_error` (body bytes) and `.error` (decoded as `HTTPResponseError.error`, lazily); both are
+`None` on any other response. `download` then writes nothing to `dest`. The streaming verbs
+(`stream_get`/`stream_post`/`sse`) always raise.
 
 For `stream_get`/`stream_post`/`download` the client `timeout` is the longest gap allowed between
 chunks (and before headers), not a total cap; a per-call `timeout=` is a total cap; `read_timeout`
@@ -163,7 +169,7 @@ lookups, `get_all(name)` for a repeated header's every value.
 
 ## Errors
 
-- `HTTPResponseError[E = object]` — 4xx/5xx when `error_for_status=True` (default). `.status`,
+- `HTTPResponseError[E = object]` — 4xx/5xx when `raise_for_status=True` (default). `.status`,
   `.headers`, `.body` (whole), `.body_start` (first 100 bytes), `.request`, `.error`,
   `.parse_error`; pickles (as its own subclass). `.error` is `E | dict[str, Any] | None`: the body
   as the pinned `E`, else a JSON object, else `None`; `.parse_error` says why a pinned `E` didn't

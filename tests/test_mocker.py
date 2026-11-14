@@ -75,6 +75,34 @@ async def test_add_get_response_with_status_raises_http_response_error(
     assert exc_info.value.body_start == b"not found"
 
 
+async def test_a_mocked_error_status_is_returned_with_raise_for_status_false(
+    client: HTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/items/7", status=404, data={"detail": "not-found"})
+
+    response = await client.get("items/7", into=ItemModel, raise_for_status=False)
+
+    assert response.status == 404
+    assert response.error == {"detail": "not-found"}
+    assert response.raw_error == b'{"detail":"not-found"}'
+    with pytest.raises(HTTPResponseError) as exc_info:
+        _ = response.data
+    assert exc_info.value.status == 404
+
+
+def test_sync_a_mocked_error_status_is_returned_with_raise_for_status_false(
+    sync_client: SyncHTTPClient, lothc_mocker: LOTHCMocker
+) -> None:
+    lothc_mocker.add_get_response(path="/items/7", status=404, data={"detail": "not-found"})
+
+    response = sync_client.get("items/7", into=ItemModel, raise_for_status=False)
+
+    assert response.status == 404
+    assert response.error == {"detail": "not-found"}
+    with pytest.raises(HTTPResponseError):
+        _ = response.data
+
+
 async def test_add_get_response_with_headers(client: HTTPClient, lothc_mocker: LOTHCMocker) -> None:
     lothc_mocker.add_get_response(path="/items/7", headers={"x-custom": "header-value"})
 

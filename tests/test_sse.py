@@ -68,10 +68,14 @@ async def test_sse_skips_comment_only_and_unrecognized_field_records(client: HTT
     assert events[0].event == "message"
 
 
-async def test_sse_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
-    events = [event async for event in client.sse("boom", error_for_status=False)]
+async def test_sse_raises_on_an_error_status_even_with_raise_for_status_false(
+    base_url: str,
+) -> None:
+    async with HTTPClient(base_url=base_url, raise_for_status=False) as client:
+        with pytest.raises(HTTPResponseError) as exc_info:
+            _ = [event async for event in client.sse("boom")]
 
-    assert events == []
+    assert exc_info.value.status == 500
 
 
 async def test_sse_yields_typed_events_via_struct_class(client: HTTPClient) -> None:
@@ -136,10 +140,16 @@ def test_sync_sse_skips_comment_only_and_unrecognized_field_records(
     assert events[0].data == "hello"
 
 
-def test_sync_sse_error_for_status_false_suppresses_raise(sync_client: SyncHTTPClient) -> None:
-    events = list(sync_client.sse("boom", error_for_status=False))
+def test_sync_sse_raises_on_an_error_status_even_with_raise_for_status_false(
+    base_url: str,
+) -> None:
+    with (
+        SyncHTTPClient(base_url=base_url, raise_for_status=False) as client,
+        pytest.raises(HTTPResponseError) as exc_info,
+    ):
+        _ = list(client.sse("boom"))
 
-    assert events == []
+    assert exc_info.value.status == 500
 
 
 def test_sync_sse_yields_typed_events_via_struct_class(sync_client: SyncHTTPClient) -> None:
@@ -156,12 +166,16 @@ def test_sync_sse_transport_error_mid_stream_raises_connection_error(
         list(sync_client.sse("events-truncated", max_reconnects=0, interruptible=interruptible))
 
 
-def test_sync_sse_interruptible_error_for_status_false_suppresses_raise(
-    sync_client: SyncHTTPClient,
+def test_sync_sse_interruptible_raises_on_an_error_status_even_with_raise_for_status_false(
+    base_url: str,
 ) -> None:
-    events = list(sync_client.sse("boom", error_for_status=False, interruptible=True))
+    with (
+        SyncHTTPClient(base_url=base_url, raise_for_status=False) as client,
+        pytest.raises(HTTPResponseError) as exc_info,
+    ):
+        _ = list(client.sse("boom", interruptible=True))
 
-    assert events == []
+    assert exc_info.value.status == 500
 
 
 def _consume_one_event_then_break(sync_client: SyncHTTPClient) -> None:

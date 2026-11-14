@@ -461,7 +461,8 @@ def _retried_cases() -> list[_Case]:
 
 
 def _seen(response: Any) -> _Seen:  # noqa: ANN401 — whichever `Response` the verb returned
-    wire: Any = response.data
+    # A 4xx/5xx under `raise_for_status=False`: its `.data` raises, so its body is compared.
+    wire: Any = response.raw_error if response.status >= 400 else response.data
     if response.request.path == "/echo-request" and response.status == 200:
         wire = json.loads(response.data)
     return _Seen(response.status, response.request, wire)
@@ -490,13 +491,13 @@ def _pair[TClient](
 async def _async_seen(client: HTTPClient, case: _Case, base_url: str) -> _Seen:
     async with client:
         send: Callable[..., Awaitable[Any]] = getattr(client, case.verb)
-        return _seen(await send(_path(case, base_url), error_for_status=False, **case.call))
+        return _seen(await send(_path(case, base_url), raise_for_status=False, **case.call))
 
 
 def _sync_seen(client: SyncHTTPClient, case: _Case, base_url: str) -> _Seen:
     with client:
         send: Callable[..., Any] = getattr(client, case.verb)
-        return _seen(send(_path(case, base_url), error_for_status=False, **case.call))
+        return _seen(send(_path(case, base_url), raise_for_status=False, **case.call))
 
 
 @pytest.mark.parametrize("case", _wire_cases(), ids=lambda case: case.id)
@@ -528,16 +529,14 @@ def test_sync_native_transport_sends_what_pyreqwest_sends(
 async def _async_streamed(client: HTTPClient, case: _Case, base_url: str) -> Any:  # noqa: ANN401 — the echoed JSON
     async with client:
         stream: Callable[..., AsyncIterator[bytes]] = getattr(client, case.verb)
-        chunks = stream(_path(case, base_url), error_for_status=False, **case.call)
+        chunks = stream(_path(case, base_url), **case.call)
         return json.loads(b"".join([chunk async for chunk in chunks]))
 
 
 def _sync_streamed(client: SyncHTTPClient, case: _Case, base_url: str) -> Any:  # noqa: ANN401 — the echoed JSON
     with client:
         stream: Callable[..., Iterator[bytes]] = getattr(client, case.verb)
-        return json.loads(
-            b"".join(stream(_path(case, base_url), error_for_status=False, **case.call))
-        )
+        return json.loads(b"".join(stream(_path(case, base_url), **case.call)))
 
 
 @pytest.mark.parametrize("case", _streamed_cases(), ids=lambda case: case.id)
@@ -1541,7 +1540,7 @@ def _retried_form_cases() -> list[_FormCase]:
     retries: dict[str, Any] = {"max_retries": 1, "backoff_base": 0.001}
     path = "/status-then-ok?key={key}&fail_times=1"
     # The 503 a form sent once gets back is the response compared.
-    call = {"error_for_status": False}
+    call = {"raise_for_status": False}
     return [
         _FormCase("a-form-put-is-sent-once", {"a": "b"}, "put", path, call, retries),
         _FormCase(
@@ -1730,7 +1729,7 @@ async def _async_cookie_seen(client: HTTPClient, case: _CookieCase, base_url: st
         for path in case.setup:
             await client.get(_path(_Case("setup", path=path), base_url))
         send: Callable[..., Awaitable[Any]] = getattr(client, case.case.verb)
-        response = await send(_path(case.case, base_url), error_for_status=False, **case.case.call)
+        response = await send(_path(case.case, base_url), raise_for_status=False, **case.case.call)
         return _seen(response)
 
 
@@ -1739,7 +1738,7 @@ def _sync_cookie_seen(client: SyncHTTPClient, case: _CookieCase, base_url: str) 
         for path in case.setup:
             client.get(_path(_Case("setup", path=path), base_url))
         send: Callable[..., Any] = getattr(client, case.case.verb)
-        return _seen(send(_path(case.case, base_url), error_for_status=False, **case.case.call))
+        return _seen(send(_path(case.case, base_url), raise_for_status=False, **case.case.call))
 
 
 @pytest.mark.parametrize("case", _cookie_cases(), ids=lambda case: case.case.id)

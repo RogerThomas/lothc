@@ -1,6 +1,7 @@
+import pytest
 from pydantic import BaseModel
 
-from lothc import HTTPClient, SyncHTTPClient
+from lothc import HTTPClient, HTTPResponseError, SyncHTTPClient
 
 
 class EchoedHeaders(BaseModel):
@@ -33,12 +34,15 @@ def test_sync_delete_result_includes_status_and_data(sync_client: SyncHTTPClient
     assert result.data == {"id": 7, "deleted": True}
 
 
-async def test_response_delete_error_for_status_false_suppresses_raise(
+async def test_response_delete_raise_for_status_false_returns_the_error_response(
     client: HTTPClient,
 ) -> None:
-    result = await client.delete("missing", error_for_status=False)
+    result = await client.delete("missing", raise_for_status=False)
 
     assert result.status == 404
+    with pytest.raises(HTTPResponseError) as exc_info:
+        _ = result.data
+    assert exc_info.value.status == 404
 
 
 async def test_head_returns_headers_only_result(client: HTTPClient) -> None:
@@ -56,16 +60,27 @@ def test_sync_head_returns_headers_only_result(sync_client: SyncHTTPClient) -> N
     assert result.headers["x-item-exists"] == "true"
 
 
-async def test_head_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
-    result = await client.head("missing", error_for_status=False)
+async def test_head_raise_for_status_false_returns_the_error_response(
+    client: HTTPClient,
+) -> None:
+    result = await client.head("missing", raise_for_status=False)
 
     assert result.status == 404
+    assert result.raw_error == b""
+    assert result.error is None
+    with pytest.raises(HTTPResponseError) as exc_info:
+        _ = result.data
+    assert exc_info.value.status == 404
 
 
-def test_sync_head_error_for_status_false_suppresses_raise(sync_client: SyncHTTPClient) -> None:
-    result = sync_client.head("missing", error_for_status=False)
+def test_sync_head_raise_for_status_false_returns_the_error_response(
+    sync_client: SyncHTTPClient,
+) -> None:
+    result = sync_client.head("missing", raise_for_status=False)
 
     assert result.status == 404
+    with pytest.raises(HTTPResponseError):
+        _ = result.data
 
 
 async def test_options_returns_preflight_status_and_headers(client: HTTPClient) -> None:
@@ -89,15 +104,24 @@ def test_sync_options_returns_preflight_status_and_headers(sync_client: SyncHTTP
     assert result.request.method == "OPTIONS"
 
 
-async def test_options_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
-    result = await client.options("missing", error_for_status=False)
+async def test_options_raise_for_status_false_returns_the_error_response(
+    client: HTTPClient,
+) -> None:
+    result = await client.options("missing", raise_for_status=False)
 
     assert result.status == 404
+    assert result.raw_error == b""
+    assert result.error is None
+    with pytest.raises(HTTPResponseError) as exc_info:
+        _ = result.data
+    assert exc_info.value.status == 404
 
 
-def test_sync_options_error_for_status_false_suppresses_raise(
+def test_sync_options_raise_for_status_false_returns_the_error_response(
     sync_client: SyncHTTPClient,
 ) -> None:
-    result = sync_client.options("missing", error_for_status=False)
+    result = sync_client.options("missing", raise_for_status=False)
 
     assert result.status == 404
+    with pytest.raises(HTTPResponseError):
+        _ = result.data

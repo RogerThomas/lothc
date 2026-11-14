@@ -78,8 +78,8 @@ async with HTTPClient(base_url="https://api.example.com/", timeout=30) as client
 
 ## Errors
 
-`error_for_status` (default `True`) is checked once, before the first chunk is yielded — a
-4xx/5xx response raises `HTTPResponseError` immediately rather than partway through the stream. See
+A 4xx/5xx response always raises `HTTPResponseError`, before the first chunk is yielded rather
+than partway through the stream; `raise_for_status=False` doesn't apply here. See
 [Error handling](errors.md).
 
 ## Ctrl-C-interruptible streaming (sync only) — `interruptible`

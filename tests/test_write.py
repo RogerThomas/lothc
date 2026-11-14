@@ -455,10 +455,13 @@ def test_sync_post_result_includes_status_and_data(sync_client: SyncHTTPClient) 
     assert result.data == ItemModel(id=1, name="ditto")
 
 
-async def test_response_post_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
-    result = await client.post("missing", error_for_status=False)
+async def test_response_post_raise_for_status_false_returns_the_error_response(
+    client: HTTPClient,
+) -> None:
+    result = await client.post("missing", raise_for_status=False)
 
     assert result.status == 404
+    assert result.error == {"type": "not-found", "title": "Not found", "status": 404}
 
 
 async def test_response_put_includes_status_and_data(client: HTTPClient) -> None:
