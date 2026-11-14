@@ -11,15 +11,8 @@ examples below:
 uv add 'lothc[testing]' pytest-asyncio --dev
 ```
 
-`lothc_mocker` itself works as soon as `pytest` is installed alongside `lothc` — the extra above
-just pins a tested pytest version, it doesn't gate the fixture.
-
-`lothc_mocker` intercepts every request a `HTTPClient` or `SyncHTTPClient` sends during a test — no
-real network call happens, and no changes are needed to how the client under test is built
-(either transport is mocked exactly the same way). Every example on this page is a complete, runnable file — paste the setup block below into a
-`test_lothc_mocker.py` (or your `conftest.py` for just the fixtures), then any test function under
-it, and `pytest` will run it as-is. Nothing on this page ever imports from `pyreqwest` — every type
-you touch (`MockRequest`, `MockResponse`, `LOTHCMock`, `LOTHCMocker`) is lothc's own.
+`lothc_mocker` is a pytest fixture lothc registers itself (nothing to import or enable); it
+intercepts every request an `HTTPClient` or `SyncHTTPClient` sends during the test.
 
 ## Setup
 
@@ -49,11 +42,6 @@ def _sync_client():
         yield client
 ```
 
-Every test function below assumes `client`/`sync_client` come from this setup, and uses
-`@pytest.mark.asyncio` on each `async def test_...` explicitly rather than relying on your own
-project's `pytest-asyncio` mode setting — copy them in as shown and they'll run regardless of how
-your `pyproject.toml`/`pytest.ini` configures `asyncio_mode`.
-
 ## Canned responses
 
 ```python
@@ -67,10 +55,9 @@ async def test_get_item(client: HTTPClient, lothc_mocker: LOTHCMocker) -> None:
 ```
 
 `add_get_response`/`add_post_response`/`add_put_response`/`add_patch_response`/
-`add_delete_response`/`add_head_response` — one per lothc verb (no `data=` on the `head` one,
-since `head()` never decodes a body) — are the main entry points, and they work identically for
-`HTTPClient` and `SyncHTTPClient` tests: the same `lothc_mocker` fixture, the same methods, no
-separate sync/async mock API to learn.
+`add_delete_response`/`add_head_response` (no `data=` on the `head` one) are the main entry
+points, and work identically for `HTTPClient` and `SyncHTTPClient` tests. For OPTIONS, use
+`lothc_mocker.mock("OPTIONS").with_status(204)`.
 
 ## Reusing your own `data=`/`headers=` classes
 
@@ -175,8 +162,8 @@ async def test_match_header_narrows_a_mock(client: HTTPClient, lothc_mocker: LOT
     mock.assert_called(count=1)
 ```
 
-`mock.get_requests()`/`lothc_mocker.get_requests()` return `list[MockRequest]` — lothc's own
-snapshot type (`method`/`path`/`query_string`/`query`/`headers`/`body`), not pyreqwest's `Request`:
+`get_requests()` returns `MockRequest` snapshots (`method`/`path`/`query_string`/`query`/`headers`/
+`body`):
 
 ```python
 @pytest.mark.asyncio
@@ -205,12 +192,9 @@ async def test_strict_by_default_raises_for_unmatched_request(
         await client.get("items/7")
 ```
 
-Opt out per-test with the `@pytest.mark.lothc_mocker(strict=False)` marker — standard pytest, no
-special import needed — for the rare test that genuinely wants an unmocked request to fall
-through to the real network instead of raising. Since `client`'s `base_url` here isn't a real
-server (see [Setup](#setup)), falling through raises a connection error rather than succeeding —
-which is itself the point: with strict mode off, that's a real `HTTPConnectionError` from actually
-trying the network, not lothc's own `AssertionError`:
+Opt out with `@pytest.mark.lothc_mocker(strict=False)`, or mid-test with
+`lothc_mocker.strict(enabled=False)`. With `client`'s fake `base_url`, an unmatched request then
+fails on the real network:
 
 ```python
 @pytest.mark.lothc_mocker(strict=False)
@@ -222,9 +206,6 @@ async def test_lothc_mocker_marker_disables_strict(
         await client.get("items/7")
 ```
 
-Or call `lothc_mocker.strict(enabled=False)` mid-test instead, if you only want it off for part of
-a test rather than the whole thing.
-
 ## Custom responses
 
 For anything the `add_*_response` shape doesn't cover (a computed response, a handler that
@@ -234,17 +215,9 @@ only place `match_request_with_response` can be used — calling it on a mock th
 canned response (any `add_*_response` call, or `with_status`/`with_headers`/`with_data`) raises a
 `ValueError`: a mock rule is either a canned response or a custom handler, never both.
 
-A custom handler (like a `match_request` predicate) can be a plain function, which answers either
-client, or an `async def`, which only a `HTTPClient` can await: a `SyncHTTPClient` request that
-reaches one raises `TypeError`. What the handler *returns* is the same either way: a
-plain `MockResponse` (`data`/`headers`/`status`, same fields and same encoding as
-`add_*_response`) either way, or `None` to decline and let a later mock try to match instead —
-lothc never hands you pyreqwest's own response types to build this, `MockResponse` is a plain
-dataclass, no builder. The handler's own parameter is `MockRequest`, the same snapshot type
-`get_requests()` returns — reading it is the reason to reach for a custom handler instead of
-`add_*_response`, whose `data=` is fixed once at registration time. Here the handler computes its
-response from `request.path` instead of returning a hardcoded value, so it works for *any* item ID
-without registering a separate mock per ID:
+A handler (sync, or async for `HTTPClient` only) takes a `MockRequest` and returns a
+`MockResponse`, or `None` to defer to a later mock. A sync handler serves both clients; a
+`SyncHTTPClient` request that reaches an async one raises `TypeError`:
 
 ```python
 def _item_id_from_request(request: MockRequest) -> int:
@@ -279,9 +252,6 @@ def test_sync_custom_handler_computes_response_from_the_request(
 
     assert response.data == {"id": 42}
 ```
-
-`request` also exposes `.method`, `.query_string`, `.query` (`Mapping[str, str]`), and `.body`
-(`bytes | None`) — anything a real handler would need to branch on.
 
 ## How a request finds its mock
 

@@ -4,7 +4,8 @@ icon: lucide/key-round
 
 # Authentication
 
-Two ways to send a `Bearer` `Authorization` header — provide at most one:
+Provide at most one of `bearer_token` (static), `bearer_auth` (a callable, async on `HTTPClient`,
+called per request) or `basic_auth` (`(user, password | None)`):
 
 ```python
 async with HTTPClient(
@@ -12,10 +13,6 @@ async with HTTPClient(
 ) as client:
     await client.get("items/7")
 ```
-
-`bearer_token` is a static string, sent as-is on every request. For a token that expires or
-rotates, pass `bearer_auth` instead — an async callable (sync callable on `SyncHTTPClient`)
-resolved fresh on *every* request, not just once when the client is created:
 
 ```python
 async def get_current_token() -> str:
@@ -27,23 +24,12 @@ async with HTTPClient(base_url="https://api.example.com/", bearer_auth=get_curre
     await client.get("items/8")  # calls it again — always the latest token
 ```
 
-For the most common reason to need `bearer_auth` — an OAuth 2 client-credentials token that
-expires — lothc ships a ready-made provider, so you don't write that callable yourself; see
-[OAuth 2 client credentials](#oauth-2-client-credentials) below.
-
-`bearer_token`/`bearer_auth` both only ever produce a `Bearer` `Authorization` header. For a
-Basic-auth `username`/`password` pair instead, pass `basic_auth` — provide at most one of the
-three:
-
 ```python
 async with HTTPClient(
     base_url="https://api.example.com/", basic_auth=("my-username", "my-password")
 ) as client:
     await client.get("items/7")
 ```
-
-`password` may be `None` for a username with no password. There's no other custom-auth-scheme
-option today.
 
 Every verb also takes `skip_auth`, which omits the `Authorization` header for that one call —
 useful when a client configured with `bearer_token`/`bearer_auth`/`basic_auth` also needs to hit a
@@ -124,7 +110,7 @@ token cached forever.
 Each token request goes through its own short-lived client, built by calling `client_factory`
 with no arguments (default `HTTPClient`). Anything the token endpoint needs that the API
 client doesn't — a shorter timeout, a proxy, a private CA, an mTLS identity — goes through a
-`functools.partial` of `build`:
+`functools.partial` of `HTTPClient`:
 
 ```python
 from functools import partial
@@ -156,12 +142,8 @@ OAuthProvider(
 )
 ```
 
-Each provider gets its own file in that directory, named for the token URL's host, the client ID
-and a short hash of the token URL, client ID and scope, e.g.
-`auth.example.com-my-client-id-825a9a6162ca.json`. So several providers (different clients, token
-URLs or scopes) can share one directory without overwriting each other, and you can still tell the
-files apart by eye. Characters that aren't safe in a filename are replaced with `_` in the
-readable part; the hash always uses the real values.
+Each provider gets its own file, named from its token URL, client ID and scope, so several can
+share one directory; like the AWS CLI's and gcloud's caches, it isn't encrypted.
 
 After every mint/refresh the token triple is written to that file as JSON, atomically (a temp file in
 the same directory, then replaced into place) with `0600` permissions, since it holds live
@@ -190,10 +172,6 @@ fatal — it's ignored and overwritten on the next mint. The directory is the on
 up front: if it doesn't exist, constructing the provider raises `FileNotFoundError` immediately
 rather than failing on the first write.
 
-The file isn't encrypted: like the AWS CLI's `~/.aws/sso/cache` and gcloud's credentials, it
-relies on `0600` permissions. Encrypting it with the client secret would add little, since anyone
-who can read the secret can mint a fresh token anyway.
-
 ### Non-RFC token endpoints
 
 Plenty of real APIs hand out bearer tokens without speaking RFC 6749: a JSON body instead of
@@ -214,59 +192,68 @@ them. The contract is on the *attribute* names, never the *wire* names:
 Provide `token_request` and `token_response` together, or neither. `client_auth` is ignored on
 this path: the request model carries the credentials, so nothing is sent as HTTP Basic.
 
-```python
-from pydantic import BaseModel, ConfigDict, Field
+=== "pydantic"
+
+    ```python
+    from pydantic import BaseModel, ConfigDict, Field
 
 
-class TokenRequest(BaseModel):
-    model_config = ConfigDict(validate_by_name=True, serialize_by_alias=True)
+    class TokenRequest(BaseModel):
+        model_config = ConfigDict(validate_by_name=True)
 
-    client_id: str = Field(alias="clientID")
-    client_secret: str = Field(alias="clientSecret")
-    grant_type: str = Field(default="client_credentials", alias="grantType")
-
-
-class TokenResponse(BaseModel):
-    access_token: str = Field(alias="accessToken")
-    expires_in: int = Field(alias="expiresIn")
-    # This API never returns a refresh token, so there's no field for it at all — leave
-    # `token_refresh_request` out too, and renewal simply mints a fresh token every time.
+        client_id: str = Field(alias="clientID")
+        client_secret: str = Field(alias="clientSecret")
+        grant_type: str = Field(default="client_credentials", alias="grantType")
 
 
-OAuthProvider(
-    token_url="https://auth.example.com/v2/token",
-    client_id="my-client-id",
-    client_secret="my-client-secret",
-    token_request=TokenRequest,
-    token_response=TokenResponse,
-)
-```
-
-The `model_config` line on the request model is load-bearing, not boilerplate: lothc constructs
-the model by attribute name, and `validate_by_name=True` is what lets an aliased pydantic model
-accept `client_id=` at all. `serialize_by_alias=True` is no longer needed, since lothc encodes
-every pydantic model by its aliases unless the model explicitly sets `serialize_by_alias=False`
-(the same way msgspec's `rename=`/`name=` works in both directions); it's harmless to keep.
-
-The msgspec spelling of the same thing needs no config — `name=` covers both directions:
-
-```python
-import msgspec
+    class TokenResponse(BaseModel):
+        access_token: str = Field(alias="accessToken")
+        expires_in: int = Field(alias="expiresIn")
+        # This API never returns a refresh token, so there's no field for it at all — leave
+        # `token_refresh_request` out too, and renewal simply mints a fresh token every time.
 
 
-class TokenRequest(msgspec.Struct):
-    client_id: str = msgspec.field(name="clientID")
-    client_secret: str = msgspec.field(name="clientSecret")
-    grant_type: str = msgspec.field(default="client_credentials", name="grantType")
+    OAuthProvider(
+        token_url="https://auth.example.com/v2/token",
+        client_id="my-client-id",
+        client_secret="my-client-secret",
+        token_request=TokenRequest,
+        token_response=TokenResponse,
+    )
+    ```
+
+=== "msgspec"
+
+    ```python
+    import msgspec
 
 
-class TokenResponse(msgspec.Struct):
-    access_token: str = msgspec.field(name="accessToken")
-    expires_in: int = msgspec.field(name="expiresIn")
-```
+    class TokenRequest(msgspec.Struct):
+        client_id: str = msgspec.field(name="clientID")
+        client_secret: str = msgspec.field(name="clientSecret")
+        grant_type: str = msgspec.field(default="client_credentials", name="grantType")
 
-If the API does issue refresh tokens, declare `refresh_token` on the response model (it's
-read if present, see above) and add a third model for the refresh call:
+
+    class TokenResponse(msgspec.Struct):
+        access_token: str = msgspec.field(name="accessToken")
+        expires_in: int = msgspec.field(name="expiresIn")
+
+
+    OAuthProvider(
+        token_url="https://auth.example.com/v2/token",
+        client_id="my-client-id",
+        client_secret="my-client-secret",
+        token_request=TokenRequest,
+        token_response=TokenResponse,
+    )
+    ```
+
+lothc constructs the request model by attribute name, so an aliased pydantic model needs
+`validate_by_name=True`. msgspec: `msgspec.field(name=...)`, no config needed.
+
+If the API does issue refresh tokens, declare `refresh_token` on the response model (it's read if
+present, see above), add a model for the refresh call, and pass it as
+`token_refresh_request=TokenRefreshRequest`:
 
 ```python
 class TokenResponse(BaseModel):
@@ -276,7 +263,7 @@ class TokenResponse(BaseModel):
 
 
 class TokenRefreshRequest(BaseModel):
-    model_config = ConfigDict(validate_by_name=True, serialize_by_alias=True)
+    model_config = ConfigDict(validate_by_name=True)
 
     refresh_token: str = Field(alias="refreshToken")
     grant_type: str = Field(default="refresh_token", alias="grantType")
@@ -310,9 +297,8 @@ The client knows nothing about OAuth here: any `bearer_auth` callable with an
 
 ### Sync
 
-`SyncOAuthProvider` is the mirror for `SyncHTTPClient` — same constructor, same lifecycle, a
-plain `def __call__`, and a `client_factory` defaulting to `SyncHTTPClient` (so
-`partial(SyncHTTPClient, timeout=5.0)` is the sync spelling of the example above):
+`SyncOAuthProvider`: same constructor, for `SyncHTTPClient` (default
+`client_factory=SyncHTTPClient`).
 
 ```python
 from lothc import SyncHTTPClient, SyncOAuthProvider
@@ -344,29 +330,3 @@ async with HTTPClient(
 
 Combine freely with `bearer_token`/`bearer_auth`/`basic_auth` — they set different headers
 (`Authorization` vs. whatever you name here).
-
-## Timeouts
-
-`timeout` (seconds, default `30.0`) applies to the whole client, covering every request made
-through it:
-
-```python
-async with HTTPClient(base_url="https://api.example.com/", timeout=5.0) as client:
-    await client.get("items/7")  # raises HTTPTimeoutError if this takes longer than 5s
-```
-
-Pass `timeout=None` to disable it and fall back to pyreqwest's own default. See
-[Error handling](errors.md) for `HTTPTimeoutError`.
-
-Every verb also takes its own `timeout`, overriding the client's for that one call only:
-
-```python
-async with HTTPClient(base_url="https://api.example.com/", timeout=5.0) as client:
-    await client.get("items/7")  # uses the client default, 5s
-    await client.get("exports/large-file.csv", timeout=60.0)  # this call gets 60s instead
-```
-
-There's no way to make a single call wait forever when the client itself has a finite
-`timeout` — pyreqwest's own per-request `.timeout()` only ever accepts a duration, never a
-sentinel meaning "no timeout." To remove the limit entirely, build the client with
-`timeout=None` instead.
