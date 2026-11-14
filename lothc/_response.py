@@ -1,7 +1,7 @@
 """`Response` and `RequestInfo`, what every non-streaming verb returns."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ._compat import (
     BaseModel,
@@ -50,6 +50,14 @@ class Response[TData, THeaders: TypedHeaders | None = None]:
     necessarily the one a final response came from if redirects were followed.
     `.http_version` is the protocol the response came over (e.g. `"HTTP/1.1"`), and `.elapsed`
     the seconds from sending the request to having the whole response, including any retries.
+
+    With `raise_for_status=False` (the client's or the call's), a 4xx/5xx comes back as a
+    `Response` instead of raising: reading its `.data` or `.typed_headers` raises the
+    `HTTPResponseError` the call would otherwise have raised (a new one on each read),
+    `.raw_error` is the error body, and `.error` is that body decoded as
+    `HTTPResponseError.error` decodes it (the `raises=` class's pinned type, else a JSON object
+    as a `dict`, else `None`), decoded on first read. Every other response has `.error` and
+    `.raw_error` `None`.
     """
 
     data: TData
@@ -59,3 +67,11 @@ class Response[TData, THeaders: TypedHeaders | None = None]:
     request: RequestInfo
     http_version: str
     elapsed: float
+    # Class-level defaults `__init__` never sets (`init=False` on a class without slots), so
+    # building a `Response`, the native side's positional call included, costs what it did
+    # before these existed, and an instance is no bigger. `object`, since `Response` has no type
+    # parameter for the `raises=` class's error type: a `match` over the caller's own error
+    # types, or `isinstance`, narrows it without an unknown type under any of the four checkers
+    # (`Any` made zuban flag a value a mapping pattern captured as returning `Any`).
+    error: object = field(default=None, init=False, repr=False, compare=False)
+    raw_error: bytes | None = field(default=None, init=False, repr=False, compare=False)

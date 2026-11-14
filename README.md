@@ -81,7 +81,7 @@ stays close to pyreqwest's own throughput.
 | **Retries with real backoff** | `max_retries`/`retry_methods`, `Retry-After`-aware — see [Retries](https://rogerthomas.github.io/lothc/retries/). |
 | **Authentication** | Static `bearer_token`, a per-request-refreshed `bearer_auth`, `basic_auth`, or `default_headers` for anything else — plus a ready-made OAuth 2 client-credentials provider (`OAuthProvider`: mint, leeway-based renewal, refresh-then-mint fallback, optional on-disk token cache) — see [Authentication](https://rogerthomas.github.io/lothc/auth/). |
 | **Cookies, redirects, proxy** | `cookie_store`, `follow_redirects`/`max_redirects`, `proxy=` — see [Networking](https://rogerthomas.github.io/lothc/networking/). |
-| **A real error hierarchy** | `HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError` for no response, `HTTPResponseError` for 4xx/5xx — see [Error handling](https://rogerthomas.github.io/lothc/errors/). |
+| **A real error hierarchy** | `HTTPTransportError`/`HTTPTimeoutError`/`HTTPConnectionError` for no response, `HTTPResponseError` for 4xx/5xx (or `raise_for_status=False` to get those back as a `Response`) — see [Error handling](https://rogerthomas.github.io/lothc/errors/). |
 
 ## Development
 

@@ -67,11 +67,21 @@ async def test_response_get_with_msgspec_typed_headers(client: HTTPClient) -> No
     assert result.typed_headers == EchoedHeadersStruct(content_type="application/json")
 
 
-async def test_response_get_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
-    result = await client.get("boom", error_for_status=False)
+async def test_response_get_raise_for_status_false_returns_the_error_response(
+    client: HTTPClient,
+) -> None:
+    result = await client.get("boom", raise_for_status=False)
 
     assert result.status == 500
-    assert b"internal-server-error" in result.data
+    assert result.http_version == "HTTP/1.1"
+    assert result.request.path == "/boom"
+    assert result.headers["content-type"] == "application/json"
+    assert result.elapsed > 0
+    assert result.error == {
+        "type": "internal-server-error",
+        "title": "Internal server error",
+        "status": 500,
+    }
 
 
 def test_sync_get_result_includes_status_and_data(sync_client: SyncHTTPClient) -> None:
@@ -93,13 +103,18 @@ def test_sync_get_result_with_typed_headers(sync_client: SyncHTTPClient) -> None
     assert result.typed_headers == EchoedHeaders(content_type="application/json")
 
 
-def test_sync_get_result_error_for_status_false_suppresses_raise(
+def test_sync_get_result_raise_for_status_false_returns_the_error_response(
     sync_client: SyncHTTPClient,
 ) -> None:
-    result = sync_client.get("boom", error_for_status=False)
+    result = sync_client.get("boom", raise_for_status=False)
 
     assert result.status == 500
-    assert b"internal-server-error" in result.data
+    assert result.request.path == "/boom"
+    assert result.error == {
+        "type": "internal-server-error",
+        "title": "Internal server error",
+        "status": 500,
+    }
 
 
 async def test_response_get_headers_are_case_insensitive(client: HTTPClient) -> None:

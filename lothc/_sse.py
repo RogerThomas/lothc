@@ -150,8 +150,8 @@ def _verify_sse_response(state: _SSEStreamState, status: int, content_type: str 
     """Record the connection's status and enforce the spec's "must be text/event-stream" rule.
 
     Only a 2xx that isn't a 204 is held to that rule: a 204 is the spec's explicit "stop
-    reconnecting" signal and has no body to type, and a 4xx/5xx here means the caller passed
-    `error_for_status=False` and will simply get no events from a body that isn't a stream.
+    reconnecting" signal and has no body to type, and anything else that isn't a 2xx (a 4xx/5xx
+    never gets here: the stream source raises it) simply yields no events.
     """
     state.status = status
     if status == 204 or not 200 <= status < 300:

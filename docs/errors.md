@@ -112,6 +112,51 @@ contract (a proxy's HTML 502): a mismatch only leaves `.error` a `dict` or `None
 on `.parse_error` (always a `ValueError`). On the success path an `into` mismatch raises the decode
 library's own error (`pydantic.ValidationError`, `msgspec.ValidationError`), unwrapped.
 
+## Returning errors instead of raising
+
+When an error status is an outcome you'd rather branch on than catch, pass
+`raise_for_status=False` to the client. A 4xx/5xx then comes back as a `Response`, with the error
+response's `.status` and `.headers`, and reading `.data` raises the `HTTPResponseError` the call
+would have raised:
+
+```python
+async with HTTPClient(base_url="https://api.example.com/", raise_for_status=False) as client:
+    response = await client.get("jobs/7", into=Job)
+    if response.status == 503:
+        raise TryAgainLaterError()
+    job = response.data  # Job, or raises HTTPResponseError for any other 4xx/5xx
+```
+
+Nothing is decoded into `into=` on an error. Instead `.raw_error` is the body's bytes and `.error`
+is that body decoded as [`HTTPResponseError.error`](#typed-error-bodies) would be, on first read:
+
+```python
+response = await client.get("items/7", raises=MyAPIError)
+match response.error:
+    case NotFound() as missing:
+        print("no such item:", missing.title)
+    case NotAuthorized():
+        print("log in first")
+    case _ if response.status >= 400:
+        print("unexpected error:", response.status, response.raw_error)
+```
+
+Both are `None` on any other response, but `.error is None` isn't a success test, since a non-JSON
+error body decodes to `None` too: check `.status`.
+
+Each verb that returns a `Response` takes `raise_for_status=` too, overriding the client's either
+way:
+
+```python
+await client.get("items/7", raise_for_status=False)  # returns a 4xx/5xx, on any client
+await client.delete("items/7", raise_for_status=True)  # raises, even on an opt-out client
+```
+
+The second line matters: on an opt-out client, a call whose result you ignore (a bare `delete` or
+`post`) fails silently unless it passes `raise_for_status=True`. With raising off, `download` writes
+nothing to `dest` for an error status, and exhausted retries return the last error response. The
+streaming verbs (`stream_get`, `stream_post`, `sse`) always raise.
+
 ## `OAuthTokenError`
 
 `OAuthProvider`/`SyncOAuthProvider` (see [Authentication](auth.md#oauth-2-client-credentials)) run

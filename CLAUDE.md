@@ -226,6 +226,12 @@ or editing Python here.
 - **Never leak pyreqwest's exception types.** Transport errors map to `HTTPTransportError` and
   its subclasses; a client build error is a plain `ValueError`.
 - **Status errors stay separate from transport errors.**
+- **`raise_for_status=False` (client, or per call) returns a 4xx/5xx as a `Response` whose `.data`
+  raises** (decided 2026-11-14), so an error body is never decoded into `into=` and an unhandled
+  status still surfaces. Raising stays the default: an ignored result must not swallow a 500.
+  The error response is a private subclass and `.error`/`.raw_error` are class-level defaults, so
+  the success path costs what it did; a lazy `.data` measured 71ns slower and held raw bodies.
+  Streaming verbs always raise.
 - **A `BuilderError` is permanent**: never retried or reconnected.
 - **A body cut off partway is retried; a corrupt one isn't.**
 - **A multipart `form=` request is sent once, never retried or re-authenticated:** its streamed

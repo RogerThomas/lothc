@@ -190,15 +190,17 @@ async def test_default_headers_sent_on_every_request(base_url: str) -> None:
     assert headers["x-api-key"] == "secret"
 
 
-async def test_get_raises_response_error_for_status(client: HTTPClient) -> None:
+async def test_get_raises_response_error_on_an_error_status(client: HTTPClient) -> None:
     with pytest.raises(HTTPResponseError) as exc_info:
         await client.get("boom")
     assert exc_info.value.status == 500
 
 
-async def test_get_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
-    body = (await client.get("boom", error_for_status=False)).data
-    assert b"internal-server-error" in body
+async def test_get_raise_for_status_false_returns_the_error_response(client: HTTPClient) -> None:
+    response = await client.get("boom", raise_for_status=False)
+    assert response.status == 500
+    assert response.raw_error is not None
+    assert b"internal-server-error" in response.raw_error
 
 
 async def test_get_into_not_a_type_raises_type_error(client: HTTPClient) -> None:
@@ -263,15 +265,19 @@ def test_sync_get_with_repeated_query_param(sync_client: SyncHTTPClient) -> None
     assert result == {"query": {"tag": ["a", "b"], "limit": ["10"]}}
 
 
-def test_sync_get_raises_response_error_for_status(sync_client: SyncHTTPClient) -> None:
+def test_sync_get_raises_response_error_on_an_error_status(sync_client: SyncHTTPClient) -> None:
     with pytest.raises(HTTPResponseError) as exc_info:
         sync_client.get("boom")
     assert exc_info.value.status == 500
 
 
-def test_sync_get_error_for_status_false_suppresses_raise(sync_client: SyncHTTPClient) -> None:
-    body = sync_client.get("boom", error_for_status=False).data
-    assert b"internal-server-error" in body
+def test_sync_get_raise_for_status_false_returns_the_error_response(
+    sync_client: SyncHTTPClient,
+) -> None:
+    response = sync_client.get("boom", raise_for_status=False)
+    assert response.status == 500
+    assert response.raw_error is not None
+    assert b"internal-server-error" in response.raw_error
 
 
 def test_sync_get_into_not_a_type_raises_type_error(sync_client: SyncHTTPClient) -> None:

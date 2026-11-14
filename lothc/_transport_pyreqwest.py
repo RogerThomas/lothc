@@ -58,6 +58,7 @@ from ._errors import (
     HTTPResponseError,
     HTTPTimeoutError,
     HTTPTransportError,
+    _ErrorResponse,
     _status_error,
     _validate_raises,
 )
@@ -736,6 +737,8 @@ class _PyreqwestTransport:
     _bearer_auth: AuthProvider | None
     _basic_auth: tuple[str, str | None] | None
     _raises: type[HTTPResponseError[Any]]
+    # The client's `raise_for_status`, for a call that doesn't pass its own.
+    _raise_for_status: bool
     # The verbs a re-authenticated 401 may be retried for: the idempotent ones.
     _idempotent_methods: frozenset[str]
     # The longest gap `stream_get`/`stream_post`/`download` tolerate between chunks: the client's
@@ -802,6 +805,37 @@ class _PyreqwestTransport:
             CaseInsensitiveDict(raw_response.headers),
         )
 
+    async def _error_status(
+        self,
+        raw_response: RawResponse,
+        raises: type[HTTPResponseError[Any]] | None,
+        request_info: RequestInfo,
+        elapsed: float,
+        *,
+        raise_for_status: bool | None,
+    ) -> Response[Any, Any]:
+        """A 4xx/5xx's status error, raised, or with `raise_for_status` off (the call's, else
+        the client's) the deferred error response, its body read either way."""
+        body = (await _read_body(raw_response)).to_bytes()
+        error_class = raises if raises is not None else self._raises
+        if self._raise_for_status if raise_for_status is None else raise_for_status:
+            raise _status_error(
+                error_class,
+                raw_response.status,
+                body,
+                request_info,
+                CaseInsensitiveDict(raw_response.headers),
+            )
+        return _ErrorResponse(
+            error_class,
+            raw_response.status,
+            _LazyHeaders(raw_response.headers),
+            request_info,
+            raw_response.version,
+            elapsed,
+            body,
+        )
+
     async def _build_stream_request(
         self, request_builder: RequestBuilder, call: _StreamCall, last_event_id: str
     ) -> RequestBuilder:
@@ -827,7 +861,7 @@ class _PyreqwestTransport:
     ) -> _PyreqwestStreamSource:
         return _PyreqwestStreamSource(
             partial(self._build_stream_request, request_builder, call, last_event_id),
-            self._check_status if call.error_for_status else None,
+            self._check_status if call.check_status else None,
             call.raises,
         )
 
@@ -885,7 +919,7 @@ class _PyreqwestTransport:
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
+        raise_for_status: bool | None,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[Any, Any]:
         """Every body verb's shared path, taking the HTTP method as a string.
@@ -912,8 +946,10 @@ class _PyreqwestTransport:
         started = time.monotonic()
         raw_response, request_info = await _send(request_builder)
         elapsed = time.monotonic() - started
-        if error_for_status:
-            await self._check_status(raw_response, raises, request_info)
+        if raw_response.status >= 400:
+            return await self._error_status(
+                raw_response, raises, request_info, elapsed, raise_for_status=raise_for_status
+            )
         decoded = _decode_body(await _read_body(raw_response), decoder)
         response_headers = _LazyHeaders(raw_response.headers)
         if response_headers_type is None:
@@ -940,7 +976,7 @@ class _PyreqwestTransport:
         response_headers_type: type[TypedHeaders] | None,
         *,
         skip_auth: bool,
-        error_for_status: bool,
+        raise_for_status: bool | None,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[None, Any]:
         """`head`/`options`: status and headers only, the body is never read."""
@@ -951,8 +987,10 @@ class _PyreqwestTransport:
         started = time.monotonic()
         raw_response, request_info = await _send(request_builder)
         elapsed = time.monotonic() - started
-        if error_for_status:
-            await self._check_status(raw_response, raises, request_info)
+        if raw_response.status >= 400:
+            return await self._error_status(
+                raw_response, raises, request_info, elapsed, raise_for_status=raise_for_status
+            )
         response_headers = _LazyHeaders(raw_response.headers)
         typed_headers = (
             None
@@ -978,7 +1016,6 @@ class _PyreqwestTransport:
         into: _Into,
         *,
         skip_auth: bool,
-        error_for_status: bool,
         raises: type[HTTPResponseError[Any]] | None,
         max_reconnects: int | None,
         reconnect_delay: float,
@@ -990,7 +1027,7 @@ class _PyreqwestTransport:
             headers,
             effective_timeout,
             skip_auth=skip_auth,
-            error_for_status=error_for_status,
+            check_status=True,
             raises=raises,
         )
         return _sse_events(
@@ -1017,7 +1054,6 @@ class _PyreqwestTransport:
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> AsyncGenerator[Any]:
         """`stream_get`/`stream_post`: raw chunks, or one decoded value per line with `into`.
@@ -1037,7 +1073,7 @@ class _PyreqwestTransport:
             content,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
+            check_status=True,
             raises=raises,
         )
         source = self._stream_source(self._client.request(method, path), call)
@@ -1052,21 +1088,25 @@ class _PyreqwestTransport:
         timeout: float | None,
         *,
         skip_auth: bool,
-        error_for_status: bool,
+        raise_for_status: bool | None,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[bytes] | Response[Path]:
         _validate_raises(raises)
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
         idle = self._stream_idle_timeout if timeout is None else None
+        check_status = self._raise_for_status if raise_for_status is None else raise_for_status
         call = _StreamCall(
             params,
             headers,
             effective_timeout,
             skip_auth=skip_auth,
-            error_for_status=error_for_status,
+            check_status=check_status,
             raises=raises,
         )
-        return await _download_stream(self._stream_source(self._client.get(path), call), dest, idle)
+        # Unchecked, a 4xx/5xx comes back as the error response `_download_stream` builds.
+        deferred = None if check_status else (raises if raises is not None else self._raises)
+        source = self._stream_source(self._client.get(path), call)
+        return await _download_stream(source, dest, idle, deferred)
 
 
 @dataclass(slots=True, eq=False, repr=False)
@@ -1093,6 +1133,8 @@ class _SyncPyreqwestTransport:
     _bearer_auth: SyncAuthProvider | None
     _basic_auth: tuple[str, str | None] | None
     _raises: type[HTTPResponseError[Any]]
+    # The client's `raise_for_status`, for a call that doesn't pass its own.
+    _raise_for_status: bool
     # The verbs a re-authenticated 401 may be retried for: the idempotent ones.
     _idempotent_methods: frozenset[str]
     # The longest gap `stream_get`/`stream_post`/`download` tolerate between chunks: the client's
@@ -1159,6 +1201,37 @@ class _SyncPyreqwestTransport:
             CaseInsensitiveDict(raw_response.headers),
         )
 
+    def _error_status(
+        self,
+        raw_response: RawSyncResponse,
+        raises: type[HTTPResponseError[Any]] | None,
+        request_info: RequestInfo,
+        elapsed: float,
+        *,
+        raise_for_status: bool | None,
+    ) -> Response[Any, Any]:
+        """A 4xx/5xx's status error, raised, or with `raise_for_status` off (the call's, else
+        the client's) the deferred error response, its body read either way."""
+        body = _read_body_sync(raw_response).to_bytes()
+        error_class = raises if raises is not None else self._raises
+        if self._raise_for_status if raise_for_status is None else raise_for_status:
+            raise _status_error(
+                error_class,
+                raw_response.status,
+                body,
+                request_info,
+                CaseInsensitiveDict(raw_response.headers),
+            )
+        return _ErrorResponse(
+            error_class,
+            raw_response.status,
+            _LazyHeaders(raw_response.headers),
+            request_info,
+            raw_response.version,
+            elapsed,
+            body,
+        )
+
     def _build_stream_request(
         self, request_builder: SyncRequestBuilder, call: _StreamCall, last_event_id: str
     ) -> SyncRequestBuilder:
@@ -1184,7 +1257,7 @@ class _SyncPyreqwestTransport:
     ) -> _SyncPyreqwestStreamSource:
         return _SyncPyreqwestStreamSource(
             partial(self._build_stream_request, request_builder, call, last_event_id),
-            self._check_status if call.error_for_status else None,
+            self._check_status if call.check_status else None,
             call.raises,
         )
 
@@ -1242,7 +1315,7 @@ class _SyncPyreqwestTransport:
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
+        raise_for_status: bool | None,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[Any, Any]:
         """Every body verb's shared path, taking the HTTP method as a string.
@@ -1267,8 +1340,10 @@ class _SyncPyreqwestTransport:
         started = time.monotonic()
         raw_response, request_info = _send_sync(request_builder)
         elapsed = time.monotonic() - started
-        if error_for_status:
-            self._check_status(raw_response, raises, request_info)
+        if raw_response.status >= 400:
+            return self._error_status(
+                raw_response, raises, request_info, elapsed, raise_for_status=raise_for_status
+            )
         decoded = _decode_body(_read_body_sync(raw_response), decoder)
         response_headers = _LazyHeaders(raw_response.headers)
         if response_headers_type is None:
@@ -1295,7 +1370,7 @@ class _SyncPyreqwestTransport:
         response_headers_type: type[TypedHeaders] | None,
         *,
         skip_auth: bool,
-        error_for_status: bool,
+        raise_for_status: bool | None,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[None, Any]:
         """`head`/`options`: status and headers only, the body is never read."""
@@ -1306,8 +1381,10 @@ class _SyncPyreqwestTransport:
         started = time.monotonic()
         raw_response, request_info = _send_sync(request_builder)
         elapsed = time.monotonic() - started
-        if error_for_status:
-            self._check_status(raw_response, raises, request_info)
+        if raw_response.status >= 400:
+            return self._error_status(
+                raw_response, raises, request_info, elapsed, raise_for_status=raise_for_status
+            )
         response_headers = _LazyHeaders(raw_response.headers)
         typed_headers = (
             None
@@ -1333,7 +1410,6 @@ class _SyncPyreqwestTransport:
         into: _Into,
         *,
         skip_auth: bool,
-        error_for_status: bool,
         raises: type[HTTPResponseError[Any]] | None,
         max_reconnects: int | None,
         reconnect_delay: float,
@@ -1346,7 +1422,7 @@ class _SyncPyreqwestTransport:
             headers,
             effective_timeout,
             skip_auth=skip_auth,
-            error_for_status=error_for_status,
+            check_status=True,
             raises=raises,
         )
         return _sse_events_sync(
@@ -1374,7 +1450,6 @@ class _SyncPyreqwestTransport:
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
         raises: type[HTTPResponseError[Any]] | None,
         interruptible: bool,
     ) -> Generator[Any]:
@@ -1395,7 +1470,7 @@ class _SyncPyreqwestTransport:
             content,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
+            check_status=True,
             raises=raises,
         )
         source = self._stream_source(self._client.request(method, path), call)
@@ -1410,18 +1485,22 @@ class _SyncPyreqwestTransport:
         timeout: float | None,
         *,
         skip_auth: bool,
-        error_for_status: bool,
+        raise_for_status: bool | None,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[bytes] | Response[Path]:
         _validate_raises(raises)
         effective_timeout = timeout if timeout is not None else self._streaming_default_timeout
         idle = self._stream_idle_timeout if timeout is None else None
+        check_status = self._raise_for_status if raise_for_status is None else raise_for_status
         call = _StreamCall(
             params,
             headers,
             effective_timeout,
             skip_auth=skip_auth,
-            error_for_status=error_for_status,
+            check_status=check_status,
             raises=raises,
         )
-        return _download_stream_sync(self._stream_source(self._client.get(path), call), dest, idle)
+        # Unchecked, a 4xx/5xx comes back as the error response `_download_stream` builds.
+        deferred = None if check_status else (raises if raises is not None else self._raises)
+        source = self._stream_source(self._client.get(path), call)
+        return _download_stream_sync(source, dest, idle, deferred)

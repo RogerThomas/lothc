@@ -713,6 +713,89 @@ def test_sync_token_endpoint_server_error_is_an_oauth_token_error(
     assert cause.status == 500
 
 
+async def test_a_token_endpoint_error_still_raises_with_a_raise_for_status_false_factory(
+    base_url: str, token_server: TokenServer
+) -> None:
+    endpoint = TokenEndpoint(path="oauth/token-boom")
+    provider = OAuthProvider(
+        token_url=token_server.url(endpoint),
+        client_id="client-id",
+        client_secret="client-secret",
+        client_factory=partial(HTTPClient, raise_for_status=False),
+    )
+
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        with pytest.raises(OAuthTokenError) as error_info:
+            await _bearer(api)
+
+    cause = error_info.value.__cause__
+    assert isinstance(cause, HTTPResponseError)
+    assert cause.status == 500
+
+
+def test_sync_a_token_endpoint_error_still_raises_with_a_raise_for_status_false_factory(
+    base_url: str, token_server: TokenServer
+) -> None:
+    endpoint = TokenEndpoint(path="oauth/token-boom")
+    provider = SyncOAuthProvider(
+        token_url=token_server.url(endpoint),
+        client_id="client-id",
+        client_secret="client-secret",
+        client_factory=partial(SyncHTTPClient, raise_for_status=False),
+    )
+
+    with (
+        SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api,
+        pytest.raises(OAuthTokenError) as error_info,
+    ):
+        _sync_bearer(api)
+
+    cause = error_info.value.__cause__
+    assert isinstance(cause, HTTPResponseError)
+    assert cause.status == 500
+
+
+async def test_a_rejected_refresh_still_mints_with_a_raise_for_status_false_factory(
+    base_url: str, token_server: TokenServer
+) -> None:
+    endpoint = TokenEndpoint(with_refresh=True, expires_in=0, refresh_fails=True)
+    provider = OAuthProvider(
+        token_url=token_server.url(endpoint),
+        client_id="client-id",
+        client_secret="client-secret",
+        client_factory=partial(HTTPClient, raise_for_status=False),
+    )
+
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        await _bearer(api)
+        bearer = await _bearer(api)
+
+    assert bearer == "Bearer token-3"
+    assert token_server.grant_types() == [
+        "client_credentials",
+        "refresh_token",
+        "client_credentials",
+    ]
+
+
+def test_sync_a_rejected_refresh_still_mints_with_a_raise_for_status_false_factory(
+    base_url: str, token_server: TokenServer
+) -> None:
+    endpoint = TokenEndpoint(with_refresh=True, expires_in=0, refresh_fails=True)
+    provider = SyncOAuthProvider(
+        token_url=token_server.url(endpoint),
+        client_id="client-id",
+        client_secret="client-secret",
+        client_factory=partial(SyncHTTPClient, raise_for_status=False),
+    )
+
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        _sync_bearer(api)
+        bearer = _sync_bearer(api)
+
+    assert bearer == "Bearer token-3"
+
+
 @pytest.mark.parametrize(
     "provider_class", [OAuthProvider, SyncOAuthProvider], ids=["async", "sync"]
 )

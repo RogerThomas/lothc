@@ -38,6 +38,8 @@ class _Glue(Protocol):
     @property
     def status_error(self) -> Callable[..., HTTPResponseError[Any]]: ...
     @property
+    def error_response(self) -> Callable[..., Response[Any, Any]]: ...
+    @property
     def parse_typed_headers(self) -> Callable[..., object]: ...
     @property
     def connection_error(self) -> type[HTTPConnectionError]: ...
@@ -263,6 +265,7 @@ class Pool:
         raises: type[HTTPResponseError[Any]] | None,
         typed_headers: type | None,
         headers_only: bool,
+        defer_error: bool,
     ) -> asyncio.Future[Response[Any, Any]]:
         """Start a request; its Future resolves to lothc's `Response` or raises its exception.
 
@@ -270,7 +273,8 @@ class Pool:
         or `(name, value)` pairs. `body_kind`: 0 raw `bytes`/`str`, 1 already-encoded JSON, 2 a
         `dict`/`list` to serialize, 3 a form, 4 a multipart body as `_NativeForm` describes it
         (its parts built in order as reqwest's are: a file opened here, its errors pyreqwest's
-        `OSError`s; a file part read as it's sent). `raises` is `None` for no status check.
+        `OSError`s; a file part read as it's sent). `raises` is `None` for no status check; with
+        `defer_error`, a 4xx/5xx resolves to `glue.error_response` instead of raising.
         `timeout` is the request's total timeout, as pyreqwest's builder takes it (a negative one
         raises `ValueError`), its deadline rounded up to the end of a millisecond as tokio's timer
         rounds reqwest's. Raises before any I/O for a request that can't be built (`ValueError`,
@@ -353,6 +357,7 @@ class SyncPool:
         raises: type[HTTPResponseError[Any]] | None,
         typed_headers: type | None,
         headers_only: bool,
+        defer_error: bool,
     ) -> Response[Any, Any]:
         """One blocking request, GIL released while it waits: `Pool.request`'s arguments."""
 

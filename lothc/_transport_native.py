@@ -33,6 +33,7 @@ from ._errors import (
     HTTPResponseError,
     HTTPTimeoutError,
     HTTPTransportError,
+    _ErrorResponse,
     _status_error,
     _validate_raises,
 )
@@ -301,6 +302,7 @@ class _NativeGlue:
     lazy_headers: Callable[[RawHeaders], CaseInsensitiveDict]
     eager_headers: Callable[[RawHeaders], CaseInsensitiveDict]
     status_error: Callable[..., HTTPResponseError[Any]]
+    error_response: Callable[..., Response[Any, Any]]
     parse_typed_headers: Callable[..., TypedHeaders]
     connection_error: type[HTTPConnectionError]
     timeout_error: type[HTTPTimeoutError]
@@ -316,6 +318,7 @@ def _native_glue() -> _NativeGlue:
         _LazyHeaders,
         _eager_headers,
         _status_error,
+        _ErrorResponse,
         _parse_typed_headers,
         HTTPConnectionError,
         HTTPTimeoutError,
@@ -346,16 +349,28 @@ def _without_authorization(headers: dict[str, str] | None) -> dict[str, str] | N
 def _finish_undecoded(
     response: Response[Any, Any],
     decode: _DecodeFn | None,
-    error_class: type[HTTPResponseError[Any]] | None,
+    error_class: type[HTTPResponseError[Any]],
     response_headers_type: type[TypedHeaders] | None,
     elapsed: float,
     *,
     headers_only: bool,
+    defer_error: bool,
 ) -> Response[Any, Any]:
-    """The `Response` (or status error) for an exchange that went out undecoded so its status
-    could be seen first (a 401 to re-authenticate, a status to retry): what the native side would
-    otherwise have built in one pass. `elapsed` spans every attempt, as pyreqwest's does."""
-    if error_class is not None and response.status >= 400:
+    """The `Response` (or status error, or with `defer_error` the deferred error response) for an
+    exchange that went out undecoded so its status could be seen first (a 401 to re-authenticate,
+    a status to retry): what the native side would otherwise have built in one pass. `elapsed`
+    spans every attempt, as pyreqwest's does."""
+    if response.status >= 400:
+        if defer_error:
+            return _ErrorResponse(
+                error_class,
+                response.status,
+                response.headers,
+                response.request,
+                response.http_version,
+                elapsed,
+                response.data,
+            )
         raise _status_error(
             error_class,
             response.status,
@@ -752,8 +767,10 @@ class _SyncNativeStreamSource:
         return head, self._read_chunk
 
 
+# Every field is a constructor setting or something derived from one once, as on
+# `_SyncNativeTransport`, plus the loop's `_connections`, which the sync transport has no need of.
 @dataclass(slots=True, eq=False, repr=False)
-class _NativeTransport:
+class _NativeTransport:  # pylint: disable=too-many-instance-attributes
     """`HTTPClient`'s native transport, selected by `native=` (`_uses_native_transport`) when a
     client is constructed: lothc's own HTTP/1.1 client in `lothc._native` (hyper on the asyncio
     loop's thread, no tokio, see `native/src/pool.rs`), behind the same seam as
@@ -777,6 +794,8 @@ class _NativeTransport:
     _bearer_auth: AuthProvider | None
     _basic_auth: tuple[str, str | None] | None
     _raises: type[HTTPResponseError[Any]]
+    # The client's `raise_for_status`, for a call that doesn't pass its own.
+    _raise_for_status: bool
     # The verbs a re-authenticated 401 may be retried for: the idempotent ones.
     _idempotent_methods: frozenset[str]
     # The `Authorization` a static `bearer_token`/`basic_auth` sends, built once.
@@ -841,6 +860,7 @@ class _NativeTransport:
         response_headers_type: type[TypedHeaders] | None,
         *,
         headers_only: bool,
+        defer_error: bool,
     ) -> Response[Any, Any]:
         fut = pool.request(
             method,
@@ -855,6 +875,7 @@ class _NativeTransport:
             error_class,
             response_headers_type,
             headers_only,
+            defer_error,
         )
         try:
             return await fut
@@ -887,6 +908,7 @@ class _NativeTransport:
             None,
             None,
             headers_only=False,
+            defer_error=False,
         )
         if reauth is None or token is None or response.status != 401:
             return response
@@ -910,6 +932,7 @@ class _NativeTransport:
             None,
             None,
             headers_only=False,
+            defer_error=False,
         )
 
     async def _send_through_middleware(
@@ -917,11 +940,12 @@ class _NativeTransport:
         pool: _NativePool,
         call: _NativeCall,
         decode: _DecodeFn | None,
-        error_class: type[HTTPResponseError[Any]] | None,
+        error_class: type[HTTPResponseError[Any]],
         response_headers_type: type[TypedHeaders] | None,
         *,
         skip_auth: bool,
         headers_only: bool,
+        defer_error: bool,
     ) -> Response[Any, Any]:
         """The middleware chain `_PyreqwestTransport.open` installs, in its order:
         `_RetryMiddleware` (for a retried method) around `_ReauthMiddleware` (for a
@@ -951,6 +975,7 @@ class _NativeTransport:
             response_headers_type,
             time.monotonic() - started,
             headers_only=headers_only,
+            defer_error=defer_error,
         )
 
     def _stream_source(
@@ -962,8 +987,9 @@ class _NativeTransport:
         accept: str | None = None,
         last_event_id: str | None = None,
     ) -> _NativeStreamSource:
-        error_for_status, raises = call.error_for_status, call.raises
-        error_class = (raises if raises is not None else self._raises) if error_for_status else None
+        error_class = None
+        if call.check_status:
+            error_class = call.raises if call.raises is not None else self._raises
         # A multipart body with parts is sent once (`_NativeCall.replayable`).
         replayable = not call.form
         if call.skip_auth:
@@ -1055,7 +1081,7 @@ class _NativeTransport:
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
+        raise_for_status: bool | None,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[Any, Any]:
         """Every body verb's shared path, as `_PyreqwestTransport.send`. The hot path awaits the
@@ -1090,7 +1116,8 @@ class _NativeTransport:
         effective_timeout = (
             self._total_timeout if timeout is None else _native_call_timeout(timeout)
         )
-        error_class = (raises if raises is not None else self._raises) if error_for_status else None
+        error_class = raises if raises is not None else self._raises
+        defer_error = not (self._raise_for_status if raise_for_status is None else raise_for_status)
         if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
             call = _NativeCall(
                 method, path, query, encoded_headers, body, body_kind, effective_timeout, not form
@@ -1103,6 +1130,7 @@ class _NativeTransport:
                 response_headers_type,
                 skip_auth=skip_auth,
                 headers_only=False,
+                defer_error=defer_error,
             )
         if skip_auth:
             auth = None
@@ -1123,6 +1151,7 @@ class _NativeTransport:
             error_class,
             response_headers_type,
             False,  # noqa: FBT003 — the native side's positional `headers_only`
+            defer_error,
         )
         try:
             return await fut
@@ -1140,7 +1169,7 @@ class _NativeTransport:
         response_headers_type: type[TypedHeaders] | None,
         *,
         skip_auth: bool,
-        error_for_status: bool,
+        raise_for_status: bool | None,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[None, Any]:
         """`head`/`options`: status and headers only, the body is never decoded."""
@@ -1159,7 +1188,8 @@ class _NativeTransport:
         effective_timeout = (
             self._total_timeout if timeout is None else _native_call_timeout(timeout)
         )
-        error_class = (raises if raises is not None else self._raises) if error_for_status else None
+        error_class = raises if raises is not None else self._raises
+        defer_error = not (self._raise_for_status if raise_for_status is None else raise_for_status)
         if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
             call = _NativeCall(
                 method, path, query, encoded_headers, None, _NativeBody.RAW, effective_timeout
@@ -1172,6 +1202,7 @@ class _NativeTransport:
                 response_headers_type,
                 skip_auth=skip_auth,
                 headers_only=True,
+                defer_error=defer_error,
             )
         if skip_auth:
             auth = None
@@ -1193,6 +1224,7 @@ class _NativeTransport:
             error_class,
             response_headers_type,
             headers_only=True,
+            defer_error=defer_error,
         )
 
     def sse(
@@ -1204,7 +1236,6 @@ class _NativeTransport:
         into: _Into,
         *,
         skip_auth: bool,
-        error_for_status: bool,
         raises: type[HTTPResponseError[Any]] | None,
         max_reconnects: int | None,
         reconnect_delay: float,
@@ -1216,7 +1247,7 @@ class _NativeTransport:
             headers,
             timeout,
             skip_auth=skip_auth,
-            error_for_status=error_for_status,
+            check_status=True,
             raises=raises,
         )
         return _sse_events(
@@ -1243,7 +1274,6 @@ class _NativeTransport:
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> AsyncGenerator[Any]:
         """`_PyreqwestTransport.stream_lines`: not a generator itself, so a closed client raises
@@ -1262,7 +1292,7 @@ class _NativeTransport:
             content,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
+            check_status=True,
             raises=raises,
         )
         return _stream_lines(self._stream_source(pool, method, path, call), into, raises, idle)
@@ -1276,7 +1306,7 @@ class _NativeTransport:
         timeout: float | None,
         *,
         skip_auth: bool,
-        error_for_status: bool,
+        raise_for_status: bool | None,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[bytes] | Response[Path]:
         _validate_raises(raises)
@@ -1284,16 +1314,19 @@ class _NativeTransport:
         if pool is None:
             raise self._closed_error()
         idle = self._stream_idle_timeout if timeout is None else None
+        check_status = self._raise_for_status if raise_for_status is None else raise_for_status
         call = _StreamCall(
             params,
             headers,
             timeout,
             skip_auth=skip_auth,
-            error_for_status=error_for_status,
+            check_status=check_status,
             raises=raises,
         )
         source = self._stream_source(pool, "GET", path, call)
-        return await _download_stream(source, dest, idle)
+        # Unchecked, a 4xx/5xx comes back as the error response `_download_stream` builds.
+        deferred = None if check_status else (raises if raises is not None else self._raises)
+        return await _download_stream(source, dest, idle, deferred)
 
 
 @dataclass(slots=True, eq=False, repr=False)
@@ -1319,6 +1352,8 @@ class _SyncNativeTransport:
     _bearer_auth: SyncAuthProvider | None
     _basic_auth: tuple[str, str | None] | None
     _raises: type[HTTPResponseError[Any]]
+    # The client's `raise_for_status`, for a call that doesn't pass its own.
+    _raise_for_status: bool
     # The verbs a re-authenticated 401 may be retried for: the idempotent ones.
     _idempotent_methods: frozenset[str]
     # The `Authorization` a static `bearer_token`/`basic_auth` sends, built once.
@@ -1382,6 +1417,7 @@ class _SyncNativeTransport:
         response_headers_type: type[TypedHeaders] | None,
         *,
         headers_only: bool,
+        defer_error: bool,
     ) -> Response[Any, Any]:
         return pool.request(
             method,
@@ -1396,6 +1432,7 @@ class _SyncNativeTransport:
             error_class,
             response_headers_type,
             headers_only,
+            defer_error,
         )
 
     def _attempt(
@@ -1423,6 +1460,7 @@ class _SyncNativeTransport:
             None,
             None,
             headers_only=False,
+            defer_error=False,
         )
         if reauth is None or token is None or response.status != 401:
             return response
@@ -1446,6 +1484,7 @@ class _SyncNativeTransport:
             None,
             None,
             headers_only=False,
+            defer_error=False,
         )
 
     def _send_through_middleware(
@@ -1453,11 +1492,12 @@ class _SyncNativeTransport:
         pool: _NativeSyncPool,
         call: _NativeCall,
         decode: _DecodeFn | None,
-        error_class: type[HTTPResponseError[Any]] | None,
+        error_class: type[HTTPResponseError[Any]],
         response_headers_type: type[TypedHeaders] | None,
         *,
         skip_auth: bool,
         headers_only: bool,
+        defer_error: bool,
     ) -> Response[Any, Any]:
         """The middleware chain `_SyncPyreqwestTransport.open` installs, in its order:
         `_SyncRetryMiddleware` (for a retried method) around `_SyncReauthMiddleware` (for a
@@ -1487,6 +1527,7 @@ class _SyncNativeTransport:
             response_headers_type,
             time.monotonic() - started,
             headers_only=headers_only,
+            defer_error=defer_error,
         )
 
     def _stream_source(
@@ -1498,8 +1539,9 @@ class _SyncNativeTransport:
         accept: str | None = None,
         last_event_id: str | None = None,
     ) -> _SyncNativeStreamSource:
-        error_for_status, raises = call.error_for_status, call.raises
-        error_class = (raises if raises is not None else self._raises) if error_for_status else None
+        error_class = None
+        if call.check_status:
+            error_class = call.raises if call.raises is not None else self._raises
         # A multipart body with parts is sent once (`_NativeCall.replayable`).
         replayable = not call.form
         if call.skip_auth:
@@ -1580,7 +1622,7 @@ class _SyncNativeTransport:
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
+        raise_for_status: bool | None,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[Any, Any]:
         """Every body verb's shared path, as `_SyncPyreqwestTransport.send`. A plain-`dict`
@@ -1614,7 +1656,8 @@ class _SyncNativeTransport:
         effective_timeout = (
             self._total_timeout if timeout is None else _native_call_timeout(timeout)
         )
-        error_class = (raises if raises is not None else self._raises) if error_for_status else None
+        error_class = raises if raises is not None else self._raises
+        defer_error = not (self._raise_for_status if raise_for_status is None else raise_for_status)
         if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
             call = _NativeCall(
                 method, path, query, encoded_headers, body, body_kind, effective_timeout, not form
@@ -1627,6 +1670,7 @@ class _SyncNativeTransport:
                 response_headers_type,
                 skip_auth=skip_auth,
                 headers_only=False,
+                defer_error=defer_error,
             )
         if skip_auth:
             auth = None
@@ -1647,6 +1691,7 @@ class _SyncNativeTransport:
             error_class,
             response_headers_type,
             False,  # noqa: FBT003 — the native side's positional `headers_only`
+            defer_error,
         )
 
     def send_headers_only(
@@ -1659,7 +1704,7 @@ class _SyncNativeTransport:
         response_headers_type: type[TypedHeaders] | None,
         *,
         skip_auth: bool,
-        error_for_status: bool,
+        raise_for_status: bool | None,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[None, Any]:
         """`head`/`options`: status and headers only, the body is never decoded."""
@@ -1678,7 +1723,8 @@ class _SyncNativeTransport:
         effective_timeout = (
             self._total_timeout if timeout is None else _native_call_timeout(timeout)
         )
-        error_class = (raises if raises is not None else self._raises) if error_for_status else None
+        error_class = raises if raises is not None else self._raises
+        defer_error = not (self._raise_for_status if raise_for_status is None else raise_for_status)
         if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
             call = _NativeCall(
                 method, path, query, encoded_headers, None, _NativeBody.RAW, effective_timeout
@@ -1691,6 +1737,7 @@ class _SyncNativeTransport:
                 response_headers_type,
                 skip_auth=skip_auth,
                 headers_only=True,
+                defer_error=defer_error,
             )
         if skip_auth:
             auth = None
@@ -1712,6 +1759,7 @@ class _SyncNativeTransport:
             error_class,
             response_headers_type,
             headers_only=True,
+            defer_error=defer_error,
         )
 
     def sse(
@@ -1723,7 +1771,6 @@ class _SyncNativeTransport:
         into: _Into,
         *,
         skip_auth: bool,
-        error_for_status: bool,
         raises: type[HTTPResponseError[Any]] | None,
         max_reconnects: int | None,
         reconnect_delay: float,
@@ -1736,7 +1783,7 @@ class _SyncNativeTransport:
             headers,
             timeout,
             skip_auth=skip_auth,
-            error_for_status=error_for_status,
+            check_status=True,
             raises=raises,
         )
         return _sse_events_sync(
@@ -1764,7 +1811,6 @@ class _SyncNativeTransport:
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
-        error_for_status: bool,
         raises: type[HTTPResponseError[Any]] | None,
         interruptible: bool,
     ) -> Generator[Any]:
@@ -1784,7 +1830,7 @@ class _SyncNativeTransport:
             content,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
+            check_status=True,
             raises=raises,
         )
         return _stream_lines_sync(
@@ -1804,7 +1850,7 @@ class _SyncNativeTransport:
         timeout: float | None,
         *,
         skip_auth: bool,
-        error_for_status: bool,
+        raise_for_status: bool | None,
         raises: type[HTTPResponseError[Any]] | None,
     ) -> Response[bytes] | Response[Path]:
         _validate_raises(raises)
@@ -1812,13 +1858,16 @@ class _SyncNativeTransport:
         if pool is None:
             raise self._closed_error()
         idle = self._stream_idle_timeout if timeout is None else None
+        check_status = self._raise_for_status if raise_for_status is None else raise_for_status
         call = _StreamCall(
             params,
             headers,
             timeout,
             skip_auth=skip_auth,
-            error_for_status=error_for_status,
+            check_status=check_status,
             raises=raises,
         )
         source = self._stream_source(pool, "GET", path, call)
-        return _download_stream_sync(source, dest, idle)
+        # Unchecked, a 4xx/5xx comes back as the error response `_download_stream` builds.
+        deferred = None if check_status else (raises if raises is not None else self._raises)
+        return _download_stream_sync(source, dest, idle, deferred)

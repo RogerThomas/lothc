@@ -32,7 +32,13 @@ from typing import (
 )
 
 from ._decode import _decode_json_line, _decoder_for, _Into, _TextDecoder
-from ._errors import HTTPResponseError, HTTPTimeoutError, HTTPTransportError, _validate_raises
+from ._errors import (
+    HTTPResponseError,
+    HTTPTimeoutError,
+    HTTPTransportError,
+    _ErrorResponse,
+    _validate_raises,
+)
 from ._headers import CaseInsensitiveDict
 from ._response import RequestInfo, Response
 from ._types import Form, Headers, JSONPayload, Params
@@ -150,7 +156,9 @@ type _SyncChunkReader = Callable[[], Buffer | None]
 @dataclass(slots=True)
 class _StreamCall:
     """A streaming verb's request, as the client passed it, for a transport's stream source to
-    build. `timeout` is the total cap the transport chose for it (`None`: none)."""
+    build. `timeout` is the total cap the transport chose for it (`None`: none). `check_status`
+    is whether the source raises a 4xx/5xx: always for `stream_get`/`stream_post`/`sse`, and for
+    `download` unless `raise_for_status=False` leaves the status to `_download_stream`."""
 
     params: Params | None
     headers: Headers | None
@@ -162,7 +170,7 @@ class _StreamCall:
     _: KW_ONLY
     skip_auth: bool
     infer_mime_type_from_file_extension: bool = True
-    error_for_status: bool
+    check_status: bool
     raises: type[HTTPResponseError[Any]] | None
 
 
@@ -172,8 +180,9 @@ class _StreamSource(Protocol):
     `_sse_events`), which does everything else, both transports alike.
 
     `prepare` does what comes before the idle clock starts (auth, building the request). `open`
-    sends it, waits for the head and checks its status (an error status's body is read and its
-    status error raised), registering on `stack` whatever ends the exchange; the reader it returns
+    sends it, waits for the head and, with `check_status`, checks its status (an error status's
+    body is read and its status error raised), registering on `stack` whatever ends the exchange;
+    the reader it returns
     gives the body chunk by chunk as it arrives, `None` at its end. A transport's own exceptions,
     `failures`, become lothc's through `failure`; `permanent` says whether `sse()` may reconnect
     after a transport error. `request_info` is valid once `open` has started.
@@ -455,9 +464,16 @@ def _stream_lines_sync(
 
 
 async def _download_stream(
-    source: _StreamSource, dest: Path | None, idle: float | None
+    source: _StreamSource,
+    dest: Path | None,
+    idle: float | None,
+    deferred: type[HTTPResponseError[Any]] | None,
 ) -> Response[bytes] | Response[Path]:
-    """`download()` over either transport: the body into memory, or into `dest` atomically."""
+    """`download()` over either transport: the body into memory, or into `dest` atomically.
+
+    With `deferred` (`raise_for_status=False`, the source not checking the status), a 4xx/5xx's
+    body is read into memory, never into `dest`, and comes back as the error response for that
+    `raises=` class."""
     await source.prepare()
     buffer = bytearray()
     started = time.monotonic()
@@ -465,7 +481,8 @@ async def _download_stream(
         async with AsyncExitStack() as stack:
             async with _within_idle_limit(idle):
                 head, read_chunk = await source.open(stack)
-            if dest is None:
+            failed = deferred is not None and head.status >= 400
+            if dest is None or failed:
                 while True:
                     chunk = await _read_chunk_within(read_chunk, idle)
                     if chunk is None:
@@ -482,6 +499,16 @@ async def _download_stream(
         raise source.failure(error) from error
     elapsed = time.monotonic() - started
     request_info = source.request_info
+    if deferred is not None and head.status >= 400:
+        return _ErrorResponse(
+            deferred,
+            head.status,
+            head.headers,
+            request_info,
+            head.http_version,
+            elapsed,
+            bytes(buffer),
+        )
     if dest is None:
         data = bytes(buffer)
         return Response(
@@ -491,7 +518,10 @@ async def _download_stream(
 
 
 def _download_stream_sync(
-    source: _SyncStreamSource, dest: Path | None, idle: float | None
+    source: _SyncStreamSource,
+    dest: Path | None,
+    idle: float | None,
+    deferred: type[HTTPResponseError[Any]] | None,
 ) -> Response[bytes] | Response[Path]:
     """Sync mirror of `_download_stream`, reading through `_sync_stream_chunks`."""
     source.prepare()
@@ -504,11 +534,19 @@ def _download_stream_sync(
         chunks = _sync_stream_chunks(
             source, None, interruptible=False, idle_timeout=idle, head_sink=head_sink
         )
-        if dest is None:
+        # The head is in `head_sink` before the first chunk (or the end) arrives, and only then
+        # is it known whether the body goes to `dest`.
+        first = next(chunks, None)
+        failed = deferred is not None and head_sink[0].status >= 400
+        if dest is None or failed:
+            if first is not None:
+                buffer += first
             for chunk in chunks:
                 buffer += chunk
         else:
             with _atomic_download_file(dest) as file:
+                if first is not None:
+                    file.write(first)
                 for chunk in chunks:
                     file.write(chunk)
     except source.failures as error:
@@ -516,6 +554,16 @@ def _download_stream_sync(
     elapsed = time.monotonic() - started
     head = head_sink[0]
     request_info = source.request_info
+    if deferred is not None and head.status >= 400:
+        return _ErrorResponse(
+            deferred,
+            head.status,
+            head.headers,
+            request_info,
+            head.http_version,
+            elapsed,
+            bytes(buffer),
+        )
     if dest is None:
         data = bytes(buffer)
         return Response(
