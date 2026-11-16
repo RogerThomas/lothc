@@ -10,7 +10,13 @@ from msgspec.json import Decoder
 from pydantic import BaseModel, TypeAdapter
 from typing_extensions import TypeForm
 
-from lothc import HTTPClient, HTTPConnectionError, HTTPResponseError, SyncHTTPClient
+from lothc import (
+    HTTPClient,
+    HTTPConnectionError,
+    HTTPDecodeError,
+    HTTPResponseError,
+    SyncHTTPClient,
+)
 
 
 class Line(Struct):
@@ -295,15 +301,19 @@ class _WrongLine(Struct):
     i: str
 
 
-async def test_stream_get_raises_the_decoders_error_for_a_line_that_does_not_fit(
+async def test_stream_get_raises_a_decode_error_for_a_line_that_does_not_fit(
     client: HTTPClient,
 ) -> None:
-    with pytest.raises(msgspec.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         [line async for line in client.stream_get("ndjson", into=_WrongLine)]
 
+    assert type(exc_info.value.parse_error) is msgspec.ValidationError
 
-def test_sync_stream_get_raises_the_decoders_error_for_a_line_that_does_not_fit(
+
+def test_sync_stream_get_raises_a_decode_error_for_a_line_that_does_not_fit(
     sync_client: SyncHTTPClient,
 ) -> None:
-    with pytest.raises(msgspec.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         list(sync_client.stream_get("ndjson", into=_WrongLine))
+
+    assert type(exc_info.value.parse_error) is msgspec.ValidationError

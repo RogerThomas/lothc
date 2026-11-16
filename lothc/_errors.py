@@ -1,5 +1,9 @@
 """lothc's exceptions, and `RequestInfo`, the request a status error (or a `Response`) describes.
 
+`HTTPResponseError`: a 4xx/5xx. `HTTPDecodeError` (a `ValueError`): a successful response that
+didn't decode. `HTTPTransportError` (and its `HTTPConnectionError`/`HTTPTimeoutError`): no
+response at all.
+
 `HTTPResponseError` is defined here, before `Response` (`_response.py`) annotates `.error` with it,
 since annotations are evaluated at definition on 3.13. Choosing which `raises=` class a 4xx/5xx is
 raised as is `_raises.py`'s.
@@ -72,7 +76,8 @@ class HTTPResponseError[P = object](Exception):
     `raise_for_status=False`, the returned `Response`'s `.error`, and raised by reading its
     `.data`).
 
-    A response WAS received — for a request that never got one, see `HTTPTransportError`.
+    A response WAS received — for a request that never got one, see `HTTPTransportError`; for a
+    successful one that didn't decode, `HTTPDecodeError`.
     `.request` is the request actually sent — the target you asked for, not necessarily the one a
     final response came from if redirects were followed. `.headers` are the error response's own
     (e.g. a `Retry-After` once retries are exhausted, or a request id to quote to support), and
@@ -164,6 +169,101 @@ def _rebuild_http_response_error(
     """Unpickling target for `HTTPResponseError.__reduce__` (keyword-only `headers` rules out
     returning the class itself with positional args)."""
     return cls(status, body, request, problem, headers=headers)
+
+
+def _as_parse_error(error: Exception) -> ValueError:
+    """`error` as the `ValueError` a `.parse_error` promises: itself if it already is one (every
+    decode library's own failure), else a `ValueError` chained to it (`__cause__`), for the
+    `RecursionError` a deeply nested body raises and the `TypeError` a pinned `dict` subclass's
+    own constructor can raise."""
+    if isinstance(error, ValueError):
+        return error
+    parse_error = ValueError(f"body could not be decoded: {error!r}")
+    parse_error.__cause__ = error
+    return parse_error
+
+
+class HTTPDecodeError(ValueError):
+    """Raised when a successful response (status below 400) was received but couldn't be decoded:
+    its body into `into=`, its headers into `response_headers_type`, a line of `stream_get`/
+    `stream_post` into `into=`, or an `sse()` event's data into `into=`.
+
+    Neither an `HTTPResponseError` (the status was fine) nor an `HTTPTransportError` (a response
+    WAS received), and a `ValueError` like every decode failure. `.parse_error` is the decode
+    library's own error (`msgspec.ValidationError`, `pydantic.ValidationError`,
+    `json.JSONDecodeError`, ...), or a `ValueError` chained to whatever else decoding raised (a
+    `RecursionError` for a body nested too deep to parse); `__cause__` is what decoding raised.
+
+    `.body` is what didn't decode: the whole body, that one line, or that event's data, as bytes
+    (`b""` for `head`/`options`, whose body is never read); `.body_start` is its first 100 bytes,
+    as used in the message. `.status`, `.headers` and `.request` are the response's (a stream's,
+    for a line or an event). Pickling keeps everything but the decode library's error itself
+    (pydantic's `ValidationError` can't be pickled): `.parse_error` comes back as a plain
+    `ValueError` with its message, and `__cause__` as `None`.
+    """
+
+    def __init__(
+        self,
+        status: int,
+        body: bytes,
+        request: RequestInfo,
+        parse_error: ValueError,
+        *,
+        headers: CaseInsensitiveDict | None = None,
+    ) -> None:
+        self.status = status
+        self.body = body
+        self.body_start = body[:100]
+        self.request = request
+        self.parse_error = parse_error
+        self.headers = headers if headers is not None else CaseInsensitiveDict()
+        snippet = self.body_start.decode(errors="replace")
+        truncation_marker = "…" if len(body) > 100 else ""
+        super().__init__(
+            f"Could not decode the {status} response to {request.method} {request.url}:"
+            f" {parse_error}\nBody: {snippet}{truncation_marker}"
+        )
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # As `HTTPResponseError.__reduce__`, carrying `.parse_error` as its message only.
+        return (
+            _rebuild_http_decode_error,
+            (
+                type(self),
+                self.status,
+                self.body,
+                self.request,
+                str(self.parse_error),
+                self.headers,
+            ),
+        )
+
+
+def _rebuild_http_decode_error(
+    cls: type[HTTPDecodeError],
+    status: int,
+    body: bytes,
+    request: RequestInfo,
+    parse_error_message: str,
+    headers: CaseInsensitiveDict,
+) -> HTTPDecodeError:
+    """Unpickling target for `HTTPDecodeError.__reduce__`."""
+    return cls(status, body, request, ValueError(parse_error_message), headers=headers)
+
+
+def _decode_error(
+    error: ValueError | RecursionError,
+    status: int,
+    body: bytes,
+    request: RequestInfo,
+    headers: CaseInsensitiveDict,
+) -> HTTPDecodeError:
+    """The `HTTPDecodeError` for a successful response whose `body` (or one streamed line or
+    event's data) decoding rejected with `error`, chained to it. Off the hot path: only a failed
+    decode builds one."""
+    decode_error = HTTPDecodeError(status, body, request, _as_parse_error(error), headers=headers)
+    decode_error.__cause__ = error
+    return decode_error
 
 
 class HTTPTransportError(Exception):

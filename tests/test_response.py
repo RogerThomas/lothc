@@ -11,7 +11,7 @@ import pytest
 from msgspec import Struct
 from pydantic import BaseModel
 
-from lothc import CaseInsensitiveDict, HTTPClient, Response, SyncHTTPClient
+from lothc import CaseInsensitiveDict, HTTPClient, HTTPDecodeError, Response, SyncHTTPClient
 
 
 @dataclass
@@ -557,24 +557,32 @@ def test_sync_typed_headers_are_converted_to_the_field_types(
     assert result.typed_headers == headers_type(content_length=12)
 
 
-async def test_typed_headers_missing_a_required_header_raise_pydantics_error(
+async def test_typed_headers_missing_a_required_header_carry_pydantics_error(
     client: HTTPClient,
 ) -> None:
-    with pytest.raises(pydantic.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         await client.get("binary", response_headers_type=MissingHeaders)
 
+    assert isinstance(exc_info.value.parse_error, pydantic.ValidationError)
 
-async def test_typed_headers_missing_a_required_header_raise_msgspecs_error(
+
+async def test_typed_headers_missing_a_required_header_carry_msgspecs_error(
     client: HTTPClient,
 ) -> None:
-    with pytest.raises(msgspec.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         await client.get("binary", response_headers_type=MissingHeadersStruct)
 
+    assert type(exc_info.value.parse_error) is msgspec.ValidationError
 
-def test_sync_typed_headers_missing_a_required_header_raise_the_libraries_error(
+
+def test_sync_typed_headers_missing_a_required_header_carry_the_libraries_error(
     sync_client: SyncHTTPClient,
 ) -> None:
-    with pytest.raises(pydantic.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         sync_client.get("binary", response_headers_type=MissingHeaders)
-    with pytest.raises(msgspec.ValidationError):
+
+    assert isinstance(exc_info.value.parse_error, pydantic.ValidationError)
+    with pytest.raises(HTTPDecodeError) as exc_info:
         sync_client.get("binary", response_headers_type=MissingHeadersStruct)
+
+    assert type(exc_info.value.parse_error) is msgspec.ValidationError

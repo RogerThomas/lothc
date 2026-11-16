@@ -9,7 +9,7 @@ from typing import Any, assert_type
 
 import pytest
 
-from lothc import HTTPClient, HTTPResponseError, SyncHTTPClient
+from lothc import HTTPClient, HTTPDecodeError, HTTPResponseError, SyncHTTPClient
 
 
 class ItemDict(dict[str, Any]):
@@ -127,8 +127,11 @@ def test_sync_get_into_str_returns_the_body_text_unparsed(sync_client: SyncHTTPC
 
 
 async def test_get_into_str_rejects_invalid_utf8(client: HTTPClient) -> None:
-    with pytest.raises(UnicodeDecodeError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         await client.get("invalid-utf8", into=str)
+
+    assert isinstance(exc_info.value.parse_error, UnicodeDecodeError)
+    assert exc_info.value.body == b"\xff\xfe"
 
 
 async def test_sse_into_str_matches_the_default(client: HTTPClient) -> None:
@@ -261,6 +264,58 @@ def test_sync_a_pinned_dict_subclass_rejecting_the_body_sets_parse_error(
     assert isinstance(exc_info.value.parse_error.__cause__, TypeError)
 
 
+async def test_a_deeply_nested_body_is_a_decode_error_chained_to_the_recursion_error(
+    client: HTTPClient,
+) -> None:
+    with pytest.raises(HTTPDecodeError) as exc_info:
+        await client.get("deeply-nested", into=dict)
+
+    assert exc_info.value.status == 200
+    assert exc_info.value.body_start == b"[" * 100
+    assert isinstance(exc_info.value.__cause__, RecursionError)
+    assert exc_info.value.parse_error.__cause__ is exc_info.value.__cause__
+
+
+def test_sync_a_deeply_nested_body_is_a_decode_error_chained_to_the_recursion_error(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(HTTPDecodeError) as exc_info:
+        sync_client.get("deeply-nested", into=dict)
+
+    assert isinstance(exc_info.value.__cause__, RecursionError)
+    assert exc_info.value.parse_error.__cause__ is exc_info.value.__cause__
+
+
+async def test_a_dict_subclass_rejecting_a_successful_body_raises_its_own_error(
+    client: HTTPClient,
+) -> None:
+    # The caller's own constructor raised it: not a decode failure lothc wraps.
+    with pytest.raises(TypeError, match="rejected"):
+        await client.get("items/7", into=RejectingDict)
+
+
+def test_sync_a_dict_subclass_rejecting_a_successful_body_raises_its_own_error(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(TypeError, match="rejected"):
+        sync_client.get("items/7", into=RejectingDict)
+
+
+def test_sync_get_into_str_rejects_invalid_utf8(sync_client: SyncHTTPClient) -> None:
+    with pytest.raises(HTTPDecodeError) as exc_info:
+        sync_client.get("invalid-utf8", into=str)
+
+    assert isinstance(exc_info.value.parse_error, UnicodeDecodeError)
+
+
+async def test_get_into_dict_rejects_invalid_json(client: HTTPClient) -> None:
+    with pytest.raises(HTTPDecodeError) as exc_info:
+        await client.get("invalid-json", into=dict)
+
+    assert isinstance(exc_info.value.parse_error, json.JSONDecodeError)
+    assert exc_info.value.body == b"{not json"
+
+
 async def test_stream_get_into_str_keeps_blank_lines_and_strips_crlf(client: HTTPClient) -> None:
     lines = [line async for line in client.stream_get("crlf-text", into=str)]
 
@@ -313,7 +368,7 @@ def test_sync_get_into_mapping_str_any_decodes_a_json_object(sync_client: SyncHT
 
 
 async def test_get_into_mapping_str_any_rejects_a_json_array(client: HTTPClient) -> None:
-    with pytest.raises(ValueError, match="Expected a JSON object"):
+    with pytest.raises(HTTPDecodeError, match="Expected a JSON object"):
         await client.get("json-array", into=Mapping[str, Any])
 
 

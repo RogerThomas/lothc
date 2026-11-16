@@ -55,9 +55,11 @@ from ._decode import _Decoder, _decoder_for, _Into
 from ._encode import _encode_headers, _encode_params, _pydantic_by_alias, _query_pairs
 from ._errors import (
     HTTPConnectionError,
+    HTTPDecodeError,
     HTTPTimeoutError,
     HTTPTransportError,
     RequestInfo,
+    _decode_error,
 )
 from ._form import _build_form, _build_sync_form
 from ._headers import CaseInsensitiveDict, _LazyHeaders
@@ -387,6 +389,19 @@ def _decode_body(body: Bytes, decoder: _Decoder | None) -> Any:  # noqa: ANN401
     if isinstance(decoder, TypeAdapter):
         return decoder.validate_json(body.to_bytes())
     return decoder.decode(body.to_bytes())
+
+
+def _response_decode_error(
+    error: ValueError | RecursionError,
+    raw_response: RawResponse | RawSyncResponse,
+    body: bytes,
+    request_info: RequestInfo,
+) -> HTTPDecodeError:
+    """The `HTTPDecodeError` for a successful response whose `body` (or headers, for
+    `response_headers_type`) didn't decode, its headers built at once (off the hot path)."""
+    return _decode_error(
+        error, raw_response.status, body, request_info, CaseInsensitiveDict(raw_response.headers)
+    )
 
 
 def _apply_params[TBuilder: BaseRequestBuilder](
@@ -951,12 +966,23 @@ class _PyreqwestTransport:
             return await self._error_status(
                 raw_response, raises, request_info, elapsed, raise_for_status=raise_for_status
             )
-        decoded = _decode_body(await _read_body(raw_response), decoder)
+        body = await _read_body(raw_response)
+        try:
+            decoded = _decode_body(body, decoder)
+        except (ValueError, RecursionError) as error:
+            raise _response_decode_error(
+                error, raw_response, body.to_bytes(), request_info
+            ) from error
         response_headers = _LazyHeaders(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
-            typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+            try:
+                typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+            except ValueError as error:
+                raise _response_decode_error(
+                    error, raw_response, body.to_bytes(), request_info
+                ) from error
         return Response(
             decoded,
             raw_response.status,
@@ -993,11 +1019,14 @@ class _PyreqwestTransport:
                 raw_response, raises, request_info, elapsed, raise_for_status=raise_for_status
             )
         response_headers = _LazyHeaders(raw_response.headers)
-        typed_headers = (
-            None
-            if response_headers_type is None
-            else _parse_typed_headers(response_headers, response_headers_type)
-        )
+        if response_headers_type is None:
+            typed_headers = None
+        else:
+            try:
+                typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+            except ValueError as error:
+                # The body is never read here, so there's none to carry.
+                raise _response_decode_error(error, raw_response, b"", request_info) from error
         return Response(
             None,
             raw_response.status,
@@ -1345,12 +1374,23 @@ class _SyncPyreqwestTransport:
             return self._error_status(
                 raw_response, raises, request_info, elapsed, raise_for_status=raise_for_status
             )
-        decoded = _decode_body(_read_body_sync(raw_response), decoder)
+        body = _read_body_sync(raw_response)
+        try:
+            decoded = _decode_body(body, decoder)
+        except (ValueError, RecursionError) as error:
+            raise _response_decode_error(
+                error, raw_response, body.to_bytes(), request_info
+            ) from error
         response_headers = _LazyHeaders(raw_response.headers)
         if response_headers_type is None:
             typed_headers = None
         else:
-            typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+            try:
+                typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+            except ValueError as error:
+                raise _response_decode_error(
+                    error, raw_response, body.to_bytes(), request_info
+                ) from error
         return Response(
             decoded,
             raw_response.status,
@@ -1387,11 +1427,14 @@ class _SyncPyreqwestTransport:
                 raw_response, raises, request_info, elapsed, raise_for_status=raise_for_status
             )
         response_headers = _LazyHeaders(raw_response.headers)
-        typed_headers = (
-            None
-            if response_headers_type is None
-            else _parse_typed_headers(response_headers, response_headers_type)
-        )
+        if response_headers_type is None:
+            typed_headers = None
+        else:
+            try:
+                typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+            except ValueError as error:
+                # The body is never read here, so there's none to carry.
+                raise _response_decode_error(error, raw_response, b"", request_info) from error
         return Response(
             None,
             raw_response.status,

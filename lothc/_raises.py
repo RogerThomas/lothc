@@ -16,7 +16,7 @@ from typing import (
 )
 
 from ._decode import _decode_json_line, _Decoder, _decoder_for
-from ._errors import HTTPResponseError, RequestInfo, _unread_problem
+from ._errors import HTTPResponseError, RequestInfo, _as_parse_error, _unread_problem
 from ._headers import CaseInsensitiveDict
 from ._response import Response
 
@@ -258,18 +258,6 @@ def _call_raises(raises: _RaisesArg | None, client_raises: _RaisesTable) -> _Rai
 # Whatever the pinned `P` decodes to — genuinely dynamic, can't state it statically.
 def _decode_pinned_error(body: bytes, decoder: _Decoder | None) -> Any:  # noqa: ANN401
     return body if decoder is None else _decode_json_line(body, decoder)
-
-
-def _as_parse_error(error: Exception) -> ValueError:
-    """`error` as the `ValueError` `.parse_error` promises: itself if it already is one (every
-    decode library's own failure), else a `ValueError` chained to it (`__cause__`), for the
-    `RecursionError` a deeply nested body raises and the `TypeError` a pinned `dict` subclass's
-    own constructor can raise."""
-    if isinstance(error, ValueError):
-        return error
-    parse_error = ValueError(f"error body could not be decoded: {error!r}")
-    parse_error.__cause__ = error
-    return parse_error
 
 
 # The matched `P` value, or `_unread_problem` — genuinely dynamic, can't state it statically.

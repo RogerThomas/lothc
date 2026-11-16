@@ -13,7 +13,7 @@ from msgspec import Struct
 from pydantic import AfterValidator, BaseModel, Field, GetCoreSchemaHandler
 from pydantic_core import CoreSchema
 
-from lothc import HTTPClient, SyncHTTPClient
+from lothc import HTTPClient, HTTPDecodeError, SyncHTTPClient
 from lothc.testing import LOTHCMocker
 
 # pylint: disable=duplicate-code
@@ -192,9 +192,11 @@ def test_sync_get_decodes_a_list_of_ints(sync_client: SyncHTTPClient) -> None:
 
 
 async def test_get_validates_a_list_of_ints(client: HTTPClient) -> None:
-    # Same rule as a model `into`: the chosen library's own error, unwrapped.
-    with pytest.raises(msgspec.ValidationError):
+    # Same rule as a model `into`: the chosen library's own error, as `.parse_error`.
+    with pytest.raises(HTTPDecodeError) as exc_info:
         await client.get("json-array", into=list[int])
+
+    assert type(exc_info.value.parse_error) is msgspec.ValidationError
 
 
 async def test_get_decodes_into_an_unhashable_annotated_form(client: HTTPClient) -> None:
@@ -306,20 +308,26 @@ async def test_get_enforces_pydantic_only_metadata_on_a_form_without_models(
     client: HTTPClient,
     form: Any,  # noqa: ANN401 — the forms differ in type, which isn't what's under test
 ) -> None:
-    with pytest.raises(pydantic.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         await client.get("json-literal", params={"value": "[-5]"}, into=form)
+
+    assert isinstance(exc_info.value.parse_error, pydantic.ValidationError)
 
 
 def test_sync_get_enforces_pydantic_field_metadata(sync_client: SyncHTTPClient) -> None:
-    with pytest.raises(pydantic.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         sync_client.get(
             "json-literal", params={"value": "[-5]"}, into=list[Annotated[int, Field(gt=0)]]
         )
 
+    assert isinstance(exc_info.value.parse_error, pydantic.ValidationError)
+
 
 async def test_get_enforces_a_pydantic_dataclass_field_constraint(client: HTTPClient) -> None:
-    with pytest.raises(pydantic.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         await client.get("json-literal", params={"value": '{"id": -1}'}, into=PositiveItem)
+
+    assert isinstance(exc_info.value.parse_error, pydantic.ValidationError)
 
 
 def test_sync_get_enforces_a_pydantic_dataclass_field_constraint(
@@ -328,8 +336,10 @@ def test_sync_get_enforces_a_pydantic_dataclass_field_constraint(
     item = sync_client.get("json-literal", params={"value": '{"id": 1}'}, into=PositiveItem).data
 
     assert item == PositiveItem(id=1)
-    with pytest.raises(pydantic.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         sync_client.get("json-literal", params={"value": '{"id": -1}'}, into=PositiveItem)
+
+    assert isinstance(exc_info.value.parse_error, pydantic.ValidationError)
 
 
 @pytest.mark.parametrize(
@@ -346,8 +356,10 @@ async def test_get_keeps_plain_and_msgspec_metadata_on_msgspec(
     form: Any,  # noqa: ANN401 — the forms differ in type, which isn't what's under test
 ) -> None:
     # msgspec's own error type shows which library decoded it.
-    with pytest.raises(msgspec.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         await client.get("json-literal", params={"value": value}, into=form)
+
+    assert type(exc_info.value.parse_error) is msgspec.ValidationError
 
 
 async def test_get_into_a_struct_with_pydantic_metadata_raises_type_error(
@@ -502,12 +514,14 @@ async def test_get_reuses_the_decoder_of_an_inline_validator_of_a_module_functio
         )
     ).data
     builds = counter.builds
-    with pytest.raises(pydantic.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         await client.get(
             "json-literal",
             params={"value": "[-5]"},
             into=list[Annotated[int, AfterValidator(_positive), counter]],
         )
+
+    assert isinstance(exc_info.value.parse_error, pydantic.ValidationError)
 
     assert numbers == [1]
     assert builds > 0
@@ -525,12 +539,14 @@ def test_sync_get_reuses_the_decoder_of_an_inline_validator_of_a_module_function
         into=dict[str, Annotated[int, AfterValidator(_positive), counter]],
     )
     builds = counter.builds
-    with pytest.raises(pydantic.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         sync_client.get(
             "json-literal",
             params={"value": '{"a": -5}'},
             into=dict[str, Annotated[int, AfterValidator(_positive), counter]],
         )
+
+    assert isinstance(exc_info.value.parse_error, pydantic.ValidationError)
 
     assert builds > 0
     assert counter.builds == builds
@@ -622,11 +638,15 @@ def test_sync_get_decodes_parametrized_dict_subclasses(sync_client: SyncHTTPClie
 
 
 async def test_get_validates_a_parametrized_dict_subclass_values(client: HTTPClient) -> None:
-    with pytest.raises(pydantic.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         await client.get("json-literal", params={"value": '{"a": "b"}'}, into=OrderedDict[str, int])
+
+    assert isinstance(exc_info.value.parse_error, pydantic.ValidationError)
 
 
 async def test_get_still_decodes_a_type_msgspec_supports_with_msgspec(client: HTTPClient) -> None:
     # Which library's `ValidationError` a bad value raises is what shows who decoded it.
-    with pytest.raises(msgspec.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         await client.get("json-literal", params={"value": '"not-a-date"'}, into=datetime)
+
+    assert type(exc_info.value.parse_error) is msgspec.ValidationError

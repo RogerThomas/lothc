@@ -89,14 +89,12 @@ type TokenResponseTyping = _StructTokenResponseTyping | _BaseModelTokenResponseT
 class OAuthTokenError(Exception):
     """Raised by `OAuthProvider`/`SyncOAuthProvider` when a token could not be obtained, wrapping
     whatever the token endpoint call raised as `__cause__` (an `HTTPResponseError`, an
-    `HTTPTransportError`, the decode library's own validation error, a `ValueError`/`KeyError`
-    from a malformed payload). `.token_url` is the endpoint that was asked.
+    `HTTPTransportError`, an `HTTPDecodeError` for a token response that didn't decode, a
+    `ValueError`/`KeyError` from a malformed payload). `.token_url` is the endpoint that was asked.
 
-    This is the one place lothc wraps a decode library's error: the provider runs *inside* the
-    user's unrelated verb call (`await client.get("items/7")`), so an unwrapped error there reads
-    as a failure of that call — e.g. an `HTTPResponseError` whose `.status` is really the token
-    endpoint's, not the API's. An `into` decode error, by contrast, already belongs
-    to the call that raised it.
+    Wrapped because the provider runs *inside* the user's unrelated verb call
+    (`await client.get("items/7")`), so an unwrapped error there reads as a failure of that call —
+    e.g. an `HTTPResponseError` whose `.status` is really the token endpoint's, not the API's.
     """
 
     def __init__(self, token_url: str, error: BaseException) -> None:

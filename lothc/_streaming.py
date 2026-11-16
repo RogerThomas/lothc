@@ -32,7 +32,13 @@ from typing import (
 )
 
 from ._decode import _decode_json_line, _decoder_for, _Into, _TextDecoder
-from ._errors import HTTPTimeoutError, HTTPTransportError, RequestInfo
+from ._errors import (
+    HTTPDecodeError,
+    HTTPTimeoutError,
+    HTTPTransportError,
+    RequestInfo,
+    _decode_error,
+)
 from ._headers import CaseInsensitiveDict
 from ._raises import _ErrorResponse, _RaisesArg, _RaisesTable, _validate_raises
 from ._response import Response
@@ -389,6 +395,13 @@ def _sync_stream_chunks(
             yield bytes(chunk)
 
 
+def _line_decode_error(
+    error: ValueError | RecursionError, line: bytearray, head: _ResponseHead, request: RequestInfo
+) -> HTTPDecodeError:
+    """The `HTTPDecodeError` for one streamed `line` that didn't decode."""
+    return _decode_error(error, head.status, bytes(line), request, head.headers)
+
+
 async def _stream_lines(
     source: _StreamSource,
     into: _Into,
@@ -404,7 +417,7 @@ async def _stream_lines(
     try:
         async with AsyncExitStack() as stack:
             async with _within_idle_limit(idle):
-                _, read_chunk = await source.open(stack)
+                head, read_chunk = await source.open(stack)
             if decoder is None:
                 while True:
                     chunk = await _read_chunk_within(read_chunk, idle)
@@ -419,10 +432,20 @@ async def _stream_lines(
                 if chunk is None:
                     break
                 for line in complete_lines(pending, chunk):
-                    yield _decode_json_line(line, decoder)
+                    try:
+                        value = _decode_json_line(line, decoder)
+                    except (ValueError, RecursionError) as error:
+                        raise _line_decode_error(error, line, head, source.request_info) from error
+                    yield value
             final_line = _final_line(pending, raw_text=raw_text)
             if final_line is not None:
-                yield _decode_json_line(final_line, decoder)
+                try:
+                    value = _decode_json_line(final_line, decoder)
+                except (ValueError, RecursionError) as error:
+                    raise _line_decode_error(
+                        error, final_line, head, source.request_info
+                    ) from error
+                yield value
     except source.failures as error:
         raise source.failure(error) from error
 
@@ -440,8 +463,13 @@ def _stream_lines_sync(
     # Resolved before connecting, so an unusable `into` fails without a request.
     decoder = _decoder_for(into)
     source.prepare()
+    # The response stays inside `_sync_stream_chunks`, so its head comes back through this,
+    # before the first chunk, for a line that doesn't decode.
+    head_sink: list[_ResponseHead] = []
     try:
-        chunks = _sync_stream_chunks(source, None, interruptible=interruptible, idle_timeout=idle)
+        chunks = _sync_stream_chunks(
+            source, None, interruptible=interruptible, idle_timeout=idle, head_sink=head_sink
+        )
         if decoder is None:
             yield from chunks
             return
@@ -450,10 +478,22 @@ def _stream_lines_sync(
         pending = bytearray()
         for chunk in chunks:
             for line in complete_lines(pending, chunk):
-                yield _decode_json_line(line, decoder)
+                try:
+                    value = _decode_json_line(line, decoder)
+                except (ValueError, RecursionError) as error:
+                    raise _line_decode_error(
+                        error, line, head_sink[0], source.request_info
+                    ) from error
+                yield value
         final_line = _final_line(pending, raw_text=raw_text)
         if final_line is not None:
-            yield _decode_json_line(final_line, decoder)
+            try:
+                value = _decode_json_line(final_line, decoder)
+            except (ValueError, RecursionError) as error:
+                raise _line_decode_error(
+                    error, final_line, head_sink[0], source.request_info
+                ) from error
+            yield value
     except source.failures as error:
         raise source.failure(error) from error
 

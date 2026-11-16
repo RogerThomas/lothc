@@ -34,6 +34,7 @@ from ._errors import (
     HTTPTimeoutError,
     HTTPTransportError,
     RequestInfo,
+    _decode_error,
 )
 from ._form import _form_parts, _FormPart
 from ._headers import CaseInsensitiveDict, _LazyHeaders
@@ -287,6 +288,22 @@ def _native_decode_error(message: str) -> HTTPConnectionError:
     return error
 
 
+def _native_decode_failure(
+    error: BaseException,
+    status: int,
+    body: bytes,
+    request_info: RequestInfo,
+    headers: CaseInsensitiveDict,
+) -> BaseException:
+    """What the native side raises when decoding a successful response's body (or its headers,
+    for `response_headers_type`) raised `error`: `HTTPDecodeError` for a decode failure, its
+    headers built at once (off the hot path), and anything else (a `dict` subclass's own
+    `TypeError`, a `KeyboardInterrupt`) as it was."""
+    if not isinstance(error, (ValueError, RecursionError)):
+        return error
+    return _decode_error(error, status, body, request_info, CaseInsensitiveDict(headers))
+
+
 def _native_retryable(error: HTTPTransportError) -> bool:
     """`_is_retryable_send_error` for the native transport's exceptions (`_retried`'s
     `retryable`): a timeout or a failed
@@ -315,6 +332,7 @@ class _NativeGlue:
     transport_error: type[HTTPTransportError]
     builder_error: Callable[[str], HTTPTransportError]
     decode_error: Callable[[str], HTTPConnectionError]
+    decode_failure: Callable[..., BaseException]
 
 
 def _native_glue() -> _NativeGlue:
@@ -331,6 +349,7 @@ def _native_glue() -> _NativeGlue:
         HTTPTransportError,
         _native_builder_error,
         _native_decode_error,
+        _native_decode_failure,
     )
 
 
@@ -384,14 +403,32 @@ def _finish_undecoded(
             response.request,
             CaseInsensitiveDict(response.headers),
         )
-    data = None if headers_only else response.data
+    # As the native side's `outcome()`: a `head`/`options` body is never decoded or carried.
+    body = b"" if headers_only else response.data
+    data = None if headers_only else body
     if data is not None and decode is not None:
-        data = decode(data)
-    typed_headers = (
-        None
-        if response_headers_type is None
-        else _parse_typed_headers(response.headers, response_headers_type)
-    )
+        try:
+            data = decode(data)
+        except (ValueError, RecursionError) as error:
+            raise _decode_error(
+                error,
+                response.status,
+                body,
+                response.request,
+                CaseInsensitiveDict(response.headers),
+            ) from error
+    typed_headers = None
+    if response_headers_type is not None:
+        try:
+            typed_headers = _parse_typed_headers(response.headers, response_headers_type)
+        except ValueError as error:
+            raise _decode_error(
+                error,
+                response.status,
+                body,
+                response.request,
+                CaseInsensitiveDict(response.headers),
+            ) from error
     return Response(
         data,
         response.status,

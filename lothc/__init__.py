@@ -1,6 +1,7 @@
 from ._client import HTTPClient
 from ._errors import (
     HTTPConnectionError,
+    HTTPDecodeError,
     HTTPResponseError,
     HTTPTimeoutError,
     HTTPTransportError,
@@ -39,6 +40,7 @@ __all__ = [
     "Form",
     "HTTPClient",
     "HTTPConnectionError",
+    "HTTPDecodeError",
     "HTTPResponseError",
     "HTTPTimeoutError",
     "HTTPTransportError",

@@ -5,7 +5,7 @@ import pytest
 from msgspec import Struct
 from pydantic import BaseModel, ValidationError
 
-from lothc import HTTPClient, HTTPResponseError, SyncHTTPClient
+from lothc import HTTPClient, HTTPDecodeError, HTTPResponseError, SyncHTTPClient
 
 
 class ErrorBodyModel(BaseModel):
@@ -224,7 +224,7 @@ async def test_matching_error_body_has_no_parse_error(client: HTTPClient) -> Non
 
 
 async def test_a_json_array_decoded_as_dict_raises_a_clear_error(client: HTTPClient) -> None:
-    with pytest.raises(ValueError, match="got a JSON array"):
+    with pytest.raises(HTTPDecodeError, match="got a JSON array"):
         await client.get("json-array", into=dict)
 
 
@@ -235,7 +235,7 @@ async def test_a_json_array_decoded_as_dict_raises_a_clear_error(client: HTTPCli
 async def test_a_non_object_json_body_decoded_as_dict_names_what_it_got(
     client: HTTPClient, value: str, kind: str
 ) -> None:
-    with pytest.raises(ValueError, match=f"got a JSON {kind}"):
+    with pytest.raises(HTTPDecodeError, match=f"got a JSON {kind}"):
         await client.get("json-literal", params={"value": value}, into=dict)
 
 

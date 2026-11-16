@@ -18,7 +18,7 @@ from ._decode import (
     _SSEBytesDecoder,
     _TextDecoder,
 )
-from ._errors import HTTPTransportError
+from ._errors import HTTPTransportError, RequestInfo, _decode_error
 from ._raises import _RaisesArg, _validate_raises
 from ._streaming import _ResponseHead, _StreamSource, _sync_stream_chunks, _SyncStreamSource
 
@@ -181,13 +181,18 @@ def _sse_data_decoder(into: _Into) -> _Decoder:
 
 
 def _dispatch_sse_record(
-    record: bytes, state: _SSEStreamState, decoder: _Decoder
+    record: bytes,
+    state: _SSEStreamState,
+    decoder: _Decoder,
+    head: _ResponseHead,
+    request: RequestInfo,
 ) -> SSEEvent[Any] | None:
     """Apply one record's `retry:`/`id:` fields to `state`, then build its event (if it has data).
 
     `.id` comes from the *persisted* last-event-id buffer, not this record alone — per spec an
     event with no `id:` line carries the most recent id seen on the stream, and the buffer is
-    only cleared by an explicit empty `id:` line.
+    only cleared by an explicit empty `id:` line. Data that doesn't decode is an
+    `HTTPDecodeError` carrying the connection's `head` and `request`.
     """
     # UTF-8 with replacement, as the spec's own decode step does, rather than raising.
     parsed_record = _parse_sse_record(record.decode(errors="replace"))
@@ -197,7 +202,12 @@ def _dispatch_sse_record(
         state.last_event_id = parsed_record.id
     if parsed_record.data is None:
         return None
-    data = _decode_json_line(parsed_record.data, decoder)
+    try:
+        data = _decode_json_line(parsed_record.data, decoder)
+    except (ValueError, RecursionError) as error:
+        raise _decode_error(
+            error, head.status, parsed_record.data.encode(), request, head.headers
+        ) from error
     return SSEEvent(id=state.last_event_id, event=parsed_record.event, data=data)
 
 
@@ -232,7 +242,7 @@ async def _sse_connection(
                 records, tail = _split_sse_records(bytes(buffer))
                 buffer = bytearray(tail)
                 for record in records:
-                    event = _dispatch_sse_record(record, state, decoder)
+                    event = _dispatch_sse_record(record, state, decoder, head, source.request_info)
                     if event is not None:
                         yield event
     except source.failures as error:
@@ -247,11 +257,17 @@ def _sse_connection_sync(
     interruptible: bool,
 ) -> Generator[SSEEvent[Any]]:
     """Sync mirror of `_sse_connection`, reading through `_sync_stream_chunks`."""
+    # The response stays inside `_sync_stream_chunks`, so its head comes back through this,
+    # before the first chunk, for an event whose data doesn't decode.
+    head_sink: list[_ResponseHead] = []
     try:
         buffer = bytearray()
         strip_bom = True
         for chunk in _sync_stream_chunks(
-            source, partial(_verify_sse_head, state), interruptible=interruptible
+            source,
+            partial(_verify_sse_head, state),
+            interruptible=interruptible,
+            head_sink=head_sink,
         ):
             new_from = len(buffer)
             buffer += chunk
@@ -264,7 +280,9 @@ def _sse_connection_sync(
             records, tail = _split_sse_records(bytes(buffer))
             buffer = bytearray(tail)
             for record in records:
-                event = _dispatch_sse_record(record, state, decoder)
+                event = _dispatch_sse_record(
+                    record, state, decoder, head_sink[0], source.request_info
+                )
                 if event is not None:
                     yield event
     except source.failures as error:

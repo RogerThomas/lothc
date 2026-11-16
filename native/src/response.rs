@@ -113,6 +113,7 @@ pub(crate) struct Glue {
     transport_error: Py<PyAny>,
     builder_error: Py<PyAny>,
     decode_error: Py<PyAny>,
+    decode_failure: Py<PyAny>,
     http_10: Py<PyString>,
     http_11: Py<PyString>,
 }
@@ -133,6 +134,7 @@ impl Glue {
             transport_error: get("transport_error")?,
             builder_error: get("builder_error")?,
             decode_error: get("decode_error")?,
+            decode_failure: get("decode_failure")?,
             http_10: PyString::intern(py, "HTTP/1.0").unbind(),
             http_11: PyString::intern(py, "HTTP/1.1").unbind(),
         })
@@ -194,6 +196,24 @@ impl Glue {
         }
     }
 
+    /// What a successful response raises when decoding its body (or its headers, for
+    /// `response_headers_type`) raised `error`: `HTTPDecodeError` for a decode failure, chained to
+    /// it, and anything else as it was. Only a failed decode pays for this.
+    fn decode_failure(
+        &self,
+        py: Python<'_>,
+        error: PyErr,
+        status: u16,
+        body: &Bound<'_, PyBytes>,
+        request_info: &Bound<'_, PyAny>,
+        headers: &Bound<'_, PyAny>,
+    ) -> PyErr {
+        match self.decode_failure.bind(py).call1((error.into_value(py), status, body, request_info, headers)) {
+            Ok(failure) => PyErr::from_value(failure),
+            Err(error) => error,
+        }
+    }
+
     /// A streamed response's head as `(status, RawHeaders, http_version)`.
     pub(crate) fn stream_head<'py>(&self, py: Python<'py>, status: u16, version: Version, headers: HeaderMap) -> PyResult<Bound<'py, PyTuple>> {
         let version = if version == Version::HTTP_10 { &self.http_10 } else { &self.http_11 };
@@ -241,12 +261,22 @@ impl Glue {
             py.None().into_bound(py)
         } else {
             match &exchange.decode {
-                Some(decode) => decode.bind(py).call1((body,))?,
-                None => body.into_any(),
+                Some(decode) => match decode.bind(py).call1((&body,)) {
+                    Ok(data) => data,
+                    Err(error) => return Err(self.decode_failure(py, error, head.status, &body, &request_info, &headers)),
+                },
+                None => body.clone().into_any(),
             }
         };
         let typed_headers = match &exchange.typed_headers {
-            Some(header_type) => self.parse_typed_headers.bind(py).call1((&headers, header_type.bind(py)))?,
+            Some(header_type) => match self.parse_typed_headers.bind(py).call1((&headers, header_type.bind(py))) {
+                Ok(typed_headers) => typed_headers,
+                Err(error) => {
+                    // As on pyreqwest, which never reads a `head`/`options` body: none to carry.
+                    let body = if exchange.headers_only { PyBytes::new(py, b"") } else { body };
+                    return Err(self.decode_failure(py, error, head.status, &body, &request_info, &headers));
+                }
+            },
             None => py.None().into_bound(py),
         };
         self.response
