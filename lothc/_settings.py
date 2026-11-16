@@ -3,6 +3,7 @@
 import os
 import sys
 from collections.abc import (
+    Collection,
     Mapping,
     Sequence,
 )
@@ -37,6 +38,52 @@ def _retry_method_set(
     if retry_methods is None:
         return default
     return frozenset(method.upper() for method in retry_methods)
+
+
+def _retry_status_set(
+    retry_statuses: Collection[int] | None, default: frozenset[int]
+) -> frozenset[int]:
+    """`retry_statuses` as the set the retry loop checks a status against, refused at
+    construction unless each one is a 4xx/5xx status, an `int` (not a `bool`). `None` means the
+    defaults; an empty collection retries no status, while a transport failure is still retried.
+    A bare `int` (`retry_statuses=503`) is a `TypeError`, not one status.
+
+    >>> sorted(_retry_status_set((503, 429), frozenset({500})))
+    [429, 503]
+    >>> len(_retry_status_set(range(500, 600), frozenset()))
+    100
+    >>> _retry_status_set((), frozenset({500}))
+    frozenset()
+    >>> _retry_status_set([302], frozenset())
+    Traceback (most recent call last):
+    ...
+    ValueError: 'retry_statuses' takes 4xx/5xx statuses (400 to 599), not 302
+    """
+    if retry_statuses is None:
+        return default
+    if isinstance(retry_statuses, int):
+        raise TypeError(f"'retry_statuses' takes a collection of statuses, not {retry_statuses!r}")
+    for status in retry_statuses:
+        if isinstance(status, bool) or not isinstance(status, int):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(f"'retry_statuses' takes int statuses, not {status!r}")
+        if not 400 <= status <= 599:
+            raise ValueError(f"'retry_statuses' takes 4xx/5xx statuses (400 to 599), not {status}")
+    return frozenset(retry_statuses)
+
+
+def _validate_max_retries(max_retries: int) -> None:
+    """Refuse a `max_retries` (the client's, or one call's) that isn't a count: a non-`int`
+    (a `bool` included) is a `TypeError`, a negative one a `ValueError`.
+
+    >>> _validate_max_retries(-1)
+    Traceback (most recent call last):
+    ...
+    ValueError: 'max_retries' must be 0 or more, not -1
+    """
+    if isinstance(max_retries, bool) or not isinstance(max_retries, int):  # pyright: ignore[reportUnnecessaryIsInstance]
+        raise TypeError(f"'max_retries' must be an int, not {max_retries!r}")
+    if max_retries < 0:
+        raise ValueError(f"'max_retries' must be 0 or more, not {max_retries}")
 
 
 type TlsVersion = Literal["TLSv1.0", "TLSv1.1", "TLSv1.2", "TLSv1.3"]
@@ -83,6 +130,7 @@ class _TransportSettings:  # pylint: disable=too-many-instance-attributes
     retry_methods: frozenset[str]
     backoff_base: float
     max_retry_after: float | None
+    retry_statuses: frozenset[int]
     connect_timeout: float | None
     read_timeout: float | None
     root_certificates: Sequence[bytes] | None
@@ -111,6 +159,7 @@ class _TransportSettings:  # pylint: disable=too-many-instance-attributes
             raise ValueError("'no_proxy' needs a 'proxy' to exclude hosts from")
         if self.native not in ("auto", "off", "on"):
             raise ValueError(f"'native' must be 'auto', 'off' or 'on', not {self.native!r}")
+        _validate_max_retries(self.max_retries)
 
 
 @cache

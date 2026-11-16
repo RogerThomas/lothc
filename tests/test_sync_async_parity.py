@@ -345,7 +345,7 @@ def test_implementation_pairs_were_discovered() -> None:
         "_PyreqwestTransport.open",
         "_NativeTransport.send",
         "_NativeTransport.send_headers_only",
-        "_RetryMiddleware.__call__",
+        "_retried",
         "_ReauthMiddleware.__call__",
         "OAuthProvider._renew",
         "_send",

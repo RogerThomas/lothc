@@ -3,7 +3,7 @@ import time
 from collections.abc import AsyncGenerator, Generator
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
-from typing import Literal
+from typing import Any, Literal
 
 import pytest
 
@@ -1000,3 +1000,619 @@ def test_sync_a_cut_off_body_on_a_post_is_not_retried_by_default(
 ) -> None:
     with pytest.raises(HTTPConnectionError):
         sync_retry_client.post("body-flaky", params={"key": server_key, "fail_times": 1})
+
+
+# --- retry_statuses -----------------------------------------------------------------------------
+
+
+async def test_retry_statuses_replaces_the_statuses_retried(base_url: str, server_key: str) -> None:
+    async with HTTPClient(
+        base_url=base_url, max_retries=2, retry_statuses=(409,), backoff_base=0.001
+    ) as client:
+        result = await client.get(
+            "status-then-ok",
+            params={"key": server_key, "status": 409, "fail_times": 2},
+            into=dict,
+        )
+
+    assert result.data["attempts"] == 3
+
+
+def test_sync_retry_statuses_replaces_the_statuses_retried(base_url: str, server_key: str) -> None:
+    with SyncHTTPClient(
+        base_url=base_url, max_retries=2, retry_statuses=(409,), backoff_base=0.001
+    ) as client:
+        result = client.get(
+            "status-then-ok",
+            params={"key": server_key, "status": 409, "fail_times": 2},
+            into=dict,
+        )
+
+    assert result.data["attempts"] == 3
+
+
+async def test_a_default_status_outside_retry_statuses_is_not_retried(
+    base_url: str, server_key: str
+) -> None:
+    async with HTTPClient(
+        base_url=base_url, max_retries=2, retry_statuses={409}, backoff_base=0.001
+    ) as client:
+        with pytest.raises(HTTPResponseError) as exc_info:
+            await client.get("status-then-ok", params={"key": server_key, "fail_times": 1})
+        hits = (await client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert exc_info.value.status == 503
+    assert hits == {"hits": 1}
+
+
+def test_sync_a_default_status_outside_retry_statuses_is_not_retried(
+    base_url: str, server_key: str
+) -> None:
+    with SyncHTTPClient(
+        base_url=base_url, max_retries=2, retry_statuses={409}, backoff_base=0.001
+    ) as client:
+        with pytest.raises(HTTPResponseError) as exc_info:
+            client.get("status-then-ok", params={"key": server_key, "fail_times": 1})
+        hits = client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert exc_info.value.status == 503
+    assert hits == {"hits": 1}
+
+
+async def test_retry_statuses_takes_a_range(base_url: str, server_key: str) -> None:
+    async with HTTPClient(
+        base_url=base_url, max_retries=1, retry_statuses=range(500, 600), backoff_base=0.001
+    ) as client:
+        result = await client.get(
+            "status-then-ok",
+            params={"key": server_key, "status": 501, "fail_times": 1},
+            into=dict,
+        )
+
+    assert result.data["attempts"] == 2
+
+
+def test_sync_retry_statuses_takes_a_range(base_url: str, server_key: str) -> None:
+    with SyncHTTPClient(
+        base_url=base_url, max_retries=1, retry_statuses=range(500, 600), backoff_base=0.001
+    ) as client:
+        result = client.get(
+            "status-then-ok",
+            params={"key": server_key, "status": 501, "fail_times": 1},
+            into=dict,
+        )
+
+    assert result.data["attempts"] == 2
+
+
+async def test_empty_retry_statuses_retries_no_status(base_url: str, server_key: str) -> None:
+    async with HTTPClient(
+        base_url=base_url, max_retries=2, retry_statuses=(), backoff_base=0.001
+    ) as client:
+        with pytest.raises(HTTPResponseError) as exc_info:
+            await client.get("status-then-ok", params={"key": server_key, "fail_times": 1})
+        hits = (await client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert exc_info.value.status == 503
+    assert hits == {"hits": 1}
+
+
+def test_sync_empty_retry_statuses_retries_no_status(base_url: str, server_key: str) -> None:
+    with SyncHTTPClient(
+        base_url=base_url, max_retries=2, retry_statuses=(), backoff_base=0.001
+    ) as client:
+        with pytest.raises(HTTPResponseError) as exc_info:
+            client.get("status-then-ok", params={"key": server_key, "fail_times": 1})
+        hits = client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert exc_info.value.status == 503
+    assert hits == {"hits": 1}
+
+
+async def test_empty_retry_statuses_still_retries_a_transport_failure(
+    base_url: str, server_key: str
+) -> None:
+    async with HTTPClient(
+        base_url=base_url, max_retries=2, retry_statuses=(), backoff_base=0.001
+    ) as client:
+        result = await client.get(
+            "connection-flaky", params={"key": server_key, "fail_times": 2}, into=dict
+        )
+
+    assert result.data == {"attempts": 3}
+
+
+def test_sync_empty_retry_statuses_still_retries_a_transport_failure(
+    base_url: str, server_key: str
+) -> None:
+    with SyncHTTPClient(
+        base_url=base_url, max_retries=2, retry_statuses=(), backoff_base=0.001
+    ) as client:
+        result = client.get(
+            "connection-flaky", params={"key": server_key, "fail_times": 2}, into=dict
+        )
+
+    assert result.data == {"attempts": 3}
+
+
+def _invalid_retry_statuses() -> list[tuple[object, type[Exception], str]]:
+    return [
+        (503, TypeError, "takes a collection of statuses, not 503"),
+        ([True], TypeError, "takes int statuses, not True"),
+        (["503"], TypeError, "takes int statuses, not '503'"),
+        ([503.0], TypeError, "takes int statuses, not 503.0"),
+        ([302], ValueError, r"takes 4xx/5xx statuses \(400 to 599\), not 302"),
+        ([600], ValueError, r"takes 4xx/5xx statuses \(400 to 599\), not 600"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("retry_statuses", "error", "match"),
+    _invalid_retry_statuses(),
+    ids=["bare-int", "bool", "str", "float", "below-400", "above-599"],
+)
+def test_invalid_retry_statuses_fail_at_construction(
+    retry_statuses: object, error: type[Exception], match: str
+) -> None:
+    settings: dict[str, Any] = {"retry_statuses": retry_statuses}
+
+    with pytest.raises(error, match=match):
+        HTTPClient(**settings)
+
+
+@pytest.mark.parametrize(
+    ("retry_statuses", "error", "match"),
+    _invalid_retry_statuses(),
+    ids=["bare-int", "bool", "str", "float", "below-400", "above-599"],
+)
+def test_sync_invalid_retry_statuses_fail_at_construction(
+    retry_statuses: object, error: type[Exception], match: str
+) -> None:
+    settings: dict[str, Any] = {"retry_statuses": retry_statuses}
+
+    with pytest.raises(error, match=match):
+        SyncHTTPClient(**settings)
+
+
+# --- per-call max_retries -----------------------------------------------------------------------
+
+
+# Retries off, as by default, with a short backoff for the calls that switch them on themselves.
+@pytest.fixture(name="backoff_client")
+async def _backoff_client(base_url: str) -> AsyncGenerator[HTTPClient]:
+    async with HTTPClient(base_url=base_url, backoff_base=0.001) as client:
+        yield client
+
+
+@pytest.fixture(name="sync_backoff_client")
+def _sync_backoff_client(base_url: str) -> Generator[SyncHTTPClient]:
+    with SyncHTTPClient(base_url=base_url, backoff_base=0.001) as client:
+        yield client
+
+
+async def test_a_call_max_retries_of_0_switches_retries_off(
+    server_key: str, retry_client: HTTPClient
+) -> None:
+    with pytest.raises(HTTPResponseError):
+        await retry_client.get(
+            "status-then-ok", params={"key": server_key, "fail_times": 1}, max_retries=0
+        )
+    hits = (await retry_client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert hits == {"hits": 1}
+
+
+def test_sync_a_call_max_retries_of_0_switches_retries_off(
+    server_key: str, sync_retry_client: SyncHTTPClient
+) -> None:
+    with pytest.raises(HTTPResponseError):
+        sync_retry_client.get(
+            "status-then-ok", params={"key": server_key, "fail_times": 1}, max_retries=0
+        )
+    hits = sync_retry_client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert hits == {"hits": 1}
+
+
+async def test_a_call_max_retries_switches_retries_on(
+    server_key: str, backoff_client: HTTPClient
+) -> None:
+    result = await backoff_client.get(
+        "status-then-ok", params={"key": server_key, "fail_times": 2}, into=dict, max_retries=2
+    )
+
+    assert result.data["attempts"] == 3
+
+
+def test_sync_a_call_max_retries_switches_retries_on(
+    server_key: str, sync_backoff_client: SyncHTTPClient
+) -> None:
+    result = sync_backoff_client.get(
+        "status-then-ok", params={"key": server_key, "fail_times": 2}, into=dict, max_retries=2
+    )
+
+    assert result.data["attempts"] == 3
+
+
+async def test_a_call_max_retries_replaces_the_clients_count(
+    server_key: str, retry_client: HTTPClient
+) -> None:
+    with pytest.raises(HTTPResponseError):
+        await retry_client.get(
+            "status-then-ok", params={"key": server_key, "fail_times": 5}, max_retries=3
+        )
+    hits = (await retry_client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert hits == {"hits": 4}
+
+
+def test_sync_a_call_max_retries_replaces_the_clients_count(
+    server_key: str, sync_retry_client: SyncHTTPClient
+) -> None:
+    with pytest.raises(HTTPResponseError):
+        sync_retry_client.get(
+            "status-then-ok", params={"key": server_key, "fail_times": 5}, max_retries=3
+        )
+    hits = sync_retry_client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert hits == {"hits": 4}
+
+
+async def test_a_call_max_retries_retries_a_verb_outside_retry_methods(
+    server_key: str, retry_client: HTTPClient
+) -> None:
+    result = await retry_client.post(
+        "status-then-ok",
+        params={"key": server_key, "fail_times": 1},
+        json={"a": 1},
+        into=dict,
+        max_retries=1,
+    )
+
+    assert result.data == {"attempts": 2, "bodies": ['{"a":1}', '{"a":1}']}
+
+
+def test_sync_a_call_max_retries_retries_a_verb_outside_retry_methods(
+    server_key: str, sync_retry_client: SyncHTTPClient
+) -> None:
+    result = sync_retry_client.post(
+        "status-then-ok",
+        params={"key": server_key, "fail_times": 1},
+        json={"a": 1},
+        into=dict,
+        max_retries=1,
+    )
+
+    assert result.data == {"attempts": 2, "bodies": ['{"a":1}', '{"a":1}']}
+
+
+async def test_a_call_max_retries_still_sends_a_form_once(
+    server_key: str, backoff_client: HTTPClient
+) -> None:
+    with pytest.raises(HTTPResponseError) as exc_info:
+        await backoff_client.post(
+            "status-then-ok",
+            params={"key": server_key, "fail_times": 1},
+            form={"a": "b"},
+            max_retries=2,
+        )
+    hits = (await backoff_client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert exc_info.value.status == 503
+    assert hits == {"hits": 1}
+
+
+def test_sync_a_call_max_retries_still_sends_a_form_once(
+    server_key: str, sync_backoff_client: SyncHTTPClient
+) -> None:
+    with pytest.raises(HTTPResponseError) as exc_info:
+        sync_backoff_client.post(
+            "status-then-ok",
+            params={"key": server_key, "fail_times": 1},
+            form={"a": "b"},
+            max_retries=2,
+        )
+    hits = sync_backoff_client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert exc_info.value.status == 503
+    assert hits == {"hits": 1}
+
+
+async def test_a_call_max_retries_retries_a_transport_failure(
+    server_key: str, backoff_client: HTTPClient
+) -> None:
+    result = await backoff_client.get(
+        "connection-flaky", params={"key": server_key, "fail_times": 1}, into=dict, max_retries=1
+    )
+
+    assert result.data == {"attempts": 2}
+
+
+def test_sync_a_call_max_retries_retries_a_transport_failure(
+    server_key: str, sync_backoff_client: SyncHTTPClient
+) -> None:
+    result = sync_backoff_client.get(
+        "connection-flaky", params={"key": server_key, "fail_times": 1}, into=dict, max_retries=1
+    )
+
+    assert result.data == {"attempts": 2}
+
+
+async def test_exhausted_call_retries_return_the_last_error_response_unraised(
+    server_key: str, backoff_client: HTTPClient
+) -> None:
+    response = await backoff_client.get(
+        "status-then-ok",
+        params={"key": server_key, "fail_times": 5},
+        raise_for_status=False,
+        max_retries=1,
+    )
+    hits = (await backoff_client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert response.status == 503
+    assert response.error is not None
+    assert response.error.problem == {"attempt": 2}
+    assert hits == {"hits": 2}
+
+
+def test_sync_exhausted_call_retries_return_the_last_error_response_unraised(
+    server_key: str, sync_backoff_client: SyncHTTPClient
+) -> None:
+    response = sync_backoff_client.get(
+        "status-then-ok",
+        params={"key": server_key, "fail_times": 5},
+        raise_for_status=False,
+        max_retries=1,
+    )
+    hits = sync_backoff_client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert response.status == 503
+    assert response.error is not None
+    assert response.error.problem == {"attempt": 2}
+    assert hits == {"hits": 2}
+
+
+@pytest.mark.parametrize("verb", ["head", "options"])
+async def test_a_call_max_retries_retries_head_and_options(
+    server_key: str, verb: Literal["head", "options"], backoff_client: HTTPClient
+) -> None:
+    params: dict[str, str | int] = {"key": server_key, "fail_times": 1}
+    if verb == "head":
+        response = await backoff_client.head("status-then-ok", params=params, max_retries=1)
+    else:
+        response = await backoff_client.options("status-then-ok", params=params, max_retries=1)
+    hits = (await backoff_client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert response.status == 200
+    assert hits == {"hits": 2}
+
+
+@pytest.mark.parametrize("verb", ["head", "options"])
+def test_sync_a_call_max_retries_retries_head_and_options(
+    server_key: str, verb: Literal["head", "options"], sync_backoff_client: SyncHTTPClient
+) -> None:
+    params: dict[str, str | int] = {"key": server_key, "fail_times": 1}
+    if verb == "head":
+        response = sync_backoff_client.head("status-then-ok", params=params, max_retries=1)
+    else:
+        response = sync_backoff_client.options("status-then-ok", params=params, max_retries=1)
+    hits = sync_backoff_client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert response.status == 200
+    assert hits == {"hits": 2}
+
+
+async def test_a_call_max_retries_retries_a_download(
+    server_key: str, backoff_client: HTTPClient
+) -> None:
+    response = await backoff_client.download(
+        "status-then-ok", params={"key": server_key, "fail_times": 1}, max_retries=1
+    )
+
+    assert json.loads(response.data)["attempts"] == 2
+
+
+def test_sync_a_call_max_retries_retries_a_download(
+    server_key: str, sync_backoff_client: SyncHTTPClient
+) -> None:
+    response = sync_backoff_client.download(
+        "status-then-ok", params={"key": server_key, "fail_times": 1}, max_retries=1
+    )
+
+    assert json.loads(response.data)["attempts"] == 2
+
+
+async def test_a_call_max_retries_of_0_downloads_once(
+    server_key: str, retry_client: HTTPClient
+) -> None:
+    with pytest.raises(HTTPResponseError):
+        await retry_client.download(
+            "status-then-ok", params={"key": server_key, "fail_times": 1}, max_retries=0
+        )
+    hits = (await retry_client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert hits == {"hits": 1}
+
+
+def test_sync_a_call_max_retries_of_0_downloads_once(
+    server_key: str, sync_retry_client: SyncHTTPClient
+) -> None:
+    with pytest.raises(HTTPResponseError):
+        sync_retry_client.download(
+            "status-then-ok", params={"key": server_key, "fail_times": 1}, max_retries=0
+        )
+    hits = sync_retry_client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert hits == {"hits": 1}
+
+
+async def test_a_call_max_retries_retries_a_stream_get(
+    server_key: str, backoff_client: HTTPClient
+) -> None:
+    chunks = backoff_client.stream_get(
+        "status-then-ok", params={"key": server_key, "fail_times": 1}, max_retries=1
+    )
+
+    assert json.loads(b"".join([chunk async for chunk in chunks]))["attempts"] == 2
+
+
+def test_sync_a_call_max_retries_retries_a_stream_get(
+    server_key: str, sync_backoff_client: SyncHTTPClient
+) -> None:
+    chunks = sync_backoff_client.stream_get(
+        "status-then-ok", params={"key": server_key, "fail_times": 1}, max_retries=1
+    )
+
+    assert json.loads(b"".join(chunks))["attempts"] == 2
+
+
+async def test_a_call_max_retries_retries_a_stream_post(
+    server_key: str, backoff_client: HTTPClient
+) -> None:
+    lines = backoff_client.stream_post(
+        "status-then-ok",
+        params={"key": server_key, "fail_times": 1},
+        content="content",
+        into=dict,
+        max_retries=1,
+    )
+
+    assert [line async for line in lines] == [{"attempts": 2, "bodies": ["content", "content"]}]
+
+
+def test_sync_a_call_max_retries_retries_a_stream_post(
+    server_key: str, sync_backoff_client: SyncHTTPClient
+) -> None:
+    lines = sync_backoff_client.stream_post(
+        "status-then-ok",
+        params={"key": server_key, "fail_times": 1},
+        content="content",
+        into=dict,
+        max_retries=1,
+    )
+
+    assert list(lines) == [{"attempts": 2, "bodies": ["content", "content"]}]
+
+
+async def test_a_call_max_retries_still_streams_a_form_once(
+    server_key: str, backoff_client: HTTPClient
+) -> None:
+    chunks = backoff_client.stream_post(
+        "status-then-ok",
+        params={"key": server_key, "fail_times": 1},
+        form={"a": "b"},
+        max_retries=2,
+    )
+    with pytest.raises(HTTPResponseError):
+        _ = [chunk async for chunk in chunks]
+    hits = (await backoff_client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert hits == {"hits": 1}
+
+
+def test_sync_a_call_max_retries_still_streams_a_form_once(
+    server_key: str, sync_backoff_client: SyncHTTPClient
+) -> None:
+    chunks = sync_backoff_client.stream_post(
+        "status-then-ok",
+        params={"key": server_key, "fail_times": 1},
+        form={"a": "b"},
+        max_retries=2,
+    )
+    with pytest.raises(HTTPResponseError):
+        _ = list(chunks)
+    hits = sync_backoff_client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert hits == {"hits": 1}
+
+
+def _invalid_max_retries() -> list[tuple[object, type[Exception], str]]:
+    return [
+        (-1, ValueError, "'max_retries' must be 0 or more, not -1"),
+        (True, TypeError, "'max_retries' must be an int, not True"),
+        (1.5, TypeError, "'max_retries' must be an int, not 1.5"),
+        ("1", TypeError, "'max_retries' must be an int, not '1'"),
+    ]
+
+
+_invalid_max_retries_ids = ["negative", "bool", "float", "str"]
+
+
+@pytest.mark.parametrize(
+    ("max_retries", "error", "match"), _invalid_max_retries(), ids=_invalid_max_retries_ids
+)
+async def test_an_invalid_call_max_retries_fails_before_sending(
+    server_key: str,
+    max_retries: Any,  # noqa: ANN401 — deliberately not a valid `max_retries=`
+    error: type[Exception],
+    match: str,
+    backoff_client: HTTPClient,
+) -> None:
+    params = {"key": server_key}
+    with pytest.raises(error, match=match):
+        await backoff_client.get("status-then-ok", params=params, max_retries=max_retries)
+    with pytest.raises(error, match=match):
+        await backoff_client.head("status-then-ok", params=params, max_retries=max_retries)
+    with pytest.raises(error, match=match):
+        await backoff_client.post(
+            "status-then-ok", params=params, form={"a": "b"}, max_retries=max_retries
+        )
+    with pytest.raises(error, match=match):
+        await backoff_client.download("status-then-ok", params=params, max_retries=max_retries)
+    with pytest.raises(error, match=match):
+        backoff_client.stream_get("status-then-ok", params=params, max_retries=max_retries)
+    hits = (await backoff_client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert hits == {"hits": 0}
+
+
+@pytest.mark.parametrize(
+    ("max_retries", "error", "match"), _invalid_max_retries(), ids=_invalid_max_retries_ids
+)
+def test_sync_an_invalid_call_max_retries_fails_before_sending(
+    server_key: str,
+    max_retries: Any,  # noqa: ANN401 — deliberately not a valid `max_retries=`
+    error: type[Exception],
+    match: str,
+    sync_backoff_client: SyncHTTPClient,
+) -> None:
+    params = {"key": server_key}
+    with pytest.raises(error, match=match):
+        sync_backoff_client.get("status-then-ok", params=params, max_retries=max_retries)
+    with pytest.raises(error, match=match):
+        sync_backoff_client.head("status-then-ok", params=params, max_retries=max_retries)
+    with pytest.raises(error, match=match):
+        sync_backoff_client.post(
+            "status-then-ok", params=params, form={"a": "b"}, max_retries=max_retries
+        )
+    with pytest.raises(error, match=match):
+        sync_backoff_client.download("status-then-ok", params=params, max_retries=max_retries)
+    with pytest.raises(error, match=match):
+        sync_backoff_client.stream_get("status-then-ok", params=params, max_retries=max_retries)
+    hits = sync_backoff_client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert hits == {"hits": 0}
+
+
+@pytest.mark.parametrize(
+    ("max_retries", "error", "match"), _invalid_max_retries(), ids=_invalid_max_retries_ids
+)
+def test_an_invalid_client_max_retries_fails_at_construction(
+    max_retries: object, error: type[Exception], match: str
+) -> None:
+    settings: dict[str, Any] = {"max_retries": max_retries}
+
+    with pytest.raises(error, match=match):
+        HTTPClient(**settings)
+
+
+@pytest.mark.parametrize(
+    ("max_retries", "error", "match"), _invalid_max_retries(), ids=_invalid_max_retries_ids
+)
+def test_sync_an_invalid_client_max_retries_fails_at_construction(
+    max_retries: object, error: type[Exception], match: str
+) -> None:
+    settings: dict[str, Any] = {"max_retries": max_retries}
+
+    with pytest.raises(error, match=match):
+        SyncHTTPClient(**settings)

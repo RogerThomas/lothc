@@ -53,7 +53,7 @@ from ._raises import (
     _validate_raises,
 )
 from ._response import Response, _parse_typed_headers
-from ._retry import _retried, _retried_sync, _retry_policy, _RetryPolicy
+from ._retry import _call_retries, _retried, _retried_sync, _retry_policy, _RetryPolicy
 from ._settings import _default_user_agent, _TransportSettings
 from ._sse import SSEEvent, _sse_events, _sse_events_sync
 from ._streaming import (
@@ -309,7 +309,7 @@ def _native_retryable(error: HTTPTransportError) -> bool:
     `retryable`): a timeout or a failed
     connection (a body cut off partway included), but not a body that couldn't be decompressed,
     and none of the plain `HTTPTransportError`s (a redirect that can't be followed, a request that
-    can't be built), which pyreqwest's retry middleware doesn't catch either."""
+    can't be built), which the pyreqwest transport doesn't retry either (`_pyreqwest_retryable`)."""
     if not isinstance(error, (HTTPConnectionError, HTTPTimeoutError)):
         return False
     return not isinstance(error.__cause__, _NativeDecodeError)
@@ -443,7 +443,7 @@ def _finish_undecoded(
 @dataclass(slots=True)
 class _NativeCall:
     """A buffered request as the pool's `request` takes it, kept for each exchange the middleware
-    chain makes (`_NativeTransport._send_through_middleware`), as pyreqwest's retry copies it."""
+    chain makes (`_NativeTransport._send_through_middleware`), as pyreqwest's retries copy it."""
 
     method: str
     path: str
@@ -532,9 +532,9 @@ class _NativeStreamSource:
     """`_StreamSource` (`_streaming.py`) over the async native pool: `Pool.stream` prepares the
     request, a `Stream` sends and reads it (following redirects), and the pool raises lothc's own
     exceptions, so there are no `failures` to translate. An error status's body is read here and
-    raised as `_check_status` raises it; with `retry`, the head is retried as `_RetryMiddleware`
-    retries it, each attempt on a stream of its own whose 401 re-authenticates as
-    `_ReauthMiddleware` does, the same middleware order as the pyreqwest transport's."""
+    raised as `_check_status` raises it; with `retries`, the head is retried through `_retried`,
+    each attempt on a stream of its own whose 401 re-authenticates as `_ReauthMiddleware` does,
+    the same order as the pyreqwest transport's."""
 
     failures: ClassVar[tuple[type[Exception], ...]] = ()
     _pool: _NativePool
@@ -543,8 +543,9 @@ class _NativeStreamSource:
     _call: _StreamCall
     _auth: _NativeStreamAuth
     _error_class: _RaisesTable | None
-    # The client's retry policy, if this request's method is retried.
-    _retry: _RetryPolicy | None
+    _retry: _RetryPolicy
+    # How many times opening may be retried (0: sent once).
+    _retries: int
     # The headers `sse()` sets: `accept`, and `last-event-id` once there is one.
     _accept: str | None = None
     _last_event_id: str | None = None
@@ -666,12 +667,12 @@ class _NativeStreamSource:
 
     async def open(self, stack: AsyncExitStack) -> tuple[_ResponseHead, _ChunkReader]:
         stack.callback(self._close)
-        if self._retry is None:
-            head, raw_headers = await self._attempt()
-        else:
+        if self._retries:
             head, raw_headers = await _retried(
-                self._retry, self._attempt, _head_retry_signal, _native_retryable
+                self._retry, self._retries, self._attempt, _head_retry_signal, _native_retryable
             )
+        else:
+            head, raw_headers = await self._attempt()
         if self._error_class is not None and head.status >= 400:
             await self._raise_status_error(head, raw_headers, self._error_class)
         return head, self._read_chunk
@@ -688,8 +689,9 @@ class _SyncNativeStreamSource:
     _call: _StreamCall
     _auth: _SyncNativeStreamAuth
     _error_class: _RaisesTable | None
-    # The client's retry policy, if this request's method is retried.
-    _retry: _RetryPolicy | None
+    _retry: _RetryPolicy
+    # How many times opening may be retried (0: sent once).
+    _retries: int
     # The headers `sse()` sets: `accept`, and `last-event-id` once there is one.
     _accept: str | None = None
     _last_event_id: str | None = None
@@ -799,12 +801,12 @@ class _SyncNativeStreamSource:
 
     def open(self, stack: ExitStack) -> tuple[_ResponseHead, _SyncChunkReader]:
         stack.callback(self._close)
-        if self._retry is None:
-            head, raw_headers = self._attempt()
-        else:
+        if self._retries:
             head, raw_headers = _retried_sync(
-                self._retry, self._attempt, _head_retry_signal, _native_retryable
+                self._retry, self._retries, self._attempt, _head_retry_signal, _native_retryable
             )
+        else:
+            head, raw_headers = self._attempt()
         if self._error_class is not None and head.status >= 400:
             self._raise_status_error(head, raw_headers, self._error_class)
         return head, self._read_chunk
@@ -845,9 +847,8 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
     _static_auth: str | None = _dataclass_field(init=False)
     # `bearer_auth`, when it can `invalidate()` a rejected token (`_ReauthMiddleware`'s case).
     _reauth: _InvalidatableAuth | None = _dataclass_field(init=False)
-    # The client's retry policy (`_RetryMiddleware`'s), and the methods it retries (none without).
-    _retry: _RetryPolicy | None = _dataclass_field(init=False)
-    _retried_methods: frozenset[str] = _dataclass_field(init=False)
+    # The client's retry policy, which `_call_retries` reads each call's retries from.
+    _retry: _RetryPolicy = _dataclass_field(init=False)
     # The longest gap `stream_get`/`stream_post`/`download` tolerate between chunks: the client's
     # `timeout`, unless `read_timeout` was set, which the native side then enforces at the socket
     # (see `_PyreqwestTransport`). Not applied to `sse`.
@@ -868,7 +869,6 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
             self._bearer_auth if isinstance(self._bearer_auth, _InvalidatableAuth) else None
         )
         self._retry = _retry_policy(self._settings)
-        self._retried_methods = frozenset() if self._retry is None else self._retry.methods
         self._stream_idle_timeout = (
             self._settings.timeout if self._settings.read_timeout is None else None
         )
@@ -989,11 +989,12 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
         skip_auth: bool,
         headers_only: bool,
         defer_error: bool,
+        retries: int,
     ) -> Response[Any, Any]:
-        """The middleware chain `_PyreqwestTransport.open` installs, in its order:
-        `_RetryMiddleware` (for a retried method) around `_ReauthMiddleware` (for a
-        `bearer_auth` that can invalidate), each `_attempt`. The auth is fetched once, before
-        either, as pyreqwest applies it to the request they copy, so `.elapsed` starts after it."""
+        """The pyreqwest transport's order: `_retried` (up to `retries` times) around
+        `_ReauthMiddleware` (for a `bearer_auth` that can invalidate), each `_attempt`. The auth is
+        fetched once, before either, as pyreqwest applies it to the request each attempt copies,
+        so `.elapsed` starts after it."""
         reauth = None if skip_auth else self._reauth
         token = None
         if skip_auth:
@@ -1005,9 +1006,9 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
             auth = self._static_auth
         started = time.monotonic()
         attempt = partial(self._attempt, pool, call, auth, reauth, token)
-        if call.method in self._retried_methods and self._retry is not None and call.replayable:
+        if retries and call.replayable:
             response = await _retried(
-                self._retry, attempt, _response_retry_signal, _native_retryable
+                self._retry, retries, attempt, _response_retry_signal, _native_retryable
             )
         else:
             response = await attempt()
@@ -1040,9 +1041,19 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
         else:
             retry = method in self._idempotent_methods and replayable
             auth = _NativeStreamAuth(self._bearer_auth, self._static_auth, self._reauth, retry)
-        retry = self._retry if method in self._retried_methods and replayable else None
+        # Refused before sending even when the body can't be replayed.
+        retries = _call_retries(self._retry, method, call.max_retries)
         return _NativeStreamSource(
-            pool, method, path, call, auth, error_class, retry, accept, last_event_id
+            pool,
+            method,
+            path,
+            call,
+            auth,
+            error_class,
+            self._retry,
+            retries if replayable else 0,
+            accept,
+            last_event_id,
         )
 
     def _sse_source(self, path: str, call: _StreamCall, last_event_id: str) -> _NativeStreamSource:
@@ -1108,7 +1119,8 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
         if connections is not None:
             connections.stop()
 
-    async def send(
+    # Every local but a few is a verb argument; the hot path stays inline (see the docstring).
+    async def send(  # pylint: disable=too-many-locals
         self,
         method: str,
         path: str,
@@ -1126,11 +1138,13 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
         infer_mime_type_from_file_extension: bool,
         raise_for_status: bool | None,
         raises: _RaisesArg | None,
+        max_retries: int | None,
     ) -> Response[Any, Any]:
         """Every body verb's shared path, as `_PyreqwestTransport.send`. The hot path awaits the
         pool's Future right here (no further coroutine), and a plain-`dict` `params`/`headers`
         goes to the native side as is, skipping lothc's Python encoders."""
         error_class = _call_raises(raises, self._raises)
+        retries = _call_retries(self._retry, method, max_retries)
         try:
             decode = self._decode_cache[into]
         except (KeyError, TypeError):  # not cached yet, or an unhashable form
@@ -1160,7 +1174,7 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
             self._total_timeout if timeout is None else _native_call_timeout(timeout)
         )
         defer_error = not (self._raise_for_status if raise_for_status is None else raise_for_status)
-        if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
+        if (self._reauth is not None and not skip_auth) or retries:
             call = _NativeCall(
                 method, path, query, encoded_headers, body, body_kind, effective_timeout, not form
             )
@@ -1173,6 +1187,7 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
                 skip_auth=skip_auth,
                 headers_only=False,
                 defer_error=defer_error,
+                retries=retries,
             )
         if skip_auth:
             auth = None
@@ -1213,9 +1228,11 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
         skip_auth: bool,
         raise_for_status: bool | None,
         raises: _RaisesArg | None,
+        max_retries: int | None,
     ) -> Response[None, Any]:
         """`head`/`options`: status and headers only, the body is never decoded."""
         error_class = _call_raises(raises, self._raises)
+        retries = _call_retries(self._retry, method, max_retries)
         pool = self._native_pool
         if pool is None:
             raise self._closed_error()
@@ -1231,7 +1248,7 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
             self._total_timeout if timeout is None else _native_call_timeout(timeout)
         )
         defer_error = not (self._raise_for_status if raise_for_status is None else raise_for_status)
-        if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
+        if (self._reauth is not None and not skip_auth) or retries:
             call = _NativeCall(
                 method, path, query, encoded_headers, None, _NativeBody.RAW, effective_timeout
             )
@@ -1244,6 +1261,7 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
                 skip_auth=skip_auth,
                 headers_only=True,
                 defer_error=defer_error,
+                retries=retries,
             )
         if skip_auth:
             auth = None
@@ -1316,6 +1334,7 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         raises: _RaisesArg | None,
+        max_retries: int | None,
     ) -> AsyncGenerator[Any]:
         """`_PyreqwestTransport.stream_lines`: not a generator itself, so a closed client raises
         at the call."""
@@ -1335,6 +1354,7 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             check_status=True,
             raises=raises,
+            max_retries=max_retries,
         )
         return _stream_lines(self._stream_source(pool, method, path, call), into, raises, idle)
 
@@ -1349,6 +1369,7 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
         skip_auth: bool,
         raise_for_status: bool | None,
         raises: _RaisesArg | None,
+        max_retries: int | None,
     ) -> Response[bytes] | Response[Path]:
         _validate_raises(raises)
         pool = self._native_pool
@@ -1363,6 +1384,7 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
             skip_auth=skip_auth,
             check_status=check_status,
             raises=raises,
+            max_retries=max_retries,
         )
         source = self._stream_source(pool, "GET", path, call)
         # Unchecked, a 4xx/5xx comes back as the error response `_download_stream` builds.
@@ -1401,9 +1423,8 @@ class _SyncNativeTransport:
     _static_auth: str | None = _dataclass_field(init=False)
     # `bearer_auth`, when it can `invalidate()` a rejected token (`_ReauthMiddleware`'s case).
     _reauth: _SyncInvalidatableAuth | None = _dataclass_field(init=False)
-    # The client's retry policy (`_RetryMiddleware`'s), and the methods it retries (none without).
-    _retry: _RetryPolicy | None = _dataclass_field(init=False)
-    _retried_methods: frozenset[str] = _dataclass_field(init=False)
+    # The client's retry policy, which `_call_retries` reads each call's retries from.
+    _retry: _RetryPolicy = _dataclass_field(init=False)
     # The longest gap `stream_get`/`stream_post`/`download` tolerate between chunks: the client's
     # `timeout`, unless `read_timeout` was set, which the native side then enforces at the socket
     # (see `_PyreqwestTransport`). Not applied to `sse`.
@@ -1423,7 +1444,6 @@ class _SyncNativeTransport:
             self._bearer_auth if isinstance(self._bearer_auth, _SyncInvalidatableAuth) else None
         )
         self._retry = _retry_policy(self._settings)
-        self._retried_methods = frozenset() if self._retry is None else self._retry.methods
         self._stream_idle_timeout = (
             self._settings.timeout if self._settings.read_timeout is None else None
         )
@@ -1539,11 +1559,9 @@ class _SyncNativeTransport:
         skip_auth: bool,
         headers_only: bool,
         defer_error: bool,
+        retries: int,
     ) -> Response[Any, Any]:
-        """The middleware chain `_SyncPyreqwestTransport.open` installs, in its order:
-        `_SyncRetryMiddleware` (for a retried method) around `_SyncReauthMiddleware` (for a
-        `bearer_auth` that can invalidate), each `_attempt`. The auth is fetched once, before
-        either, as pyreqwest applies it to the request they copy, so `.elapsed` starts after it."""
+        """Sync mirror of `_NativeTransport._send_through_middleware`."""
         reauth = None if skip_auth else self._reauth
         token = None
         if skip_auth:
@@ -1555,9 +1573,9 @@ class _SyncNativeTransport:
             auth = self._static_auth
         started = time.monotonic()
         attempt = partial(self._attempt, pool, call, auth, reauth, token)
-        if call.method in self._retried_methods and self._retry is not None and call.replayable:
+        if retries and call.replayable:
             response = _retried_sync(
-                self._retry, attempt, _response_retry_signal, _native_retryable
+                self._retry, retries, attempt, _response_retry_signal, _native_retryable
             )
         else:
             response = attempt()
@@ -1590,9 +1608,19 @@ class _SyncNativeTransport:
         else:
             retry = method in self._idempotent_methods and replayable
             auth = _SyncNativeStreamAuth(self._bearer_auth, self._static_auth, self._reauth, retry)
-        retry = self._retry if method in self._retried_methods and replayable else None
+        # Refused before sending even when the body can't be replayed.
+        retries = _call_retries(self._retry, method, call.max_retries)
         return _SyncNativeStreamSource(
-            pool, method, path, call, auth, error_class, retry, accept, last_event_id
+            pool,
+            method,
+            path,
+            call,
+            auth,
+            error_class,
+            self._retry,
+            retries if replayable else 0,
+            accept,
+            last_event_id,
         )
 
     def _sse_source(
@@ -1665,10 +1693,12 @@ class _SyncNativeTransport:
         infer_mime_type_from_file_extension: bool,
         raise_for_status: bool | None,
         raises: _RaisesArg | None,
+        max_retries: int | None,
     ) -> Response[Any, Any]:
         """Every body verb's shared path, as `_SyncPyreqwestTransport.send`. A plain-`dict`
         `params`/`headers` goes to the native side as is, skipping lothc's Python encoders."""
         error_class = _call_raises(raises, self._raises)
+        retries = _call_retries(self._retry, method, max_retries)
         try:
             decode = self._decode_cache[into]
         except (KeyError, TypeError):  # not cached yet, or an unhashable form
@@ -1698,7 +1728,7 @@ class _SyncNativeTransport:
             self._total_timeout if timeout is None else _native_call_timeout(timeout)
         )
         defer_error = not (self._raise_for_status if raise_for_status is None else raise_for_status)
-        if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
+        if (self._reauth is not None and not skip_auth) or retries:
             call = _NativeCall(
                 method, path, query, encoded_headers, body, body_kind, effective_timeout, not form
             )
@@ -1711,6 +1741,7 @@ class _SyncNativeTransport:
                 skip_auth=skip_auth,
                 headers_only=False,
                 defer_error=defer_error,
+                retries=retries,
             )
         if skip_auth:
             auth = None
@@ -1746,9 +1777,11 @@ class _SyncNativeTransport:
         skip_auth: bool,
         raise_for_status: bool | None,
         raises: _RaisesArg | None,
+        max_retries: int | None,
     ) -> Response[None, Any]:
         """`head`/`options`: status and headers only, the body is never decoded."""
         error_class = _call_raises(raises, self._raises)
+        retries = _call_retries(self._retry, method, max_retries)
         pool = self._native_pool
         if pool is None:
             raise self._closed_error()
@@ -1764,7 +1797,7 @@ class _SyncNativeTransport:
             self._total_timeout if timeout is None else _native_call_timeout(timeout)
         )
         defer_error = not (self._raise_for_status if raise_for_status is None else raise_for_status)
-        if (self._reauth is not None and not skip_auth) or method in self._retried_methods:
+        if (self._reauth is not None and not skip_auth) or retries:
             call = _NativeCall(
                 method, path, query, encoded_headers, None, _NativeBody.RAW, effective_timeout
             )
@@ -1777,6 +1810,7 @@ class _SyncNativeTransport:
                 skip_auth=skip_auth,
                 headers_only=True,
                 defer_error=defer_error,
+                retries=retries,
             )
         if skip_auth:
             auth = None
@@ -1851,6 +1885,7 @@ class _SyncNativeTransport:
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
         raises: _RaisesArg | None,
+        max_retries: int | None,
         interruptible: bool,
     ) -> Generator[Any]:
         """`_SyncPyreqwestTransport.stream_lines`: not a generator itself, so a closed client
@@ -1871,6 +1906,7 @@ class _SyncNativeTransport:
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
             check_status=True,
             raises=raises,
+            max_retries=max_retries,
         )
         return _stream_lines_sync(
             self._stream_source(pool, method, path, call),
@@ -1891,6 +1927,7 @@ class _SyncNativeTransport:
         skip_auth: bool,
         raise_for_status: bool | None,
         raises: _RaisesArg | None,
+        max_retries: int | None,
     ) -> Response[bytes] | Response[Path]:
         _validate_raises(raises)
         pool = self._native_pool
@@ -1905,6 +1942,7 @@ class _SyncNativeTransport:
             skip_auth=skip_auth,
             check_status=check_status,
             raises=raises,
+            max_retries=max_retries,
         )
         source = self._stream_source(pool, "GET", path, call)
         # Unchecked, a 4xx/5xx comes back as the error response `_download_stream` builds.
