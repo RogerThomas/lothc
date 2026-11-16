@@ -76,16 +76,13 @@ class DocumentLockedProblem(Struct):  # any status: {"code": "document_locked", 
     locked_by: str
 
 
-class QuotaExceededError(HTTPResponseError[QuotaExceededProblem], status=429):
-    pass
+class QuotaExceededError(HTTPResponseError[QuotaExceededProblem], status=429): ...
 
 
-class JobNotFoundError(HTTPResponseError[Problem], status=404):
-    pass
+class JobNotFoundError(HTTPResponseError[Problem], status=404): ...
 
 
-class DocumentLockedError(HTTPResponseError[DocumentLockedProblem]):  # no status=: any 4xx/5xx
-    pass
+class DocumentLockedError(HTTPResponseError[DocumentLockedProblem]): ...  # no status=: any 4xx/5xx
 
 
 async with HTTPClient(
@@ -127,12 +124,10 @@ To catch all of one API's errors in one `except`, give its classes a generic bas
 last, where, pinning nothing, it takes every 4xx/5xx the others didn't:
 
 ```python
-class APIError[P = object](HTTPResponseError[P]):
-    pass
+class APIError[P = object](HTTPResponseError[P]): ...
 
 
-class QuotaExceededError(APIError[QuotaExceededProblem], status=429):
-    pass
+class QuotaExceededError(APIError[QuotaExceededProblem], status=429): ...
 
 
 raises = [QuotaExceededError, APIError]

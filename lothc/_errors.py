@@ -84,7 +84,7 @@ class HTTPResponseError[P = object](Exception):
     `.body` is the whole body; `.body_start` is just its first 100 bytes, as used in the message.
 
     Subclass it to have an error body decoded and raised as its own class, and pass the subclasses
-    as `raises=`: `class QuotaExceededError(HTTPResponseError[QuotaExceeded], status=429): pass`
+    as `raises=`: `class QuotaExceededError(HTTPResponseError[QuotaExceeded], status=429): ...`
     pins the problem type `P` and the statuses it's for (`status=` takes an int or an iterable of
     them, a tuple or a range, inherited by a subclass that doesn't pass its own; without one, a
     class is for every 4xx/5xx). A 4xx/5xx is raised as the first `raises=` class for its status

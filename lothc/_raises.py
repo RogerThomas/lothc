@@ -116,7 +116,7 @@ def _error_body_decoding(raises: type[HTTPResponseError[Any]]) -> _ErrorBodyDeco
         raise TypeError(
             f"{raises.__qualname__} leaves HTTPResponseError's problem type unbound ({form!r}),"
             " so there is nothing to decode an error body as. Pin it directly:"
-            f" `class {raises.__name__}(HTTPResponseError[YourProblemType]): pass`."
+            f" `class {raises.__name__}(HTTPResponseError[YourProblemType]): ...`."
         )
     return _ErrorBodyDecoding(pinned=True, form=form, decoder=_decoder_for(form))
 
@@ -163,7 +163,7 @@ def _candidates(classes: tuple[object, ...]) -> list[_Candidate]:
             raise TypeError(
                 "raises= takes an HTTPResponseError subclass or a sequence of them, got"
                 f" {cls!r}. To decode error bodies as a type P, subclass it:"
-                " `class APIError(HTTPResponseError[P]): pass`."
+                " `class APIError(HTTPResponseError[P]): ...`."
             )
         # The statuses `status=` set: package-private, as every `_` name is here.
         statuses = cls._lothc_statuses  # pylint: disable=protected-access

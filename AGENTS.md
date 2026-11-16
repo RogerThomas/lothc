@@ -173,7 +173,7 @@ lookups, `get_all(name)` for a repeated header's every value.
 - `HTTPResponseError[P = object]` — 4xx/5xx when `raise_for_status=True` (default). `.status`,
   `.headers`, `.body` (whole), `.body_start` (first 100 bytes), `.request`, `.problem`,
   `.parse_error`; pickles (as its own subclass). Subclass it per error, pinning the body type and
-  statuses: `class QuotaExceededError(HTTPResponseError[QuotaExceededProblem], status=429): pass`
+  statuses: `class QuotaExceededError(HTTPResponseError[QuotaExceededProblem], status=429): ...`
   (`status=`: an int or an iterable, 400-599, inherited; none = every 4xx/5xx). `raises=` (client,
   or a verb's, which replaces the client's) takes one class or a list: a 4xx/5xx is raised as the
   first class for its status whose `P` decodes the body (a class pinning no `P` takes any body),
