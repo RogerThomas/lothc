@@ -1358,19 +1358,20 @@ impl PoolState {
         raises: Option<Py<PyAny>>,
         typed_headers: Option<Py<PyAny>>,
         headers_only: bool,
+        defer_error: bool,
     ) -> PyResult<Py<PyAny>> {
         if self.is_closed {
             return Err(Glue::closed_error());
         }
         let prepared =
             self.config.prepare(py, &self.glue, method.to_str()?, path, query, headers, auth, body, body_kind)?;
-        let settings = Settings { decode, timeout, raises, typed_headers, headers_only };
+        let settings = Settings { decode, timeout, raises, defer_error, typed_headers, headers_only };
         self.submit(py, method.unbind(), prepared, settings)
     }
 
     /// Queue a prepared request: the Future it resolves.
     fn submit(&mut self, py: Python<'_>, method: Py<PyString>, prepared: Prepared, settings: Settings) -> PyResult<Py<PyAny>> {
-        let Settings { decode, timeout, raises, typed_headers, headers_only } = settings;
+        let Settings { decode, timeout, raises, defer_error, typed_headers, headers_only } = settings;
         let origin = self.origin_for(&prepared.url, prepared.route);
         let fut = self.event_loop.create_future.call0(py)?;
         let started = Instant::now();
@@ -1384,6 +1385,7 @@ impl PoolState {
                 url: prepared.url,
                 decode,
                 raises,
+                defer_error,
                 typed_headers,
                 headers_only,
                 started,
@@ -1438,6 +1440,7 @@ impl PoolState {
                 url: prepared.url,
                 decode: None,
                 raises: None,
+                defer_error: false,
                 typed_headers: None,
                 headers_only: false,
                 started: Instant::now(),
@@ -1732,7 +1735,7 @@ impl Pool {
 
     /// Start a request and return the asyncio Future it resolves (see `response.rs`); under a
     /// mock hook (`mock.rs`), whatever the hook's `request` returns for it instead.
-    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, decode, timeout, raises, typed_headers, headers_only))]
+    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, decode, timeout, raises, typed_headers, headers_only, defer_error))]
     #[allow(clippy::too_many_arguments)]
     fn request(
         slf: &Bound<'_, Self>,
@@ -1749,10 +1752,11 @@ impl Pool {
         raises: Option<Py<PyAny>>,
         typed_headers: Option<Py<PyAny>>,
         headers_only: bool,
+        defer_error: bool,
     ) -> PyResult<Py<PyAny>> {
         if let Some(hook) = mock::hook(py) {
             let call = Call { path, query: query.as_ref(), headers: headers.as_ref(), auth, body: body.as_ref(), body_kind, verb_headers: VerbHeaders::default() };
-            let settings = Settings { decode, timeout, raises, typed_headers, headers_only };
+            let settings = Settings { decode, timeout, raises, defer_error, typed_headers, headers_only };
             let intercepted = Intercepted::new(slf, py, method, call, settings)?;
             return hook.call_method1(py, intern!(py, "request"), (intercepted,));
         }
@@ -1770,6 +1774,7 @@ impl Pool {
             raises,
             typed_headers,
             headers_only,
+            defer_error,
         )
     }
 

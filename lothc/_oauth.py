@@ -89,14 +89,12 @@ type TokenResponseTyping = _StructTokenResponseTyping | _BaseModelTokenResponseT
 class OAuthTokenError(Exception):
     """Raised by `OAuthProvider`/`SyncOAuthProvider` when a token could not be obtained, wrapping
     whatever the token endpoint call raised as `__cause__` (an `HTTPResponseError`, an
-    `HTTPTransportError`, the decode library's own validation error, a `ValueError`/`KeyError`
-    from a malformed payload). `.token_url` is the endpoint that was asked.
+    `HTTPTransportError`, an `HTTPDecodeError` for a token response that didn't decode, a
+    `ValueError`/`KeyError` from a malformed payload). `.token_url` is the endpoint that was asked.
 
-    This is the one place lothc wraps a decode library's error: the provider runs *inside* the
-    user's unrelated verb call (`await client.get("items/7")`), so an unwrapped error there reads
-    as a failure of that call — e.g. an `HTTPResponseError` whose `.status` is really the token
-    endpoint's, not the API's. An `into` decode error, by contrast, already belongs
-    to the call that raised it.
+    Wrapped because the provider runs *inside* the user's unrelated verb call
+    (`await client.get("items/7")`), so an unwrapped error there reads as a failure of that call —
+    e.g. an `HTTPResponseError` whose `.status` is really the token endpoint's, not the API's.
     """
 
     def __init__(self, token_url: str, error: BaseException) -> None:
@@ -628,7 +626,10 @@ class OAuthProvider:
     async def _post_rfc(self, body: dict[str, str]) -> _CachedToken:
         headers = _rfc_headers(self._client_id, self._client_secret, self._client_auth)
         async with self._client_factory() as client:
-            response = await client.post(self._token_url, data=body, headers=headers, into=dict)
+            # Pinned, since renewal relies on a 4xx raising whatever the factory's client says.
+            response = await client.post(
+                self._token_url, data=body, headers=headers, into=dict, raise_for_status=True
+            )
         payload = response.data
         return _token_from_rfc_payload(payload, self._default_expires_in, time.time())
 
@@ -636,7 +637,9 @@ class OAuthProvider:
         self, payload: JSONPayload, token_response: type[TokenResponseTyping]
     ) -> _CachedToken:
         async with self._client_factory() as client:
-            response = await client.post(self._token_url, json=payload, into=token_response)
+            response = await client.post(
+                self._token_url, json=payload, into=token_response, raise_for_status=True
+            )
         decoded = response.data
         return _token_from_model(decoded, self._default_expires_in, time.time())
 
@@ -774,7 +777,10 @@ class SyncOAuthProvider:
     def _post_rfc(self, body: dict[str, str]) -> _CachedToken:
         headers = _rfc_headers(self._client_id, self._client_secret, self._client_auth)
         with self._client_factory() as client:
-            response = client.post(self._token_url, data=body, headers=headers, into=dict)
+            # Pinned, since renewal relies on a 4xx raising whatever the factory's client says.
+            response = client.post(
+                self._token_url, data=body, headers=headers, into=dict, raise_for_status=True
+            )
         payload = response.data
         return _token_from_rfc_payload(payload, self._default_expires_in, time.time())
 
@@ -782,7 +788,9 @@ class SyncOAuthProvider:
         self, payload: JSONPayload, token_response: type[TokenResponseTyping]
     ) -> _CachedToken:
         with self._client_factory() as client:
-            response = client.post(self._token_url, json=payload, into=token_response)
+            response = client.post(
+                self._token_url, json=payload, into=token_response, raise_for_status=True
+            )
         decoded = response.data
         return _token_from_model(decoded, self._default_expires_in, time.time())
 

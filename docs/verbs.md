@@ -124,8 +124,9 @@ extra to install.
 
 `into=str` is the raw text (UTF-8), like `into=bytes`; on `stream_get`/`stream_post` it's each
 line. A bare `dict` subclass decodes like `into=dict` and is built as that subclass (a
-parametrized one needs pydantic). `into=dict` on anything but a JSON object raises `ValueError`. A
-pre-built pydantic `TypeAdapter` or msgspec `Decoder` is used as is:
+parametrized one needs pydantic). `into=dict` on anything but a JSON object raises
+[`HTTPDecodeError`](errors.md#httpdecodeerror), a `ValueError`, as does any body that doesn't
+decode. A pre-built pydantic `TypeAdapter` or msgspec `Decoder` is used as is:
 
 ```python
 from msgspec.json import Decoder
@@ -153,6 +154,9 @@ response.elapsed  # 0.042: seconds from sending to having the whole response
 ```
 
 `response.elapsed` includes any retries, since it spans the whole call.
+
+A 4xx/5xx raises `HTTPResponseError` instead, unless you
+[pass `raise_for_status=False`](errors.md#returning-errors-instead-of-raising).
 
 `response.request` is the request actually sent — useful for logging, or for telling apart which
 call a `Response` came from when you're juggling several. It reflects the target you asked for, not
@@ -355,5 +359,6 @@ The file only appears at `dest` once the whole body has arrived. It's written to
 first and renamed into place on success, so a download that fails partway never leaves a
 truncated file behind, and an existing file at `dest` is left exactly as it was. `download()` only
 ever does a `GET`; there's no `json`/`data`/`form`/`content` body option and no `into` — the
-response is always raw bytes, on disk or in memory. Same `params`/`headers`/`error_for_status` as
-every other verb.
+response is always raw bytes, on disk or in memory. Same `params`/`headers`/`raise_for_status` as
+every other verb; with [`raise_for_status=False`](errors.md#returning-errors-instead-of-raising),
+an error status writes nothing to `dest`.

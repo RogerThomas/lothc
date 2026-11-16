@@ -109,8 +109,8 @@ and a no-op if the provider has already renewed. Any `bearer_auth` with an
 - `str` — raw text (UTF-8, never JSON-parsed): the body, each SSE `data`, each streamed line, or a
   pinned `HTTPResponseError[str]`'s body
 - `dict` / `dict[str, Any]` — plain `dict[str, Any]` for a JSON *object* (stdlib `json`, no extra
-  needed); any other JSON value raises `ValueError`. A bare `dict` subclass (`OrderedDict`,
-  `defaultdict`, your own) decodes the same way and is built as that subclass
+  needed); any other JSON value raises `HTTPDecodeError` (a `ValueError`). A bare `dict` subclass
+  (`OrderedDict`, `defaultdict`, your own) decodes the same way and is built as that subclass
 - any type expression (PEP 747 `TypeForm`): a `BaseModel`/`Struct` subclass, `list[Item]` for a
   top-level array, `Item | None`, a union, a `type` alias, a TypedDict/dataclass/NamedTuple (its
   fields are walked too). A `Struct` inside → msgspec; a `BaseModel`, pydantic `Annotated`
@@ -126,25 +126,32 @@ and a no-op if the provider has already renewed. Any `bearer_auth` with an
 
 Every body verb returns a `Response[TData]`: `.data` (the body decoded as `into`),
 `.status`, `.headers`, `.typed_headers` (set with `response_headers_type=`), `.request`,
-`.http_version` (e.g. `"HTTP/1.1"`) and `.elapsed` (seconds, including retries).
+`.http_version` (e.g. `"HTTP/1.1"`), `.elapsed` (seconds, including retries) and `.error` (see
+`raise_for_status` below).
 
-- `get(path, *, params=None, headers=None, into=None, response_headers_type=None, error_for_status=True, raises=None) -> Response[Data]`
-- `post/put/patch(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, into=None, response_headers_type=None, error_for_status=True, raises=None) -> Response[Data]` —
+- `get(path, *, params=None, headers=None, into=None, response_headers_type=None, raise_for_status=None, raises=None) -> Response[Data]`
+- `post/put/patch(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, into=None, response_headers_type=None, raise_for_status=None, raises=None) -> Response[Data]` —
   at most one of `json`/`data`/`form`/`content`, else `ValueError`
 - `delete(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, into=None, ...) -> Response[Data]` — a body is optional
-- `head(path, *, params=None, headers=None, response_headers_type=None, error_for_status=True) -> Response[None]`
-- `sse(path, *, params=None, headers=None, into=None, error_for_status=True) -> Generator[SSEEvent[TData]]` —
+- `head(path, *, params=None, headers=None, response_headers_type=None, raise_for_status=None) -> Response[None]`
+- `sse(path, *, params=None, headers=None, into=None) -> Generator[SSEEvent[TData]]` —
   yields `SSEEvent(id=, event=, data=)` (kw-only dataclass, `SSEEvent[TData]`).
   `into` controls `.data` only (default `str`); any type expression | `TypeAdapter` | `Decoder`.
   `.event` and `.id` are always `str`, defaulting to `"message"` and `""` as the spec does.
-- `stream_get(path, *, params=None, headers=None, into=None, error_for_status=True) -> Generator[bytes | TLine]` —
+- `stream_get(path, *, params=None, headers=None, into=None) -> Generator[bytes | TLine]` —
   raw unbuffered bytes by default; `into` switches to newline-buffered per-line decode
 - `stream_post(path, *, ..., json=None, data=None, form=None, content=None, into=None, ...) -> Generator[bytes | TLine]`
   (async: `AsyncGenerator`). Generators so a caller can `close()`/`aclose()` one it stops reading early.
-- `download(path, dest=None, *, params=None, headers=None, error_for_status=True) -> bytes | None` —
+- `download(path, dest=None, *, params=None, headers=None, raise_for_status=None) -> bytes | None` —
   large bodies: no `dest` returns `bytes` (~2/3 the peak memory of `get()`), `dest` (`str` or
   path-like) streams to a file (O(chunk size) memory), written to a hidden sibling and renamed on
   success, so a failed download never leaves a truncated file or clobbers an existing one
+
+`raise_for_status` (client, default `True`; a verb's `None` keeps the client's): `False` returns a
+4xx/5xx as a `Response` whose `.error` is the `HTTPResponseError` the call would have raised (`None`
+on any other response) and whose `.data`/`.typed_headers` raise it. `download` then writes nothing
+to `dest`. The streaming verbs
+(`stream_get`/`stream_post`/`sse`) always raise.
 
 For `stream_get`/`stream_post`/`download` the client `timeout` is the longest gap allowed between
 chunks (and before headers), not a total cap; a per-call `timeout=` is a total cap; `read_timeout`
@@ -163,20 +170,25 @@ lookups, `get_all(name)` for a repeated header's every value.
 
 ## Errors
 
-- `HTTPResponseError[E = object]` — 4xx/5xx when `error_for_status=True` (default). `.status`,
-  `.headers`, `.body` (whole), `.body_start` (first 100 bytes), `.request`, `.error`,
-  `.parse_error`; pickles (as its own subclass). `.error` is `E | dict[str, Any] | None`: the body
-  as the pinned `E`, else a JSON object, else `None`; `.parse_error` says why a pinned `E` didn't
-  match, never replacing the error. Pin `E` on a subclass,
-  `class MyAPIError(HTTPResponseError[NotFound | NotAuthorized]): pass` (Python can't `except` a
-  parametrized generic), and pass it as `raises=` on the client constructor (default for every
-  call; a bad class is a `TypeError` at construction) or on any verb (overrides for that call).
-  A generic subclass's PEP 696 default counts as pinned (`class Base[T = APIError](HTTPResponseError[T])`
-  as `raises=Base` decodes as `APIError`).
+- `HTTPResponseError[P = object]` — 4xx/5xx when `raise_for_status=True` (default). `.status`,
+  `.headers`, `.body` (whole), `.body_start` (first 100 bytes), `.request`, `.problem`,
+  `.parse_error`; pickles (as its own subclass). Subclass it per error, pinning the body type and
+  statuses: `class QuotaExceededError(HTTPResponseError[QuotaExceededProblem], status=429): ...`
+  (`status=`: an int or an iterable, 400-599, inherited; none = every 4xx/5xx). `raises=` (client,
+  or a verb's, which replaces the client's) takes one class or a list: a 4xx/5xx is raised as the
+  first class for its status whose `P` decodes the body (a class pinning no `P` takes any body),
+  else plain `HTTPResponseError`. `.problem` is exactly `P` on a matched class; on one pinning none,
+  or plain, the body as a `dict` if a JSON object, else `None`. `.parse_error`: on plain, why the
+  first candidate didn't decode, else `None`. An entry that can never match (an earlier one covers
+  its statuses and bodies) or a bad class is a `TypeError` when `raises=` is resolved. A generic
+  subclass's PEP 696 default counts as pinned (`class Base[T = APIError](HTTPResponseError[T])`).
+- `HTTPDecodeError(ValueError)` — a response below 400 whose body doesn't decode into `into`, whose
+  headers don't parse into `response_headers_type`, or whose streamed line / SSE event data doesn't
+  decode. `.status`, `.headers`, `.body`, `.body_start`, `.request`, `.parse_error` (the decode
+  library's own error, also `__cause__`).
 - `HTTPTransportError` base; `HTTPTimeoutError`, `HTTPConnectionError` subclasses — no usable
   response (none at all, or the connection failed partway through one)
 - Using a closed client → `RuntimeError`
-- `into` validation errors (pydantic/msgspec/`json`) propagate unwrapped
 
 ## Retries
 

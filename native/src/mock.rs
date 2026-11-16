@@ -70,6 +70,7 @@ pub(crate) struct Settings {
     pub(crate) decode: Option<Py<PyAny>>,
     pub(crate) timeout: Option<Duration>,
     pub(crate) raises: Option<Py<PyAny>>,
+    pub(crate) defer_error: bool,
     pub(crate) typed_headers: Option<Py<PyAny>>,
     pub(crate) headers_only: bool,
 }
@@ -81,6 +82,7 @@ impl Settings {
             decode: copy(&self.decode),
             timeout: self.timeout,
             raises: copy(&self.raises),
+            defer_error: self.defer_error,
             typed_headers: copy(&self.typed_headers),
             headers_only: self.headers_only,
         }
@@ -141,12 +143,12 @@ impl Core {
 
     /// The exchange its answer completes, as the pool's own requests carry one.
     fn exchange(&self, py: Python<'_>) -> Exchange {
-        let Settings { decode, raises, typed_headers, headers_only, .. } = self.settings.clone_ref(py);
-        Exchange { method: self.method.clone_ref(py), url: self.url.clone(), decode, raises, typed_headers, headers_only, started: self.started }
+        let Settings { decode, raises, defer_error, typed_headers, headers_only, .. } = self.settings.clone_ref(py);
+        Exchange { method: self.method.clone_ref(py), url: self.url.clone(), decode, raises, defer_error, typed_headers, headers_only, started: self.started }
     }
 
-    /// The mock's answer as the pool's response path takes it: lothc's `Response`, or what a
-    /// status error raises, built as for any response.
+    /// The mock's answer as the pool's response path takes it: lothc's `Response` (a deferred
+    /// error response included), or what a status error raises, built as for any response.
     pub(crate) fn respond<'py>(&self, py: Python<'py>, glue: &Glue, status: u16, headers: &Bound<'_, PyAny>, body: &[u8]) -> PyResult<Bound<'py, PyAny>> {
         let head = Head { status, version: Version::HTTP_11, headers: header_map(headers)?, body: Bytes::copy_from_slice(body) };
         glue.outcome(py, &self.exchange(py), Ok(head))

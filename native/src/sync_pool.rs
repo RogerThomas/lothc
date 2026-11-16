@@ -1008,7 +1008,7 @@ impl SyncPool {
     /// Send a prepared request and wait for its outcome: lothc's `Response`, or what it raises.
     fn send_prepared<'py>(&self, py: Python<'py>, method: Py<PyString>, prepared: Prepared, settings: Settings) -> PyResult<Bound<'py, PyAny>> {
         let Prepared { request, url, route, redirect, cookies } = prepared;
-        let Settings { decode, timeout, raises, typed_headers, headers_only } = settings;
+        let Settings { decode, timeout, raises, defer_error, typed_headers, headers_only } = settings;
         let target = match Self::target(&url, route) {
             Ok(target) => target,
             Err(message) => return Err(self.glue.connection_error(py, message)),
@@ -1023,7 +1023,7 @@ impl SyncPool {
                 Err(failure) => Err(failure),
             },
         };
-        let exchange = Exchange { method, url, decode, raises, typed_headers, headers_only, started };
+        let exchange = Exchange { method, url, decode, raises, defer_error, typed_headers, headers_only, started };
         self.glue.outcome(py, &exchange, result)
     }
 
@@ -1108,7 +1108,7 @@ impl SyncPool {
 
     /// One blocking request: same arguments as `Pool.request`, returns lothc's `Response`; under
     /// a mock hook (`mock.rs`), whatever the hook's `request_sync` returns for it instead.
-    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, decode, timeout, raises, typed_headers, headers_only))]
+    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, decode, timeout, raises, typed_headers, headers_only, defer_error))]
     #[allow(clippy::too_many_arguments)]
     fn request<'py>(
         slf: &Bound<'py, Self>,
@@ -1125,8 +1125,9 @@ impl SyncPool {
         raises: Option<Py<PyAny>>,
         typed_headers: Option<Py<PyAny>>,
         headers_only: bool,
+        defer_error: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let settings = Settings { decode, timeout, raises, typed_headers, headers_only };
+        let settings = Settings { decode, timeout, raises, defer_error, typed_headers, headers_only };
         if let Some(hook) = mock::hook(py) {
             let call = Call { path, query: query.as_ref(), headers: headers.as_ref(), auth, body: body.as_ref(), body_kind, verb_headers: VerbHeaders::default() };
             let intercepted = SyncIntercepted::new(slf, py, method, call, settings)?;

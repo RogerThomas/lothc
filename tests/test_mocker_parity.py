@@ -171,7 +171,7 @@ async def _async_request(client: HTTPClient, case: _Case, path: str, call: dict[
         if case.verb in {"stream_get", "stream_post", "sse"}:
             await _drain(send(path, **call))
             return None
-        returned: Awaitable[Any] = send(path, error_for_status=False, **call)
+        returned: Awaitable[Any] = send(path, raise_for_status=False, **call)
         return await returned
 
 
@@ -181,7 +181,7 @@ def _sync_request(client: SyncHTTPClient, case: _Case, path: str, call: dict[str
         if case.verb in {"stream_get", "stream_post", "sse"}:
             _drain_sync(send(path, **call))
             return None
-        return send(path, error_for_status=False, **call)
+        return send(path, raise_for_status=False, **call)
 
 
 def _request_info(result: object) -> RequestInfo | None:

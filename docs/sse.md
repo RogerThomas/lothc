@@ -154,9 +154,9 @@ effect — a server can prime the reconnect delay or the last-event-id before se
 
 ## Errors
 
-`error_for_status` (default `True`) is checked once per connection, before its first event is
-yielded — a 4xx/5xx response raises `HTTPResponseError` immediately rather than partway through
-iteration, and (per spec) is never reconnected. A 2xx response whose `Content-Type` isn't
+A 4xx/5xx response always raises `HTTPResponseError`, before the connection's first event is
+yielded rather than partway through iteration, and (per spec) is never reconnected;
+`raise_for_status=False` doesn't apply here. A 2xx response whose `Content-Type` isn't
 `text/event-stream` raises `ValueError` — it isn't a stream, and parsing it as one would just
 silently yield nothing. Once streaming has started, a dropped connection reconnects as described
 above; only once the reconnect budget is exhausted does the usual `HTTPTransportError` family

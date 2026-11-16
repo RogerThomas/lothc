@@ -72,8 +72,8 @@ a docstring or a test already says.
 
 ## Architecture
 
-- **`lothc/` is split by concern**, imports running one way: types, headers, response, decode,
-  errors, encode, then form/streaming/SSE/settings/retry, then the two transports, then
+- **`lothc/` is split by concern**, imports running one way: types, headers, decode, errors,
+  response, raises, encode, then form/streaming/SSE/settings/retry, then the two transports, then
   `_client.py` and `_sync_client.py`. `lothc/_oauth.py` is built *on* the client.
 - **Top-level names are unique across `lothc/`**: the parity test pairs twins by name across
   modules.
@@ -212,11 +212,22 @@ or editing Python here.
 - **Decoders are cached by form** (a `TypeAdapter` costs ~31us to build), except for forms whose
   metadata compares by identity, which would grow the cache forever; 4096 entries is the
   backstop.
-- **`str` means raw text**, like `bytes`. Every decode failure is a `ValueError`; a decode
-  library's validation errors propagate unwrapped.
-- **`raises=` is a subclass pinning `HTTPResponseError[E]`**, because Python can't `except` a
-  parametrized generic. It's resolved before sending, and the error body is decoded
-  best-effort, so a proxy's HTML 502 still surfaces as a status error.
+- **`str` means raw text**, like `bytes`. Every decode failure is a `ValueError`.
+- **A successful response that doesn't decode raises `HTTPDecodeError`** (decided 2026-11-16),
+  wrapping the decode library's error (`.parse_error`, `__cause__`): unwrapped, the body, status
+  and request were unreachable. Native wraps it in Rust's `outcome()`, which alone has them.
+- **`raises=` is a class, or a list, of subclasses pinning `HTTPResponseError[P]`**, because
+  Python can't `except` a parametrized generic, each optionally keyed with `status=` (decided
+  2026-11-16). The first class for the status whose `P` decodes the body is raised, else plain
+  `HTTPResponseError`, so a proxy's HTML 502 still surfaces as a status error. Resolved before
+  sending; an entry that can never match is a `TypeError`. A per-call value replaces the client's.
+- **`.problem` is exactly `P` on a matched class, read-only** (so `P` is covariant and a pinned
+  subclass passes where the plain class is expected); a pinned class whose `P` doesn't decode
+  doesn't match, or `.problem` would be `P | dict | None`. Unpinned, it's the JSON object or
+  `None`, parsed on first read. Named `problem`, since `details.detail` stutters on the commonest
+  body.
+- **Rejected:** fields declared on the error class itself (they'd collide with `status`, `body`,
+  `headers`), `retry_after` on the error (it's in `.headers`), choosing a class by header.
 - **`Response.headers` is a `CaseInsensitiveDict`**, a `MutableMapping` rather than a `dict`
   subclass (which would lose case-insensitivity under `dict(h)`). It's built on first read
   (~15% throughput).
@@ -226,6 +237,12 @@ or editing Python here.
 - **Never leak pyreqwest's exception types.** Transport errors map to `HTTPTransportError` and
   its subclasses; a client build error is a plain `ValueError`.
 - **Status errors stay separate from transport errors.**
+- **`raise_for_status=False` (client, or per call) returns a 4xx/5xx as a `Response` whose `.data`
+  raises** (decided 2026-11-14), so an error body is never decoded into `into=` and an unhandled
+  status still surfaces. Raising stays the default: an ignored result must not swallow a 500.
+  The error response is a private subclass and `Response.error` (the exception, built on first
+  read) is a class-level default, so the success path costs what it did; a lazy `.data` measured
+  71ns slower and held raw bodies. Streaming verbs always raise.
 - **A `BuilderError` is permanent**: never retried or reconnected.
 - **A body cut off partway is retried; a corrupt one isn't.**
 - **A multipart `form=` request is sent once, never retried or re-authenticated:** its streamed

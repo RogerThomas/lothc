@@ -11,7 +11,7 @@ import pytest
 from msgspec import Struct
 from pydantic import BaseModel
 
-from lothc import CaseInsensitiveDict, HTTPClient, Response, SyncHTTPClient
+from lothc import CaseInsensitiveDict, HTTPClient, HTTPDecodeError, Response, SyncHTTPClient
 
 
 @dataclass
@@ -67,11 +67,22 @@ async def test_response_get_with_msgspec_typed_headers(client: HTTPClient) -> No
     assert result.typed_headers == EchoedHeadersStruct(content_type="application/json")
 
 
-async def test_response_get_error_for_status_false_suppresses_raise(client: HTTPClient) -> None:
-    result = await client.get("boom", error_for_status=False)
+async def test_response_get_raise_for_status_false_returns_the_error_response(
+    client: HTTPClient,
+) -> None:
+    result = await client.get("boom", raise_for_status=False)
 
     assert result.status == 500
-    assert b"internal-server-error" in result.data
+    assert result.http_version == "HTTP/1.1"
+    assert result.request.path == "/boom"
+    assert result.headers["content-type"] == "application/json"
+    assert result.elapsed > 0
+    assert result.error is not None
+    assert result.error.problem == {
+        "type": "internal-server-error",
+        "title": "Internal server error",
+        "status": 500,
+    }
 
 
 def test_sync_get_result_includes_status_and_data(sync_client: SyncHTTPClient) -> None:
@@ -93,13 +104,19 @@ def test_sync_get_result_with_typed_headers(sync_client: SyncHTTPClient) -> None
     assert result.typed_headers == EchoedHeaders(content_type="application/json")
 
 
-def test_sync_get_result_error_for_status_false_suppresses_raise(
+def test_sync_get_result_raise_for_status_false_returns_the_error_response(
     sync_client: SyncHTTPClient,
 ) -> None:
-    result = sync_client.get("boom", error_for_status=False)
+    result = sync_client.get("boom", raise_for_status=False)
 
     assert result.status == 500
-    assert b"internal-server-error" in result.data
+    assert result.request.path == "/boom"
+    assert result.error is not None
+    assert result.error.problem == {
+        "type": "internal-server-error",
+        "title": "Internal server error",
+        "status": 500,
+    }
 
 
 async def test_response_get_headers_are_case_insensitive(client: HTTPClient) -> None:
@@ -540,24 +557,32 @@ def test_sync_typed_headers_are_converted_to_the_field_types(
     assert result.typed_headers == headers_type(content_length=12)
 
 
-async def test_typed_headers_missing_a_required_header_raise_pydantics_error(
+async def test_typed_headers_missing_a_required_header_carry_pydantics_error(
     client: HTTPClient,
 ) -> None:
-    with pytest.raises(pydantic.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         await client.get("binary", response_headers_type=MissingHeaders)
 
+    assert isinstance(exc_info.value.parse_error, pydantic.ValidationError)
 
-async def test_typed_headers_missing_a_required_header_raise_msgspecs_error(
+
+async def test_typed_headers_missing_a_required_header_carry_msgspecs_error(
     client: HTTPClient,
 ) -> None:
-    with pytest.raises(msgspec.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         await client.get("binary", response_headers_type=MissingHeadersStruct)
 
+    assert type(exc_info.value.parse_error) is msgspec.ValidationError
 
-def test_sync_typed_headers_missing_a_required_header_raise_the_libraries_error(
+
+def test_sync_typed_headers_missing_a_required_header_carry_the_libraries_error(
     sync_client: SyncHTTPClient,
 ) -> None:
-    with pytest.raises(pydantic.ValidationError):
+    with pytest.raises(HTTPDecodeError) as exc_info:
         sync_client.get("binary", response_headers_type=MissingHeaders)
-    with pytest.raises(msgspec.ValidationError):
+
+    assert isinstance(exc_info.value.parse_error, pydantic.ValidationError)
+    with pytest.raises(HTTPDecodeError) as exc_info:
         sync_client.get("binary", response_headers_type=MissingHeadersStruct)
+
+    assert type(exc_info.value.parse_error) is msgspec.ValidationError

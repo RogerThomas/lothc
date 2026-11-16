@@ -29,9 +29,10 @@ from pyreqwest.response import SyncResponse as RawSyncResponse
 
 from ._compat import BaseModel, Struct, msgspec
 from ._encode import _encode_headers, _pydantic_by_alias
+from ._errors import RequestInfo
 from ._headers import CaseInsensitiveDict
 from ._native import Intercepted, RawHeaders, Stream, SyncIntercepted, SyncStream, set_mock_hook
-from ._response import RequestInfo, Response
+from ._response import Response
 from ._transport_pyreqwest import _mock_hook
 from ._types import Data, Headers, JSONPayload
 

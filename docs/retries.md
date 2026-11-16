@@ -29,7 +29,7 @@ async with HTTPClient(
 The wait between attempts is `backoff_base * 2 ** attempt`, so the default `backoff_base=0.1`
 waits 0.1s, then 0.2s, then 0.4s. A `Retry-After` header on the response wins over the computed
 delay, up to `max_retry_after` (default 60s). A server asking for a longer wait ends retrying:
-its 429/503 is raised as `HTTPResponseError`, so you can schedule a retry from
+its 429/503 is raised as `HTTPResponseError` (or returned, with `raise_for_status=False`), so you can schedule a retry from
 `e.headers["Retry-After"]` rather than a call silently blocking for as long as the server likes.
 Pass `max_retry_after=None` to honour any wait:
 

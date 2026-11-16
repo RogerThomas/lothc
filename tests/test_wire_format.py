@@ -171,14 +171,14 @@ def _path(case: _Case, base_url: str) -> str:
 async def _async_seen(client: HTTPClient, case: _Case, base_url: str, ports: list[int]) -> _Seen:
     async with client:
         send: Callable[..., Awaitable[Any]] = getattr(client, case.verb)
-        response = await send(_path(case, base_url), error_for_status=False, **case.call)
+        response = await send(_path(case, base_url), raise_for_status=False, **case.call)
     return _seen(response, ports)
 
 
 def _sync_seen(client: SyncHTTPClient, case: _Case, base_url: str, ports: list[int]) -> _Seen:
     with client:
         send: Callable[..., Any] = getattr(client, case.verb)
-        response = send(_path(case, base_url), error_for_status=False, **case.call)
+        response = send(_path(case, base_url), raise_for_status=False, **case.call)
     return _seen(response, ports)
 
 

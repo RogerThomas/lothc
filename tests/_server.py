@@ -715,6 +715,15 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_deeply_nested(self) -> None:
+        # A 200 nested far past any JSON parser's recursion limit.
+        body = b"[" * 200000
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _handle_deeply_nested_error(self) -> None:
         # Nested far past any JSON parser's recursion limit.
         body = b"[" * 200000
@@ -1301,6 +1310,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             "/invalid-json-error": self._handle_invalid_json_error,
             "/rejects-first-token": self._handle_rejects_first_token,
             "/json-array": self._handle_json_array,
+            "/deeply-nested": self._handle_deeply_nested,
             "/deeply-nested-error": self._handle_deeply_nested_error,
             "/crlf-text": self._handle_crlf_text,
         }
