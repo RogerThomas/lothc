@@ -35,7 +35,7 @@ async with HTTPClient(
     retry_methods=None,  # set/frozenset/list/tuple of str, case-insensitive; empty = retry nothing
     backoff_base=0.1,
     max_retry_after=60.0,
-    retry_statuses=None,  # 4xx/5xx ints (set/tuple/range); None = {429,500,502,503,504}; empty = none
+    retry_statuses=None,  # set/tuple/range of 4xx/5xx; None = 429, 500, 502, 503, 504
     retry=None,  # Callable[[RetryAttempt], float | None], not async (see Retries)
     connect_timeout=None,
     read_timeout=None,
