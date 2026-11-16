@@ -124,8 +124,9 @@ extra to install.
 
 `into=str` is the raw text (UTF-8), like `into=bytes`; on `stream_get`/`stream_post` it's each
 line. A bare `dict` subclass decodes like `into=dict` and is built as that subclass (a
-parametrized one needs pydantic). `into=dict` on anything but a JSON object raises `ValueError`. A
-pre-built pydantic `TypeAdapter` or msgspec `Decoder` is used as is:
+parametrized one needs pydantic). `into=dict` on anything but a JSON object raises
+[`HTTPDecodeError`](errors.md#httpdecodeerror), a `ValueError`, as does any body that doesn't
+decode. A pre-built pydantic `TypeAdapter` or msgspec `Decoder` is used as is:
 
 ```python
 from msgspec.json import Decoder

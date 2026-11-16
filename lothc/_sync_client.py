@@ -338,7 +338,8 @@ class SyncHTTPClient:
 
         Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
         else the client's) is `False`: the `Response` then comes back, and reading its `.data`
-        raises that error instead.
+        raises that error instead. A response below 400 whose body doesn't decode into `into` (or
+        headers into `response_headers_type`) raises `HTTPDecodeError`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
@@ -540,7 +541,8 @@ class SyncHTTPClient:
 
         Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
         else the client's) is `False`: the `Response` then comes back, and reading its `.data`
-        raises that error instead.
+        raises that error instead. A response below 400 whose body doesn't decode into `into` (or
+        headers into `response_headers_type`) raises `HTTPDecodeError`.
         """
         return self._transport.send(
             "POST",
@@ -735,7 +737,8 @@ class SyncHTTPClient:
 
         Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
         else the client's) is `False`: the `Response` then comes back, and reading its `.data`
-        raises that error instead.
+        raises that error instead. A response below 400 whose body doesn't decode into `into` (or
+        headers into `response_headers_type`) raises `HTTPDecodeError`.
         """
         return self._transport.send(
             "PUT",
@@ -930,7 +933,8 @@ class SyncHTTPClient:
 
         Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
         else the client's) is `False`: the `Response` then comes back, and reading its `.data`
-        raises that error instead.
+        raises that error instead. A response below 400 whose body doesn't decode into `into` (or
+        headers into `response_headers_type`) raises `HTTPDecodeError`.
         """
         return self._transport.send(
             "PATCH",
@@ -1126,7 +1130,8 @@ class SyncHTTPClient:
 
         Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
         else the client's) is `False`: the `Response` then comes back, and reading its `.data`
-        raises that error instead.
+        raises that error instead. A response below 400 whose body doesn't decode into `into` (or
+        headers into `response_headers_type`) raises `HTTPDecodeError`.
         """
         return self._transport.send(
             "DELETE",
@@ -1239,7 +1244,7 @@ class SyncHTTPClient:
         4xx/5xx may be raised as) for this call.
 
         A 4xx/5xx response always raises `HTTPResponseError`, whatever the client's
-        `raise_for_status`.
+        `raise_for_status`. An event whose data doesn't decode into `into` raises `HTTPDecodeError`.
 
         A dropped connection (transport error or timeout) reconnects automatically, after
         `reconnect_delay` seconds — or the server's own `retry:` value once it has sent one —
@@ -1350,7 +1355,7 @@ class SyncHTTPClient:
         this call.
 
         A 4xx/5xx response always raises `HTTPResponseError`, whatever the client's
-        `raise_for_status`.
+        `raise_for_status`. A line that doesn't decode into `into` raises `HTTPDecodeError`.
 
         `interruptible=True` runs the blocking read loop on a daemon worker thread so Ctrl-C
         works while waiting between chunks (the default `False` leaves Ctrl-C dead in that
@@ -1480,7 +1485,7 @@ class SyncHTTPClient:
         this call.
 
         A 4xx/5xx response always raises `HTTPResponseError`, whatever the client's
-        `raise_for_status`.
+        `raise_for_status`. A line that doesn't decode into `into` raises `HTTPDecodeError`.
 
         `interruptible=True` runs the blocking read loop on a daemon worker thread so Ctrl-C
         works while waiting between chunks (the default `False` leaves Ctrl-C dead in that
@@ -1626,7 +1631,8 @@ class SyncHTTPClient:
 
         Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
         else the client's) is `False`: the `Response` then comes back, and reading its `.data`
-        raises that error instead.
+        raises that error instead. Headers that don't parse into `response_headers_type` raise
+        `HTTPDecodeError`.
         """
         return self._transport.send_headers_only(
             "HEAD",
@@ -1687,7 +1693,8 @@ class SyncHTTPClient:
 
         Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
         else the client's) is `False`: the `Response` then comes back, and reading its `.data`
-        raises that error instead.
+        raises that error instead. Headers that don't parse into `response_headers_type` raise
+        `HTTPDecodeError`.
         """
         return self._transport.send_headers_only(
             "OPTIONS",

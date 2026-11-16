@@ -100,8 +100,8 @@ token cached forever.
   obtain a token — a `401`/`403`/`429` on the refresh, a 5xx from the token endpoint, a
   transport error, a decode error, a payload with no `access_token` — is not a fallback case: it
   is raised from the request that triggered the renewal as an `OAuthTokenError`, with the
-  original exception (`HTTPResponseError`, `HTTPTransportError`, the decode library's own error,
-  ...) as its `__cause__` and the token endpoint in `.token_url`. See
+  original exception (`HTTPResponseError`, `HTTPTransportError`, `HTTPDecodeError`, ...) as its
+  `__cause__` and the token endpoint in `.token_url`. See
   [Error handling](errors.md#oauthtokenerror) for why this one is wrapped when nothing else in
   lothc is.
 - Concurrent requests that all land inside the leeway window share one renewal (a lock); the
