@@ -59,6 +59,7 @@ from ._encode import _encode_headers, _encode_params, _pydantic_by_alias, _query
 from ._errors import (
     HTTPConnectionError,
     HTTPDecodeError,
+    HTTPResponseError,
     HTTPTimeoutError,
     HTTPTransportError,
     RequestInfo,
@@ -75,18 +76,28 @@ from ._raises import (
     _validate_raises,
 )
 from ._response import Response, _parse_typed_headers
-from ._retry import _call_retries, _retried, _retried_sync, _retry_policy, _RetryPolicy
+from ._retry import (
+    _call_retries,
+    _retried,
+    _retried_sync,
+    _retry_policy,
+    _RetryPolicy,
+    _RetryRuling,
+    _SyncRetryRuling,
+)
 from ._settings import TlsVersion, _default_user_agent, _TransportSettings
 from ._sse import SSEEvent, _sse_events, _sse_events_sync
 from ._streaming import (
     _ChunkReader,
     _download_stream,
     _download_stream_sync,
+    _ReplayedBody,
     _ResponseHead,
     _stream_lines,
     _stream_lines_sync,
     _StreamCall,
     _SyncChunkReader,
+    _SyncReplayedBody,
 )
 from ._types import (
     AuthProvider,
@@ -263,13 +274,77 @@ def _send_copy_sync(request: SyncConsumedRequest) -> RawSyncResponse:
         raise _translate_transport_error(error) from error
 
 
+async def _raw_status_error(
+    error_class: _RaisesTable, request_info: RequestInfo, raw_response: RawResponse
+) -> HTTPResponseError[Any]:
+    """The status error `raw_response` would raise, its body read whole, for a `retry=` rule."""
+    body = (await _read_body(raw_response)).to_bytes()
+    return _status_error(
+        error_class,
+        raw_response.status,
+        body,
+        request_info,
+        CaseInsensitiveDict(raw_response.headers),
+    )
+
+
+def _raw_status_error_sync(
+    error_class: _RaisesTable, request_info: RequestInfo, raw_response: RawSyncResponse
+) -> HTTPResponseError[Any]:
+    """Sync mirror of `_raw_status_error`."""
+    body = _read_body_sync(raw_response).to_bytes()
+    return _status_error(
+        error_class,
+        raw_response.status,
+        body,
+        request_info,
+        CaseInsensitiveDict(raw_response.headers),
+    )
+
+
+def _raw_ruling(
+    retry: _RetryPolicy,
+    raises: _RaisesArg | None,
+    client_raises: _RaisesTable,
+    request_info: RequestInfo,
+) -> _RetryRuling[RawResponse] | None:
+    """How `_retried` asks the client's `retry=` rule about a call's attempts, or `None` when
+    the client has none. `raises` is resolved only then, by which time it has been validated."""
+    if retry.rule is None:
+        return None
+    error_class = _call_raises(raises, client_raises)
+    return _RetryRuling(
+        retry.rule, request_info.method, partial(_raw_status_error, error_class, request_info)
+    )
+
+
+def _raw_ruling_sync(
+    retry: _RetryPolicy,
+    raises: _RaisesArg | None,
+    client_raises: _RaisesTable,
+    request_info: RequestInfo,
+) -> _SyncRetryRuling[RawSyncResponse] | None:
+    """Sync mirror of `_raw_ruling`."""
+    if retry.rule is None:
+        return None
+    error_class = _call_raises(raises, client_raises)
+    return _SyncRetryRuling(
+        retry.rule, request_info.method, partial(_raw_status_error_sync, error_class, request_info)
+    )
+
+
 async def _send_retried(
-    request_builder: RequestBuilder, retry: _RetryPolicy, retries: int
-) -> tuple[RawResponse, RequestInfo]:
+    request_builder: RequestBuilder,
+    retry: _RetryPolicy,
+    retries: int,
+    raises: _RaisesArg | None,
+    client_raises: _RaisesTable,
+) -> tuple[RawResponse, RequestInfo, HTTPResponseError[Any] | None]:
     """`_send`, retried up to `retries` times: each attempt sends a copy of the request as built
     (its auth included) through the client's middleware (re-authentication) and the mocker, and
     reqwest follows its redirects, so a retry starts the whole chain over. Never a multipart
-    `form=` body, which pyreqwest can't copy (`_replayable_copy`): the caller sends that once."""
+    `form=` body, which pyreqwest can't copy (`_replayable_copy`): the caller sends that once.
+    Also returns the status error a `retry=` rule stopped retrying on, if it did (`_retried`)."""
     if (mock := _mock_hook.middleware) is not None:
         request_builder = request_builder.with_middleware(mock)
     try:
@@ -277,15 +352,24 @@ async def _send_retried(
     except (PyreqwestRequestError, PyreqwestBuilderError) as error:
         raise _translate_transport_error(error) from error
     request_info = _request_info(built)
-    raw_response = await _retried(
-        retry, retries, partial(_send_copy, built), _raw_retry_signal, _pyreqwest_retryable
+    raw_response, ruled = await _retried(
+        retry,
+        retries,
+        partial(_send_copy, built),
+        _raw_retry_signal,
+        _pyreqwest_retryable,
+        _raw_ruling(retry, raises, client_raises, request_info),
     )
-    return raw_response, request_info
+    return raw_response, request_info, ruled
 
 
 def _send_retried_sync(
-    request_builder: SyncRequestBuilder, retry: _RetryPolicy, retries: int
-) -> tuple[RawSyncResponse, RequestInfo]:
+    request_builder: SyncRequestBuilder,
+    retry: _RetryPolicy,
+    retries: int,
+    raises: _RaisesArg | None,
+    client_raises: _RaisesTable,
+) -> tuple[RawSyncResponse, RequestInfo, HTTPResponseError[Any] | None]:
     """Sync mirror of `_send_retried`."""
     if (mock := _mock_hook.sync_middleware) is not None:
         request_builder = request_builder.with_middleware(mock)
@@ -294,10 +378,15 @@ def _send_retried_sync(
     except (PyreqwestRequestError, PyreqwestBuilderError) as error:
         raise _translate_transport_error(error) from error
     request_info = _request_info(built)
-    raw_response = _retried_sync(
-        retry, retries, partial(_send_copy_sync, built), _raw_retry_signal, _pyreqwest_retryable
+    raw_response, ruled = _retried_sync(
+        retry,
+        retries,
+        partial(_send_copy_sync, built),
+        _raw_retry_signal,
+        _pyreqwest_retryable,
+        _raw_ruling_sync(retry, raises, client_raises, request_info),
     )
-    return raw_response, request_info
+    return raw_response, request_info, ruled
 
 
 async def _open_streamed_attempt(request: StreamRequest, attempts: AsyncExitStack) -> RawResponse:
@@ -669,6 +758,8 @@ class _PyreqwestStreamSource:
     _build: Callable[[], Awaitable[RequestBuilder]]
     _check_status: _StatusCheck | None
     _raises: _RaisesArg | None
+    # The client's own `raises=`, which `_raises` (the call's) replaces when given.
+    _client_raises: _RaisesTable
     _retry: _RetryPolicy
     # How many times opening may be retried (0: sent once).
     _retries: int
@@ -706,13 +797,19 @@ class _PyreqwestStreamSource:
         request_info = self._info = _request_info(request)
         if self._retries:
             attempts = await stack.enter_async_context(AsyncExitStack())
-            raw_response = await _retried(
+            raw_response, ruled = await _retried(
                 self._retry,
                 self._retries,
                 partial(_open_streamed_attempt, request, attempts),
                 _raw_retry_signal,
                 _pyreqwest_retryable,
+                _raw_ruling(self._retry, self._raises, self._client_raises, request_info),
             )
+            # An error status a `retry=` rule stopped retrying on: its body is already read.
+            if ruled is not None:
+                if self._check_status is not None:
+                    raise ruled
+                return _response_head(raw_response), _ReplayedBody(ruled.body).read
         else:
             raw_response = await stack.enter_async_context(request)
         if self._check_status is not None:
@@ -731,6 +828,8 @@ class _SyncPyreqwestStreamSource:
     _build: Callable[[], SyncRequestBuilder]
     _check_status: _SyncStatusCheck | None
     _raises: _RaisesArg | None
+    # The client's own `raises=`, which `_raises` (the call's) replaces when given.
+    _client_raises: _RaisesTable
     _retry: _RetryPolicy
     # How many times opening may be retried (0: sent once).
     _retries: int
@@ -763,13 +862,19 @@ class _SyncPyreqwestStreamSource:
         request_info = self._info = _request_info(request)
         if self._retries:
             attempts = stack.enter_context(ExitStack())
-            raw_response = _retried_sync(
+            raw_response, ruled = _retried_sync(
                 self._retry,
                 self._retries,
                 partial(_open_streamed_attempt_sync, request, attempts),
                 _raw_retry_signal,
                 _pyreqwest_retryable,
+                _raw_ruling_sync(self._retry, self._raises, self._client_raises, request_info),
             )
+            # An error status a `retry=` rule stopped retrying on: its body is already read.
+            if ruled is not None:
+                if self._check_status is not None:
+                    raise ruled
+                return _response_head(raw_response), _SyncReplayedBody(ruled.body).read
         else:
             raw_response = stack.enter_context(request)
         if self._check_status is not None:
@@ -878,14 +983,18 @@ class _PyreqwestTransport:
         raises: _RaisesArg | None,
         request_info: RequestInfo,
         elapsed: float,
+        ruled: HTTPResponseError[Any] | None,
         *,
         raise_for_status: bool | None,
     ) -> Response[Any, Any]:
         """A 4xx/5xx's status error, raised, or with `raise_for_status` off (the call's, else
-        the client's) the deferred error response, its body read either way."""
-        body = (await _read_body(raw_response)).to_bytes()
+        the client's) the deferred error response, its body read either way. `ruled` is the
+        error a `retry=` rule was shown for this response, if any: raised or kept as is."""
+        body = (await _read_body(raw_response)).to_bytes() if ruled is None else ruled.body
         error_class = _call_raises(raises, self._raises)
         if self._raise_for_status if raise_for_status is None else raise_for_status:
+            if ruled is not None:
+                raise ruled
             raise _status_error(
                 error_class,
                 raw_response.status,
@@ -901,6 +1010,7 @@ class _PyreqwestTransport:
             raw_response.version,
             elapsed,
             body,
+            ruled,
         )
 
     async def _build_stream_request(
@@ -935,6 +1045,7 @@ class _PyreqwestTransport:
             partial(self._build_stream_request, request_builder, call, last_event_id),
             self._check_status if call.check_status else None,
             call.raises,
+            self._raises,
             self._retry,
             # A multipart body with parts is sent once: pyreqwest can't copy it.
             0 if call.form else retries,
@@ -969,7 +1080,8 @@ class _PyreqwestTransport:
         if stack is not None:
             await stack.aclose()
 
-    async def send(
+    # Every local but a few is a verb argument; the hot path stays inline (see the docstring).
+    async def send(  # pylint: disable=too-many-locals
         self,
         method: str,
         path: str,
@@ -1014,13 +1126,21 @@ class _PyreqwestTransport:
         started = time.monotonic()
         # A multipart body with parts is sent once: pyreqwest can't copy it.
         if retries and not form:
-            raw_response, request_info = await _send_retried(request_builder, self._retry, retries)
+            raw_response, request_info, ruled = await _send_retried(
+                request_builder, self._retry, retries, raises, self._raises
+            )
         else:
             raw_response, request_info = await _send(request_builder)
+            ruled = None
         elapsed = time.monotonic() - started
         if raw_response.status >= 400:
             return await self._error_status(
-                raw_response, raises, request_info, elapsed, raise_for_status=raise_for_status
+                raw_response,
+                raises,
+                request_info,
+                elapsed,
+                ruled,
+                raise_for_status=raise_for_status,
             )
         body = await _read_body(raw_response)
         try:
@@ -1071,13 +1191,21 @@ class _PyreqwestTransport:
         )
         started = time.monotonic()
         if retries:
-            raw_response, request_info = await _send_retried(request_builder, self._retry, retries)
+            raw_response, request_info, ruled = await _send_retried(
+                request_builder, self._retry, retries, raises, self._raises
+            )
         else:
             raw_response, request_info = await _send(request_builder)
+            ruled = None
         elapsed = time.monotonic() - started
         if raw_response.status >= 400:
             return await self._error_status(
-                raw_response, raises, request_info, elapsed, raise_for_status=raise_for_status
+                raw_response,
+                raises,
+                request_info,
+                elapsed,
+                ruled,
+                raise_for_status=raise_for_status,
             )
         response_headers = _LazyHeaders(raw_response.headers)
         if response_headers_type is None:
@@ -1305,14 +1433,18 @@ class _SyncPyreqwestTransport:
         raises: _RaisesArg | None,
         request_info: RequestInfo,
         elapsed: float,
+        ruled: HTTPResponseError[Any] | None,
         *,
         raise_for_status: bool | None,
     ) -> Response[Any, Any]:
         """A 4xx/5xx's status error, raised, or with `raise_for_status` off (the call's, else
-        the client's) the deferred error response, its body read either way."""
-        body = _read_body_sync(raw_response).to_bytes()
+        the client's) the deferred error response, its body read either way. `ruled` is the
+        error a `retry=` rule was shown for this response, if any: raised or kept as is."""
+        body = _read_body_sync(raw_response).to_bytes() if ruled is None else ruled.body
         error_class = _call_raises(raises, self._raises)
         if self._raise_for_status if raise_for_status is None else raise_for_status:
+            if ruled is not None:
+                raise ruled
             raise _status_error(
                 error_class,
                 raw_response.status,
@@ -1328,6 +1460,7 @@ class _SyncPyreqwestTransport:
             raw_response.version,
             elapsed,
             body,
+            ruled,
         )
 
     def _build_stream_request(
@@ -1362,6 +1495,7 @@ class _SyncPyreqwestTransport:
             partial(self._build_stream_request, request_builder, call, last_event_id),
             self._check_status if call.check_status else None,
             call.raises,
+            self._raises,
             self._retry,
             # A multipart body with parts is sent once: pyreqwest can't copy it.
             0 if call.form else retries,
@@ -1396,7 +1530,8 @@ class _SyncPyreqwestTransport:
         if stack is not None:
             stack.close()
 
-    def send(
+    # Every local but a few is a verb argument; the hot path stays inline (see the docstring).
+    def send(  # pylint: disable=too-many-locals
         self,
         method: str,
         path: str,
@@ -1439,13 +1574,21 @@ class _SyncPyreqwestTransport:
         started = time.monotonic()
         # A multipart body with parts is sent once: pyreqwest can't copy it.
         if retries and not form:
-            raw_response, request_info = _send_retried_sync(request_builder, self._retry, retries)
+            raw_response, request_info, ruled = _send_retried_sync(
+                request_builder, self._retry, retries, raises, self._raises
+            )
         else:
             raw_response, request_info = _send_sync(request_builder)
+            ruled = None
         elapsed = time.monotonic() - started
         if raw_response.status >= 400:
             return self._error_status(
-                raw_response, raises, request_info, elapsed, raise_for_status=raise_for_status
+                raw_response,
+                raises,
+                request_info,
+                elapsed,
+                ruled,
+                raise_for_status=raise_for_status,
             )
         body = _read_body_sync(raw_response)
         try:
@@ -1496,13 +1639,21 @@ class _SyncPyreqwestTransport:
         )
         started = time.monotonic()
         if retries:
-            raw_response, request_info = _send_retried_sync(request_builder, self._retry, retries)
+            raw_response, request_info, ruled = _send_retried_sync(
+                request_builder, self._retry, retries, raises, self._raises
+            )
         else:
             raw_response, request_info = _send_sync(request_builder)
+            ruled = None
         elapsed = time.monotonic() - started
         if raw_response.status >= 400:
             return self._error_status(
-                raw_response, raises, request_info, elapsed, raise_for_status=raise_for_status
+                raw_response,
+                raises,
+                request_info,
+                elapsed,
+                ruled,
+                raise_for_status=raise_for_status,
             )
         response_headers = _LazyHeaders(raw_response.headers)
         if response_headers_type is None:

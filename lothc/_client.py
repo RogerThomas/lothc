@@ -2,6 +2,7 @@
 
 from collections.abc import (
     AsyncGenerator,
+    Callable,
     Collection,
     Mapping,
     Sequence,
@@ -26,6 +27,7 @@ from ._raises import _resolve_raises
 from ._response import Response
 from ._settings import (
     NativeMode,
+    RetryAttempt,
     TlsVersion,
     _retry_method_set,
     _retry_status_set,
@@ -81,6 +83,7 @@ class HTTPClient:
         backoff_base: float = 0.1,
         max_retry_after: float | None = 60.0,
         retry_statuses: Collection[int] | None = None,
+        retry: Callable[[RetryAttempt], float | None] | None = None,
         connect_timeout: float | None = None,
         read_timeout: float | None = None,
         root_certificates: Sequence[bytes] | None = None,
@@ -118,6 +121,14 @@ class HTTPClient:
         its 429/503 is raised as `HTTPResponseError` (or returned, with `raise_for_status=False`)
         so you can schedule a retry from its `headers["Retry-After"]`. Pass
         `max_retry_after=None` to honour any wait.
+
+        `retry` is a rule asked about each failure that would be retried (see `RetryAttempt`): a
+        plain function, not an async one, returning the seconds to wait before the next attempt
+        (`attempt.delay` is the wait lothc would take), or `None` to stop retrying, so the call
+        raises that failure (or returns it, with `raise_for_status=False`). A wait above
+        `max_retry_after` stops retrying too, a negative one is no wait, and anything but a
+        finite number or `None` is a `TypeError`/`ValueError` raised from the call; an exception
+        the rule raises propagates unchanged.
 
         `connect_timeout` bounds only the TCP connect phase (separate from `timeout`, which
         covers the whole request); `read_timeout` bounds the idle gap between two consecutive
@@ -176,6 +187,7 @@ class HTTPClient:
             backoff_base=backoff_base,
             max_retry_after=max_retry_after,
             retry_statuses=_retry_status_set(retry_statuses, self._default_retry_statuses),
+            retry_rule=retry,
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
             root_certificates=root_certificates,

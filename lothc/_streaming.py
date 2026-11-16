@@ -155,6 +155,30 @@ type _SyncChunkReader = Callable[[], Buffer | None]
 
 
 @dataclass(slots=True)
+class _ReplayedBody:
+    """A body already read whole, handed out again as a stream's one chunk (`read`, a
+    `_ChunkReader`): an error status's, which a `retry=` rule was shown before retrying stopped,
+    for a `download(raise_for_status=False)` to return."""
+
+    body: bytes | None
+
+    async def read(self) -> bytes | None:
+        body, self.body = self.body, None
+        return body
+
+
+@dataclass(slots=True)
+class _SyncReplayedBody:
+    """Sync mirror of `_ReplayedBody`."""
+
+    body: bytes | None
+
+    def read(self) -> bytes | None:
+        body, self.body = self.body, None
+        return body
+
+
+@dataclass(slots=True)
 class _StreamCall:
     """A streaming verb's request, as the client passed it, for a transport's stream source to
     build. `timeout` is the total cap the transport chose for it (`None`: none). `check_status`

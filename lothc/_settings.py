@@ -1,8 +1,11 @@
-"""`_TransportSettings`, the validated client settings every transport is built from."""
+"""`_TransportSettings`, the validated client settings every transport is built from, and
+`RetryAttempt`, what a `retry=` rule among them is asked about."""
 
+import inspect
 import os
 import sys
 from collections.abc import (
+    Callable,
     Collection,
     Mapping,
     Sequence,
@@ -14,7 +17,51 @@ from importlib.metadata import version as _distribution_version
 from typing import Literal
 from urllib.parse import urlsplit
 
+from ._errors import HTTPResponseError, HTTPTransportError
 from ._types import Headers
+
+
+@dataclass(slots=True)
+class RetryAttempt:
+    """A failed attempt a client's `retry=` rule is asked about: one lothc would retry, since the
+    call has retries left, its request can be sent again, and the failure is a `retry_statuses`
+    response or a transport error a retry can fix.
+
+    `attempt` is which retry this would be (0 for the first). `error` is the failure: for a
+    status, the `HTTPResponseError` the call would raise for that response (the matching
+    `raises=` class, its `.problem` decoded); otherwise the `HTTPTransportError`. `delay` is the
+    wait lothc would take on its own (the response's `Retry-After`, else the backoff), `method`
+    the upper-case HTTP method, and `elapsed` the seconds since the call started.
+    """
+
+    attempt: int
+    error: HTTPResponseError | HTTPTransportError
+    delay: float
+    method: str
+    elapsed: float
+
+
+# A client's `retry=`: the seconds to wait before the next attempt, or `None` to stop retrying.
+type _RetryRule = Callable[[RetryAttempt], float | None]
+
+
+def _validate_retry_rule(rule: _RetryRule | None) -> None:
+    """Refuse a `retry=` that isn't a plain callable, an `async` one included: the rule is called
+    the same way by both clients, and nothing would await it.
+
+    >>> async def rule(attempt: RetryAttempt) -> float | None: ...
+    >>> _validate_retry_rule(rule)
+    Traceback (most recent call last):
+    ...
+    TypeError: 'retry' takes a plain function, not an async one: rule
+    """
+    if rule is None:
+        return
+    if not callable(rule):
+        raise TypeError(f"'retry' takes a function of a RetryAttempt, not {rule!r}")
+    if inspect.iscoroutinefunction(rule) or inspect.iscoroutinefunction(type(rule).__call__):
+        name = getattr(rule, "__qualname__", repr(rule))
+        raise TypeError(f"'retry' takes a plain function, not an async one: {name}")
 
 
 def _retry_method_set(
@@ -131,6 +178,7 @@ class _TransportSettings:  # pylint: disable=too-many-instance-attributes
     backoff_base: float
     max_retry_after: float | None
     retry_statuses: frozenset[int]
+    retry_rule: _RetryRule | None
     connect_timeout: float | None
     read_timeout: float | None
     root_certificates: Sequence[bytes] | None
@@ -160,6 +208,7 @@ class _TransportSettings:  # pylint: disable=too-many-instance-attributes
         if self.native not in ("auto", "off", "on"):
             raise ValueError(f"'native' must be 'auto', 'off' or 'on', not {self.native!r}")
         _validate_max_retries(self.max_retries)
+        _validate_retry_rule(self.retry_rule)
 
 
 @cache
