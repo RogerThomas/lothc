@@ -1,27 +1,76 @@
-"""lothc's exceptions, and building an `HTTPResponseError` (with its `raises=` body)."""
+"""lothc's exceptions, and `RequestInfo`, the request a status error (or a `Response`) describes.
 
-from collections.abc import Mapping
+`HTTPResponseError` is defined here, before `Response` (`_response.py`) annotates `.error` with it,
+since annotations are evaluated at definition on 3.13. Choosing which `raises=` class a 4xx/5xx is
+raised as is `_raises.py`'s.
+"""
+
+from collections.abc import Iterable
 from dataclasses import dataclass
-from functools import cache, cached_property
-from types import get_original_bases
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    NoReturn,
-    TypeIs,
-    TypeVar,
-    get_args,
-    get_origin,
-)
+from typing import Any, ClassVar
 
-from ._decode import _decode_json_line, _Decoder, _decoder_for, _JSONObjectDecoder
+from ._decode import _JSONObjectDecoder
 from ._headers import CaseInsensitiveDict
-from ._response import RequestInfo, Response
 
 
-class HTTPResponseError[E = object](Exception):
+@dataclass(slots=True)
+class RequestInfo:
+    """The request actually sent, attached to `Response.request` (every non-streaming verb's
+    result) and to `HTTPResponseError.request` — the target you asked for, not necessarily the
+    one a final response came from if redirects were followed.
+    """
+
+    method: str
+    url: str
+    path: str
+    host: str | None
+
+
+def _json_object_or_none(body: bytes) -> dict[str, Any] | None:
+    """`body` as a JSON object, or `None` if it isn't one (HTML, text, an array, `null`, or
+    nested too deep to parse)."""
+    try:
+        return _JSONObjectDecoder().decode(body)
+    except (ValueError, RecursionError):  # `RecursionError`: nested too deep for stdlib `json`
+        return None
+
+
+def _status_set(status: int | Iterable[int], cls: type) -> frozenset[int]:
+    """A `status=` class keyword as the statuses it names, each an `int` from 400 to 599."""
+    try:
+        named = (status,) if isinstance(status, int) else tuple(status)
+    except TypeError as error:  # not iterable
+        raise TypeError(
+            f"{cls.__qualname__}: status= takes an int or an iterable of ints (a tuple, a range),"
+            f" got {status!r}"
+        ) from error
+    statuses: set[int] = set()
+    for value in named:
+        # The annotation doesn't stop a caller passing anything (`"404"`, `True`).
+        if not isinstance(value, int) or isinstance(value, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise TypeError(
+                f"{cls.__qualname__}: status= takes an int or an iterable of ints (a tuple, a"
+                f" range), got {value!r} in {status!r}"
+            )
+        if not 400 <= value <= 599:
+            raise ValueError(
+                f"{cls.__qualname__}: status= takes 4xx/5xx statuses (400 to 599), got {value!r}"
+            )
+        statuses.add(value)
+    if not statuses:
+        raise ValueError(f"{cls.__qualname__}: status= names no status ({status!r})")
+    return frozenset(statuses)
+
+
+# What `HTTPResponseError.__init__` is given for a `.problem` read from the body only when first
+# read (a JSON object, else `None`), for a class that pins no problem type.
+_unread_problem: Any = object()
+
+
+class HTTPResponseError[P = object](Exception):
     """Raised when a request gets a 4xx/5xx response (`raise_for_status=True`, the default; with
-    `raise_for_status=False`, raised by reading the returned `Response`'s `.data` instead).
+    `raise_for_status=False`, the returned `Response`'s `.error`, and raised by reading its
+    `.data`).
 
     A response WAS received — for a request that never got one, see `HTTPTransportError`.
     `.request` is the request actually sent — the target you asked for, not necessarily the one a
@@ -29,23 +78,41 @@ class HTTPResponseError[E = object](Exception):
     (e.g. a `Retry-After` once retries are exhausted, or a request id to quote to support), and
     `.body` is the whole body; `.body_start` is just its first 100 bytes, as used in the message.
 
-    `.error` is the body decoded: as `E` when a subclass pins it
-    (`class APIError(HTTPResponseError[NotFound | Conflict]): pass`, passed as `raises=`), else
-    as a JSON object (`dict`), else `None` (HTML, text, an array). When a pinned `E` didn't match,
-    `.parse_error` holds why (the decode library's own `ValueError`, or a `ValueError` chained to
-    whatever else decoding raised, e.g. a `RecursionError` for a body nested too deep to parse).
-    `.parse_error` isn't
-    carried across pickling, since pydantic's `ValidationError` can't be pickled.
+    Subclass it to have an error body decoded and raised as its own class, and pass the subclasses
+    as `raises=`: `class QuotaExceededError(HTTPResponseError[QuotaExceeded], status=429): pass`
+    pins the problem type `P` and the statuses it's for (`status=` takes an int or an iterable of
+    them, a tuple or a range, inherited by a subclass that doesn't pass its own; without one, a
+    class is for every 4xx/5xx). A 4xx/5xx is raised as the first `raises=` class for its status
+    whose `P` decodes the body (one that pins no `P` takes any body), else as plain
+    `HTTPResponseError`.
+
+    `.problem` is the body as the matched class's `P`; for a class that pins none, or plain
+    `HTTPResponseError`, the body as a JSON object (`dict`), else `None` (HTML, text, an array),
+    parsed when first read. On plain `HTTPResponseError` after a pinned class failed to decode the
+    body, `.parse_error` holds the first such failure (the decode library's own `ValueError`, or a
+    `ValueError` chained to whatever else decoding raised, e.g. a `RecursionError` for a body
+    nested too deep to parse); otherwise it's `None`. `.parse_error` isn't carried across
+    pickling, since pydantic's `ValidationError` can't be pickled.
     """
+
+    # The statuses a `status=` class is for (`None`: every 4xx/5xx), read by `_raises.py`.
+    _lothc_statuses: ClassVar[frozenset[int] | None] = None
+
+    def __init_subclass__(
+        cls, *, status: int | Iterable[int] | None = None, **kwargs: object
+    ) -> None:
+        super().__init_subclass__(**kwargs)
+        if status is not None:
+            cls._lothc_statuses = _status_set(status, cls)
 
     def __init__(
         self,
         status: int,
         body: bytes,
         request: RequestInfo,
-        error: E | dict[str, Any] | None = None,
+        problem: P,
         *,
-        headers: "CaseInsensitiveDict | None" = None,
+        headers: CaseInsensitiveDict | None = None,
         parse_error: ValueError | None = None,
     ) -> None:
         self.status = status
@@ -53,11 +120,26 @@ class HTTPResponseError[E = object](Exception):
         self.body = body
         self.body_start = body[:100]
         self.request = request
-        self.error = error
+        # In `__dict__` directly, so `.problem` (a property, which keeps `P` covariant) can parse
+        # an unread one on first read with one atomic `setdefault`, safe on a free-threaded build.
+        if problem is not _unread_problem:
+            self.__dict__["_problem"] = problem
         self.headers = headers if headers is not None else CaseInsensitiveDict()
         snippet = self.body_start.decode(errors="replace")
         truncation_marker = "…" if len(body) > 100 else ""
         super().__init__(f"Request failed with status {status}: {snippet}{truncation_marker}")
+
+    def _read_problem(self) -> P:
+        try:
+            problem: P = self.__dict__["_problem"]
+        except KeyError:
+            problem = self.__dict__.setdefault("_problem", _json_object_or_none(self.body))
+        return problem
+
+    @property
+    def problem(self) -> P:
+        """The error body decoded: see the class docstring."""
+        return self._read_problem()
 
     def __reduce__(self) -> tuple[Any, ...]:
         # Exception's own pickling replays `self.args` — just the message here — into `__init__`,
@@ -67,7 +149,7 @@ class HTTPResponseError[E = object](Exception):
         # it must be a module-level class).
         return (
             _rebuild_http_response_error,
-            (type(self), self.status, self.body, self.request, self.error, self.headers),
+            (type(self), self.status, self.body, self.request, self._read_problem(), self.headers),
         )
 
 
@@ -76,12 +158,12 @@ def _rebuild_http_response_error(
     status: int,
     body: bytes,
     request: RequestInfo,
-    error: object,
-    headers: "CaseInsensitiveDict",
+    problem: object,
+    headers: CaseInsensitiveDict,
 ) -> HTTPResponseError[Any]:
     """Unpickling target for `HTTPResponseError.__reduce__` (keyword-only `headers` rules out
     returning the class itself with positional args)."""
-    return cls(status, body, request, error, headers=headers)
+    return cls(status, body, request, problem, headers=headers)
 
 
 class HTTPTransportError(Exception):
@@ -97,271 +179,3 @@ class HTTPConnectionError(HTTPTransportError):
 class HTTPTimeoutError(HTTPTransportError):
     """A configured timeout elapsed: the total `timeout`, or `connect_timeout`, `read_timeout` or
     `pool_timeout` if set."""
-
-
-@dataclass(slots=True)
-class _ErrorBodyDecoding:
-    """How a `raises=` class decodes a 4xx/5xx body. `pinned` is whether it pins an `E` at all,
-    since `decoder` is `None` both when it doesn't and when it pins `E = bytes`."""
-
-    pinned: bool
-    decoder: _Decoder | None
-
-
-def _is_response_error_class(value: object) -> TypeIs[type[HTTPResponseError[Any]]]:
-    return isinstance(value, type) and issubclass(value, HTTPResponseError)
-
-
-def _has_free_type_params(form: object) -> bool:
-    """Whether `form` is, or still contains, a type parameter nothing bound."""
-    if isinstance(form, TypeVar):
-        return True
-    return get_origin(form) is not None and bool(getattr(form, "__parameters__", ()))
-
-
-def _bound_type_param(parameter: TypeVar, bindings: Mapping[TypeVar, object]) -> object:
-    """What `parameter` stands for: its binding, else its PEP 696 default (checkers read a bare
-    `class Base[T = APIError]` as `Base[APIError]`), else itself, still free."""
-    if parameter in bindings:
-        return bindings[parameter]
-    if parameter.has_default():
-        # A default may name an earlier parameter (`[T, U = list[T]]`).
-        return _bind_type_params(parameter.__default__, bindings)
-    return parameter
-
-
-def _bind_type_params(form: object, bindings: Mapping[TypeVar, object]) -> object:
-    """`form` with its type parameters replaced by their bindings, else their defaults
-    (`T` -> `int`, `list[T]` -> `list[int]`); anything with neither is left as it was."""
-    if isinstance(form, TypeVar):
-        return _bound_type_param(form, bindings)
-    parameters: tuple[TypeVar, ...] = getattr(form, "__parameters__", ())
-    if get_origin(form) is None or not parameters:
-        return form
-    # A parametrized alias with free parameters (`list[T]`) is subscriptable, which `object`
-    # can't say.
-    alias: Any = form
-    return alias[tuple(_bound_type_param(parameter, bindings) for parameter in parameters)]
-
-
-def _pinned_error_form(cls: type, bindings: Mapping[TypeVar, object]) -> tuple[()] | tuple[object]:
-    """`(E,)` for the `E` that `cls` pins on `HTTPResponseError`, or `()` if nothing does.
-
-    Walks the bases as written (`types.get_original_bases`, which keeps their type arguments,
-    unlike `__mro__`), depth first in declaration order, so a subclass of a subclass finds what
-    its parent pinned. Type parameters bound along the way are carried down, so
-    `class Base[T](HTTPResponseError[T])` then `class Final(Base[NotFound])` resolves to
-    `NotFound`.
-    """
-    for base in get_original_bases(cls):
-        origin = get_origin(base)
-        if origin is HTTPResponseError:
-            return (_bind_type_params(get_args(base)[0], bindings),)
-        if origin is None:
-            parent, parent_bindings = base, {}
-        else:
-            parent = origin
-            arguments = (_bind_type_params(argument, bindings) for argument in get_args(base))
-            parameters: tuple[TypeVar, ...] = getattr(origin, "__parameters__", ())
-            parent_bindings = dict(zip(parameters, arguments, strict=False))
-        if _is_response_error_class(parent) and parent is not HTTPResponseError:
-            pinned = _pinned_error_form(parent, parent_bindings)
-            if pinned:
-                return pinned
-    return ()
-
-
-# One per `raises=` class, shared by both clients, like `_decoders` (which caches the decoder
-# itself): what this saves is the walk through the class's bases on every error. Unbounded, since
-# the classes come from source code, not data. `cache` stores nothing when the call raises, so an
-# unusable `raises` (not an `HTTPResponseError` subclass, an unbound `E`, an `E` no library can
-# decode) is a `TypeError` on every call: a caller bug, never cached and never swallowed.
-@cache
-def _error_body_decoding(raises: object) -> _ErrorBodyDecoding:
-    """`raises`'s resolved `E` and its decoder. Takes `object`, since nothing has checked yet
-    that `raises` really is an `HTTPResponseError` subclass."""
-    if not _is_response_error_class(raises):
-        raise TypeError(
-            f"raises= must be HTTPResponseError or a subclass of it, got {raises!r}. To decode"
-            " error bodies as a type E, subclass it: `class APIError(HTTPResponseError[E]): pass`."
-        )
-    pinned = _pinned_error_form(raises, {})
-    if not pinned:
-        return _ErrorBodyDecoding(pinned=False, decoder=None)
-    (form,) = pinned
-    if _has_free_type_params(form):
-        raise TypeError(
-            f"{raises.__qualname__} leaves HTTPResponseError's error type unbound ({form!r}), so"
-            " there is nothing to decode an error body as. Pin it directly:"
-            f" `class {raises.__name__}(HTTPResponseError[YourErrorType]): pass`."
-        )
-    return _ErrorBodyDecoding(pinned=True, decoder=_decoder_for(form))
-
-
-def _validate_raises(raises: type[HTTPResponseError[Any]] | None) -> None:
-    """Resolve a per-call `raises=` before anything is sent, so a bad class is a `TypeError` on
-    every call rather than one that only surfaces on a real 4xx/5xx, in place of that error.
-    `None` (the client's own, already resolved at construction) costs nothing."""
-    if raises is not None:
-        _error_body_decoding(raises)
-
-
-def _json_object_or_none(body: bytes) -> dict[str, Any] | None:
-    """`body` as a JSON object, or `None` if it isn't one (HTML, text, an array, `null`, or
-    nested too deep to parse)."""
-    try:
-        return _JSONObjectDecoder().decode(body)
-    except (ValueError, RecursionError):  # `RecursionError`: nested too deep for stdlib `json`
-        return None
-
-
-# Whatever the pinned `E` decodes to — genuinely dynamic, can't state it statically.
-def _decode_pinned_error(body: bytes, decoder: _Decoder | None) -> Any:  # noqa: ANN401
-    return body if decoder is None else _decode_json_line(body, decoder)
-
-
-def _as_parse_error(error: Exception) -> ValueError:
-    """`error` as the `ValueError` `.parse_error` promises: itself if it already is one (every
-    decode library's own failure), else a `ValueError` chained to it (`__cause__`), for the
-    `RecursionError` a deeply nested body raises and the `TypeError` a pinned `dict` subclass's
-    own constructor can raise."""
-    if isinstance(error, ValueError):
-        return error
-    parse_error = ValueError(f"error body could not be decoded: {error!r}")
-    parse_error.__cause__ = error
-    return parse_error
-
-
-def _decoded_error_body(
-    raises: type[HTTPResponseError[Any]], body: bytes
-) -> tuple[Any, ValueError | None]:
-    """A 4xx/5xx body decoded for `raises`, as `(error, parse_error)` (see `_status_error`)."""
-    decoding = _error_body_decoding(raises)
-    if not decoding.pinned:
-        return _json_object_or_none(body), None
-    try:
-        error = _decode_pinned_error(body, decoding.decoder)
-    # An unusable `E` was already rejected when `raises` was resolved, so anything decoding
-    # raises here is the body's fault: too deeply nested (`RecursionError`), or refused by a
-    # pinned `dict` subclass's own constructor (`TypeError`).
-    except (ValueError, RecursionError, TypeError) as decode_error:
-        return _json_object_or_none(body), _as_parse_error(decode_error)
-    return error, None
-
-
-def _status_error(
-    raises: type[HTTPResponseError[Any]],
-    status: int,
-    body: bytes,
-    request_info: RequestInfo,
-    headers: CaseInsensitiveDict,
-) -> HTTPResponseError[Any]:
-    """The `raises` error for a 4xx/5xx whose whole body has already been read.
-
-    Decoding is best-effort, since an error body is where a server is least likely to honour its
-    own contract: a body that doesn't match the pinned `E` (a proxy's HTML 502, an error shape
-    the union doesn't cover) keeps the decode library's `ValueError` on `.parse_error` and falls
-    back to a JSON object, else `None`, rather than replacing the status error with a
-    `ValidationError`. A body too deeply nested to parse, or one a pinned `dict` subclass's
-    constructor rejects, is treated the same, its error wrapped in a `ValueError`. Nothing pinned:
-    a JSON object, else `None`.
-    """
-    error, parse_error = _decoded_error_body(raises, body)
-    return raises(status, body, request_info, error, headers=headers, parse_error=parse_error)
-
-
-class _ErrorResponse(Response[Any, Any]):
-    """What a non-streaming verb returns for a 4xx/5xx under `raise_for_status=False` (see
-    `Response`), from the parts a raising call builds its `HTTPResponseError` from: the body is
-    decoded for `.error` only on first read, and `.data`/`.typed_headers` raise that error, a
-    new one on each read (one shared instance grew its traceback on every read, and mixed
-    tracebacks across threads on a free-threaded build).
-
-    Not a dataclass: `Response`'s generated `__init__`, `__repr__` and `__eq__` would set or read
-    `.data`. Its own read none of it, and pickling (`__getstate__`) leaves out the decoded body,
-    which may hold a pydantic `ValidationError` that can't be pickled; it's decoded again on
-    first read. The properties are hidden from type checkers, since ty and zuban reject a
-    read-only property over a writable dataclass field: statically this is just a `Response`.
-    """
-
-    def __init__(  # pylint: disable=super-init-not-called
-        self,
-        raises: type[HTTPResponseError[Any]],
-        status: int,
-        headers: CaseInsensitiveDict,
-        request: RequestInfo,
-        http_version: str,
-        elapsed: float,
-        body: bytes,
-    ) -> None:
-        # No `super().__init__()`: it would set `.data` and `.typed_headers`, which raise here.
-        self._raises = raises
-        self._body = body
-        self.status = status
-        self.headers = headers
-        self.request = request
-        self.http_version = http_version
-        self.elapsed = elapsed
-        self.raw_error = body
-
-    @cached_property
-    def _decoded(self) -> tuple[Any, ValueError | None]:
-        return _decoded_error_body(self._raises, self._body)
-
-    def _raise_status_error(self) -> NoReturn:
-        error, parse_error = self._decoded
-        raise self._raises(
-            self.status,
-            self._body,
-            self.request,
-            error,
-            headers=self.headers,
-            parse_error=parse_error,
-        )
-
-    if not TYPE_CHECKING:
-
-        @property
-        def data(self) -> NoReturn:
-            self._raise_status_error()
-
-        @property
-        def typed_headers(self) -> NoReturn:
-            self._raise_status_error()
-
-        @property
-        def error(self) -> object:
-            return self._decoded[0]
-
-    def __getstate__(self) -> dict[str, object]:
-        state = dict(self.__dict__)
-        state.pop("_decoded", None)
-        return state
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, _ErrorResponse):
-            return NotImplemented
-        return (
-            self._raises,
-            self.status,
-            self.headers,
-            self.request,
-            self.http_version,
-            self.elapsed,
-            self._body,
-        ) == (
-            other._raises,
-            other.status,
-            other.headers,
-            other.request,
-            other.http_version,
-            other.elapsed,
-            other._body,
-        )
-
-    def __repr__(self) -> str:
-        return (
-            f"Response(status={self.status!r}, headers={self.headers!r},"
-            f" request={self.request!r}, http_version={self.http_version!r},"
-            f" elapsed={self.elapsed!r}, raw_error={self._body!r})"
-        )

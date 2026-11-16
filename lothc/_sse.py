@@ -18,7 +18,8 @@ from ._decode import (
     _SSEBytesDecoder,
     _TextDecoder,
 )
-from ._errors import HTTPResponseError, HTTPTransportError, _validate_raises
+from ._errors import HTTPTransportError
+from ._raises import _RaisesArg, _validate_raises
 from ._streaming import _ResponseHead, _StreamSource, _sync_stream_chunks, _SyncStreamSource
 
 
@@ -273,7 +274,7 @@ def _sse_connection_sync(
 async def _sse_events(
     connect: Callable[[str], _StreamSource],
     into: _Into,
-    raises: type[HTTPResponseError[Any]] | None,
+    raises: _RaisesArg | None,
     *,
     max_reconnects: int | None,
     reconnect_delay: float,
@@ -320,7 +321,7 @@ async def _sse_events(
 def _sse_events_sync(
     connect: Callable[[str], _SyncStreamSource],
     into: _Into,
-    raises: type[HTTPResponseError[Any]] | None,
+    raises: _RaisesArg | None,
     *,
     max_reconnects: int | None,
     reconnect_delay: float,

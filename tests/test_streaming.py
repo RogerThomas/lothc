@@ -107,7 +107,7 @@ async def test_stream_get_raw_bytes_mode_raises_even_with_raise_for_status_false
         with pytest.raises(HTTPResponseError) as exc_info:
             _ = [chunk async for chunk in client.stream_get("boom")]
 
-    assert exc_info.value.error == {
+    assert exc_info.value.problem == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,
@@ -165,7 +165,7 @@ def test_sync_stream_get_raw_bytes_mode_raises_even_with_raise_for_status_false(
     ):
         _ = list(client.stream_get("boom"))
 
-    assert exc_info.value.error == {
+    assert exc_info.value.problem == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,

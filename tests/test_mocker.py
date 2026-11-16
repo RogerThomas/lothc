@@ -83,8 +83,9 @@ async def test_a_mocked_error_status_is_returned_with_raise_for_status_false(
     response = await client.get("items/7", into=ItemModel, raise_for_status=False)
 
     assert response.status == 404
-    assert response.error == {"detail": "not-found"}
-    assert response.raw_error == b'{"detail":"not-found"}'
+    assert response.error is not None
+    assert response.error.problem == {"detail": "not-found"}
+    assert response.error.body == b'{"detail":"not-found"}'
     with pytest.raises(HTTPResponseError) as exc_info:
         _ = response.data
     assert exc_info.value.status == 404
@@ -98,7 +99,8 @@ def test_sync_a_mocked_error_status_is_returned_with_raise_for_status_false(
     response = sync_client.get("items/7", into=ItemModel, raise_for_status=False)
 
     assert response.status == 404
-    assert response.error == {"detail": "not-found"}
+    assert response.error is not None
+    assert response.error.problem == {"detail": "not-found"}
     with pytest.raises(HTTPResponseError):
         _ = response.data
 

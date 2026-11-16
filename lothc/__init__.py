@@ -4,6 +4,7 @@ from ._errors import (
     HTTPResponseError,
     HTTPTimeoutError,
     HTTPTransportError,
+    RequestInfo,
 )
 from ._headers import CaseInsensitiveDict
 from ._oauth import (
@@ -14,10 +15,7 @@ from ._oauth import (
     TokenRequestTyping,
     TokenResponseTyping,
 )
-from ._response import (
-    RequestInfo,
-    Response,
-)
+from ._response import Response
 from ._settings import NativeMode, TlsVersion
 from ._sse import SSEEvent
 from ._sync_client import SyncHTTPClient

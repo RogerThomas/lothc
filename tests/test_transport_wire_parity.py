@@ -462,7 +462,7 @@ def _retried_cases() -> list[_Case]:
 
 def _seen(response: Any) -> _Seen:  # noqa: ANN401 — whichever `Response` the verb returned
     # A 4xx/5xx under `raise_for_status=False`: its `.data` raises, so its body is compared.
-    wire: Any = response.raw_error if response.status >= 400 else response.data
+    wire: Any = response.error.body if response.status >= 400 else response.data
     if response.request.path == "/echo-request" and response.status == 200:
         wire = json.loads(response.data)
     return _Seen(response.status, response.request, wire)

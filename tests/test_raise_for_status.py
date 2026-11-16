@@ -1,6 +1,5 @@
-"""`raise_for_status=False`: a 4xx/5xx comes back as a `Response` whose `.data` raises the
-`HTTPResponseError` a raising call would have raised, with the error body on `.raw_error` and
-decoded on `.error`."""
+"""`raise_for_status=False`: a 4xx/5xx comes back as a `Response` whose `.error` is the
+`HTTPResponseError` a raising call would have raised, and whose `.data` raises it."""
 
 import copy
 import pickle
@@ -58,7 +57,7 @@ def _sync_lenient_client(base_url: str) -> Generator[SyncHTTPClient]:
 
 
 def _describe(error: HTTPResponseError[Any]) -> tuple[object, ...]:
-    return (type(error), error.status, error.body, error.error, error.request)
+    return (type(error), error.status, error.body, error.problem, error.request)
 
 
 async def test_a_client_with_raise_for_status_false_returns_an_error_status(
@@ -67,7 +66,8 @@ async def test_a_client_with_raise_for_status_false_returns_an_error_status(
     response = await lenient_client.get("boom")
 
     assert response.status == 500
-    assert response.error == {
+    assert response.error is not None
+    assert response.error.problem == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,
@@ -123,7 +123,7 @@ async def test_reading_data_raises_what_a_raising_call_raises(client: HTTPClient
         _ = response.data
 
     assert _describe(deferred.value) == _describe(raised.value)
-    assert deferred.value.error == NotFound(title="Not found", status=404)
+    assert deferred.value.problem == NotFound(title="Not found", status=404)
     assert deferred.value.parse_error is None
     assert deferred.value.headers == response.headers
 
@@ -147,7 +147,7 @@ async def test_reading_data_raises_the_clients_raises_class(base_url: str) -> No
     with pytest.raises(APIError) as exc_info:
         _ = response.data
 
-    assert exc_info.value.error == NotAuthorized(title="Not authorized", status=401)
+    assert exc_info.value.problem == NotAuthorized(title="Not authorized", status=401)
 
 
 def test_sync_reading_data_raises_the_clients_raises_class(base_url: str) -> None:
@@ -157,7 +157,7 @@ def test_sync_reading_data_raises_the_clients_raises_class(base_url: str) -> Non
     with pytest.raises(APIError) as exc_info:
         _ = response.data
 
-    assert exc_info.value.error == NotAuthorized(title="Not authorized", status=401)
+    assert exc_info.value.problem == NotAuthorized(title="Not authorized", status=401)
 
 
 async def test_reading_data_without_raises_raises_plain_http_response_error(
@@ -181,7 +181,7 @@ async def test_each_read_of_data_raises_a_new_error(lenient_client: HTTPClient) 
         _ = response.data
 
     assert first.value is not second.value
-    assert first.value.error == second.value.error
+    assert _describe(first.value) == _describe(second.value)
 
 
 def test_sync_each_read_of_data_raises_a_new_error(sync_lenient_client: SyncHTTPClient) -> None:
@@ -195,16 +195,19 @@ def test_sync_each_read_of_data_raises_a_new_error(sync_lenient_client: SyncHTTP
     assert first.value is not second.value
 
 
-async def test_a_pinned_type_that_does_not_match_keeps_its_parse_error(
+async def test_a_pinned_type_that_does_not_match_is_plain_with_its_parse_error(
     lenient_client: HTTPClient,
 ) -> None:
     response = await lenient_client.get("boom", raises=UnmatchedError)
 
-    with pytest.raises(UnmatchedError) as exc_info:
+    with pytest.raises(HTTPResponseError) as exc_info:
         _ = response.data
 
+    assert type(exc_info.value) is HTTPResponseError
     assert isinstance(exc_info.value.parse_error, ValueError)
-    assert response.error == {
+    assert response.error is not None
+    assert type(response.error) is HTTPResponseError
+    assert response.error.problem == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,
@@ -234,7 +237,7 @@ def test_sync_nothing_is_decoded_into_into_or_parsed_into_typed_headers(
         _ = response.typed_headers
 
 
-async def test_into_bytes_data_raises_and_raw_error_is_the_body(
+async def test_into_bytes_data_raises_and_the_error_has_the_body(
     lenient_client: HTTPClient,
 ) -> None:
     response = await lenient_client.get("invalid-json-error", into=bytes)
@@ -242,69 +245,127 @@ async def test_into_bytes_data_raises_and_raw_error_is_the_body(
     with pytest.raises(HTTPResponseError) as exc_info:
         _ = response.data
 
-    assert response.raw_error == b"<html><body>502 Bad Gateway</body></html>"
-    assert exc_info.value.body == response.raw_error
+    assert response.error is not None
+    assert response.error.body == b"<html><body>502 Bad Gateway</body></html>"
+    assert exc_info.value.body == response.error.body
 
 
-async def test_error_is_the_pinned_type_a_json_object_or_none(lenient_client: HTTPClient) -> None:
+async def test_error_problem_is_the_pinned_type_a_json_object_or_none(
+    lenient_client: HTTPClient,
+) -> None:
     pinned = await lenient_client.get("missing", raises=APIError)
     json_object = await lenient_client.get("boom")
     not_json = await lenient_client.get("invalid-json-error")
 
-    assert pinned.error == NotFound(title="Not found", status=404)
-    assert json_object.error == {
+    assert isinstance(pinned.error, APIError)
+    assert pinned.error.problem == NotFound(title="Not found", status=404)
+    assert json_object.error is not None
+    assert json_object.error.problem == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,
     }
-    assert not_json.error is None
+    assert not_json.error is not None
+    assert not_json.error.problem is None
 
 
-def test_sync_error_is_the_pinned_type_a_json_object_or_none(
+def test_sync_error_problem_is_the_pinned_type_a_json_object_or_none(
     sync_lenient_client: SyncHTTPClient,
 ) -> None:
     pinned = sync_lenient_client.get("missing", raises=APIError)
     not_json = sync_lenient_client.get("invalid-json-error")
 
-    assert pinned.error == NotFound(title="Not found", status=404)
-    assert not_json.error is None
+    assert isinstance(pinned.error, APIError)
+    assert pinned.error.problem == NotFound(title="Not found", status=404)
+    assert not_json.error is not None
+    assert not_json.error.problem is None
 
 
-async def test_error_is_decoded_once_and_kept(lenient_client: HTTPClient) -> None:
+async def test_error_is_built_once_and_kept(lenient_client: HTTPClient) -> None:
     response = await lenient_client.get("boom")
 
+    assert response.error is not None
     assert response.error is response.error
+
+
+def test_sync_error_is_built_once_and_kept(sync_lenient_client: SyncHTTPClient) -> None:
+    response = sync_lenient_client.get("boom")
+
+    assert response.error is not None
+    assert response.error is response.error
+
+
+async def test_reading_data_raises_a_new_error_equal_to_the_kept_one(
+    lenient_client: HTTPClient,
+) -> None:
+    response = await lenient_client.get("missing", raises=APIError)
+
+    with pytest.raises(APIError) as exc_info:
+        _ = response.data
+
+    assert response.error is not None
+    assert exc_info.value is not response.error
+    assert _describe(exc_info.value) == _describe(response.error)
+
+
+def test_sync_reading_data_raises_a_new_error_equal_to_the_kept_one(
+    sync_lenient_client: SyncHTTPClient,
+) -> None:
+    response = sync_lenient_client.get("missing", raises=APIError)
+
+    with pytest.raises(APIError) as exc_info:
+        _ = response.typed_headers
+
+    assert response.error is not None
+    assert exc_info.value is not response.error
+    assert _describe(exc_info.value) == _describe(response.error)
 
 
 async def test_a_caller_can_match_on_error(lenient_client: HTTPClient) -> None:
     response = await lenient_client.get("missing", raises=APIError)
 
     match response.error:
-        case NotFound(title=title):
+        case APIError(problem=NotFound(title=title)):
             outcome = title
-        case NotAuthorized():
-            outcome = "not-authorized"
-        case {"title": str(title)}:
-            outcome = title
-        case _:
+        case APIError():
+            outcome = "other-api-error"
+        case HTTPResponseError(status=503):
+            outcome = "unavailable"
+        case HTTPResponseError():
             outcome = "other"
+        case None:
+            outcome = "success"
 
     assert outcome == "Not found"
 
 
-async def test_a_success_has_no_error_or_raw_error(lenient_client: HTTPClient) -> None:
+def test_sync_a_caller_can_match_on_the_status_of_a_plain_error(
+    sync_lenient_client: SyncHTTPClient, server_key: str
+) -> None:
+    response = sync_lenient_client.get("flaky", params={"key": server_key, "fail_times": 1})
+
+    match response.error:
+        case HTTPResponseError(status=503):
+            outcome = "unavailable"
+        case HTTPResponseError():
+            outcome = "other"
+        case None:
+            outcome = "success"
+
+    assert outcome == "unavailable"
+
+
+async def test_a_success_has_no_error(lenient_client: HTTPClient) -> None:
     response = await lenient_client.get("items/7", into=dict)
 
     assert response.error is None
-    assert response.raw_error is None
     assert response.data == {"id": 7, "name": "item-7"}
 
 
-def test_sync_a_success_has_no_error_or_raw_error(sync_client: SyncHTTPClient) -> None:
+def test_sync_a_success_has_no_error(sync_client: SyncHTTPClient) -> None:
     response = sync_client.get("items/7")
 
     assert response.error is None
-    assert response.raw_error is None
 
 
 async def test_exhausted_retries_return_the_last_error_response(
@@ -370,7 +431,8 @@ async def test_a_401_is_re_authenticated_once_then_returned(
         )
 
     assert response.status == 401
-    assert response.error == {"hits": 2}
+    assert response.error is not None
+    assert response.error.problem == {"hits": 2}
     assert len(token_server.requests()) == 2
 
 
@@ -383,7 +445,8 @@ def test_sync_a_401_is_re_authenticated_once_then_returned(
         response = client.get("always-unauthorized", params={"key": f"{token_server.key}-api"})
 
     assert response.status == 401
-    assert response.error == {"hits": 2}
+    assert response.error is not None
+    assert response.error.problem == {"hits": 2}
 
 
 async def test_stream_post_raises_even_with_raise_for_status_false(
@@ -419,14 +482,34 @@ def test_sync_an_error_response_pickles_after_a_failed_decode(
     sync_lenient_client: SyncHTTPClient,
 ) -> None:
     response = sync_lenient_client.get("boom", raises=UnmatchedError)
-    with pytest.raises(UnmatchedError):
+    with pytest.raises(HTTPResponseError):
         _ = response.data
 
     restored = pickle.loads(pickle.dumps(response))  # noqa: S301 — round-tripping our own object
 
     assert restored == response
     assert restored.status == 500
-    assert restored.error == response.error
-    with pytest.raises(UnmatchedError) as exc_info:
+    assert restored.error is not None
+    assert response.error is not None
+    assert _describe(restored.error) == _describe(response.error)
+    with pytest.raises(HTTPResponseError) as exc_info:
         _ = restored.data
     assert isinstance(exc_info.value.parse_error, ValueError)
+
+
+async def test_an_error_response_pickles_before_and_after_reading_error(
+    client: HTTPClient,
+) -> None:
+    unread = await client.get("missing", raises=APIError, raise_for_status=False)
+    read = await client.get("missing", raises=[APIError], raise_for_status=False)
+    assert read.error is not None
+
+    restored_unread = pickle.loads(pickle.dumps(unread))  # noqa: S301 — our own object
+    restored_read = pickle.loads(pickle.dumps(read))  # noqa: S301 — our own object
+
+    assert restored_unread == unread
+    assert restored_read == read
+    assert isinstance(restored_unread.error, APIError)
+    assert isinstance(restored_read.error, APIError)
+    assert restored_read.error.problem == NotFound(title="Not found", status=404)
+    assert restored_unread.error.problem == NotFound(title="Not found", status=404)

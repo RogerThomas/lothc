@@ -32,15 +32,10 @@ from typing import (
 )
 
 from ._decode import _decode_json_line, _decoder_for, _Into, _TextDecoder
-from ._errors import (
-    HTTPResponseError,
-    HTTPTimeoutError,
-    HTTPTransportError,
-    _ErrorResponse,
-    _validate_raises,
-)
+from ._errors import HTTPTimeoutError, HTTPTransportError, RequestInfo
 from ._headers import CaseInsensitiveDict
-from ._response import RequestInfo, Response
+from ._raises import _ErrorResponse, _RaisesArg, _RaisesTable, _validate_raises
+from ._response import Response
 from ._types import Form, Headers, JSONPayload, Params
 
 
@@ -171,7 +166,7 @@ class _StreamCall:
     skip_auth: bool
     infer_mime_type_from_file_extension: bool = True
     check_status: bool
-    raises: type[HTTPResponseError[Any]] | None
+    raises: _RaisesArg | None
 
 
 class _StreamSource(Protocol):
@@ -397,7 +392,7 @@ def _sync_stream_chunks(
 async def _stream_lines(
     source: _StreamSource,
     into: _Into,
-    raises: type[HTTPResponseError[Any]] | None,
+    raises: _RaisesArg | None,
     idle: float | None,
 ) -> AsyncGenerator[Any]:
     """`stream_get`/`stream_post` over either transport: raw chunks, or one decoded value per
@@ -435,7 +430,7 @@ async def _stream_lines(
 def _stream_lines_sync(
     source: _SyncStreamSource,
     into: _Into,
-    raises: type[HTTPResponseError[Any]] | None,
+    raises: _RaisesArg | None,
     idle: float | None,
     *,
     interruptible: bool,
@@ -467,7 +462,7 @@ async def _download_stream(
     source: _StreamSource,
     dest: Path | None,
     idle: float | None,
-    deferred: type[HTTPResponseError[Any]] | None,
+    deferred: _RaisesTable | None,
 ) -> Response[bytes] | Response[Path]:
     """`download()` over either transport: the body into memory, or into `dest` atomically.
 
@@ -521,7 +516,7 @@ def _download_stream_sync(
     source: _SyncStreamSource,
     dest: Path | None,
     idle: float | None,
-    deferred: type[HTTPResponseError[Any]] | None,
+    deferred: _RaisesTable | None,
 ) -> Response[bytes] | Response[Path]:
     """Sync mirror of `_download_stream`, reading through `_sync_stream_chunks`."""
     source.prepare()

@@ -17,12 +17,11 @@ from ._errors import (
     HTTPResponseError,
     HTTPTimeoutError,
     HTTPTransportError,
+    RequestInfo,
 )
 from ._headers import CaseInsensitiveDict
-from ._response import (
-    RequestInfo,
-    Response,
-)
+from ._raises import _RaisesTable
+from ._response import Response
 
 class _Glue(Protocol):
     """What the pools read off `glue` at construction (`_NativeGlue`)."""
@@ -262,7 +261,7 @@ class Pool:
         body_kind: int,
         decode: Callable[[bytes], object] | None,
         timeout: timedelta | None,
-        raises: type[HTTPResponseError[Any]] | None,
+        raises: _RaisesTable | None,
         typed_headers: type | None,
         headers_only: bool,
         defer_error: bool,
@@ -354,7 +353,7 @@ class SyncPool:
         body_kind: int,
         decode: Callable[[bytes], object] | None,
         timeout: timedelta | None,
-        raises: type[HTTPResponseError[Any]] | None,
+        raises: _RaisesTable | None,
         typed_headers: type | None,
         headers_only: bool,
         defer_error: bool,

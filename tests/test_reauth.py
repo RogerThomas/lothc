@@ -71,7 +71,7 @@ async def test_a_second_401_is_raised_rather_than_retried_again(
         await reauth_client.get("always-unauthorized", params={"key": f"{token_server.key}-api"})
 
     assert exc_info.value.status == 401
-    assert exc_info.value.error == {"hits": 2}  # the original request plus exactly one retry
+    assert exc_info.value.problem == {"hits": 2}  # the original request plus exactly one retry
 
 
 async def test_a_401_after_reauthenticating_is_raised_as_the_clients_raises_class(
@@ -83,7 +83,7 @@ async def test_a_401_after_reauthenticating_is_raised_as_the_clients_raises_clas
         with pytest.raises(ReauthError) as exc_info:
             await client.get("always-unauthorized", params={"key": f"{token_server.key}-api"})
 
-    assert exc_info.value.error == {"hits": 2}
+    assert exc_info.value.problem == {"hits": 2}
 
 
 async def test_a_bearer_auth_without_invalidate_is_not_retried(
@@ -93,7 +93,7 @@ async def test_a_bearer_auth_without_invalidate_is_not_retried(
         with pytest.raises(HTTPResponseError) as exc_info:
             await client.get("always-unauthorized", params={"key": server_key})
 
-    assert exc_info.value.error == {"hits": 1}
+    assert exc_info.value.problem == {"hits": 1}
 
 
 async def test_a_skip_auth_request_is_not_retried(
@@ -104,7 +104,7 @@ async def test_a_skip_auth_request_is_not_retried(
             "always-unauthorized", params={"key": f"{token_server.key}-api"}, skip_auth=True
         )
 
-    assert exc_info.value.error == {"hits": 1}
+    assert exc_info.value.problem == {"hits": 1}
 
 
 async def test_invalidate_with_a_stale_token_keeps_a_newer_one(token_server: TokenServer) -> None:
@@ -146,7 +146,7 @@ def test_sync_a_skip_auth_request_is_not_retried(
             "always-unauthorized", params={"key": f"{token_server.key}-api"}, skip_auth=True
         )
 
-    assert exc_info.value.error == {"hits": 1}
+    assert exc_info.value.problem == {"hits": 1}
 
 
 def test_sync_a_401_after_reauthenticating_is_raised_as_the_clients_raises_class(
@@ -160,7 +160,7 @@ def test_sync_a_401_after_reauthenticating_is_raised_as_the_clients_raises_class
     ):
         client.get("always-unauthorized", params={"key": f"{token_server.key}-api"})
 
-    assert exc_info.value.error == {"hits": 2}
+    assert exc_info.value.problem == {"hits": 2}
 
 
 type _ReplayedVerb = Literal["put", "delete", "head", "options", "patch"]

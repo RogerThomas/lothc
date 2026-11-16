@@ -20,7 +20,8 @@ from ._compat import (
     DecoderTyping,
     TypeAdapterTyping,
 )
-from ._errors import HTTPResponseError, _error_body_decoding
+from ._errors import HTTPResponseError
+from ._raises import _resolve_raises
 from ._response import Response
 from ._settings import (
     NativeMode,
@@ -94,7 +95,8 @@ class SyncHTTPClient:
         pool_timeout: float | None = None,
         native: NativeMode = "auto",
         raise_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] = HTTPResponseError,
+        raises: type[HTTPResponseError[Any]]
+        | Sequence[type[HTTPResponseError[Any]]] = HTTPResponseError,
     ) -> None:
         """The client's settings. Nothing opens until it's entered, as
         `with SyncHTTPClient(...) as client:`.
@@ -135,15 +137,16 @@ class SyncHTTPClient:
         always uses pyreqwest; `"on"` always uses native, raising `NotImplementedError` here on
         Windows or with `http2=True`. `lothc.testing`'s mocker intercepts either.
 
-        `raises` is the `HTTPResponseError` class every 4xx/5xx is raised as (each verb's own
-        `raises=` overrides it). A subclass that pins the error type,
-        `class APIError(HTTPResponseError[NotFound | Conflict]): pass`, decodes the body onto
-        `.error` as that type; a bad class raises `TypeError` here, not on the first error.
+        `raises` is the `HTTPResponseError` subclass, or sequence of them, a 4xx/5xx may be raised
+        as (each verb's own `raises=` replaces it): the first, in order, whose `status=` covers the
+        response's status and whose pinned problem type decodes the body, else plain
+        `HTTPResponseError`; see `HTTPResponseError`. A class no response could ever be raised as,
+        or a bad class, raises `TypeError` here, not on the first error.
 
         `raise_for_status=False` makes `get`/`post`/`put`/`patch`/`delete`/`head`/`options`/
         `download` return a 4xx/5xx as a `Response` instead of raising (each verb's own
-        `raise_for_status=` overrides it): `.status`, `.error` (the body decoded as `raises`
-        decodes it) and `.raw_error` say what went wrong, and reading `.data` raises the error.
+        `raise_for_status=` overrides it): its `.error` is the error the call would have raised,
+        and reading `.data` raises it.
         The streaming verbs always raise.
         """
         if sum(value is not None for value in (bearer_token, bearer_auth, basic_auth)) > 1:
@@ -151,7 +154,7 @@ class SyncHTTPClient:
                 "Provide at most one of 'bearer_token', 'bearer_auth', or 'basic_auth'"
             )
         # Resolved now, so a bad class fails here rather than on the first 4xx/5xx.
-        _error_body_decoding(raises)
+        resolved_raises = _resolve_raises(raises)
         self._settings = _TransportSettings(
             base_url=base_url,
             default_headers=default_headers,
@@ -195,7 +198,7 @@ class SyncHTTPClient:
             bearer_token,
             bearer_auth,
             basic_auth,
-            raises,
+            resolved_raises,
             raise_for_status,
             self._default_retry_methods,
         )
@@ -218,7 +221,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         into: None = None,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     def get(
@@ -231,7 +234,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         into: type[dict[Any, Any]],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[dict[str, Any]]: ...
     @overload
     def get[TAdapted](
@@ -244,7 +247,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TAdapted]: ...
     @overload
     def get[TData](
@@ -257,7 +260,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         into: TypeForm[TData],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TData]: ...
     @overload
     def get[THeaders: TypedHeaders](
@@ -271,7 +274,7 @@ class SyncHTTPClient:
         into: None = None,
         response_headers_type: type[THeaders],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     def get[THeaders: TypedHeaders](
@@ -285,7 +288,7 @@ class SyncHTTPClient:
         into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
     @overload
     def get[TAdapted, THeaders: TypedHeaders](
@@ -299,7 +302,7 @@ class SyncHTTPClient:
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
     @overload
     def get[TData, THeaders: TypedHeaders](
@@ -313,7 +316,7 @@ class SyncHTTPClient:
         into: TypeForm[TData],
         response_headers_type: type[THeaders],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TData, THeaders]: ...
     def get(
         self,
@@ -326,7 +329,7 @@ class SyncHTTPClient:
         into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[Any, Any]:
         """GET `path`, returning a `Response` whose `.data` is the body decoded as
         `into` (raw `bytes` by default), alongside `.status`, `.headers`,
@@ -339,7 +342,7 @@ class SyncHTTPClient:
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
         this call.
         """
         return self._transport.send(
@@ -376,7 +379,7 @@ class SyncHTTPClient:
         into: None = None,
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     def post(
@@ -394,7 +397,7 @@ class SyncHTTPClient:
         into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[dict[str, Any]]: ...
     @overload
     def post[TAdapted](
@@ -412,7 +415,7 @@ class SyncHTTPClient:
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TAdapted]: ...
     @overload
     def post[TData](
@@ -430,7 +433,7 @@ class SyncHTTPClient:
         into: TypeForm[TData],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TData]: ...
     @overload
     def post[THeaders: TypedHeaders](
@@ -449,7 +452,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     def post[THeaders: TypedHeaders](
@@ -468,7 +471,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
     @overload
     def post[TAdapted, THeaders: TypedHeaders](
@@ -487,7 +490,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
     @overload
     def post[TData, THeaders: TypedHeaders](
@@ -506,7 +509,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TData, THeaders]: ...
     def post(
         self,
@@ -524,7 +527,7 @@ class SyncHTTPClient:
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[Any, Any]:
         """POST to `path` with at most one of `json`/`data`/`form`/`content` (raises
         `ValueError` if more than one is given), returning a `Response` like `get`'s.
@@ -532,7 +535,7 @@ class SyncHTTPClient:
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
         this call.
 
         Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
@@ -573,7 +576,7 @@ class SyncHTTPClient:
         into: None = None,
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     def put(
@@ -591,7 +594,7 @@ class SyncHTTPClient:
         into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[dict[str, Any]]: ...
     @overload
     def put[TAdapted](
@@ -609,7 +612,7 @@ class SyncHTTPClient:
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TAdapted]: ...
     @overload
     def put[TData](
@@ -627,7 +630,7 @@ class SyncHTTPClient:
         into: TypeForm[TData],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TData]: ...
     @overload
     def put[THeaders: TypedHeaders](
@@ -646,7 +649,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     def put[THeaders: TypedHeaders](
@@ -665,7 +668,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
     @overload
     def put[TAdapted, THeaders: TypedHeaders](
@@ -684,7 +687,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
     @overload
     def put[TData, THeaders: TypedHeaders](
@@ -703,7 +706,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TData, THeaders]: ...
     def put(
         self,
@@ -721,13 +724,13 @@ class SyncHTTPClient:
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[Any, Any]:
         """PUT to `path`. Same body/decode rules as `post`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
         this call.
 
         Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
@@ -768,7 +771,7 @@ class SyncHTTPClient:
         into: None = None,
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     def patch(
@@ -786,7 +789,7 @@ class SyncHTTPClient:
         into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[dict[str, Any]]: ...
     @overload
     def patch[TAdapted](
@@ -804,7 +807,7 @@ class SyncHTTPClient:
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TAdapted]: ...
     @overload
     def patch[TData](
@@ -822,7 +825,7 @@ class SyncHTTPClient:
         into: TypeForm[TData],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TData]: ...
     @overload
     def patch[THeaders: TypedHeaders](
@@ -841,7 +844,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     def patch[THeaders: TypedHeaders](
@@ -860,7 +863,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
     @overload
     def patch[TAdapted, THeaders: TypedHeaders](
@@ -879,7 +882,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
     @overload
     def patch[TData, THeaders: TypedHeaders](
@@ -898,7 +901,7 @@ class SyncHTTPClient:
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TData, THeaders]: ...
     def patch(
         self,
@@ -916,13 +919,13 @@ class SyncHTTPClient:
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[Any, Any]:
         """PATCH `path`. Same body/decode rules as `post`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
         this call.
 
         Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
@@ -963,7 +966,7 @@ class SyncHTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         into: None = None,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     def delete(
@@ -981,7 +984,7 @@ class SyncHTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         into: type[dict[Any, Any]],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[dict[str, Any]]: ...
     @overload
     def delete[TAdapted](
@@ -999,7 +1002,7 @@ class SyncHTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TAdapted]: ...
     @overload
     def delete[TData](
@@ -1017,7 +1020,7 @@ class SyncHTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         into: TypeForm[TData],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TData]: ...
     @overload
     def delete[THeaders: TypedHeaders](
@@ -1036,7 +1039,7 @@ class SyncHTTPClient:
         into: None = None,
         response_headers_type: type[THeaders],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     def delete[THeaders: TypedHeaders](
@@ -1055,7 +1058,7 @@ class SyncHTTPClient:
         into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
     @overload
     def delete[TAdapted, THeaders: TypedHeaders](
@@ -1074,7 +1077,7 @@ class SyncHTTPClient:
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TAdapted, THeaders]: ...
     @overload
     def delete[TData, THeaders: TypedHeaders](
@@ -1093,7 +1096,7 @@ class SyncHTTPClient:
         into: TypeForm[TData],
         response_headers_type: type[THeaders],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[TData, THeaders]: ...
     def delete(
         self,
@@ -1111,14 +1114,14 @@ class SyncHTTPClient:
         into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[Any, Any]:
         """DELETE `path`, returning a `Response` like `get`'s. A body is rare on a DELETE but
         allowed: the same `json`/`data`/`form`/`content` options as `post`, at most one.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
         this call.
 
         Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
@@ -1153,7 +1156,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -1169,7 +1172,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: type[dict[Any, Any]],
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -1185,7 +1188,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeAdapterTyping[TData] | DecoderTyping[TData],
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -1201,7 +1204,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeForm[TData],
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -1216,7 +1219,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -1232,8 +1235,8 @@ class SyncHTTPClient:
         request timeout would kill every healthy stream on schedule. `timeout` bounds one
         connection attempt only; use the client's `read_timeout` to detect a stalled stream.
         `skip_auth` omits the `Authorization` header (and skips invoking `bearer_auth`) for this
-        call; `raises` overrides the client's own `raises` (the `HTTPResponseError` subclass a
-        4xx/5xx is raised as) for this call.
+        call; `raises` overrides the client's own `raises` (the `HTTPResponseError` subclasses a
+        4xx/5xx may be raised as) for this call.
 
         A 4xx/5xx response always raises `HTTPResponseError`, whatever the client's
         `raise_for_status`.
@@ -1282,7 +1285,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         interruptible: bool = False,
     ) -> Generator[bytes]: ...
     @overload
@@ -1295,7 +1298,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: type[dict[Any, Any]],
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         interruptible: bool = False,
     ) -> Generator[dict[str, Any]]: ...
     @overload
@@ -1308,7 +1311,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeAdapterTyping[TLine] | DecoderTyping[TLine],
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         interruptible: bool = False,
     ) -> Generator[TLine]: ...
     @overload
@@ -1321,7 +1324,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeForm[TLine],
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         interruptible: bool = False,
     ) -> Generator[TLine]: ...
     def stream_get(
@@ -1333,7 +1336,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         interruptible: bool = False,
     ) -> Generator[Any]:
         """Stream GET `path`'s response as raw `bytes` chunks (unbuffered, safe for binary).
@@ -1343,7 +1346,7 @@ class SyncHTTPClient:
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
         this call.
 
         A 4xx/5xx response always raises `HTTPResponseError`, whatever the client's
@@ -1393,7 +1396,7 @@ class SyncHTTPClient:
         content: str | bytes | None = None,
         into: None = None,
         infer_mime_type_from_file_extension: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         interruptible: bool = False,
     ) -> Generator[bytes]: ...
     @overload
@@ -1411,7 +1414,7 @@ class SyncHTTPClient:
         content: str | bytes | None = None,
         into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         interruptible: bool = False,
     ) -> Generator[dict[str, Any]]: ...
     @overload
@@ -1429,7 +1432,7 @@ class SyncHTTPClient:
         content: str | bytes | None = None,
         into: TypeAdapterTyping[TLine] | DecoderTyping[TLine],
         infer_mime_type_from_file_extension: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         interruptible: bool = False,
     ) -> Generator[TLine]: ...
     @overload
@@ -1447,7 +1450,7 @@ class SyncHTTPClient:
         content: str | bytes | None = None,
         into: TypeForm[TLine],
         infer_mime_type_from_file_extension: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         interruptible: bool = False,
     ) -> Generator[TLine]: ...
     def stream_post(
@@ -1464,7 +1467,7 @@ class SyncHTTPClient:
         content: str | bytes | None = None,
         into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         interruptible: bool = False,
     ) -> Generator[Any]:
         """Like `stream_get`, but POST a body first — same `json`/`data`/`form`/`content`
@@ -1473,7 +1476,7 @@ class SyncHTTPClient:
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
         this call.
 
         A 4xx/5xx response always raises `HTTPResponseError`, whatever the client's
@@ -1519,7 +1522,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[bytes]: ...
     @overload
     def download(
@@ -1532,7 +1535,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[Path]: ...
     def download(
         self,
@@ -1544,7 +1547,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[bytes] | Response[Path]:
         """Download `path`'s response body, optimized for large objects (e.g. a presigned GET
         URL for a multi-GB file) — much lower peak memory than `get()` for big bodies.
@@ -1562,7 +1565,7 @@ class SyncHTTPClient:
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
         this call.
         """
         return self._transport.download(
@@ -1586,7 +1589,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[None]: ...
     @overload
     def head[THeaders: TypedHeaders](
@@ -1599,7 +1602,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[THeaders],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[None, THeaders]: ...
     def head(
         self,
@@ -1611,14 +1614,14 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[TypedHeaders] | None = None,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[None, Any]:
         """HEAD `path` — headers-only, no body is ever decoded. Pass
         `response_headers_type` to get the response headers parsed into `.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
         this call.
 
         Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
@@ -1647,7 +1650,7 @@ class SyncHTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[None]: ...
     @overload
     def options[THeaders: TypedHeaders](
@@ -1660,7 +1663,7 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[THeaders],
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[None, THeaders]: ...
     def options(
         self,
@@ -1672,14 +1675,14 @@ class SyncHTTPClient:
         skip_auth: bool = False,
         response_headers_type: type[TypedHeaders] | None = None,
         raise_for_status: bool | None = None,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
     ) -> Response[None, Any]:
         """OPTIONS `path` (e.g. a CORS preflight) — status and headers only, any body is discarded.
         Pass `response_headers_type` to get the response headers parsed into `.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
         this call.
 
         Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,

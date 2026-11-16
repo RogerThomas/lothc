@@ -77,7 +77,8 @@ async def test_response_get_raise_for_status_false_returns_the_error_response(
     assert result.request.path == "/boom"
     assert result.headers["content-type"] == "application/json"
     assert result.elapsed > 0
-    assert result.error == {
+    assert result.error is not None
+    assert result.error.problem == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,
@@ -110,7 +111,8 @@ def test_sync_get_result_raise_for_status_false_returns_the_error_response(
 
     assert result.status == 500
     assert result.request.path == "/boom"
-    assert result.error == {
+    assert result.error is not None
+    assert result.error.problem == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,

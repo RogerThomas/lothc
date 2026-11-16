@@ -66,8 +66,9 @@ async def test_head_raise_for_status_false_returns_the_error_response(
     result = await client.head("missing", raise_for_status=False)
 
     assert result.status == 404
-    assert result.raw_error == b""
-    assert result.error is None
+    assert result.error is not None
+    assert result.error.body == b""
+    assert result.error.problem is None
     with pytest.raises(HTTPResponseError) as exc_info:
         _ = result.data
     assert exc_info.value.status == 404
@@ -110,8 +111,9 @@ async def test_options_raise_for_status_false_returns_the_error_response(
     result = await client.options("missing", raise_for_status=False)
 
     assert result.status == 404
-    assert result.raw_error == b""
-    assert result.error is None
+    assert result.error is not None
+    assert result.error.body == b""
+    assert result.error.problem is None
     with pytest.raises(HTTPResponseError) as exc_info:
         _ = result.data
     assert exc_info.value.status == 404

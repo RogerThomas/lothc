@@ -34,14 +34,15 @@ async def test_download_raise_for_status_false_returns_the_error_response(
     response = await client.download("boom", raise_for_status=False)
 
     assert response.status == 500
-    assert response.error == {
+    assert response.error is not None
+    assert response.error.problem == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,
     }
     with pytest.raises(HTTPResponseError) as exc_info:
         _ = response.data
-    assert exc_info.value.body == response.raw_error
+    assert exc_info.value.body == response.error.body
 
 
 async def test_download_raise_for_status_false_writes_nothing_to_dest(
@@ -50,8 +51,8 @@ async def test_download_raise_for_status_false_writes_nothing_to_dest(
     response = await client.download("boom", tmp_path / "out.bin", raise_for_status=False)
 
     assert response.status == 500
-    assert response.raw_error is not None
-    assert b"internal-server-error" in response.raw_error
+    assert response.error is not None
+    assert b"internal-server-error" in response.error.body
     assert list(tmp_path.iterdir()) == []
 
 
@@ -89,7 +90,8 @@ def test_sync_download_raise_for_status_false_returns_the_error_response(
     assert response.status == 500
     with pytest.raises(HTTPResponseError) as exc_info:
         _ = response.data
-    assert exc_info.value.body == response.raw_error
+    assert response.error is not None
+    assert exc_info.value.body == response.error.body
 
 
 def test_sync_download_raise_for_status_false_writes_nothing_to_dest(
@@ -98,7 +100,8 @@ def test_sync_download_raise_for_status_false_writes_nothing_to_dest(
     response = sync_client.download("boom", tmp_path / "out.bin", raise_for_status=False)
 
     assert response.status == 500
-    assert response.error == {
+    assert response.error is not None
+    assert response.error.problem == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,

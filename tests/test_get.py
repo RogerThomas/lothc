@@ -199,8 +199,8 @@ async def test_get_raises_response_error_on_an_error_status(client: HTTPClient) 
 async def test_get_raise_for_status_false_returns_the_error_response(client: HTTPClient) -> None:
     response = await client.get("boom", raise_for_status=False)
     assert response.status == 500
-    assert response.raw_error is not None
-    assert b"internal-server-error" in response.raw_error
+    assert response.error is not None
+    assert b"internal-server-error" in response.error.body
 
 
 async def test_get_into_not_a_type_raises_type_error(client: HTTPClient) -> None:
@@ -276,8 +276,8 @@ def test_sync_get_raise_for_status_false_returns_the_error_response(
 ) -> None:
     response = sync_client.get("boom", raise_for_status=False)
     assert response.status == 500
-    assert response.raw_error is not None
-    assert b"internal-server-error" in response.raw_error
+    assert response.error is not None
+    assert b"internal-server-error" in response.error.body
 
 
 def test_sync_get_into_not_a_type_raises_type_error(sync_client: SyncHTTPClient) -> None:

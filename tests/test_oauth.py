@@ -1473,7 +1473,7 @@ async def test_a_cached_token_rejected_twice_by_a_get_is_retried_only_once(
         with pytest.raises(HTTPResponseError) as exc_info:
             await api.get("always-unauthorized", params={"key": f"{token_server.key}-api"})
 
-    assert exc_info.value.error == {"hits": 2}  # the original request plus exactly one retry
+    assert exc_info.value.problem == {"hits": 2}  # the original request plus exactly one retry
     assert len(token_server.requests()) == 2
 
 
@@ -1489,7 +1489,7 @@ def test_sync_a_cached_token_rejected_twice_by_a_get_is_retried_only_once(
     ):
         api.get("always-unauthorized", params={"key": f"{token_server.key}-api"})
 
-    assert exc_info.value.error == {"hits": 2}  # the original request plus exactly one retry
+    assert exc_info.value.problem == {"hits": 2}  # the original request plus exactly one retry
     assert len(token_server.requests()) == 2
 
 

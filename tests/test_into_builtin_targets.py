@@ -163,7 +163,7 @@ async def test_a_str_pinned_error_is_the_body_text(client: HTTPClient) -> None:
     with pytest.raises(TextError) as exc_info:
         await client.get("invalid-json-error", raises=TextError)
 
-    assert exc_info.value.error == "<html><body>502 Bad Gateway</body></html>"
+    assert exc_info.value.problem == "<html><body>502 Bad Gateway</body></html>"
     assert exc_info.value.parse_error is None
 
 
@@ -171,7 +171,7 @@ def test_sync_a_str_pinned_error_is_the_body_text(sync_client: SyncHTTPClient) -
     with pytest.raises(TextError) as exc_info:
         sync_client.get("invalid-json-error", raises=TextError)
 
-    assert exc_info.value.error == "<html><body>502 Bad Gateway</body></html>"
+    assert exc_info.value.problem == "<html><body>502 Bad Gateway</body></html>"
 
 
 class DeepDict(dict[str, Any]):
@@ -196,7 +196,7 @@ async def test_a_deeply_nested_error_body_gives_no_error(client: HTTPClient) -> 
         await client.get("deeply-nested-error")
 
     assert exc_info.value.status == 500
-    assert exc_info.value.error is None
+    assert exc_info.value.problem is None
 
 
 def test_sync_a_deeply_nested_error_body_gives_no_error(sync_client: SyncHTTPClient) -> None:
@@ -204,16 +204,18 @@ def test_sync_a_deeply_nested_error_body_gives_no_error(sync_client: SyncHTTPCli
         sync_client.get("deeply-nested-error")
 
     assert exc_info.value.status == 500
-    assert exc_info.value.error is None
+    assert exc_info.value.problem is None
 
 
 async def test_a_deeply_nested_body_for_a_pinned_error_sets_parse_error(
     client: HTTPClient,
 ) -> None:
-    with pytest.raises(DeepDictError) as exc_info:
+    with pytest.raises(HTTPResponseError) as exc_info:
         await client.get("deeply-nested-error", raises=DeepDictError)
 
-    assert exc_info.value.error is None
+    # A pinned type that doesn't decode the body doesn't match: plain `HTTPResponseError`.
+    assert type(exc_info.value) is HTTPResponseError
+    assert exc_info.value.problem is None
     assert isinstance(exc_info.value.parse_error, ValueError)
     assert isinstance(exc_info.value.parse_error.__cause__, RecursionError)
 
@@ -221,10 +223,12 @@ async def test_a_deeply_nested_body_for_a_pinned_error_sets_parse_error(
 def test_sync_a_deeply_nested_body_for_a_pinned_error_sets_parse_error(
     sync_client: SyncHTTPClient,
 ) -> None:
-    with pytest.raises(DeepDictError) as exc_info:
+    with pytest.raises(HTTPResponseError) as exc_info:
         sync_client.get("deeply-nested-error", raises=DeepDictError)
 
-    assert exc_info.value.error is None
+    # A pinned type that doesn't decode the body doesn't match: plain `HTTPResponseError`.
+    assert type(exc_info.value) is HTTPResponseError
+    assert exc_info.value.problem is None
     assert isinstance(exc_info.value.parse_error, ValueError)
     assert isinstance(exc_info.value.parse_error.__cause__, RecursionError)
 
@@ -232,11 +236,13 @@ def test_sync_a_deeply_nested_body_for_a_pinned_error_sets_parse_error(
 async def test_a_pinned_dict_subclass_rejecting_the_body_sets_parse_error(
     client: HTTPClient,
 ) -> None:
-    with pytest.raises(RejectingDictError) as exc_info:
+    with pytest.raises(HTTPResponseError) as exc_info:
         await client.get("boom", raises=RejectingDictError)
 
+    # A pinned type that doesn't decode the body doesn't match: plain `HTTPResponseError`.
+    assert type(exc_info.value) is HTTPResponseError
     assert exc_info.value.status == 500
-    assert type(exc_info.value.error) is dict
+    assert type(exc_info.value.problem) is dict
     assert isinstance(exc_info.value.parse_error, ValueError)
     assert isinstance(exc_info.value.parse_error.__cause__, TypeError)
 
@@ -244,11 +250,13 @@ async def test_a_pinned_dict_subclass_rejecting_the_body_sets_parse_error(
 def test_sync_a_pinned_dict_subclass_rejecting_the_body_sets_parse_error(
     sync_client: SyncHTTPClient,
 ) -> None:
-    with pytest.raises(RejectingDictError) as exc_info:
+    with pytest.raises(HTTPResponseError) as exc_info:
         sync_client.get("boom", raises=RejectingDictError)
 
+    # A pinned type that doesn't decode the body doesn't match: plain `HTTPResponseError`.
+    assert type(exc_info.value) is HTTPResponseError
     assert exc_info.value.status == 500
-    assert type(exc_info.value.error) is dict
+    assert type(exc_info.value.problem) is dict
     assert isinstance(exc_info.value.parse_error, ValueError)
     assert isinstance(exc_info.value.parse_error.__cause__, TypeError)
 

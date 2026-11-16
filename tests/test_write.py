@@ -461,7 +461,8 @@ async def test_response_post_raise_for_status_false_returns_the_error_response(
     result = await client.post("missing", raise_for_status=False)
 
     assert result.status == 404
-    assert result.error == {"type": "not-found", "title": "Not found", "status": 404}
+    assert result.error is not None
+    assert result.error.problem == {"type": "not-found", "title": "Not found", "status": 404}
 
 
 async def test_response_put_includes_status_and_data(client: HTTPClient) -> None:
