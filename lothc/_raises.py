@@ -330,6 +330,7 @@ class _ErrorResponse(Response[Any, Any]):
         http_version: str,
         elapsed: float,
         body: bytes,
+        error: HTTPResponseError[Any] | None = None,
     ) -> None:
         # No `super().__init__()`: it would set `.data` and `.typed_headers`, which raise here.
         self._raises = raises
@@ -339,6 +340,10 @@ class _ErrorResponse(Response[Any, Any]):
         self.request = request
         self.http_version = http_version
         self.elapsed = elapsed
+        # The error already built for this response (the one a `retry=` rule was shown), kept
+        # as `.error`, so the rule and the caller see one object.
+        if error is not None:
+            self.__dict__["_error"] = error
 
     @cached_property
     def _match(self) -> tuple[type[HTTPResponseError[Any]], Any, ValueError | None]:

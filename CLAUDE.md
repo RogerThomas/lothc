@@ -168,7 +168,7 @@ or editing Python here.
     that opened it.
 - **Redirects run in Rust; retries and re-auth in Python.** A hop's headers must be reqwest's,
   in reqwest's order, which only the same Rust calls produce. Retries wrap the whole redirect
-  chain, as pyreqwest's middleware does.
+  chain, on both transports.
 - **Streaming shares one Python implementation with pyreqwest**: a transport supplies only a
   chunk source. Native reads at most two chunks ahead and stops reading the socket while nobody
   reads, so a slow consumer never buffers a whole body.
@@ -191,6 +191,15 @@ or editing Python here.
 - **Auth is `bearer_token`/`bearer_auth`/`basic_auth`**, one pyreqwest mechanism each, at most one.
 - **`max_retry_after` (60s) stops retrying instead of clamping**, leaving the caller to schedule
   from `Retry-After`; an early retry against a long wait is usually rejected again.
+- **Both transports retry in one Python loop** (`_retried`, decided 2026-11-16): pyreqwest's
+  retry middleware cost every async request ~57us, retried or not.
+- **Retries are bounded by settings, then decided by a rule** (decided 2026-11-16):
+  `retry_statuses` and `retry_methods` say what may be retried, `max_retries` (client, or per
+  call, where it also opts a verb in) how often, and `retry=` (a sync function on both clients,
+  so one type) is asked only about such a failure, so it can't retry a 404. It gets the error
+  the call would raise, so a rule can use the `raises=` classes, and lothc's own wait.
+  `max_retry_after` caps its answer too. No per-call `retry_statuses`/`retry=`: the rule can
+  branch on the method. Deferred: telling a never-sent request apart (needs Rust).
 - **A 401 re-authenticates once**, idempotent verbs only, through any `bearer_auth` that can
   `invalidate()`. A stale invalidation is a no-op, so concurrent 401s can't discard a fresh token.
 

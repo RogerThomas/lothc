@@ -155,11 +155,36 @@ type _SyncChunkReader = Callable[[], Buffer | None]
 
 
 @dataclass(slots=True)
+class _ReplayedBody:
+    """A body already read whole, handed out again as a stream's one chunk (`read`, a
+    `_ChunkReader`): an error status's, which a `retry=` rule was shown before retrying stopped,
+    for a `download(raise_for_status=False)` to return."""
+
+    body: bytes | None
+
+    async def read(self) -> bytes | None:
+        body, self.body = self.body, None
+        return body
+
+
+@dataclass(slots=True)
+class _SyncReplayedBody:
+    """Sync mirror of `_ReplayedBody`."""
+
+    body: bytes | None
+
+    def read(self) -> bytes | None:
+        body, self.body = self.body, None
+        return body
+
+
+@dataclass(slots=True)
 class _StreamCall:
     """A streaming verb's request, as the client passed it, for a transport's stream source to
     build. `timeout` is the total cap the transport chose for it (`None`: none). `check_status`
     is whether the source raises a 4xx/5xx: always for `stream_get`/`stream_post`/`sse`, and for
-    `download` unless `raise_for_status=False` leaves the status to `_download_stream`."""
+    `download` unless `raise_for_status=False` leaves the status to `_download_stream`. A
+    transport's source retries opening it as `_call_retries` says for `max_retries`."""
 
     params: Params | None
     headers: Headers | None
@@ -173,6 +198,8 @@ class _StreamCall:
     infer_mime_type_from_file_extension: bool = True
     check_status: bool
     raises: _RaisesArg | None
+    # The call's own `max_retries` (`None`: the client's); `sse()` never passes one.
+    max_retries: int | None = None
 
 
 class _StreamSource(Protocol):

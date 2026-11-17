@@ -17,7 +17,7 @@ from ._oauth import (
     TokenResponseTyping,
 )
 from ._response import Response
-from ._settings import NativeMode, TlsVersion
+from ._settings import NativeMode, RetryAttempt, TlsVersion
 from ._sse import SSEEvent
 from ._sync_client import SyncHTTPClient
 from ._types import (
@@ -52,6 +52,7 @@ __all__ = [
     "Params",
     "RequestInfo",
     "Response",
+    "RetryAttempt",
     "SSEEvent",
     "SyncAuthProvider",
     "SyncHTTPClient",

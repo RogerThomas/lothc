@@ -1,55 +1,92 @@
 """Retrying as both transports do it (`max_retries=` and friends): which statuses are retried, how
-long to wait before the next attempt, and when a server's `Retry-After` ends retrying instead.
+long to wait before the next attempt, when a server's `Retry-After` ends retrying instead, and
+asking a client's `retry=` rule about each failure that would be retried.
 
-The pyreqwest transport retries in a middleware around each `send()` (`_RetryMiddleware`); the
-native one runs `_retried` around each exchange instead, the same loop over the same helpers, so
-the two retry exactly alike.
+Both transports run `_retried` around each exchange (a whole redirect chain, re-authentication
+included), one loop over the same helpers, so the two retry exactly alike. Not a pyreqwest client
+middleware: that cost every async request ~57us, retried or not.
 """
 
 import asyncio
+import inspect
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
+from typing import Any
 
-from ._errors import HTTPTransportError
-from ._settings import _TransportSettings
+from ._errors import HTTPResponseError, HTTPTransportError
+from ._settings import RetryAttempt, _RetryRule, _TransportSettings, _validate_max_retries
 
 
 @dataclass(slots=True, frozen=True)
 class _RetryPolicy:
-    """A client's `max_retries`/`retry_methods`/`backoff_base`/`max_retry_after`, when it retries
-    at all (`_retry_policy`)."""
+    """A client's `max_retries`/`retry_methods`/`retry_statuses`/`backoff_base`/
+    `max_retry_after`/`retry` (`_retry_policy`)."""
 
     max_retries: int
-    # The upper-case methods that are retried; any other request goes out once.
+    # The upper-case methods the client retries: none when `max_retries` is 0, so a method's
+    # membership alone says whether a call that doesn't pass its own `max_retries` retries.
     methods: frozenset[str]
+    # The statuses that are retried; any other comes back from the first attempt.
+    statuses: frozenset[int]
     backoff_base: float
     # The longest `Retry-After` honoured; a longer one ends retrying instead (`None`: no limit).
     max_retry_after: float | None
+    # The client's `retry=`, asked about each failure the loop would retry (`None`: none).
+    rule: _RetryRule | None
 
 
-def _retry_policy(settings: _TransportSettings) -> _RetryPolicy | None:
-    """The client's retry policy, `None` without retries (`max_retries` below 1)."""
-    if settings.max_retries <= 0:
-        return None
+@dataclass(slots=True)
+class _RetryRuling[T]:
+    """What `_retried` needs to ask the client's `retry=` rule about an attempt: the rule, the
+    call's method, and `status_error`, the `HTTPResponseError` an outcome's status would raise
+    (its body read whole). Built per call, and only when the client has a rule, so a client
+    without one pays nothing per attempt."""
+
+    rule: _RetryRule
+    method: str
+    status_error: Callable[[T], Awaitable[HTTPResponseError[Any]]]
+
+
+@dataclass(slots=True)
+class _SyncRetryRuling[T]:
+    """Sync mirror of `_RetryRuling`."""
+
+    rule: _RetryRule
+    method: str
+    status_error: Callable[[T], HTTPResponseError[Any]]
+
+
+def _retry_policy(settings: _TransportSettings) -> _RetryPolicy:
     return _RetryPolicy(
         settings.max_retries,
-        settings.retry_methods,
+        settings.retry_methods if settings.max_retries > 0 else frozenset(),
+        settings.retry_statuses,
         settings.backoff_base,
         settings.max_retry_after,
+        settings.retry_rule,
     )
 
 
-def _is_retryable_status(status: int) -> bool:
-    """Whether a response's status is worth another attempt: rate limiting and the server errors a
-    retry can outlast, never a 501 or 505, which no retry changes.
+def _call_retries(retry: _RetryPolicy, method: str, max_retries: int | None) -> int:
+    """How many times one call may be retried: its own `max_retries`, else the client's for a
+    method the client retries, else none. A call's own count opts it in whatever its method,
+    since the caller asked for it; it's refused here, before sending, if it isn't a count. The
+    multipart `form=` send-once rule is the caller's to apply on top.
 
-    >>> [code for code in (408, 429, 500, 501, 502, 503, 504, 505) if _is_retryable_status(code)]
-    [429, 500, 502, 503, 504]
+    >>> policy = _RetryPolicy(2, frozenset({"GET"}), frozenset({503}), 0.1, 60.0, None)
+    >>> _call_retries(policy, "GET", None), _call_retries(policy, "POST", None)
+    (2, 0)
+    >>> _call_retries(policy, "GET", 0), _call_retries(policy, "POST", 5)
+    (0, 5)
     """
-    return status in {429, 500, 502, 503, 504}
+    if max_retries is None:
+        return retry.max_retries if method in retry.methods else 0
+    _validate_max_retries(max_retries)
+    return max_retries
 
 
 def _parse_retry_after(value: str | None) -> float | None:
@@ -86,56 +123,137 @@ def _retry_after_exceeds(retry_after: float | None, limit: float | None) -> bool
     return retry_after is not None and limit is not None and retry_after > limit
 
 
+def _ruled_wait(retry: _RetryPolicy, rule: _RetryRule, asked: RetryAttempt) -> float | None:
+    """What a `retry=` rule's answer about `asked` means: the seconds to wait (a negative answer
+    as 0), or `None` to stop retrying, which an answer above `max_retry_after` also means, as an
+    over-long `Retry-After` does. Anything but a number or `None` is the rule's bug, raised from
+    the call: no type checker catches a `return False` meant as "stop", which would otherwise
+    retry at once.
+
+    >>> policy = _RetryPolicy(2, frozenset({"GET"}), frozenset({503}), 0.1, 60.0, None)
+    >>> asked = RetryAttempt(0, HTTPTransportError("x"), 0.1, "GET", 0.0)
+    >>> [_ruled_wait(policy, lambda _: answer, asked) for answer in (None, 2, -1.0, 61.0)]
+    [None, 2.0, 0.0, None]
+    >>> _ruled_wait(policy, lambda _: False, asked)
+    Traceback (most recent call last):
+    ...
+    TypeError: a retry rule returns the seconds to wait or None to stop, not False
+    """
+    answer = rule(asked)
+    if answer is None:
+        return None
+    if isinstance(answer, bool) or not isinstance(answer, (int, float)):  # pyright: ignore[reportUnnecessaryIsInstance]
+        if inspect.iscoroutine(answer):
+            answer.close()  # never awaited: closed, so it doesn't warn as well
+        raise TypeError(f"a retry rule returns the seconds to wait or None to stop, not {answer!r}")
+    if not math.isfinite(answer):
+        raise ValueError(f"a retry rule's wait must be a finite number of seconds, not {answer!r}")
+    wait = max(0.0, float(answer))
+    if _retry_after_exceeds(wait, retry.max_retry_after):
+        return None
+    return wait
+
+
 async def _retried[T](
     retry: _RetryPolicy,
+    retries: int,
     attempt: Callable[[], Awaitable[T]],
     retry_signal: Callable[[T], tuple[int, str | None]],
     retryable: Callable[[HTTPTransportError], bool],
-) -> T:
-    """`_RetryMiddleware`, for the native transport: `attempt()` until one succeeds, fails in a
-    way no retry fixes (an error `retryable` turns down), or the attempts run out, waiting as
-    `_RetryMiddleware` waits in between. `retry_signal` reads the status and `Retry-After` off
-    what an attempt returned."""
-    for number in range(retry.max_retries + 1):
+    ruling: _RetryRuling[T] | None,
+) -> tuple[T, HTTPResponseError[Any] | None]:
+    """`attempt()` until one succeeds, fails in a way no retry fixes (an error `retryable` turns
+    down, a status outside `retry.statuses`), or the `retries` after the first run out, with
+    `retry`'s backoff in between. `retry_signal` reads the status and `Retry-After` off what an
+    attempt returned; an outcome the loop turns down is the attempt's own to release (the next
+    `attempt()` call).
+
+    With a `ruling`, the client's rule is asked about each failure the loop would retry, and its
+    answer replaces the wait (`_ruled_wait`). Returns the last outcome, with the status error the
+    rule was shown for it when the rule stopped retrying on it (`None` otherwise): its body has
+    been read, so the caller raises or returns that error rather than reading the body again."""
+    started = 0.0 if ruling is None else time.monotonic()
+    for number in range(retries + 1):
         try:
             outcome = await attempt()
         except HTTPTransportError as error:
-            if number == retry.max_retries or not retryable(error):
+            if number == retries or not retryable(error):
                 raise
-            await asyncio.sleep(_backoff_delay(number, retry.backoff_base, retry_after=None))
+            wait = _backoff_delay(number, retry.backoff_base, retry_after=None)
+            if ruling is not None:
+                elapsed = time.monotonic() - started
+                asked = RetryAttempt(number, error, wait, ruling.method, elapsed)
+                ruled = _ruled_wait(retry, ruling.rule, asked)
+                if ruled is None:
+                    raise
+                wait = ruled
+            await asyncio.sleep(wait)
             continue
         status, retry_after_header = retry_signal(outcome)
-        if number == retry.max_retries or not _is_retryable_status(status):
-            return outcome
+        if number == retries or status not in retry.statuses:
+            return outcome, None
         retry_after = _parse_retry_after(retry_after_header)
-        if _retry_after_exceeds(retry_after, retry.max_retry_after):
-            return outcome
-        await asyncio.sleep(_backoff_delay(number, retry.backoff_base, retry_after))
-    # range(max_retries+1) is never empty, so this is never actually reached.
+        wait = _backoff_delay(number, retry.backoff_base, retry_after)
+        if ruling is None:
+            if _retry_after_exceeds(retry_after, retry.max_retry_after):
+                return outcome, None
+        else:
+            error = await ruling.status_error(outcome)
+            elapsed = time.monotonic() - started
+            ruled = _ruled_wait(
+                retry, ruling.rule, RetryAttempt(number, error, wait, ruling.method, elapsed)
+            )
+            if ruled is None:
+                return outcome, error
+            wait = ruled
+        await asyncio.sleep(wait)
+    # range(retries+1) is never empty, so this is never actually reached.
     raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _retried_sync[T](
     retry: _RetryPolicy,
+    retries: int,
     attempt: Callable[[], T],
     retry_signal: Callable[[T], tuple[int, str | None]],
     retryable: Callable[[HTTPTransportError], bool],
-) -> T:
+    ruling: _SyncRetryRuling[T] | None,
+) -> tuple[T, HTTPResponseError[Any] | None]:
     """Sync mirror of `_retried`."""
-    for number in range(retry.max_retries + 1):
+    started = 0.0 if ruling is None else time.monotonic()
+    for number in range(retries + 1):
         try:
             outcome = attempt()
         except HTTPTransportError as error:
-            if number == retry.max_retries or not retryable(error):
+            if number == retries or not retryable(error):
                 raise
-            time.sleep(_backoff_delay(number, retry.backoff_base, retry_after=None))
+            wait = _backoff_delay(number, retry.backoff_base, retry_after=None)
+            if ruling is not None:
+                elapsed = time.monotonic() - started
+                asked = RetryAttempt(number, error, wait, ruling.method, elapsed)
+                ruled = _ruled_wait(retry, ruling.rule, asked)
+                if ruled is None:
+                    raise
+                wait = ruled
+            time.sleep(wait)
             continue
         status, retry_after_header = retry_signal(outcome)
-        if number == retry.max_retries or not _is_retryable_status(status):
-            return outcome
+        if number == retries or status not in retry.statuses:
+            return outcome, None
         retry_after = _parse_retry_after(retry_after_header)
-        if _retry_after_exceeds(retry_after, retry.max_retry_after):
-            return outcome
-        time.sleep(_backoff_delay(number, retry.backoff_base, retry_after))
-    # range(max_retries+1) is never empty, so this is never actually reached.
+        wait = _backoff_delay(number, retry.backoff_base, retry_after)
+        if ruling is None:
+            if _retry_after_exceeds(retry_after, retry.max_retry_after):
+                return outcome, None
+        else:
+            error = ruling.status_error(outcome)
+            elapsed = time.monotonic() - started
+            ruled = _ruled_wait(
+                retry, ruling.rule, RetryAttempt(number, error, wait, ruling.method, elapsed)
+            )
+            if ruled is None:
+                return outcome, error
+            wait = ruled
+        time.sleep(wait)
+    # range(retries+1) is never empty, so this is never actually reached.
     raise AssertionError("unreachable")  # pragma: no cover

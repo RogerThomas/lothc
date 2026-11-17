@@ -35,6 +35,8 @@ async with HTTPClient(
     retry_methods=None,  # set/frozenset/list/tuple of str, case-insensitive; empty = retry nothing
     backoff_base=0.1,
     max_retry_after=60.0,
+    retry_statuses=None,  # set/tuple/range of 4xx/5xx; None = 429, 500, 502, 503, 504
+    retry=None,  # Callable[[RetryAttempt], float | None], not async (see Retries)
     connect_timeout=None,
     read_timeout=None,
     root_certificates=None,
@@ -129,11 +131,11 @@ Every body verb returns a `Response[TData]`: `.data` (the body decoded as `into`
 `.http_version` (e.g. `"HTTP/1.1"`), `.elapsed` (seconds, including retries) and `.error` (see
 `raise_for_status` below).
 
-- `get(path, *, params=None, headers=None, into=None, response_headers_type=None, raise_for_status=None, raises=None) -> Response[Data]`
-- `post/put/patch(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, into=None, response_headers_type=None, raise_for_status=None, raises=None) -> Response[Data]` —
+- `get(path, *, params=None, headers=None, into=None, response_headers_type=None, raise_for_status=None, raises=None, max_retries=None) -> Response[Data]`
+- `post/put/patch(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, into=None, response_headers_type=None, raise_for_status=None, raises=None, max_retries=None) -> Response[Data]` —
   at most one of `json`/`data`/`form`/`content`, else `ValueError`
 - `delete(path, *, params=None, headers=None, json=None, data=None, form=None, content=None, into=None, ...) -> Response[Data]` — a body is optional
-- `head(path, *, params=None, headers=None, response_headers_type=None, raise_for_status=None) -> Response[None]`
+- `head(path, *, params=None, headers=None, response_headers_type=None, raise_for_status=None, max_retries=None) -> Response[None]`
 - `sse(path, *, params=None, headers=None, into=None) -> Generator[SSEEvent[TData]]` —
   yields `SSEEvent(id=, event=, data=)` (kw-only dataclass, `SSEEvent[TData]`).
   `into` controls `.data` only (default `str`); any type expression | `TypeAdapter` | `Decoder`.
@@ -192,11 +194,20 @@ lookups, `get_all(name)` for a repeated header's every value.
 
 ## Retries
 
-`max_retries` (default `0` = off), `retry_methods` (default `{GET,PUT,DELETE,HEAD}` — `POST`/
-`PATCH` need explicit opt-in). Backoff `backoff_base * 2 ** attempt`; retries on transport error or
-status in `{429,500,502,503,504}`; honours `Retry-After` up to `max_retry_after` (default 60s),
-beyond which retrying stops and the 429/503 is raised. Never retried: a request that can't be built
-(e.g. `https_only` against `http://`), a redirect loop, a body cut short mid-read.
+`max_retries` (default `0` = off; negative → `ValueError`, non-int → `TypeError`, at construction),
+`retry_methods` (default `{GET,PUT,DELETE,HEAD,OPTIONS}` — `POST`/`PATCH` need explicit opt-in).
+Backoff `backoff_base * 2 ** attempt`; retries on transport error (a body cut short included) or a
+status in `retry_statuses`; honours `Retry-After` up to `max_retry_after` (default 60s), beyond
+which retrying stops and the 429/503 is raised. A verb's `max_retries=` (all but `sse`) replaces the
+client's for that call (`0` = once) and opts in a verb outside `retry_methods`. Never retried: a
+request that can't be built (e.g. `https_only` against `http://`), a redirect loop, a corrupt body,
+a multipart `form=` request.
+
+`retry=rule` is asked about each failure that would be retried, with a `RetryAttempt(attempt,
+error, delay, method, elapsed)` (`error`: the `HTTPResponseError`/`raises=` class or
+`HTTPTransportError` the call would raise; `delay`: lothc's own wait); it returns seconds to wait or
+`None` to stop. Its wait is capped by `max_retry_after` (above → stop); non-finite/non-number →
+`ValueError`/`TypeError`. `sse()` asks it only when opening a connection.
 
 ## Testing (`lothc[testing]`, `lothc/testing.py`)
 

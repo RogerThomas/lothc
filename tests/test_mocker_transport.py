@@ -430,6 +430,54 @@ def test_sync_a_retry_asks_the_mocks_again(base_url: str, lothc_mocker: LOTHCMoc
     mock.assert_called(count=3)
 
 
+async def test_a_call_max_retries_asks_the_mocks_again(
+    base_url: str, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items", status=409)
+
+    async with HTTPClient(base_url=base_url, retry_statuses={409}, backoff_base=0.001) as client:
+        with pytest.raises(HTTPResponseError):
+            await client.get("items", max_retries=2)
+
+    mock.assert_called(count=3)
+
+
+def test_sync_a_call_max_retries_asks_the_mocks_again(
+    base_url: str, lothc_mocker: LOTHCMocker
+) -> None:
+    mock = lothc_mocker.add_get_response(path="/items", status=409)
+
+    with (
+        SyncHTTPClient(base_url=base_url, retry_statuses={409}, backoff_base=0.001) as client,
+        pytest.raises(HTTPResponseError),
+    ):
+        client.get("items", max_retries=2)
+
+    mock.assert_called(count=3)
+
+
+async def test_a_mocked_stream_is_retried(base_url: str, lothc_mocker: LOTHCMocker) -> None:
+    mock = lothc_mocker.add_get_response(path="/items", status=503)
+
+    async with HTTPClient(base_url=base_url, backoff_base=0.001) as client:
+        chunks = client.stream_get("items", max_retries=1)
+        with pytest.raises(HTTPResponseError):
+            _ = [chunk async for chunk in chunks]
+
+    mock.assert_called(count=2)
+
+
+def test_sync_a_mocked_stream_is_retried(base_url: str, lothc_mocker: LOTHCMocker) -> None:
+    mock = lothc_mocker.add_get_response(path="/items", status=503)
+
+    with SyncHTTPClient(base_url=base_url, backoff_base=0.001) as client:
+        chunks = client.stream_get("items", max_retries=1)
+        with pytest.raises(HTTPResponseError):
+            _ = list(chunks)
+
+    mock.assert_called(count=2)
+
+
 async def test_a_mocked_401_reauthenticates_through_the_mocks(
     base_url: str, lothc_mocker: LOTHCMocker
 ) -> None:
