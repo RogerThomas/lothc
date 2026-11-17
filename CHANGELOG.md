@@ -7,6 +7,37 @@ messages; 0.0.17 to 0.0.19 were hand-written in the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. Releases up to and including
 0.0.16 predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/releases).
 
+## [0.4.0](https://github.com/RogerThomas/lothc/compare/0.3.0...0.4.0) (2026-11-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* the client's `max_retries` is validated at construction: a negative value is a `ValueError` (it silently meant no retries) and a non-int a `TypeError`.
+* a decode failure on a successful response no longer raises the decode library's error directly (`msgspec.ValidationError`, `pydantic.ValidationError`, `json.JSONDecodeError`): catch `HTTPDecodeError`, or `ValueError`, and read `.parse_error`.
+* `HTTPResponseError.error` is renamed `.problem`. A pinned `raises=` class whose type doesn't decode the body no longer raises that class with a dict: the error is plain `HTTPResponseError`. `Response.error` is the exception, not the decoded body, and `Response.raw_error` is removed. A `raises=` entry that can never match is a `TypeError`.
+* `error_for_status` is removed. Use `raise_for_status` on the client or the call; with it off, an error body is no longer decoded into `into=`, and the streaming verbs always raise.
+
+### Features
+
+* choose an error class by status and body from a raises= list ([c382e3b](https://github.com/RogerThomas/lothc/commit/c382e3b45560eb6b9b373fc02b71318a377c5374))
+* decide retries with a rule function, retry= ([cbc5a36](https://github.com/RogerThomas/lothc/commit/cbc5a36dc610bde0a39984236c08a2f17bfe8f11))
+* raise HTTPDecodeError when a successful response doesn't decode ([10a9417](https://github.com/RogerThomas/lothc/commit/10a941789a43067c962ebad51f4f8351738c1c0e))
+* retry_statuses on the client and max_retries per call ([0730390](https://github.com/RogerThomas/lothc/commit/07303901bff0030c47696f33755bb319ff239d99))
+* return a 4xx/5xx as a Response with raise_for_status=False ([8577a53](https://github.com/RogerThomas/lothc/commit/8577a5398d3e5e5bce040ea3b7dda7fb696eb966))
+
+
+### Documentation
+
+* bring back the code examples the trim cut ([7c9ae2e](https://github.com/RogerThomas/lothc/commit/7c9ae2e71f2dc3be24893c720ba18818cf73abd5))
+* credit pyreqwest as lothc's inspiration in Why ([fbad61a](https://github.com/RogerThomas/lothc/commit/fbad61ac79c70419e62298fdc2669795a8514b2b))
+* cut repetition and fix stale claims across the docs and README ([3232dc6](https://github.com/RogerThomas/lothc/commit/3232dc653a319e051e4ed4cd0ffd287fb4b0ec6f))
+* cut repetition and fix stale claims across the docs and README ([bcbbe39](https://github.com/RogerThomas/lothc/commit/bcbbe394fbfb611e935b45cdf9aa0e475a41f52c))
+* describe error classes, Response.error and HTTPDecodeError ([00dc269](https://github.com/RogerThomas/lothc/commit/00dc269abc793a2ef319ae4594bf438a0d68ce55))
+* describe retry_statuses, per-call max_retries and the retry rule ([26191d3](https://github.com/RogerThomas/lothc/commit/26191d38a49594c870e1ed8980b790bdca2a9008))
+* restore the lothc_mocker intro, pool and redirect defaults, and download's write thread ([821b7bf](https://github.com/RogerThomas/lothc/commit/821b7bf0eeae9f987205b474f5645d4ebb4b12c0))
+* shorten a line in AGENTS.md that failed the format check ([ae2af8d](https://github.com/RogerThomas/lothc/commit/ae2af8dc63e3c18941cd1bc7ffb4cf9a15aab3fb))
+* write empty error classes with an ellipsis ([88570e2](https://github.com/RogerThomas/lothc/commit/88570e2bb0f924a2a52fb15e66c2b064f46bd601))
+
 ## [0.3.0](https://github.com/RogerThomas/lothc/compare/0.2.3...0.3.0) (2026-11-13)
 
 
