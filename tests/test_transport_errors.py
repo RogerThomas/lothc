@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from lothc import (
     HTTPClient,
     HTTPConnectionError,
+    HTTPDecodeError,
     HTTPTimeoutError,
     HTTPTransportError,
     SyncHTTPClient,
@@ -186,13 +187,15 @@ async def test_download_cut_short_raises_connection_error(client: HTTPClient) ->
         await client.download("truncated-content-length")
 
 
-async def test_invalid_json_body_raises_the_stdlib_json_error(client: HTTPClient) -> None:
+async def test_invalid_json_body_carries_the_stdlib_json_error(client: HTTPClient) -> None:
     # Malformed JSON is a decode failure, not a transport one, so it must not be reported as a
     # dropped connection even though pyreqwest's own JSON error descends from its DecodeError.
-    with pytest.raises(json.JSONDecodeError) as exc_info:
+    with pytest.raises(HTTPDecodeError) as exc_info:
         await client.get("invalid-json", into=dict)
 
-    assert type(exc_info.value) is json.JSONDecodeError
+    assert not isinstance(exc_info.value, HTTPTransportError)
+    assert type(exc_info.value.parse_error) is json.JSONDecodeError
+    assert exc_info.value.__cause__ is exc_info.value.parse_error
 
 
 async def test_using_a_closed_client_raises_runtime_error(base_url: str) -> None:
@@ -216,8 +219,12 @@ def test_sync_download_cut_short_raises_connection_error(sync_client: SyncHTTPCl
         sync_client.download("truncated-content-length")
 
 
-def test_sync_invalid_json_body_raises_the_stdlib_json_error(sync_client: SyncHTTPClient) -> None:
-    with pytest.raises(json.JSONDecodeError) as exc_info:
+def test_sync_invalid_json_body_carries_the_stdlib_json_error(
+    sync_client: SyncHTTPClient,
+) -> None:
+    with pytest.raises(HTTPDecodeError) as exc_info:
         sync_client.get("invalid-json", into=dict)
 
-    assert type(exc_info.value) is json.JSONDecodeError
+    assert not isinstance(exc_info.value, HTTPTransportError)
+    assert type(exc_info.value.parse_error) is json.JSONDecodeError
+    assert exc_info.value.__cause__ is exc_info.value.parse_error

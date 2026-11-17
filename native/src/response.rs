@@ -91,6 +91,9 @@ pub(crate) struct Exchange {
     pub(crate) url: Url,
     pub(crate) decode: Option<Py<PyAny>>,
     pub(crate) raises: Option<Py<PyAny>>,
+    /// With `raises`, a 4xx/5xx comes back as a deferred error response (`raise_for_status=False`)
+    /// instead of raising; without `raises` nothing is checked either way.
+    pub(crate) defer_error: bool,
     pub(crate) typed_headers: Option<Py<PyAny>>,
     pub(crate) headers_only: bool,
     pub(crate) started: Instant,
@@ -103,12 +106,14 @@ pub(crate) struct Glue {
     lazy_headers: Py<PyAny>,
     eager_headers: Py<PyAny>,
     status_error: Py<PyAny>,
+    error_response: Py<PyAny>,
     parse_typed_headers: Py<PyAny>,
     connection_error: Py<PyAny>,
     timeout_error: Py<PyAny>,
     transport_error: Py<PyAny>,
     builder_error: Py<PyAny>,
     decode_error: Py<PyAny>,
+    decode_failure: Py<PyAny>,
     http_10: Py<PyString>,
     http_11: Py<PyString>,
 }
@@ -122,12 +127,14 @@ impl Glue {
             lazy_headers: get("lazy_headers")?,
             eager_headers: get("eager_headers")?,
             status_error: get("status_error")?,
+            error_response: get("error_response")?,
             parse_typed_headers: get("parse_typed_headers")?,
             connection_error: get("connection_error")?,
             timeout_error: get("timeout_error")?,
             transport_error: get("transport_error")?,
             builder_error: get("builder_error")?,
             decode_error: get("decode_error")?,
+            decode_failure: get("decode_failure")?,
             http_10: PyString::intern(py, "HTTP/1.0").unbind(),
             http_11: PyString::intern(py, "HTTP/1.1").unbind(),
         })
@@ -189,6 +196,24 @@ impl Glue {
         }
     }
 
+    /// What a successful response raises when decoding its body (or its headers, for
+    /// `response_headers_type`) raised `error`: `HTTPDecodeError` for a decode failure, chained to
+    /// it, and anything else as it was. Only a failed decode pays for this.
+    fn decode_failure(
+        &self,
+        py: Python<'_>,
+        error: PyErr,
+        status: u16,
+        body: &Bound<'_, PyBytes>,
+        request_info: &Bound<'_, PyAny>,
+        headers: &Bound<'_, PyAny>,
+    ) -> PyErr {
+        match self.decode_failure.bind(py).call1((error.into_value(py), status, body, request_info, headers)) {
+            Ok(failure) => PyErr::from_value(failure),
+            Err(error) => error,
+        }
+    }
+
     /// A streamed response's head as `(status, RawHeaders, http_version)`.
     pub(crate) fn stream_head<'py>(&self, py: Python<'py>, status: u16, version: Version, headers: HeaderMap) -> PyResult<Bound<'py, PyTuple>> {
         let version = if version == Version::HTTP_10 { &self.http_10 } else { &self.http_11 };
@@ -196,7 +221,8 @@ impl Glue {
         PyTuple::new(py, [status.into_pyobject(py)?.into_any(), headers.into_any(), version.bind(py).clone().into_any()])
     }
 
-    /// What lothc's pyreqwest path returns (a `Response`) or raises for this exchange.
+    /// What lothc's pyreqwest path returns (a `Response`, or a deferred error response for a
+    /// 4xx/5xx with `defer_error`) or raises for this exchange.
     pub(crate) fn outcome<'py>(
         &self,
         py: Python<'py>,
@@ -210,8 +236,21 @@ impl Glue {
         let elapsed = exchange.started.elapsed().as_secs_f64();
         let request_info = self.request_info(py, exchange)?;
         let body = PyBytes::new(py, &head.body);
+        let version = if head.version == Version::HTTP_10 { &self.http_10 } else { &self.http_11 };
         if head.status >= 400 {
             if let Some(raises) = &exchange.raises {
+                if exchange.defer_error {
+                    let headers = self.lazy_headers.bind(py).call1((RawHeaders::new(head.headers),))?;
+                    return self.error_response.bind(py).call1((
+                        raises.bind(py),
+                        head.status,
+                        headers,
+                        request_info,
+                        version.bind(py),
+                        elapsed,
+                        body,
+                    ));
+                }
                 let headers = self.eager_headers.bind(py).call1((RawHeaders::new(head.headers),))?;
                 let error = self.status_error.bind(py).call1((raises.bind(py), head.status, body, request_info, headers))?;
                 return Err(PyErr::from_value(error));
@@ -222,15 +261,24 @@ impl Glue {
             py.None().into_bound(py)
         } else {
             match &exchange.decode {
-                Some(decode) => decode.bind(py).call1((body,))?,
-                None => body.into_any(),
+                Some(decode) => match decode.bind(py).call1((&body,)) {
+                    Ok(data) => data,
+                    Err(error) => return Err(self.decode_failure(py, error, head.status, &body, &request_info, &headers)),
+                },
+                None => body.clone().into_any(),
             }
         };
         let typed_headers = match &exchange.typed_headers {
-            Some(header_type) => self.parse_typed_headers.bind(py).call1((&headers, header_type.bind(py)))?,
+            Some(header_type) => match self.parse_typed_headers.bind(py).call1((&headers, header_type.bind(py))) {
+                Ok(typed_headers) => typed_headers,
+                Err(error) => {
+                    // As on pyreqwest, which never reads a `head`/`options` body: none to carry.
+                    let body = if exchange.headers_only { PyBytes::new(py, b"") } else { body };
+                    return Err(self.decode_failure(py, error, head.status, &body, &request_info, &headers));
+                }
+            },
             None => py.None().into_bound(py),
         };
-        let version = if head.version == Version::HTTP_10 { &self.http_10 } else { &self.http_11 };
         self.response
             .bind(py)
             .call1((data, head.status, headers, typed_headers, request_info, version.bind(py), elapsed))

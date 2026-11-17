@@ -1,9 +1,11 @@
 from ._client import HTTPClient
 from ._errors import (
     HTTPConnectionError,
+    HTTPDecodeError,
     HTTPResponseError,
     HTTPTimeoutError,
     HTTPTransportError,
+    RequestInfo,
 )
 from ._headers import CaseInsensitiveDict
 from ._oauth import (
@@ -14,11 +16,8 @@ from ._oauth import (
     TokenRequestTyping,
     TokenResponseTyping,
 )
-from ._response import (
-    RequestInfo,
-    Response,
-)
-from ._settings import NativeMode, TlsVersion
+from ._response import Response
+from ._settings import NativeMode, RetryAttempt, TlsVersion
 from ._sse import SSEEvent
 from ._sync_client import SyncHTTPClient
 from ._types import (
@@ -41,6 +40,7 @@ __all__ = [
     "Form",
     "HTTPClient",
     "HTTPConnectionError",
+    "HTTPDecodeError",
     "HTTPResponseError",
     "HTTPTimeoutError",
     "HTTPTransportError",
@@ -52,6 +52,7 @@ __all__ = [
     "Params",
     "RequestInfo",
     "Response",
+    "RetryAttempt",
     "SSEEvent",
     "SyncAuthProvider",
     "SyncHTTPClient",

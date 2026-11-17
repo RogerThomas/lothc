@@ -5,7 +5,7 @@ import pytest
 from msgspec import Struct
 from pydantic import BaseModel, ValidationError
 
-from lothc import HTTPClient, HTTPResponseError, SyncHTTPClient
+from lothc import HTTPClient, HTTPDecodeError, HTTPResponseError, SyncHTTPClient
 
 
 class ErrorBodyModel(BaseModel):
@@ -39,7 +39,7 @@ class UnmatchedError(HTTPResponseError[UnmatchedErrorBodyModel]):
 async def test_get_without_raises_decodes_a_json_object_error_body(client: HTTPClient) -> None:
     with pytest.raises(HTTPResponseError) as exc_info:
         await client.get("boom")
-    assert exc_info.value.error == {
+    assert exc_info.value.problem == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,
@@ -50,7 +50,7 @@ async def test_get_without_raises_decodes_a_json_object_error_body(client: HTTPC
 async def test_get_raises_pydantic_populates_error(client: HTTPClient) -> None:
     with pytest.raises(ModelError) as exc_info:
         await client.get("boom", raises=ModelError)
-    assert exc_info.value.error == ErrorBodyModel(
+    assert exc_info.value.problem == ErrorBodyModel(
         type="internal-server-error", title="Internal server error", status=500
     )
 
@@ -58,7 +58,7 @@ async def test_get_raises_pydantic_populates_error(client: HTTPClient) -> None:
 async def test_get_raises_msgspec_populates_error(client: HTTPClient) -> None:
     with pytest.raises(StructError) as exc_info:
         await client.get("boom", raises=StructError)
-    assert exc_info.value.error == ErrorBodyStruct(
+    assert exc_info.value.problem == ErrorBodyStruct(
         type="internal-server-error", title="Internal server error", status=500
     )
 
@@ -68,11 +68,13 @@ async def test_get_raises_mismatch_still_raises_response_error(client: HTTPClien
     # used to raise pydantic's ValidationError instead, losing the status and skipping any
     # `except HTTPResponseError` handler. The decode failure is kept on `.parse_error`, and the
     # body falls back to a plain JSON object.
-    with pytest.raises(UnmatchedError) as exc_info:
+    with pytest.raises(HTTPResponseError) as exc_info:
         await client.get("boom", raises=UnmatchedError)
 
+    # A pinned type that doesn't decode the body doesn't match: plain `HTTPResponseError`.
+    assert type(exc_info.value) is HTTPResponseError
     assert exc_info.value.status == 500
-    assert exc_info.value.error == {
+    assert exc_info.value.problem == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,
@@ -101,7 +103,7 @@ def test_sync_get_without_raises_decodes_a_json_object_error_body(
 ) -> None:
     with pytest.raises(HTTPResponseError) as exc_info:
         sync_client.get("boom")
-    assert exc_info.value.error == {
+    assert exc_info.value.problem == {
         "type": "internal-server-error",
         "title": "Internal server error",
         "status": 500,
@@ -111,7 +113,7 @@ def test_sync_get_without_raises_decodes_a_json_object_error_body(
 def test_sync_get_raises_pydantic_populates_error(sync_client: SyncHTTPClient) -> None:
     with pytest.raises(ModelError) as exc_info:
         sync_client.get("boom", raises=ModelError)
-    assert exc_info.value.error == ErrorBodyModel(
+    assert exc_info.value.problem == ErrorBodyModel(
         type="internal-server-error", title="Internal server error", status=500
     )
 
@@ -119,7 +121,7 @@ def test_sync_get_raises_pydantic_populates_error(sync_client: SyncHTTPClient) -
 def test_sync_get_raises_msgspec_populates_error(sync_client: SyncHTTPClient) -> None:
     with pytest.raises(StructError) as exc_info:
         sync_client.get("boom", raises=StructError)
-    assert exc_info.value.error == ErrorBodyStruct(
+    assert exc_info.value.problem == ErrorBodyStruct(
         type="internal-server-error", title="Internal server error", status=500
     )
 
@@ -127,9 +129,11 @@ def test_sync_get_raises_msgspec_populates_error(sync_client: SyncHTTPClient) ->
 def test_sync_get_raises_mismatch_still_raises_response_error(
     sync_client: SyncHTTPClient,
 ) -> None:
-    with pytest.raises(UnmatchedError) as exc_info:
+    with pytest.raises(HTTPResponseError) as exc_info:
         sync_client.get("boom", raises=UnmatchedError)
 
+    # A pinned type that doesn't decode the body doesn't match: plain `HTTPResponseError`.
+    assert type(exc_info.value) is HTTPResponseError
     assert exc_info.value.status == 500
     assert isinstance(exc_info.value.parse_error, ValidationError)
 
@@ -193,18 +197,20 @@ async def test_response_error_survives_pickling(client: HTTPClient) -> None:
     assert restored.status == 500
     assert restored.body == exc_info.value.body
     assert restored.request == exc_info.value.request
-    assert restored.error == {"detail": "x" * 300}
+    assert restored.problem == {"detail": "x" * 300}
     assert restored.headers.get_all("x-request-id") == ["request-id"]
     assert str(restored) == str(exc_info.value)
 
 
 async def test_non_json_error_body_still_raises_response_error(client: HTTPClient) -> None:
     # The motivating case: a proxy's HTML error page against a JSON error type.
-    with pytest.raises(ModelError) as exc_info:
+    with pytest.raises(HTTPResponseError) as exc_info:
         await client.get("invalid-json-error", raises=ModelError)
 
+    # A pinned type that doesn't decode the body doesn't match: plain `HTTPResponseError`.
+    assert type(exc_info.value) is HTTPResponseError
     assert exc_info.value.status == 502
-    assert exc_info.value.error is None
+    assert exc_info.value.problem is None
     assert isinstance(exc_info.value.parse_error, ValueError)
     assert exc_info.value.body.startswith(b"<html>")
 
@@ -214,11 +220,11 @@ async def test_matching_error_body_has_no_parse_error(client: HTTPClient) -> Non
         await client.get("boom", raises=ModelError)
 
     assert exc_info.value.parse_error is None
-    assert isinstance(exc_info.value.error, ErrorBodyModel)
+    assert isinstance(exc_info.value.problem, ErrorBodyModel)
 
 
 async def test_a_json_array_decoded_as_dict_raises_a_clear_error(client: HTTPClient) -> None:
-    with pytest.raises(ValueError, match="got a JSON array"):
+    with pytest.raises(HTTPDecodeError, match="got a JSON array"):
         await client.get("json-array", into=dict)
 
 
@@ -229,7 +235,7 @@ async def test_a_json_array_decoded_as_dict_raises_a_clear_error(client: HTTPCli
 async def test_a_non_object_json_body_decoded_as_dict_names_what_it_got(
     client: HTTPClient, value: str, kind: str
 ) -> None:
-    with pytest.raises(ValueError, match=f"got a JSON {kind}"):
+    with pytest.raises(HTTPDecodeError, match=f"got a JSON {kind}"):
         await client.get("json-literal", params={"value": value}, into=dict)
 
 

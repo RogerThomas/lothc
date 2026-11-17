@@ -32,9 +32,16 @@ from typing import (
 )
 
 from ._decode import _decode_json_line, _decoder_for, _Into, _TextDecoder
-from ._errors import HTTPResponseError, HTTPTimeoutError, HTTPTransportError, _validate_raises
+from ._errors import (
+    HTTPDecodeError,
+    HTTPTimeoutError,
+    HTTPTransportError,
+    RequestInfo,
+    _decode_error,
+)
 from ._headers import CaseInsensitiveDict
-from ._response import RequestInfo, Response
+from ._raises import _ErrorResponse, _RaisesArg, _RaisesTable, _validate_raises
+from ._response import Response
 from ._types import Form, Headers, JSONPayload, Params
 
 
@@ -148,9 +155,36 @@ type _SyncChunkReader = Callable[[], Buffer | None]
 
 
 @dataclass(slots=True)
+class _ReplayedBody:
+    """A body already read whole, handed out again as a stream's one chunk (`read`, a
+    `_ChunkReader`): an error status's, which a `retry=` rule was shown before retrying stopped,
+    for a `download(raise_for_status=False)` to return."""
+
+    body: bytes | None
+
+    async def read(self) -> bytes | None:
+        body, self.body = self.body, None
+        return body
+
+
+@dataclass(slots=True)
+class _SyncReplayedBody:
+    """Sync mirror of `_ReplayedBody`."""
+
+    body: bytes | None
+
+    def read(self) -> bytes | None:
+        body, self.body = self.body, None
+        return body
+
+
+@dataclass(slots=True)
 class _StreamCall:
     """A streaming verb's request, as the client passed it, for a transport's stream source to
-    build. `timeout` is the total cap the transport chose for it (`None`: none)."""
+    build. `timeout` is the total cap the transport chose for it (`None`: none). `check_status`
+    is whether the source raises a 4xx/5xx: always for `stream_get`/`stream_post`/`sse`, and for
+    `download` unless `raise_for_status=False` leaves the status to `_download_stream`. A
+    transport's source retries opening it as `_call_retries` says for `max_retries`."""
 
     params: Params | None
     headers: Headers | None
@@ -162,8 +196,10 @@ class _StreamCall:
     _: KW_ONLY
     skip_auth: bool
     infer_mime_type_from_file_extension: bool = True
-    error_for_status: bool
-    raises: type[HTTPResponseError[Any]] | None
+    check_status: bool
+    raises: _RaisesArg | None
+    # The call's own `max_retries` (`None`: the client's); `sse()` never passes one.
+    max_retries: int | None = None
 
 
 class _StreamSource(Protocol):
@@ -172,8 +208,9 @@ class _StreamSource(Protocol):
     `_sse_events`), which does everything else, both transports alike.
 
     `prepare` does what comes before the idle clock starts (auth, building the request). `open`
-    sends it, waits for the head and checks its status (an error status's body is read and its
-    status error raised), registering on `stack` whatever ends the exchange; the reader it returns
+    sends it, waits for the head and, with `check_status`, checks its status (an error status's
+    body is read and its status error raised), registering on `stack` whatever ends the exchange;
+    the reader it returns
     gives the body chunk by chunk as it arrives, `None` at its end. A transport's own exceptions,
     `failures`, become lothc's through `failure`; `permanent` says whether `sse()` may reconnect
     after a transport error. `request_info` is valid once `open` has started.
@@ -385,10 +422,17 @@ def _sync_stream_chunks(
             yield bytes(chunk)
 
 
+def _line_decode_error(
+    error: ValueError | RecursionError, line: bytearray, head: _ResponseHead, request: RequestInfo
+) -> HTTPDecodeError:
+    """The `HTTPDecodeError` for one streamed `line` that didn't decode."""
+    return _decode_error(error, head.status, bytes(line), request, head.headers)
+
+
 async def _stream_lines(
     source: _StreamSource,
     into: _Into,
-    raises: type[HTTPResponseError[Any]] | None,
+    raises: _RaisesArg | None,
     idle: float | None,
 ) -> AsyncGenerator[Any]:
     """`stream_get`/`stream_post` over either transport: raw chunks, or one decoded value per
@@ -400,7 +444,7 @@ async def _stream_lines(
     try:
         async with AsyncExitStack() as stack:
             async with _within_idle_limit(idle):
-                _, read_chunk = await source.open(stack)
+                head, read_chunk = await source.open(stack)
             if decoder is None:
                 while True:
                     chunk = await _read_chunk_within(read_chunk, idle)
@@ -415,10 +459,20 @@ async def _stream_lines(
                 if chunk is None:
                     break
                 for line in complete_lines(pending, chunk):
-                    yield _decode_json_line(line, decoder)
+                    try:
+                        value = _decode_json_line(line, decoder)
+                    except (ValueError, RecursionError) as error:
+                        raise _line_decode_error(error, line, head, source.request_info) from error
+                    yield value
             final_line = _final_line(pending, raw_text=raw_text)
             if final_line is not None:
-                yield _decode_json_line(final_line, decoder)
+                try:
+                    value = _decode_json_line(final_line, decoder)
+                except (ValueError, RecursionError) as error:
+                    raise _line_decode_error(
+                        error, final_line, head, source.request_info
+                    ) from error
+                yield value
     except source.failures as error:
         raise source.failure(error) from error
 
@@ -426,7 +480,7 @@ async def _stream_lines(
 def _stream_lines_sync(
     source: _SyncStreamSource,
     into: _Into,
-    raises: type[HTTPResponseError[Any]] | None,
+    raises: _RaisesArg | None,
     idle: float | None,
     *,
     interruptible: bool,
@@ -436,8 +490,13 @@ def _stream_lines_sync(
     # Resolved before connecting, so an unusable `into` fails without a request.
     decoder = _decoder_for(into)
     source.prepare()
+    # The response stays inside `_sync_stream_chunks`, so its head comes back through this,
+    # before the first chunk, for a line that doesn't decode.
+    head_sink: list[_ResponseHead] = []
     try:
-        chunks = _sync_stream_chunks(source, None, interruptible=interruptible, idle_timeout=idle)
+        chunks = _sync_stream_chunks(
+            source, None, interruptible=interruptible, idle_timeout=idle, head_sink=head_sink
+        )
         if decoder is None:
             yield from chunks
             return
@@ -446,18 +505,37 @@ def _stream_lines_sync(
         pending = bytearray()
         for chunk in chunks:
             for line in complete_lines(pending, chunk):
-                yield _decode_json_line(line, decoder)
+                try:
+                    value = _decode_json_line(line, decoder)
+                except (ValueError, RecursionError) as error:
+                    raise _line_decode_error(
+                        error, line, head_sink[0], source.request_info
+                    ) from error
+                yield value
         final_line = _final_line(pending, raw_text=raw_text)
         if final_line is not None:
-            yield _decode_json_line(final_line, decoder)
+            try:
+                value = _decode_json_line(final_line, decoder)
+            except (ValueError, RecursionError) as error:
+                raise _line_decode_error(
+                    error, final_line, head_sink[0], source.request_info
+                ) from error
+            yield value
     except source.failures as error:
         raise source.failure(error) from error
 
 
 async def _download_stream(
-    source: _StreamSource, dest: Path | None, idle: float | None
+    source: _StreamSource,
+    dest: Path | None,
+    idle: float | None,
+    deferred: _RaisesTable | None,
 ) -> Response[bytes] | Response[Path]:
-    """`download()` over either transport: the body into memory, or into `dest` atomically."""
+    """`download()` over either transport: the body into memory, or into `dest` atomically.
+
+    With `deferred` (`raise_for_status=False`, the source not checking the status), a 4xx/5xx's
+    body is read into memory, never into `dest`, and comes back as the error response for that
+    `raises=` class."""
     await source.prepare()
     buffer = bytearray()
     started = time.monotonic()
@@ -465,7 +543,8 @@ async def _download_stream(
         async with AsyncExitStack() as stack:
             async with _within_idle_limit(idle):
                 head, read_chunk = await source.open(stack)
-            if dest is None:
+            failed = deferred is not None and head.status >= 400
+            if dest is None or failed:
                 while True:
                     chunk = await _read_chunk_within(read_chunk, idle)
                     if chunk is None:
@@ -482,6 +561,16 @@ async def _download_stream(
         raise source.failure(error) from error
     elapsed = time.monotonic() - started
     request_info = source.request_info
+    if deferred is not None and head.status >= 400:
+        return _ErrorResponse(
+            deferred,
+            head.status,
+            head.headers,
+            request_info,
+            head.http_version,
+            elapsed,
+            bytes(buffer),
+        )
     if dest is None:
         data = bytes(buffer)
         return Response(
@@ -491,7 +580,10 @@ async def _download_stream(
 
 
 def _download_stream_sync(
-    source: _SyncStreamSource, dest: Path | None, idle: float | None
+    source: _SyncStreamSource,
+    dest: Path | None,
+    idle: float | None,
+    deferred: _RaisesTable | None,
 ) -> Response[bytes] | Response[Path]:
     """Sync mirror of `_download_stream`, reading through `_sync_stream_chunks`."""
     source.prepare()
@@ -504,11 +596,19 @@ def _download_stream_sync(
         chunks = _sync_stream_chunks(
             source, None, interruptible=False, idle_timeout=idle, head_sink=head_sink
         )
-        if dest is None:
+        # The head is in `head_sink` before the first chunk (or the end) arrives, and only then
+        # is it known whether the body goes to `dest`.
+        first = next(chunks, None)
+        failed = deferred is not None and head_sink[0].status >= 400
+        if dest is None or failed:
+            if first is not None:
+                buffer += first
             for chunk in chunks:
                 buffer += chunk
         else:
             with _atomic_download_file(dest) as file:
+                if first is not None:
+                    file.write(first)
                 for chunk in chunks:
                     file.write(chunk)
     except source.failures as error:
@@ -516,6 +616,16 @@ def _download_stream_sync(
     elapsed = time.monotonic() - started
     head = head_sink[0]
     request_info = source.request_info
+    if deferred is not None and head.status >= 400:
+        return _ErrorResponse(
+            deferred,
+            head.status,
+            head.headers,
+            request_info,
+            head.http_version,
+            elapsed,
+            bytes(buffer),
+        )
     if dest is None:
         data = bytes(buffer)
         return Response(

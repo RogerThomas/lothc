@@ -2,6 +2,8 @@
 
 from collections.abc import (
     AsyncGenerator,
+    Callable,
+    Collection,
     Mapping,
     Sequence,
 )
@@ -20,12 +22,15 @@ from ._compat import (
     DecoderTyping,
     TypeAdapterTyping,
 )
-from ._errors import HTTPResponseError, _error_body_decoding
+from ._errors import HTTPResponseError
+from ._raises import _resolve_raises
 from ._response import Response
 from ._settings import (
     NativeMode,
+    RetryAttempt,
     TlsVersion,
     _retry_method_set,
+    _retry_status_set,
     _TransportSettings,
     _uses_native_transport,
 )
@@ -48,6 +53,7 @@ class HTTPClient:
         "HEAD",
         "OPTIONS",
     })
+    _default_retry_statuses: ClassVar[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
 
     _settings: _TransportSettings
     _transport: _PyreqwestTransport | _NativeTransport
@@ -76,6 +82,8 @@ class HTTPClient:
         retry_methods: set[str] | frozenset[str] | list[str] | tuple[str, ...] | None = None,
         backoff_base: float = 0.1,
         max_retry_after: float | None = 60.0,
+        retry_statuses: Collection[int] | None = None,
+        retry: Callable[[RetryAttempt], float | None] | None = None,
         connect_timeout: float | None = None,
         read_timeout: float | None = None,
         root_certificates: Sequence[bytes] | None = None,
@@ -93,21 +101,34 @@ class HTTPClient:
         pool_max_idle_per_host: int | None = None,
         pool_timeout: float | None = None,
         native: NativeMode = "auto",
-        raises: type[HTTPResponseError[Any]] = HTTPResponseError,
+        raise_for_status: bool = True,
+        raises: type[HTTPResponseError[Any]]
+        | Sequence[type[HTTPResponseError[Any]]] = HTTPResponseError,
     ) -> None:
         """The client's settings. Nothing opens until it's entered, as
         `async with HTTPClient(...) as client:`.
 
         `bearer_token` is a static token; `bearer_auth` is an async callable resolved fresh on
         every request; `basic_auth` is a `(username, password)` pair — provide at most one of the
-        three. `max_retries` enables a real retry middleware (backoff, `Retry-After`-aware); with
-        no `retry_methods`, only the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`/`OPTIONS`)
-        retry, and `backoff_base` scales the wait between attempts (`backoff_base * 2 **
-        attempt`, so the 0.1 default waits 0.1s then 0.2s) — a `Retry-After` header on the
-        response wins over the computed delay, up to `max_retry_after` (60s by default): a server
-        asking for a longer wait ends retrying, and its 429/503 is raised as `HTTPResponseError`
-        so you can schedule a retry from `e.headers["Retry-After"]`. Pass `max_retry_after=None`
-        to honour any wait.
+        three. `max_retries` turns on retries (backoff, `Retry-After`-aware) of a transport
+        failure or a `retry_statuses` response (429, 500, 502, 503 and 504 by default; each a
+        4xx/5xx `int`, and an empty collection retries no status); with no `retry_methods`, only
+        the idempotent verbs (`GET`/`PUT`/`DELETE`/`HEAD`/`OPTIONS`) retry, and a verb's own
+        `max_retries=` overrides the client's for one call. `backoff_base` scales the wait
+        between attempts (`backoff_base * 2 ** attempt`, so the 0.1 default waits 0.1s then
+        0.2s) — a `Retry-After` header on the response wins over the computed delay, up to
+        `max_retry_after` (60s by default): a server asking for a longer wait ends retrying, and
+        its 429/503 is raised as `HTTPResponseError` (or returned, with `raise_for_status=False`)
+        so you can schedule a retry from its `headers["Retry-After"]`. Pass
+        `max_retry_after=None` to honour any wait.
+
+        `retry` is a rule asked about each failure that would be retried (see `RetryAttempt`): a
+        plain function, not an async one, returning the seconds to wait before the next attempt
+        (`attempt.delay` is the wait lothc would take), or `None` to stop retrying, so the call
+        raises that failure (or returns it, with `raise_for_status=False`). A wait above
+        `max_retry_after` stops retrying too, a negative one is no wait, and anything but a
+        finite number or `None` is a `TypeError`/`ValueError` raised from the call; an exception
+        the rule raises propagates unchanged.
 
         `connect_timeout` bounds only the TCP connect phase (separate from `timeout`, which
         covers the whole request); `read_timeout` bounds the idle gap between two consecutive
@@ -134,17 +155,24 @@ class HTTPClient:
         always uses pyreqwest; `"on"` always uses native, raising `NotImplementedError` here on
         Windows or with `http2=True`. `lothc.testing`'s mocker intercepts either.
 
-        `raises` is the `HTTPResponseError` class every 4xx/5xx is raised as (each verb's own
-        `raises=` overrides it). A subclass that pins the error type,
-        `class APIError(HTTPResponseError[NotFound | Conflict]): pass`, decodes the body onto
-        `.error` as that type; a bad class raises `TypeError` here, not on the first error.
+        `raises` is the `HTTPResponseError` subclass, or sequence of them, a 4xx/5xx may be raised
+        as (each verb's own `raises=` replaces it): the first, in order, whose `status=` covers the
+        response's status and whose pinned problem type decodes the body, else plain
+        `HTTPResponseError`; see `HTTPResponseError`. A class no response could ever be raised as,
+        or a bad class, raises `TypeError` here, not on the first error.
+
+        `raise_for_status=False` makes `get`/`post`/`put`/`patch`/`delete`/`head`/`options`/
+        `download` return a 4xx/5xx as a `Response` instead of raising (each verb's own
+        `raise_for_status=` overrides it): its `.error` is the error the call would have raised,
+        and reading `.data` raises it.
+        The streaming verbs always raise.
         """
         if sum(value is not None for value in (bearer_token, bearer_auth, basic_auth)) > 1:
             raise ValueError(
                 "Provide at most one of 'bearer_token', 'bearer_auth', or 'basic_auth'"
             )
         # Resolved now, so a bad class fails here rather than on the first 4xx/5xx.
-        _error_body_decoding(raises)
+        resolved_raises = _resolve_raises(raises)
         self._settings = _TransportSettings(
             base_url=base_url,
             default_headers=default_headers,
@@ -158,6 +186,8 @@ class HTTPClient:
             max_retries=max_retries,
             backoff_base=backoff_base,
             max_retry_after=max_retry_after,
+            retry_statuses=_retry_status_set(retry_statuses, self._default_retry_statuses),
+            retry_rule=retry,
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
             root_certificates=root_certificates,
@@ -186,7 +216,8 @@ class HTTPClient:
             bearer_token,
             bearer_auth,
             basic_auth,
-            raises,
+            resolved_raises,
+            raise_for_status,
             self._default_retry_methods,
         )
 
@@ -207,8 +238,9 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: None = None,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[bytes]: ...
     @overload
     async def get(
@@ -220,8 +252,9 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: type[dict[Any, Any]],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[dict[str, Any]]: ...
     @overload
     async def get[TAdapted](
@@ -233,8 +266,9 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TAdapted]: ...
     @overload
     async def get[TData](
@@ -246,8 +280,9 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeForm[TData],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TData]: ...
     @overload
     async def get[THeaders: TypedHeaders](
@@ -260,8 +295,9 @@ class HTTPClient:
         skip_auth: bool = False,
         into: None = None,
         response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     async def get[THeaders: TypedHeaders](
@@ -274,8 +310,9 @@ class HTTPClient:
         skip_auth: bool = False,
         into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
     @overload
     async def get[TAdapted, THeaders: TypedHeaders](
@@ -288,8 +325,9 @@ class HTTPClient:
         skip_auth: bool = False,
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TAdapted, THeaders]: ...
     @overload
     async def get[TData, THeaders: TypedHeaders](
@@ -302,8 +340,9 @@ class HTTPClient:
         skip_auth: bool = False,
         into: TypeForm[TData],
         response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TData, THeaders]: ...
     async def get(
         self,
@@ -315,20 +354,25 @@ class HTTPClient:
         skip_auth: bool = False,
         into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[Any, Any]:
         """GET `path`, returning a `Response` whose `.data` is the body decoded as
         `into` (raw `bytes` by default), alongside `.status`, `.headers`,
         `.request`, `.http_version` and `.elapsed`. Pass `response_headers_type` to also get the
         headers parsed into `.typed_headers`.
 
-        Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
+        Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
+        else the client's) is `False`: the `Response` then comes back, and reading its `.data`
+        raises that error instead. A response below 400 whose body doesn't decode into `into` (or
+        headers into `response_headers_type`) raises `HTTPDecodeError`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
-        this call.
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
+        this call. `max_retries` replaces the client's `max_retries` for this call, even on a verb
+        outside `retry_methods` (`0` sends it once).
         """
         return await self._transport.send(
             "GET",
@@ -344,8 +388,9 @@ class HTTPClient:
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
-            error_for_status=error_for_status,
+            raise_for_status=raise_for_status,
             raises=raises,
+            max_retries=max_retries,
         )
 
     @overload
@@ -363,8 +408,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: None = None,
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[bytes]: ...
     @overload
     async def post(
@@ -381,8 +427,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[dict[str, Any]]: ...
     @overload
     async def post[TAdapted](
@@ -399,8 +446,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TAdapted]: ...
     @overload
     async def post[TData](
@@ -417,8 +465,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: TypeForm[TData],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TData]: ...
     @overload
     async def post[THeaders: TypedHeaders](
@@ -436,8 +485,9 @@ class HTTPClient:
         into: None = None,
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     async def post[THeaders: TypedHeaders](
@@ -455,8 +505,9 @@ class HTTPClient:
         into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
     @overload
     async def post[TAdapted, THeaders: TypedHeaders](
@@ -474,8 +525,9 @@ class HTTPClient:
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TAdapted, THeaders]: ...
     @overload
     async def post[TData, THeaders: TypedHeaders](
@@ -493,8 +545,9 @@ class HTTPClient:
         into: TypeForm[TData],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TData, THeaders]: ...
     async def post(
         self,
@@ -511,8 +564,9 @@ class HTTPClient:
         into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[Any, Any]:
         """POST to `path` with at most one of `json`/`data`/`form`/`content` (raises
         `ValueError` if more than one is given), returning a `Response` like `get`'s.
@@ -520,8 +574,14 @@ class HTTPClient:
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
-        this call.
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
+        this call. `max_retries` replaces the client's `max_retries` for this call, even on a verb
+        outside `retry_methods` (`0` sends it once).
+
+        Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
+        else the client's) is `False`: the `Response` then comes back, and reading its `.data`
+        raises that error instead. A response below 400 whose body doesn't decode into `into` (or
+        headers into `response_headers_type`) raises `HTTPDecodeError`.
         """
         return await self._transport.send(
             "POST",
@@ -537,8 +597,9 @@ class HTTPClient:
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
+            raise_for_status=raise_for_status,
             raises=raises,
+            max_retries=max_retries,
         )
 
     @overload
@@ -556,8 +617,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: None = None,
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[bytes]: ...
     @overload
     async def put(
@@ -574,8 +636,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[dict[str, Any]]: ...
     @overload
     async def put[TAdapted](
@@ -592,8 +655,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TAdapted]: ...
     @overload
     async def put[TData](
@@ -610,8 +674,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: TypeForm[TData],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TData]: ...
     @overload
     async def put[THeaders: TypedHeaders](
@@ -629,8 +694,9 @@ class HTTPClient:
         into: None = None,
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     async def put[THeaders: TypedHeaders](
@@ -648,8 +714,9 @@ class HTTPClient:
         into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
     @overload
     async def put[TAdapted, THeaders: TypedHeaders](
@@ -667,8 +734,9 @@ class HTTPClient:
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TAdapted, THeaders]: ...
     @overload
     async def put[TData, THeaders: TypedHeaders](
@@ -686,8 +754,9 @@ class HTTPClient:
         into: TypeForm[TData],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TData, THeaders]: ...
     async def put(
         self,
@@ -704,15 +773,22 @@ class HTTPClient:
         into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[Any, Any]:
         """PUT to `path`. Same body/decode rules as `post`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
-        this call.
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
+        this call. `max_retries` replaces the client's `max_retries` for this call, even on a verb
+        outside `retry_methods` (`0` sends it once).
+
+        Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
+        else the client's) is `False`: the `Response` then comes back, and reading its `.data`
+        raises that error instead. A response below 400 whose body doesn't decode into `into` (or
+        headers into `response_headers_type`) raises `HTTPDecodeError`.
         """
         return await self._transport.send(
             "PUT",
@@ -728,8 +804,9 @@ class HTTPClient:
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
+            raise_for_status=raise_for_status,
             raises=raises,
+            max_retries=max_retries,
         )
 
     @overload
@@ -747,8 +824,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: None = None,
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[bytes]: ...
     @overload
     async def patch(
@@ -765,8 +843,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[dict[str, Any]]: ...
     @overload
     async def patch[TAdapted](
@@ -783,8 +862,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TAdapted]: ...
     @overload
     async def patch[TData](
@@ -801,8 +881,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: TypeForm[TData],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TData]: ...
     @overload
     async def patch[THeaders: TypedHeaders](
@@ -820,8 +901,9 @@ class HTTPClient:
         into: None = None,
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     async def patch[THeaders: TypedHeaders](
@@ -839,8 +921,9 @@ class HTTPClient:
         into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
     @overload
     async def patch[TAdapted, THeaders: TypedHeaders](
@@ -858,8 +941,9 @@ class HTTPClient:
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TAdapted, THeaders]: ...
     @overload
     async def patch[TData, THeaders: TypedHeaders](
@@ -877,8 +961,9 @@ class HTTPClient:
         into: TypeForm[TData],
         response_headers_type: type[THeaders],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TData, THeaders]: ...
     async def patch(
         self,
@@ -895,15 +980,22 @@ class HTTPClient:
         into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[Any, Any]:
         """PATCH `path`. Same body/decode rules as `post`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
-        this call.
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
+        this call. `max_retries` replaces the client's `max_retries` for this call, even on a verb
+        outside `retry_methods` (`0` sends it once).
+
+        Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
+        else the client's) is `False`: the `Response` then comes back, and reading its `.data`
+        raises that error instead. A response below 400 whose body doesn't decode into `into` (or
+        headers into `response_headers_type`) raises `HTTPDecodeError`.
         """
         return await self._transport.send(
             "PATCH",
@@ -919,8 +1011,9 @@ class HTTPClient:
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
+            raise_for_status=raise_for_status,
             raises=raises,
+            max_retries=max_retries,
         )
 
     @overload
@@ -938,8 +1031,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         into: None = None,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[bytes]: ...
     @overload
     async def delete(
@@ -956,8 +1050,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         into: type[dict[Any, Any]],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[dict[str, Any]]: ...
     @overload
     async def delete[TAdapted](
@@ -974,8 +1069,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TAdapted]: ...
     @overload
     async def delete[TData](
@@ -992,8 +1088,9 @@ class HTTPClient:
         content: str | bytes | None = None,
         infer_mime_type_from_file_extension: bool = True,
         into: TypeForm[TData],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TData]: ...
     @overload
     async def delete[THeaders: TypedHeaders](
@@ -1011,8 +1108,9 @@ class HTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         into: None = None,
         response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[bytes, THeaders]: ...
     @overload
     async def delete[THeaders: TypedHeaders](
@@ -1030,8 +1128,9 @@ class HTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         into: type[dict[Any, Any]],
         response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[dict[str, Any], THeaders]: ...
     @overload
     async def delete[TAdapted, THeaders: TypedHeaders](
@@ -1049,8 +1148,9 @@ class HTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         into: TypeAdapterTyping[TAdapted] | DecoderTyping[TAdapted],
         response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TAdapted, THeaders]: ...
     @overload
     async def delete[TData, THeaders: TypedHeaders](
@@ -1068,8 +1168,9 @@ class HTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         into: TypeForm[TData],
         response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[TData, THeaders]: ...
     async def delete(
         self,
@@ -1086,16 +1187,23 @@ class HTTPClient:
         infer_mime_type_from_file_extension: bool = True,
         into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         response_headers_type: type[TypedHeaders] | None = None,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[Any, Any]:
         """DELETE `path`, returning a `Response` like `get`'s. A body is rare on a DELETE but
         allowed: the same `json`/`data`/`form`/`content` options as `post`, at most one.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
-        this call.
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
+        this call. `max_retries` replaces the client's `max_retries` for this call, even on a verb
+        outside `retry_methods` (`0` sends it once).
+
+        Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
+        else the client's) is `False`: the `Response` then comes back, and reading its `.data`
+        raises that error instead. A response below 400 whose body doesn't decode into `into` (or
+        headers into `response_headers_type`) raises `HTTPDecodeError`.
         """
         return await self._transport.send(
             "DELETE",
@@ -1111,8 +1219,9 @@ class HTTPClient:
             response_headers_type,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
+            raise_for_status=raise_for_status,
             raises=raises,
+            max_retries=max_retries,
         )
 
     @overload
@@ -1125,8 +1234,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: None = None,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -1141,8 +1249,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: type[dict[Any, Any]],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -1157,8 +1264,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeAdapterTyping[TData] | DecoderTyping[TData],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -1173,8 +1279,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeForm[TData],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -1188,8 +1293,7 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
         max_reconnects: int | None = 5,
         reconnect_delay: float = 3.0,
         reconnect_on_close: bool = False,
@@ -1204,8 +1308,11 @@ class HTTPClient:
         request timeout would kill every healthy stream on schedule. `timeout` bounds one
         connection attempt only; use the client's `read_timeout` to detect a stalled stream.
         `skip_auth` omits the `Authorization` header (and skips invoking `bearer_auth`) for this
-        call; `raises` overrides the client's own `raises` (the `HTTPResponseError` subclass a
-        4xx/5xx is raised as) for this call.
+        call; `raises` overrides the client's own `raises` (the `HTTPResponseError` subclasses a
+        4xx/5xx may be raised as) for this call.
+
+        A 4xx/5xx response always raises `HTTPResponseError`, whatever the client's
+        `raise_for_status`. An event whose data doesn't decode into `into` raises `HTTPDecodeError`.
 
         A dropped connection (transport error or timeout) reconnects automatically, after
         `reconnect_delay` seconds — or the server's own `retry:` value once it has sent one —
@@ -1222,7 +1329,6 @@ class HTTPClient:
             timeout,
             into,
             skip_auth=skip_auth,
-            error_for_status=error_for_status,
             raises=raises,
             max_reconnects=max_reconnects,
             reconnect_delay=reconnect_delay,
@@ -1239,8 +1345,8 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: None = None,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> AsyncGenerator[bytes]: ...
     @overload
     def stream_get(
@@ -1252,8 +1358,8 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: type[dict[Any, Any]],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> AsyncGenerator[dict[str, Any]]: ...
     @overload
     def stream_get[TLine](
@@ -1265,8 +1371,8 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeAdapterTyping[TLine] | DecoderTyping[TLine],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> AsyncGenerator[TLine]: ...
     @overload
     def stream_get[TLine](
@@ -1278,8 +1384,8 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeForm[TLine],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> AsyncGenerator[TLine]: ...
     def stream_get(
         self,
@@ -1290,8 +1396,8 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> AsyncGenerator[Any]:
         """Stream GET `path`'s response as raw `bytes` chunks (unbuffered, safe for binary).
 
@@ -1300,8 +1406,12 @@ class HTTPClient:
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
-        this call.
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
+        this call. `max_retries` replaces the client's `max_retries` for this call, even on a verb
+        outside `retry_methods` (`0` sends it once).
+
+        A 4xx/5xx response always raises `HTTPResponseError`, whatever the client's
+        `raise_for_status`. A line that doesn't decode into `into` raises `HTTPDecodeError`.
         """
         return self._transport.stream_lines(
             "GET",
@@ -1316,8 +1426,8 @@ class HTTPClient:
             into,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=True,
-            error_for_status=error_for_status,
             raises=raises,
+            max_retries=max_retries,
         )
 
     @overload
@@ -1335,8 +1445,8 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: None = None,
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> AsyncGenerator[bytes]: ...
     @overload
     def stream_post(
@@ -1353,8 +1463,8 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: type[dict[Any, Any]],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> AsyncGenerator[dict[str, Any]]: ...
     @overload
     def stream_post[TLine](
@@ -1371,8 +1481,8 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: TypeAdapterTyping[TLine] | DecoderTyping[TLine],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> AsyncGenerator[TLine]: ...
     @overload
     def stream_post[TLine](
@@ -1389,8 +1499,8 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: TypeForm[TLine],
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> AsyncGenerator[TLine]: ...
     def stream_post(
         self,
@@ -1406,8 +1516,8 @@ class HTTPClient:
         content: str | bytes | None = None,
         into: TypeForm[Any] | TypeAdapterTyping[Any] | DecoderTyping[Any] | None = None,
         infer_mime_type_from_file_extension: bool = True,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> AsyncGenerator[Any]:
         """Like `stream_get`, but POST a body first — same `json`/`data`/`form`/`content`
         options as `post` (at most one), same raw-bytes-by-default / NDJSON-via-
@@ -1415,8 +1525,12 @@ class HTTPClient:
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
-        this call.
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
+        this call. `max_retries` replaces the client's `max_retries` for this call, even on a verb
+        outside `retry_methods` (`0` sends it once).
+
+        A 4xx/5xx response always raises `HTTPResponseError`, whatever the client's
+        `raise_for_status`. A line that doesn't decode into `into` raises `HTTPDecodeError`.
         """
         return self._transport.stream_lines(
             "POST",
@@ -1431,8 +1545,8 @@ class HTTPClient:
             into,
             skip_auth=skip_auth,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
-            error_for_status=error_for_status,
             raises=raises,
+            max_retries=max_retries,
         )
 
     @overload
@@ -1445,8 +1559,9 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[bytes]: ...
     @overload
     async def download(
@@ -1458,8 +1573,9 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[Path]: ...
     async def download(
         self,
@@ -1470,8 +1586,9 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[bytes] | Response[Path]:
         """Download `path`'s response body, optimized for large objects (e.g. a presigned GET
         URL for a multi-GB file) — much lower peak memory than `get()` for big bodies.
@@ -1483,12 +1600,15 @@ class HTTPClient:
         memory then stays O(chunk size) regardless of how large the body is, and `.data` is
         `dest` as a `Path`. `.elapsed` runs until the whole body has been read.
 
-        Raises `HTTPResponseError` on a 4xx/5xx response unless `error_for_status=False`.
+        Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
+        else the client's) is `False`: the `Response` then comes back, with nothing written to
+        `dest`, and reading its `.data` raises that error instead.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
-        this call.
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
+        this call. `max_retries` replaces the client's `max_retries` for this call, even on a verb
+        outside `retry_methods` (`0` sends it once).
         """
         return await self._transport.download(
             path,
@@ -1497,8 +1617,9 @@ class HTTPClient:
             headers,
             timeout,
             skip_auth=skip_auth,
-            error_for_status=error_for_status,
+            raise_for_status=raise_for_status,
             raises=raises,
+            max_retries=max_retries,
         )
 
     @overload
@@ -1510,8 +1631,9 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[None]: ...
     @overload
     async def head[THeaders: TypedHeaders](
@@ -1523,8 +1645,9 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[None, THeaders]: ...
     async def head(
         self,
@@ -1535,16 +1658,23 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         response_headers_type: type[TypedHeaders] | None = None,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[None, Any]:
         """HEAD `path` — headers-only, no body is ever decoded. Pass
         `response_headers_type` to get the response headers parsed into `.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
-        this call.
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
+        this call. `max_retries` replaces the client's `max_retries` for this call, even on a verb
+        outside `retry_methods` (`0` sends it once).
+
+        Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
+        else the client's) is `False`: the `Response` then comes back, and reading its `.data`
+        raises that error instead. Headers that don't parse into `response_headers_type` raise
+        `HTTPDecodeError`.
         """
         return await self._transport.send_headers_only(
             "HEAD",
@@ -1554,8 +1684,9 @@ class HTTPClient:
             timeout,
             response_headers_type,
             skip_auth=skip_auth,
-            error_for_status=error_for_status,
+            raise_for_status=raise_for_status,
             raises=raises,
+            max_retries=max_retries,
         )
 
     @overload
@@ -1567,8 +1698,9 @@ class HTTPClient:
         headers: Headers | None = None,
         timeout: float | None = None,
         skip_auth: bool = False,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[None]: ...
     @overload
     async def options[THeaders: TypedHeaders](
@@ -1580,8 +1712,9 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         response_headers_type: type[THeaders],
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[None, THeaders]: ...
     async def options(
         self,
@@ -1592,16 +1725,23 @@ class HTTPClient:
         timeout: float | None = None,
         skip_auth: bool = False,
         response_headers_type: type[TypedHeaders] | None = None,
-        error_for_status: bool = True,
-        raises: type[HTTPResponseError[Any]] | None = None,
+        raise_for_status: bool | None = None,
+        raises: type[HTTPResponseError[Any]] | Sequence[type[HTTPResponseError[Any]]] | None = None,
+        max_retries: int | None = None,
     ) -> Response[None, Any]:
         """OPTIONS `path` (e.g. a CORS preflight) — status and headers only, any body is discarded.
         Pass `response_headers_type` to get the response headers parsed into `.typed_headers`.
 
         `timeout` overrides the client's own for this call only; `skip_auth` omits the
         `Authorization` header (and skips invoking `bearer_auth`) for this call; `raises` overrides
-        the client's own `raises` (the `HTTPResponseError` subclass a 4xx/5xx is raised as) for
-        this call.
+        the client's own `raises` (the `HTTPResponseError` classes a 4xx/5xx may be raised as) for
+        this call. `max_retries` replaces the client's `max_retries` for this call, even on a verb
+        outside `retry_methods` (`0` sends it once).
+
+        Raises `HTTPResponseError` on a 4xx/5xx response, unless `raise_for_status` (this call's,
+        else the client's) is `False`: the `Response` then comes back, and reading its `.data`
+        raises that error instead. Headers that don't parse into `response_headers_type` raise
+        `HTTPDecodeError`.
         """
         return await self._transport.send_headers_only(
             "OPTIONS",
@@ -1611,6 +1751,7 @@ class HTTPClient:
             timeout,
             response_headers_type,
             skip_auth=skip_auth,
-            error_for_status=error_for_status,
+            raise_for_status=raise_for_status,
             raises=raises,
+            max_retries=max_retries,
         )

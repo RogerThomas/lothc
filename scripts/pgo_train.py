@@ -160,7 +160,7 @@ async def _async_other_requests(client: HTTPClient, targets: _Targets) -> None:
         _ = await client.post("upload", form={"field": "value", "file": ("a.txt", b"a")})
         _ = await client.get("redirect", into=_Item)
         _ = await client.get("connection-close")
-        _ = await client.get("boom", error_for_status=False)
+        _ = await client.get("boom", raise_for_status=False)
 
 
 async def _async_events(client: HTTPClient, targets: _Targets) -> None:
@@ -286,7 +286,7 @@ def _sync_other_requests(client: SyncHTTPClient, targets: _Targets) -> None:
         _ = client.post("upload", form={"field": "value", "file": ("a.txt", b"a")})
         _ = client.get("redirect", into=_Item)
         _ = client.get("connection-close")
-        _ = client.get("boom", error_for_status=False)
+        _ = client.get("boom", raise_for_status=False)
 
 
 def _sync_events(client: SyncHTTPClient, targets: _Targets) -> None:

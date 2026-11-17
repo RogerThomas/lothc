@@ -117,7 +117,7 @@ def _partial_body_seen(base_url: str, key: str) -> dict[str, Any] | None:
     own call raised), or `None` if nothing for `key` ever arrived."""
     with SyncHTTPClient(base_url=base_url) as client:
         for _ in range(200):
-            seen = client.get("partial-body-seen", params={"key": key}, error_for_status=False)
+            seen = client.get("partial-body-seen", params={"key": key}, raise_for_status=False)
             if seen.status == 200:
                 return json.loads(seen.data)
             time.sleep(0.01)

@@ -72,8 +72,8 @@ a docstring or a test already says.
 
 ## Architecture
 
-- **`lothc/` is split by concern**, imports running one way: types, headers, response, decode,
-  errors, encode, then form/streaming/SSE/settings/retry, then the two transports, then
+- **`lothc/` is split by concern**, imports running one way: types, headers, decode, errors,
+  response, raises, encode, then form/streaming/SSE/settings/retry, then the two transports, then
   `_client.py` and `_sync_client.py`. `lothc/_oauth.py` is built *on* the client.
 - **Top-level names are unique across `lothc/`**: the parity test pairs twins by name across
   modules.
@@ -168,7 +168,7 @@ or editing Python here.
     that opened it.
 - **Redirects run in Rust; retries and re-auth in Python.** A hop's headers must be reqwest's,
   in reqwest's order, which only the same Rust calls produce. Retries wrap the whole redirect
-  chain, as pyreqwest's middleware does.
+  chain, on both transports.
 - **Streaming shares one Python implementation with pyreqwest**: a transport supplies only a
   chunk source. Native reads at most two chunks ahead and stops reading the socket while nobody
   reads, so a slow consumer never buffers a whole body.
@@ -191,6 +191,15 @@ or editing Python here.
 - **Auth is `bearer_token`/`bearer_auth`/`basic_auth`**, one pyreqwest mechanism each, at most one.
 - **`max_retry_after` (60s) stops retrying instead of clamping**, leaving the caller to schedule
   from `Retry-After`; an early retry against a long wait is usually rejected again.
+- **Both transports retry in one Python loop** (`_retried`, decided 2026-11-16): pyreqwest's
+  retry middleware cost every async request ~57us, retried or not.
+- **Retries are bounded by settings, then decided by a rule** (decided 2026-11-16):
+  `retry_statuses` and `retry_methods` say what may be retried, `max_retries` (client, or per
+  call, where it also opts a verb in) how often, and `retry=` (a sync function on both clients,
+  so one type) is asked only about such a failure, so it can't retry a 404. It gets the error
+  the call would raise, so a rule can use the `raises=` classes, and lothc's own wait.
+  `max_retry_after` caps its answer too. No per-call `retry_statuses`/`retry=`: the rule can
+  branch on the method. Deferred: telling a never-sent request apart (needs Rust).
 - **A 401 re-authenticates once**, idempotent verbs only, through any `bearer_auth` that can
   `invalidate()`. A stale invalidation is a no-op, so concurrent 401s can't discard a fresh token.
 
@@ -212,11 +221,22 @@ or editing Python here.
 - **Decoders are cached by form** (a `TypeAdapter` costs ~31us to build), except for forms whose
   metadata compares by identity, which would grow the cache forever; 4096 entries is the
   backstop.
-- **`str` means raw text**, like `bytes`. Every decode failure is a `ValueError`; a decode
-  library's validation errors propagate unwrapped.
-- **`raises=` is a subclass pinning `HTTPResponseError[E]`**, because Python can't `except` a
-  parametrized generic. It's resolved before sending, and the error body is decoded
-  best-effort, so a proxy's HTML 502 still surfaces as a status error.
+- **`str` means raw text**, like `bytes`. Every decode failure is a `ValueError`.
+- **A successful response that doesn't decode raises `HTTPDecodeError`** (decided 2026-11-16),
+  wrapping the decode library's error (`.parse_error`, `__cause__`): unwrapped, the body, status
+  and request were unreachable. Native wraps it in Rust's `outcome()`, which alone has them.
+- **`raises=` is a class, or a list, of subclasses pinning `HTTPResponseError[P]`**, because
+  Python can't `except` a parametrized generic, each optionally keyed with `status=` (decided
+  2026-11-16). The first class for the status whose `P` decodes the body is raised, else plain
+  `HTTPResponseError`, so a proxy's HTML 502 still surfaces as a status error. Resolved before
+  sending; an entry that can never match is a `TypeError`. A per-call value replaces the client's.
+- **`.problem` is exactly `P` on a matched class, read-only** (so `P` is covariant and a pinned
+  subclass passes where the plain class is expected); a pinned class whose `P` doesn't decode
+  doesn't match, or `.problem` would be `P | dict | None`. Unpinned, it's the JSON object or
+  `None`, parsed on first read. Named `problem`, since `details.detail` stutters on the commonest
+  body.
+- **Rejected:** fields declared on the error class itself (they'd collide with `status`, `body`,
+  `headers`), `retry_after` on the error (it's in `.headers`), choosing a class by header.
 - **`Response.headers` is a `CaseInsensitiveDict`**, a `MutableMapping` rather than a `dict`
   subclass (which would lose case-insensitivity under `dict(h)`). It's built on first read
   (~15% throughput).
@@ -226,6 +246,12 @@ or editing Python here.
 - **Never leak pyreqwest's exception types.** Transport errors map to `HTTPTransportError` and
   its subclasses; a client build error is a plain `ValueError`.
 - **Status errors stay separate from transport errors.**
+- **`raise_for_status=False` (client, or per call) returns a 4xx/5xx as a `Response` whose `.data`
+  raises** (decided 2026-11-14), so an error body is never decoded into `into=` and an unhandled
+  status still surfaces. Raising stays the default: an ignored result must not swallow a 500.
+  The error response is a private subclass and `Response.error` (the exception, built on first
+  read) is a class-level default, so the success path costs what it did; a lazy `.data` measured
+  71ns slower and held raw bodies. Streaming verbs always raise.
 - **A `BuilderError` is permanent**: never retried or reconnected.
 - **A body cut off partway is retried; a corrupt one isn't.**
 - **A multipart `form=` request is sent once, never retried or re-authenticated:** its streamed

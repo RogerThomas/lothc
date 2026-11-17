@@ -1,28 +1,16 @@
-"""`Response` and `RequestInfo`, what every non-streaming verb returns."""
+"""`Response`, what every non-streaming verb returns."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ._compat import (
     BaseModel,
     Struct,
     msgspec,
 )
+from ._errors import HTTPResponseError, RequestInfo
 from ._headers import CaseInsensitiveDict
 from ._types import TypedHeaders
-
-
-@dataclass(slots=True)
-class RequestInfo:
-    """The request actually sent, attached to `Response.request` (every non-streaming verb's
-    result) and to `HTTPResponseError.request` — the target you asked for, not necessarily the
-    one a final response came from if redirects were followed.
-    """
-
-    method: str
-    url: str
-    path: str
-    host: str | None
 
 
 def _parse_typed_headers(
@@ -50,6 +38,12 @@ class Response[TData, THeaders: TypedHeaders | None = None]:
     necessarily the one a final response came from if redirects were followed.
     `.http_version` is the protocol the response came over (e.g. `"HTTP/1.1"`), and `.elapsed`
     the seconds from sending the request to having the whole response, including any retries.
+
+    With `raise_for_status=False` (the client's or the call's), a 4xx/5xx comes back as a
+    `Response` instead of raising: `.error` is the `HTTPResponseError` the call would otherwise
+    have raised, built on first read and the same object on every read after, and reading
+    `.data` or `.typed_headers` raises an error of the same class and contents (a new one on each
+    read). Every other response has `.error` `None`.
     """
 
     data: TData
@@ -59,3 +53,9 @@ class Response[TData, THeaders: TypedHeaders | None = None]:
     request: RequestInfo
     http_version: str
     elapsed: float
+    # A class-level default `__init__` never sets (`init=False` on a class without slots), so
+    # building a `Response`, the native side's positional call included, costs what it did
+    # before it existed, and an instance is no bigger. Plain `HTTPResponseError` (its `P` is
+    # `object`): `.problem` is read-only, so `P` is covariant and a `match` or `isinstance` over
+    # the caller's own subclasses narrows to each, `.problem` exactly typed.
+    error: HTTPResponseError | None = field(default=None, init=False, repr=False, compare=False)

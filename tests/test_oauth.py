@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from lothc import (
     HTTPClient,
     HTTPConnectionError,
+    HTTPDecodeError,
     HTTPResponseError,
     OAuthProvider,
     OAuthTokenError,
@@ -713,6 +714,89 @@ def test_sync_token_endpoint_server_error_is_an_oauth_token_error(
     assert cause.status == 500
 
 
+async def test_a_token_endpoint_error_still_raises_with_a_raise_for_status_false_factory(
+    base_url: str, token_server: TokenServer
+) -> None:
+    endpoint = TokenEndpoint(path="oauth/token-boom")
+    provider = OAuthProvider(
+        token_url=token_server.url(endpoint),
+        client_id="client-id",
+        client_secret="client-secret",
+        client_factory=partial(HTTPClient, raise_for_status=False),
+    )
+
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        with pytest.raises(OAuthTokenError) as error_info:
+            await _bearer(api)
+
+    cause = error_info.value.__cause__
+    assert isinstance(cause, HTTPResponseError)
+    assert cause.status == 500
+
+
+def test_sync_a_token_endpoint_error_still_raises_with_a_raise_for_status_false_factory(
+    base_url: str, token_server: TokenServer
+) -> None:
+    endpoint = TokenEndpoint(path="oauth/token-boom")
+    provider = SyncOAuthProvider(
+        token_url=token_server.url(endpoint),
+        client_id="client-id",
+        client_secret="client-secret",
+        client_factory=partial(SyncHTTPClient, raise_for_status=False),
+    )
+
+    with (
+        SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api,
+        pytest.raises(OAuthTokenError) as error_info,
+    ):
+        _sync_bearer(api)
+
+    cause = error_info.value.__cause__
+    assert isinstance(cause, HTTPResponseError)
+    assert cause.status == 500
+
+
+async def test_a_rejected_refresh_still_mints_with_a_raise_for_status_false_factory(
+    base_url: str, token_server: TokenServer
+) -> None:
+    endpoint = TokenEndpoint(with_refresh=True, expires_in=0, refresh_fails=True)
+    provider = OAuthProvider(
+        token_url=token_server.url(endpoint),
+        client_id="client-id",
+        client_secret="client-secret",
+        client_factory=partial(HTTPClient, raise_for_status=False),
+    )
+
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        await _bearer(api)
+        bearer = await _bearer(api)
+
+    assert bearer == "Bearer token-3"
+    assert token_server.grant_types() == [
+        "client_credentials",
+        "refresh_token",
+        "client_credentials",
+    ]
+
+
+def test_sync_a_rejected_refresh_still_mints_with_a_raise_for_status_false_factory(
+    base_url: str, token_server: TokenServer
+) -> None:
+    endpoint = TokenEndpoint(with_refresh=True, expires_in=0, refresh_fails=True)
+    provider = SyncOAuthProvider(
+        token_url=token_server.url(endpoint),
+        client_id="client-id",
+        client_secret="client-secret",
+        client_factory=partial(SyncHTTPClient, raise_for_status=False),
+    )
+
+    with SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        _sync_bearer(api)
+        bearer = _sync_bearer(api)
+
+    assert bearer == "Bearer token-3"
+
+
 @pytest.mark.parametrize(
     "provider_class", [OAuthProvider, SyncOAuthProvider], ids=["async", "sync"]
 )
@@ -1390,7 +1474,7 @@ async def test_a_cached_token_rejected_twice_by_a_get_is_retried_only_once(
         with pytest.raises(HTTPResponseError) as exc_info:
             await api.get("always-unauthorized", params={"key": f"{token_server.key}-api"})
 
-    assert exc_info.value.error == {"hits": 2}  # the original request plus exactly one retry
+    assert exc_info.value.problem == {"hits": 2}  # the original request plus exactly one retry
     assert len(token_server.requests()) == 2
 
 
@@ -1406,7 +1490,7 @@ def test_sync_a_cached_token_rejected_twice_by_a_get_is_retried_only_once(
     ):
         api.get("always-unauthorized", params={"key": f"{token_server.key}-api"})
 
-    assert exc_info.value.error == {"hits": 2}  # the original request plus exactly one retry
+    assert exc_info.value.problem == {"hits": 2}  # the original request plus exactly one retry
     assert len(token_server.requests()) == 2
 
 
@@ -1521,6 +1605,41 @@ def test_sync_a_200_without_a_usable_token_is_an_oauth_token_error(
     assert error_info.value.__cause__ is not None
 
 
+async def test_a_token_response_that_is_not_json_is_a_decode_error_under_the_oauth_error(
+    base_url: str, token_server: TokenServer
+) -> None:
+    endpoint = TokenEndpoint(path="oauth/token-broken", broken="not-json")
+    provider = token_server.provider(endpoint)
+
+    async with HTTPClient(base_url=base_url, bearer_auth=provider) as api:
+        with pytest.raises(OAuthTokenError) as error_info:
+            await _bearer(api)
+
+    cause = error_info.value.__cause__
+    assert isinstance(cause, HTTPDecodeError)
+    assert cause.status == 200
+    assert cause.request.url == token_server.url(endpoint)
+    assert isinstance(cause.parse_error, json.JSONDecodeError)
+
+
+def test_sync_a_token_response_that_is_not_json_is_a_decode_error_under_the_oauth_error(
+    base_url: str, token_server: TokenServer
+) -> None:
+    endpoint = TokenEndpoint(path="oauth/token-broken", broken="not-json")
+    provider = token_server.sync_provider(endpoint)
+
+    with (
+        SyncHTTPClient(base_url=base_url, bearer_auth=provider) as api,
+        pytest.raises(OAuthTokenError) as error_info,
+    ):
+        _sync_bearer(api)
+
+    cause = error_info.value.__cause__
+    assert isinstance(cause, HTTPDecodeError)
+    assert cause.status == 200
+    assert isinstance(cause.parse_error, json.JSONDecodeError)
+
+
 async def test_a_custom_token_response_model_rejecting_the_body_is_an_oauth_token_error(
     base_url: str, token_server: TokenServer
 ) -> None:
@@ -1538,7 +1657,10 @@ async def test_a_custom_token_response_model_rejecting_the_body_is_an_oauth_toke
         with pytest.raises(OAuthTokenError) as error_info:
             await _bearer(api)
 
-    assert isinstance(error_info.value.__cause__, ValidationError)
+    cause = error_info.value.__cause__
+    assert isinstance(cause, HTTPDecodeError)
+    assert cause.status == 200
+    assert isinstance(cause.parse_error, ValidationError)
 
 
 def _cache_file_expected(token_url: str) -> dict[str, object]:
