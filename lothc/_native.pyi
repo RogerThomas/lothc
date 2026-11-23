@@ -249,8 +249,13 @@ class Pool:
         on_deadline: Callable[[], object],
         on_writable: Callable[[int], object],
         on_readable: Callable[[int], object],
+        wake: Callable[[], object],
     ) -> None:
-        """Hand the pool its own bound `on_deadline`/`on_writable`/`on_readable`, once."""
+        """Hand the pool its own bound `on_deadline`/`on_writable`/`on_readable`/`wake`, once."""
+
+    def wake(self) -> None:
+        """Run what's ready: a streamed form part's chunk has been pulled (`_AsyncChunkStream`),
+        so the request writing it can go on."""
 
     def request(
         self,
@@ -267,6 +272,7 @@ class Pool:
         typed_headers: type | None,
         headers_only: bool,
         defer_error: bool,
+        hook_headers: dict[str, str] | Callable[[], dict[str, str]] | None = None,
     ) -> asyncio.Future[Response[Any, Any]]:
         """Start a request; its Future resolves to lothc's `Response` or raises its exception.
 
@@ -274,13 +280,23 @@ class Pool:
         or `(name, value)` pairs. `body_kind`: 0 raw `bytes`/`str`, 1 already-encoded JSON, 2 a
         `dict`/`list` to serialize, 3 a form, 4 a multipart body as `_NativeForm` describes it
         (its parts built in order as reqwest's are: a file opened here, its errors pyreqwest's
-        `OSError`s; a file part read as it's sent). `raises` is `None` for no status check; with
-        `defer_error`, a 4xx/5xx resolves to `glue.error_response` instead of raising.
+        `OSError`s; a file part read as it's sent, and a streamed one pulled as it's sent, on the
+        loop, an exception it raises raised as it was). `raises` is `None` for no status check;
+        with `defer_error`, a 4xx/5xx resolves to `glue.error_response` instead of raising.
         `timeout` is the request's total timeout, as pyreqwest's builder takes it (a negative one
         raises `ValueError`), its deadline rounded up to the end of a millisecond as tokio's timer
         rounds reqwest's. Raises before any I/O for a request that can't be built (`ValueError`,
-        `HTTPTransportError`).
+        `HTTPTransportError`). `hook_headers` are a `request_hook=`'s, set on the request once
+        it's built (replacing a header of the same name where it stands, else appended), as the
+        pyreqwest transport sets them on its built request: a `dict`, or a callable returning
+        one, called only once the request has been built, so one that fails to build never
+        calls it.
         """
+
+    def request_info(self, method: str, path: str, query: object) -> RequestInfo:
+        """The `RequestInfo` a request with these arguments carries, sending nothing: what a
+        `request_hook=` is shown before its headers are added. Raises as `request` does for the
+        method, URL and query."""
 
     def stream(
         self,
@@ -294,10 +310,11 @@ class Pool:
         timeout: timedelta | None,
         accept: str | None,
         last_event_id: str | None,
+        hook_headers: dict[str, str] | Callable[[], dict[str, str]] | None = None,
     ) -> Stream:
         """Prepare a streamed request, sending nothing until its `open`: `request`'s arguments
         (failing as it does before any I/O), plus the `accept` and `last-event-id` headers
-        `sse()` sets, which go first and last."""
+        `sse()` sets, which go first and last, and then `hook_headers`, as `request` sets them."""
 
     def connected(self, conn: int, fd: int, resolved: str | None = None) -> None:
         """`conn`'s socket `fd` is connected; `resolved` is the first address of the host
@@ -359,8 +376,12 @@ class SyncPool:
         typed_headers: type | None,
         headers_only: bool,
         defer_error: bool,
+        hook_headers: dict[str, str] | Callable[[], dict[str, str]] | None = None,
     ) -> Response[Any, Any]:
         """One blocking request, GIL released while it waits: `Pool.request`'s arguments."""
+
+    def request_info(self, method: str, path: str, query: object) -> RequestInfo:
+        """`Pool.request_info`."""
 
     def stream(
         self,
@@ -374,6 +395,7 @@ class SyncPool:
         timeout: timedelta | None,
         accept: str | None,
         last_event_id: str | None,
+        hook_headers: dict[str, str] | Callable[[], dict[str, str]] | None = None,
     ) -> SyncStream:
         """`Pool.stream`."""
 

@@ -434,9 +434,58 @@ class TestAppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _chunk_size(self) -> tuple[bytes, int]:
+        # The next chunk's size line and size. A client that hangs up mid-body (a streamed part
+        # whose iterator raised) is a disconnect, which the server doesn't print.
+        size_line = self.rfile.readline()
+        if not size_line:
+            raise ConnectionAbortedError("the client went away mid-body")
+        return size_line, int(size_line.split(b";")[0], 16)
+
+    def _read_chunked_body(self) -> tuple[bytes, bytes]:
+        # A `Transfer-Encoding: chunked` body (a `form=` with a streamed part): as it arrived,
+        # every chunk's size line, the zero-size last chunk and the empty trailer included, and
+        # decoded.
+        arrived = bytearray()
+        body = bytearray()
+        while True:
+            size_line, size = self._chunk_size()
+            arrived += size_line
+            if not size:
+                break
+            chunk = self.rfile.read(size + 2)
+            arrived += chunk
+            body += chunk[:size]
+        while True:
+            line = self.rfile.readline()
+            arrived += line
+            if line in {b"\r\n", b"\n", b""}:
+                return bytes(arrived), bytes(body)
+
+    def _read_body(self) -> tuple[bytes, bytes]:
+        # The request's body as it arrived and decoded: chunked, or `Content-Length` bytes.
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            return self._read_chunked_body()
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        return body, body
+
+    def _handle_body_arrival(self, query: str) -> None:
+        # When the first `after` bytes of a chunked body had arrived, by this process's
+        # `time.monotonic()` (which the test shares), and how many arrived in all: for a test that
+        # a streamed `form=` part is sent as it's pulled, not pulled whole first.
+        after = int(parse_qs(query)["after"][0])
+        size = 0
+        reached_at: float | None = None
+        while chunk_size := self._chunk_size()[1]:
+            size += len(self.rfile.read(chunk_size + 2)) - 2
+            if reached_at is None and size >= after:
+                reached_at = time.monotonic()
+        while self.rfile.readline() not in {b"\r\n", b"\n", b""}:
+            pass
+        self._write_json(200, {"size": size, "reached_at": reached_at})
+
     def _handle_upload(self) -> None:
-        length = int(self.headers.get("Content-Length", "0"))
-        raw_body = self.rfile.read(length)
+        _, raw_body = self._read_body()
         # `email` parses multipart/form-data correctly since it's a MIME multipart subset —
         # confirmed against a real body lothc's own form= produces. It just wants the
         # Content-Type as a message header, so prepend it ourselves.
@@ -906,14 +955,14 @@ class TestAppHandler(BaseHTTPRequestHandler):
     def _handle_echo_request(self) -> None:
         # The request as it arrived, for the wire-format tests: the raw request line, every
         # header in arrival order with its casing, and the body as latin-1 (one character per
-        # byte, so any body round-trips through JSON unchanged).
-        length = int(self.headers.get("Content-Length", "0"))
+        # byte, so any body round-trips through JSON unchanged), a chunked one with its framing.
+        arrived, _ = self._read_body()
         self._write_json(
             200,
             {
                 "line": self.requestline,
                 "headers": [[name, value] for name, value in self.headers.items()],
-                "body": self.rfile.read(length).decode("latin-1"),
+                "body": arrived.decode("latin-1"),
             },
         )
 
@@ -938,7 +987,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
 
     def _drain_body(self) -> bytes:
         # Read any request body, so a kept-alive connection's next request isn't misread.
-        return self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        _, body = self._read_body()
+        return body
 
     def _write_bodyless(self, status: int, extra_headers: dict[str, str] | None = None) -> None:
         self.send_response(status)
@@ -1376,6 +1426,8 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self._handle_ndjson_echo()
         elif parsed.path == "/upload":
             self._handle_upload()
+        elif parsed.path == "/body-arrival":
+            self._handle_body_arrival(parsed.query)
         elif parsed.path == "/echo-body":
             self._handle_echo_body()
         elif parsed.path == "/echo-request":

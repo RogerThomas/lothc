@@ -3,19 +3,22 @@
 //! parts in Python (`_NativeForm`); each becomes a reqwest `Part` here, in order, as pyreqwest's
 //! builder makes them:
 //!
-//! - `Part::text`, `Part::bytes`, or `Part::file`, which opens the file now (its errors are
-//!   pyo3's `OSError`s, as pyreqwest raises them) and takes the path's file name and
-//!   `mime_guess`'s type for its extension (`application/octet-stream` if none);
+//! - `Part::text`, `Part::bytes`, `Part::file`, which opens the file now (its errors are pyo3's
+//!   `OSError`s, as pyreqwest raises them) and takes the path's file name and `mime_guess`'s type
+//!   for its extension (`application/octet-stream` if none), or `Part::stream`, a streamed part
+//!   (`chunks.rs`), whose length is unknown;
 //! - then its `file_name`, and its `mime`, parsed by `mime` as pyreqwest's `MimeType` parses it
 //!   (a `ValueError` with its message);
 //! - each part's headers as reqwest's `PercentEncoding::PathSegment` (pyreqwest's default, which
 //!   lothc never changes) encodes them (`encode_headers`);
 //! - the body as `Form::into_stream` lays it out, and its length as `compute_length` counts it:
-//!   known (so sent as `Content-Length`) unless a file's metadata couldn't be read.
+//!   known (so sent as `Content-Length`) unless the form has a streamed part, or a file whose
+//!   metadata couldn't be read. Without one, the body goes out chunked, each piece of reqwest's
+//!   stream a chunk of its own on the wire, so the pieces are kept apart here as reqwest's are.
 //!
 //! reqwest keeps its encoder inside its `multipart` module, behind tokio, so this is a port of
-//! it, over the crates it uses (`percent-encoding`, `mime`, `mime_guess`). A file part is read
-//! as the body is written (`body.rs`), as reqwest streams one.
+//! it, over the crates it uses (`percent-encoding`, `mime`, `mime_guess`). A file part is read,
+//! and a streamed one pulled, as the body is written (`body.rs`), as reqwest streams one.
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fs::File;
@@ -28,9 +31,10 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use pyo3::exceptions::PyValueError;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyString};
+use pyo3::types::{PyBytes, PyDict, PyString};
 
-use crate::body::{RequestBody, Segment, Segments};
+use crate::body::{RequestBody, Segment, Segments, CHUNKED_FILE_CHUNK, FILE_CHUNK};
+use crate::chunks::Chunks;
 
 // reqwest's sets, from the URL spec: https://url.spec.whatwg.org/#fragment-percent-encode-set
 const FRAGMENT_ENCODE_SET: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').add(b'`');
@@ -46,6 +50,7 @@ enum Value {
     Bytes(Bytes),
     /// `len` is the file's metadata length when it was opened (`None` if that couldn't be read).
     File { file: File, len: Option<u64> },
+    Stream(Chunks),
 }
 
 struct Part {
@@ -74,6 +79,7 @@ impl Part {
         match &self.value {
             Value::Bytes(bytes) => Some(bytes.len() as u64),
             Value::File { len, .. } => *len,
+            Value::Stream(_) => None,
         }
     }
 
@@ -117,9 +123,10 @@ fn part_name(part: &Bound<'_, PyAny>) -> PyResult<String> {
 }
 
 /// One described part as pyreqwest builds it: a text part through `FormBuilder.text(name,
-/// value)`, which extracts the name first; any other through `PartBuilder.from_bytes` or
-/// `from_file`, then `file_name`, `mime` and `FormBuilder.part(name, part)`, in that order.
-fn build_part(part: &Bound<'_, PyAny>) -> PyResult<(String, Part)> {
+/// value)`, which extracts the name first; any other through `PartBuilder.from_bytes`,
+/// `from_stream` or `from_file`, then `file_name`, `mime` and `FormBuilder.part(name, part)`, in
+/// that order. `wake` is an async pool's own, for a part streamed from an async iterable.
+fn build_part(part: &Bound<'_, PyAny>, wake: Option<&Py<PyAny>>) -> PyResult<(String, Part)> {
     let py = part.py();
     let content = part.getattr(intern!(py, "content"))?;
     if let Ok(text) = content.cast::<PyString>() {
@@ -128,7 +135,10 @@ fn build_part(part: &Bound<'_, PyAny>) -> PyResult<(String, Part)> {
     }
     let mut built = match content.cast::<PyBytes>() {
         Ok(bytes) => Part::new(Value::Bytes(Bytes::copy_from_slice(bytes.as_bytes()))),
-        Err(_) => Part::file(content.extract::<PathBuf>()?)?,
+        Err(_) => match Chunks::extract(&content, wake)? {
+            Some(chunks) => Part::new(Value::Stream(chunks)),
+            None => Part::file(content.extract::<PathBuf>()?)?,
+        },
     };
     if let Some(file_name) = part.getattr(intern!(py, "filename"))?.extract::<Option<String>>()? {
         built.file_name = Some(file_name);
@@ -156,12 +166,16 @@ pub(crate) struct Encoded {
 
 impl Form {
     /// Build every part `form.parts()` describes, in order, each before the next is described.
-    pub(crate) fn extract(form: &Bound<'_, PyAny>) -> PyResult<Self> {
+    /// `wake` is an async pool's own, which only it passes: the parts are described for an async
+    /// client then, which alone may stream one from an async iterable.
+    pub(crate) fn extract(form: &Bound<'_, PyAny>, wake: Option<&Py<PyAny>>) -> PyResult<Self> {
         let py = form.py();
         let boundary = form.getattr(intern!(py, "boundary"))?.extract::<String>()?;
+        let kwargs = PyDict::new(py);
+        kwargs.set_item(intern!(py, "async_client"), wake.is_some())?;
         let mut fields = Vec::new();
-        for part in form.call_method0(intern!(py, "parts"))?.try_iter()? {
-            fields.push(build_part(&part?)?);
+        for part in form.call_method(intern!(py, "parts"), (), Some(&kwargs))?.try_iter()? {
+            fields.push(build_part(&part?, wake)?);
         }
         Ok(Self { boundary, fields })
     }
@@ -179,44 +193,83 @@ impl Form {
         if self.fields.is_empty() {
             return Encoded { content_type, length: Some(0), body: RequestBody::full(Bytes::new()) };
         }
-        let boundary = self.boundary.as_bytes();
-        let boundary_len = boundary.len() as u64;
+        let boundary_len = self.boundary.len() as u64;
         let mut length = Some(0u64);
-        let mut segments = VecDeque::new();
-        let mut pending = BytesMut::new();
+        let mut parts = Vec::with_capacity(self.fields.len());
         for (name, part) in self.fields {
             let headers = part.encode_headers(&name);
             length = length
                 .zip(part.value_len())
                 .map(|(total, value_len)| total + 2 + boundary_len + 2 + headers.len() as u64 + 4 + value_len + 2);
-            pending.extend_from_slice(b"--");
-            pending.extend_from_slice(boundary);
-            pending.extend_from_slice(b"\r\n");
-            pending.extend_from_slice(&headers);
-            pending.extend_from_slice(b"\r\n\r\n");
-            match part.value {
-                Value::Bytes(bytes) if bytes.len() < OWN_SEGMENT => pending.extend_from_slice(&bytes),
-                Value::Bytes(bytes) => {
-                    segments.push_back(Segment::Bytes(pending.split().freeze()));
-                    segments.push_back(Segment::Bytes(bytes));
-                }
-                Value::File { file, len } => {
-                    segments.push_back(Segment::Bytes(pending.split().freeze()));
-                    segments.push_back(Segment::File { file, expected: len.unwrap_or(0) });
-                }
-            }
-            pending.extend_from_slice(b"\r\n");
+            parts.push((headers, part.value));
         }
-        pending.extend_from_slice(b"--");
-        pending.extend_from_slice(boundary);
-        pending.extend_from_slice(b"--\r\n");
-        let length = length.map(|total| total + 2 + boundary_len + 4);
-        let body = if segments.is_empty() {
-            RequestBody::full(pending.freeze())
-        } else {
-            segments.push_back(Segment::Bytes(pending.freeze()));
-            RequestBody::Segments(Segments::new(segments))
+        let body = match length {
+            Some(_) => sized_body(&self.boundary, parts),
+            None => chunked_body(&self.boundary, parts),
         };
+        let length = length.map(|total| total + 2 + boundary_len + 4);
         Encoded { content_type, length, body }
     }
+}
+
+/// A body of known length: hyper writes it as one stream of bytes, so neighbouring in-memory
+/// pieces are copied into one segment, and only a large value or a file stands alone.
+fn sized_body(boundary: &str, parts: Vec<(Vec<u8>, Value)>) -> RequestBody {
+    let boundary = boundary.as_bytes();
+    let mut segments = VecDeque::new();
+    let mut pending = BytesMut::new();
+    for (headers, value) in parts {
+        pending.extend_from_slice(b"--");
+        pending.extend_from_slice(boundary);
+        pending.extend_from_slice(b"\r\n");
+        pending.extend_from_slice(&headers);
+        pending.extend_from_slice(b"\r\n\r\n");
+        match value {
+            Value::Bytes(bytes) if bytes.len() < OWN_SEGMENT => pending.extend_from_slice(&bytes),
+            Value::Bytes(bytes) => {
+                segments.push_back(Segment::Bytes(pending.split().freeze()));
+                segments.push_back(Segment::Bytes(bytes));
+            }
+            Value::File { file, len } => {
+                segments.push_back(Segment::Bytes(pending.split().freeze()));
+                segments.push_back(Segment::File { file, expected: len.unwrap_or(0), chunk: FILE_CHUNK });
+            }
+            // A streamed part has no length, so its form never gets here.
+            Value::Stream(chunks) => {
+                segments.push_back(Segment::Bytes(pending.split().freeze()));
+                segments.push_back(Segment::Stream(chunks));
+            }
+        }
+        pending.extend_from_slice(b"\r\n");
+    }
+    pending.extend_from_slice(b"--");
+    pending.extend_from_slice(boundary);
+    pending.extend_from_slice(b"--\r\n");
+    if segments.is_empty() {
+        return RequestBody::full(pending.freeze());
+    }
+    segments.push_back(Segment::Bytes(pending.freeze()));
+    RequestBody::Segments(Segments::new(segments))
+}
+
+/// A body of unknown length, which hyper writes chunked, each piece a chunk of its own: kept
+/// apart as reqwest's `into_stream` yields them (a part's boundary line, its headers, its value,
+/// as one piece or a file's reads or a stream's chunks, its closing CRLF; then the closing
+/// boundary), so the same chunks go out. An empty piece is left out, as hyper skips one.
+fn chunked_body(boundary: &str, parts: Vec<(Vec<u8>, Value)>) -> RequestBody {
+    let mut segments = VecDeque::new();
+    for (mut headers, value) in parts {
+        segments.push_back(Segment::Bytes(Bytes::from(format!("--{boundary}\r\n"))));
+        headers.extend_from_slice(b"\r\n\r\n");
+        segments.push_back(Segment::Bytes(Bytes::from(headers)));
+        match value {
+            Value::Bytes(bytes) if bytes.is_empty() => {}
+            Value::Bytes(bytes) => segments.push_back(Segment::Bytes(bytes)),
+            Value::File { file, len } => segments.push_back(Segment::File { file, expected: len.unwrap_or(0), chunk: CHUNKED_FILE_CHUNK }),
+            Value::Stream(chunks) => segments.push_back(Segment::Stream(chunks)),
+        }
+        segments.push_back(Segment::Bytes(Bytes::from_static(b"\r\n")));
+    }
+    segments.push_back(Segment::Bytes(Bytes::from(format!("--{boundary}--\r\n"))));
+    RequestBody::Segments(Segments::new(segments))
 }

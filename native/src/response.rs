@@ -41,7 +41,7 @@ pub(crate) async fn send(sender: &mut Sender, request: http::Request<RequestBody
         Ok(response) => Ok(response),
         Err(mut error) => Err(match error.take_message() {
             Some(request) => Failure::Unsent(Box::new(request)),
-            None => Failure::Transport(error_chain(&error.into_error())),
+            None => Failure::of_hyper(&error.into_error()),
         }),
     }
 }
@@ -193,6 +193,7 @@ impl Glue {
             Failure::Builder(message) => self.builder_error(py, message),
             Failure::Unsent(_) => self.connection_error(py, "connection closed before the request could be sent".to_owned()),
             Failure::Closed => Self::closed_error(),
+            Failure::Raised(error) => error,
         }
     }
 

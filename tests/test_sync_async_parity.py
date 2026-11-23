@@ -69,6 +69,12 @@ def _differing_implementations() -> dict[str, str]:
         "a mocked async native stream hands back Futures, as the pool's `Stream` does; the sync "
         "one returns each result itself, as `SyncStream` does"
     )
+    idle_limit_while_opening = (
+        "async: a stream's idle limit cancels `open`, so the hook's attempt exits with what the "
+        "stack unwinds with, the verb's `HTTPTimeoutError`; sync: the limit fires on the "
+        "caller's thread while `open` waits on a worker, which `abandon` tells, so the attempt "
+        "exits with that error once `open` returns"
+    )
     native_pool_lifecycle = (
         "the async native pool is bound to the running loop and opens its sockets through "
         "`_LoopConnections`, which closing also shuts down; the sync pool connects by itself"
@@ -83,7 +89,14 @@ def _differing_implementations() -> dict[str, str]:
         "_NativeTransport.close": native_pool_lifecycle,
         "_NativeStreamSource._open_current": awaits_the_native_stream,
         "_NativeStreamSource._read_chunk": awaits_the_native_stream,
+        "_NativeStreamSource.open": idle_limit_while_opening,
+        "_PyreqwestStreamSource.open": idle_limit_while_opening,
         "_native_answer": awaits_the_native_future,
+        "_build_form": (
+            "async describes its parts for an async client (`async_client=True`), which may "
+            "stream a file part from an async iterable; a sync client has no loop to pull one "
+            "on, so it refuses one with `TypeError` instead"
+        ),
         "_resolved": (
             "async awaits an `async def` matcher's or handler's result; a sync request can't, "
             "so it raises `TypeError` for one instead"
@@ -101,7 +114,16 @@ def _differing_implementations() -> dict[str, str]:
 
 
 def _one_sided_methods() -> dict[str, str]:
-    return {"OAuthProvider._get_lock": "the lazy per-loop `asyncio.Lock` (see `__call__`)"}
+    abandon = (
+        "a sync stream's idle limit fires on the caller's thread while `open` waits on a worker "
+        "(see `_NativeStreamSource.open` in `_differing_implementations`)"
+    )
+    return {
+        "OAuthProvider._get_lock": "the lazy per-loop `asyncio.Lock` (see `__call__`)",
+        "_NativeStreamSource.abandon": abandon,
+        "_PyreqwestStreamSource.abandon": abandon,
+        "_StreamSource.abandon": abandon,
+    }
 
 
 def _strip_awaitable(text: str) -> str:

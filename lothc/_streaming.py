@@ -3,6 +3,7 @@ limits, line splitting, atomic downloads, the sync chunk worker, and `stream_get
 `download` themselves (`sse()` is in `_sse.py`)."""
 
 import asyncio
+import contextvars
 import queue
 import secrets
 import threading
@@ -238,6 +239,10 @@ class _SyncStreamSource(Protocol):
     def permanent(self, error: HTTPTransportError, /) -> bool: ...
     def prepare(self) -> None: ...
     def open(self, stack: ExitStack) -> tuple[_ResponseHead, _SyncChunkReader]: ...
+    def abandon(self, error: Exception, /) -> None:
+        """The caller gave up on the exchange, raising `error` (a stall past its idle limit),
+        while `open` may still be waiting on the worker thread: a `request_hook=` attempt still
+        in flight exits with `error` once `open` returns."""
 
 
 async def _read_chunk_within(read_chunk: _ChunkReader, idle: float | None) -> Buffer | None:
@@ -294,6 +299,7 @@ def _drain_stream_chunks(
     item_queue: queue.Queue[_StreamQueueItem],
     abandoned: threading.Event,
     head_sink: list[_ResponseHead] | None,
+    context: contextvars.Context,
 ) -> None:
     """Worker-thread target for `_interruptible_chunk_iter` — owns the entire exchange itself
     (opening it, the status check, `on_head`, the read loop, and its own eventual close), never
@@ -303,11 +309,13 @@ def _drain_stream_chunks(
     opens and closes the exchange, sequentially, or cleanup itself becomes the new hang.
 
     `head_sink` gets the response's status line and headers before any chunk is queued, so the
-    queue hand-off orders it ahead of the consumer's first `get()`.
+    queue hand-off orders it ahead of the consumer's first `get()`. The exchange is opened in
+    `context`, a copy of the caller's, so a `request_hook=` entered there sees the caller's context
+    variables (a tracer's active span, say).
     """
     try:
         with ExitStack() as stack:
-            head, read_chunk = source.open(stack)
+            head, read_chunk = context.run(source.open, stack)
             if on_head is not None:
                 on_head(head)
             if head_sink is not None:
@@ -357,7 +365,7 @@ def _interruptible_chunk_iter(
     abandoned = threading.Event()
     worker = threading.Thread(
         target=_drain_stream_chunks,
-        args=(source, on_head, item_queue, abandoned, head_sink),
+        args=(source, on_head, item_queue, abandoned, head_sink, contextvars.copy_context()),
         daemon=True,
     )
     worker.start()
@@ -373,7 +381,9 @@ def _interruptible_chunk_iter(
                 item = item_queue.get(timeout=wait)
             except queue.Empty:
                 if idle_timeout is not None and time.monotonic() - waiting_since > idle_timeout:
-                    raise _idle_timeout_error(idle_timeout) from None
+                    error = _idle_timeout_error(idle_timeout)
+                    source.abandon(error)
+                    raise error from None
                 continue
             match item:
                 case ("chunk", bytes_chunk):

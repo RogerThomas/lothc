@@ -166,6 +166,9 @@ or editing Python here.
     cancel and retried a POST would submit it twice.
   - Addresses are tried in order (no happy eyeballs), and an async client is bound to the loop
     that opened it.
+  - A streamed `form=` part's plain iterator is pulled on the loop thread (pyreqwest: a tokio
+    thread), and a cancel mid-upload sends `CancelledError` into an async generator (pyreqwest
+    leaves it pending).
 - **Redirects run in Rust; retries and re-auth in Python.** A hop's headers must be reqwest's,
   in reqwest's order, which only the same Rust calls produce. Retries wrap the whole redirect
   chain, on both transports.

@@ -10,15 +10,16 @@ is also how every hop of a followed redirect and every attempt of a retried requ
 the proxy sees them all.
 
 A multipart `form=` body's boundary is random, so its cases mask each one (`_boundaries_masked`)
-and compare everything else byte for byte.
+and compare everything else byte for byte: a form with a streamed part goes out chunked, and
+`/echo-request` reports its body as it arrived, every chunk's size line included.
 """
 
 import io
 import json
 import re
 import sys
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
-from contextlib import ExitStack
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator, Iterator
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -42,7 +43,7 @@ from _tls_server import tls_server_context
 from msgspec import Struct
 from pydantic import BaseModel, Field
 
-from lothc import HTTPClient, RequestInfo, SyncHTTPClient
+from lothc import HTTPClient, RequestHook, RequestInfo, SyncHTTPClient
 
 # Every test here sends through the native transport, which is POSIX only.
 pytestmark = pytest.mark.skipif(
@@ -77,6 +78,19 @@ class _HeadersModel(BaseModel):
 
 class _AliasedModel(BaseModel):
     item_id: int = Field(alias="itemId")
+
+
+@contextmanager
+def _hook_headers(_request: RequestInfo) -> Generator[RequestHook]:
+    """A `request_hook=` whose headers replace a default, a call's own header, the auth and a
+    `json=` body's content type, and add one of their own."""
+    yield RequestHook({
+        "X-Hook": "hook",
+        "x-default": "hook",
+        "X-1": "hook",
+        "Authorization": "hook",
+        "content-type": "hook",
+    })
 
 
 @dataclass(slots=True)
@@ -217,6 +231,22 @@ def _wire_cases() -> list[_Case]:
         ),
         _Case("data-model", verb="post", call={"data": _QueryModel(page=1)}),
         _Case(
+            "request-hook-headers",
+            verb="post",
+            client={
+                "request_hook": _hook_headers,
+                "default_headers": {"X-Default": "0", "Accept": "accept"},
+                "bearer_token": "token",
+            },
+            call={"json": {"a": 1}, "headers": {"X-1": "1", "X-2": "2"}},
+        ),
+        _Case(
+            "request-hook-headers-head",
+            verb="head",
+            path="/items/7",
+            client={"request_hook": _hook_headers},
+        ),
+        _Case(
             "data-keeps-a-content-type-header",
             verb="post",
             call={"data": {"a": "b"}, "headers": {"content-type": "text/plain"}},
@@ -260,6 +290,12 @@ def _streamed_cases() -> list[_Case]:
         _Case("stream-post-json", verb="stream_post", call={"json": {"b": 1, "a": [1.5, None]}}),
         _Case("stream-post-data", verb="stream_post", call={"data": {"a": "x y"}}),
         _Case("stream-post-content", verb="stream_post", call={"content": b"\x00raw"}),
+        _Case(
+            "stream-post-request-hook-headers",
+            verb="stream_post",
+            client={"request_hook": _hook_headers, "default_headers": {"X-Default": "0"}},
+            call={"json": {"a": 1}, "headers": {"X-1": "1"}},
+        ),
         _Case(
             "stream-get-redirected",
             verb="stream_get",
@@ -456,6 +492,19 @@ def _retried_cases() -> list[_Case]:
             verb="stream_get",
             path="/status-then-ok?key={key}&fail_times=1",
             client=retries,
+        ),
+        _Case(
+            "retried-with-request-hook-headers",
+            verb="post",
+            path="/status-then-ok?key={key}&fail_times=1",
+            client={**retries, "retry_methods": {"POST"}, "request_hook": _hook_headers},
+            call={"json": {"a": 1}, "headers": {"X-1": "1"}},
+        ),
+        _Case(
+            "retried-stream-get-with-request-hook-headers",
+            verb="stream_get",
+            path="/status-then-ok?key={key}&fail_times=1",
+            client={**retries, "request_hook": _hook_headers},
         ),
     ]
 
@@ -1249,6 +1298,25 @@ class _Buffered:
     content: bytes
 
 
+@dataclass(frozen=True, slots=True)
+class _Chunks:
+    """A streamed part's chunks, made an iterator afresh for each transport."""
+
+    chunks: tuple[bytes, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _AsyncChunks:
+    """`_Chunks` as an async generator, for an async client only."""
+
+    chunks: tuple[bytes, ...]
+
+
+async def _async_chunks(chunks: tuple[bytes, ...]) -> AsyncIterator[bytes]:
+    for chunk in chunks:
+        yield chunk
+
+
 @dataclass(slots=True)
 class _FormCase:
     id: str
@@ -1269,6 +1337,8 @@ def _form_files(tmp_path: Path) -> Path:
         "a.weirdext": b"weird",
         "empty.json": b"",
         'q"uo\\te ü.txt': b"quoted",
+        # Over one read of a file in a chunked body (4 KiB, as reqwest's), which is a chunk.
+        "chunky.bin": bytes(range(256)) * 40,
     }
     for name, content in files.items():
         (tmp_path / name).write_bytes(content)
@@ -1284,6 +1354,10 @@ def _resolved(value: object, files: Path, stack: ExitStack) -> object:
             return files / name
         case _Buffered(content=content):
             return io.BytesIO(content)
+        case _Chunks(chunks=chunks):
+            return iter(chunks)
+        case _AsyncChunks(chunks=chunks):
+            return _async_chunks(chunks)
         case tuple():
             items = cast("tuple[object, ...]", value)
             return tuple(_resolved(item, files, stack) for item in items)
@@ -1330,6 +1404,43 @@ def _form_parts_by_kind() -> dict[str, Any]:
         "named-stream": _FormFile("a.txt", opened=True),
         "unnamed-stream": _Buffered(b"buffered"),
     }
+
+
+def _streamed_parts() -> dict[str, Any]:
+    """A streamed part beside every other kind, so the whole body goes out chunked: each piece
+    of it a chunk, a file's in reads of 4 KiB, and an empty piece none."""
+    return {
+        "text": "v",
+        "empty-bytes": b"",
+        "streamed": ("s.bin", _Chunks((b"one", b"", b"two"))),
+        "streamed-with-type": ("t.txt", _Chunks((b"x",)), "text/x-t"),
+        "streamed-empty": ("e.json", _Chunks(())),
+        "path": _FormFile("a.txt"),
+        "chunky-path": _FormFile("chunky.bin"),
+        "empty-path": _FormFile("empty.json"),
+        "named-stream": _FormFile("a.txt", opened=True),
+        "json": [1],
+    }
+
+
+def _streamed_part_cases() -> list[_FormCase]:
+    redirect = "/redirect-to?status={}&to=/echo-request"
+    streamed = {"f": ("f.bin", _Chunks((b"1",)))}
+    return [
+        _FormCase("streamed-parts", _streamed_parts()),
+        _FormCase(
+            "streamed-parts-without-type-inference",
+            _streamed_parts(),
+            call={"infer_mime_type_from_file_extension": False},
+        ),
+        _FormCase(
+            "streamed-repeat",
+            {"r": (("a.bin", _Chunks((b"1",))), ("b.bin", _Chunks((b"2",)), "x/y"))},
+        ),
+        _FormCase("streamed-put", streamed, verb="put"),
+        _FormCase("a-streamed-post-307-is-not-followed", streamed, path=redirect.format(307)),
+        _FormCase("a-streamed-post-303-becomes-a-get", streamed, path=redirect.format(303)),
+    ]
 
 
 def _form_cases() -> list[_FormCase]:
@@ -1419,6 +1530,7 @@ def _form_cases() -> list[_FormCase]:
         _FormCase("put-303-becomes-a-get", {"a": "b"}, verb="put", path=redirect.format(303)),
         _FormCase("an-empty-form-follows-a-307", {}, path=redirect.format(307)),
         _FormCase("an-empty-form-follows-a-put-302", {}, verb="put", path=redirect.format(302)),
+        *_streamed_part_cases(),
     ]
 
 
@@ -1452,15 +1564,46 @@ def test_sync_native_transport_sends_a_form_as_pyreqwest_does(
     assert _masked_seen(actual) == _masked_seen(expected)
 
 
-def _streamed_form_case() -> _FormCase:
-    return _FormCase("stream-post-form", {"a": "b", "f": _FormFile("a.txt")}, verb="stream_post")
-
-
-async def test_native_transport_streams_a_form_as_pyreqwest_does(
-    base_url: str, form_files: Path, monkeypatch: pytest.MonkeyPatch
+# An async iterable is an async client's only.
+@pytest.mark.parametrize(
+    "form",
+    [
+        {"f": ("f.bin", _AsyncChunks((b"one", b"", b"two")))},
+        {"a": "b", "f": ("f.txt", _AsyncChunks((b"x",)), "x/y"), "g": ("g.bin", _Chunks((b"y",)))},
+    ],
+    ids=["alone", "beside-others"],
+)
+async def test_native_transport_sends_an_async_streamed_part_as_pyreqwest_does(
+    base_url: str, form_files: Path, form: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pyreqwest_client, native_client = _pair(partial(HTTPClient, base_url=base_url), monkeypatch)
-    case = _streamed_form_case()
+    case = _FormCase("async-streamed", form)
+
+    with ExitStack() as stack:
+        expected = await _async_seen(
+            pyreqwest_client, _form_call(case, form_files, stack), base_url
+        )
+        actual = await _async_seen(native_client, _form_call(case, form_files, stack), base_url)
+
+    assert _masked_seen(actual) == _masked_seen(expected)
+
+
+def _streamed_form_cases() -> list[_FormCase]:
+    return [
+        _FormCase("stream-post-form", {"a": "b", "f": _FormFile("a.txt")}, verb="stream_post"),
+        _FormCase(
+            "stream-post-a-streamed-part",
+            {"a": "b", "f": ("f.bin", _Chunks((b"one", b"two")))},
+            verb="stream_post",
+        ),
+    ]
+
+
+@pytest.mark.parametrize("case", _streamed_form_cases(), ids=lambda case: case.id)
+async def test_native_transport_streams_a_form_as_pyreqwest_does(
+    base_url: str, form_files: Path, case: _FormCase, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pyreqwest_client, native_client = _pair(partial(HTTPClient, base_url=base_url), monkeypatch)
 
     with ExitStack() as stack:
         expected = await _async_streamed(
@@ -1471,11 +1614,11 @@ async def test_native_transport_streams_a_form_as_pyreqwest_does(
     assert _boundaries_masked(json.dumps(actual)) == _boundaries_masked(json.dumps(expected))
 
 
+@pytest.mark.parametrize("case", _streamed_form_cases(), ids=lambda case: case.id)
 def test_sync_native_transport_streams_a_form_as_pyreqwest_does(
-    base_url: str, form_files: Path, monkeypatch: pytest.MonkeyPatch
+    base_url: str, form_files: Path, case: _FormCase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     pyreqwest_client, native_client = _pair(partial(SyncHTTPClient, base_url=base_url), monkeypatch)
-    case = _streamed_form_case()
 
     with ExitStack() as stack:
         expected = _sync_streamed(pyreqwest_client, _form_call(case, form_files, stack), base_url)

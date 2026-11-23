@@ -2809,6 +2809,82 @@ def test_sync_an_empty_form_goes_out_as_pinned(base_url: str) -> None:
     assert _boundary_masked(seen) == _form_seen(0, b"")
 
 
+def _streamed_form() -> dict[str, Any]:
+    return {
+        "text": "value",
+        "file": ("f.txt", iter((b"one", b"", b"two"))),
+        "typed": ("t.bin", iter((b"x",)), "x/y"),
+        "empty": ("e.bin", iter(())),
+    }
+
+
+# A streamed part makes the length unknown: no `Content-Length`, and hyper's `Transfer-Encoding:
+# chunked` last. `/echo-request` reports the body as it arrived, a chunk per piece of reqwest's
+# multipart stream (each part's boundary line, headers, value, a chunk per streamed chunk, and
+# closing CRLF, then the closing boundary), an empty piece none, then the empty last chunk.
+def _streamed_form_seen() -> _Seen:
+    return _Seen(
+        status=200,
+        request=RequestInfo(
+            method="POST",
+            url="http://127.0.0.1:<port>/echo-request",
+            path="/echo-request",
+            host="127.0.0.1",
+        ),
+        wire=_Wire(
+            line="POST /echo-request HTTP/1.1",
+            headers=[
+                ("Content-Type", "multipart/form-data; boundary=<boundary>"),
+                ("X-1", "1"),
+                ("Accept", "*/*"),
+                ("User-Agent", "python-lothc/<version>"),
+                ("Accept-Encoding", "zstd,gzip,deflate,br"),
+                ("Host", "127.0.0.1:<port>"),
+                ("Transfer-Encoding", "chunked"),
+            ],
+            body=(
+                b"47\r\n--<boundary>\r\n\r\n"
+                b'2F\r\nContent-Disposition: form-data; name="text"\r\n\r\n\r\n'
+                b"5\r\nvalue\r\n"
+                b"2\r\n\r\n\r\n"
+                b"47\r\n--<boundary>\r\n\r\n"
+                b'5B\r\nContent-Disposition: form-data; name="file"; filename="f.txt"\r\n'
+                b"Content-Type: text/plain\r\n\r\n\r\n"
+                b"3\r\none\r\n"
+                b"3\r\ntwo\r\n"
+                b"2\r\n\r\n\r\n"
+                b"47\r\n--<boundary>\r\n\r\n"
+                b'55\r\nContent-Disposition: form-data; name="typed"; filename="t.bin"\r\n'
+                b"Content-Type: x/y\r\n\r\n\r\n"
+                b"1\r\nx\r\n"
+                b"2\r\n\r\n\r\n"
+                b"47\r\n--<boundary>\r\n\r\n"
+                b'6A\r\nContent-Disposition: form-data; name="empty"; filename="e.bin"\r\n'
+                b"Content-Type: application/octet-stream\r\n\r\n\r\n"
+                b"2\r\n\r\n\r\n"
+                b"49\r\n--<boundary>--\r\n\r\n"
+                b"0\r\n\r\n"
+            ),
+        ),
+    )
+
+
+async def test_a_form_with_a_streamed_part_goes_out_as_pinned(base_url: str) -> None:
+    case = _Case("streamed-form", "post", call={"form": _streamed_form(), "headers": {"X-1": "1"}})
+
+    seen = await _async_seen(HTTPClient(base_url=base_url), case, base_url, [_port(base_url)])
+
+    assert _boundary_masked(seen) == _streamed_form_seen()
+
+
+def test_sync_a_form_with_a_streamed_part_goes_out_as_pinned(base_url: str) -> None:
+    case = _Case("streamed-form", "post", call={"form": _streamed_form(), "headers": {"X-1": "1"}})
+
+    seen = _sync_seen(SyncHTTPClient(base_url=base_url), case, base_url, [_port(base_url)])
+
+    assert _boundary_masked(seen) == _streamed_form_seen()
+
+
 # --- Through an HTTP proxy --------------------------------------------------------------------
 
 

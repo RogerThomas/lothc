@@ -1,5 +1,6 @@
-"""`_TransportSettings`, the validated client settings every transport is built from, and
-`RetryAttempt`, what a `retry=` rule among them is asked about."""
+"""`_TransportSettings`, the validated client settings every transport is built from,
+`RetryAttempt`, what a `retry=` rule among them is asked about, and `RequestHook`, what a
+`request_hook=` yields for each attempt."""
 
 import inspect
 import os
@@ -10,14 +11,15 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from dataclasses import dataclass
+from contextlib import AbstractContextManager
+from dataclasses import dataclass, field
 from functools import cache
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as _distribution_version
 from typing import Literal
 from urllib.parse import urlsplit
 
-from ._errors import HTTPResponseError, HTTPTransportError
+from ._errors import HTTPResponseError, HTTPTransportError, RequestInfo
 from ._types import Headers
 
 
@@ -62,6 +64,47 @@ def _validate_retry_rule(rule: _RetryRule | None) -> None:
     if inspect.iscoroutinefunction(rule) or inspect.iscoroutinefunction(type(rule).__call__):
         name = getattr(rule, "__qualname__", repr(rule))
         raise TypeError(f"'retry' takes a plain function, not an async one: {name}")
+
+
+@dataclass(slots=True)
+class RequestHook:
+    """One attempt at a request, as a client's `request_hook=` yields it: `headers` are added to
+    that attempt (empty at first; each replaces a header of the same name the request already
+    has), and `status` is the response's, set by lothc once a response arrives (`None` until
+    then, and if none does)."""
+
+    headers: dict[str, str] = field(default_factory=dict[str, str])
+    status: int | None = None
+
+
+# A client's `request_hook=`: entered once per attempt with the request it's about to send.
+type _RequestHookFactory = Callable[[RequestInfo], AbstractContextManager[RequestHook]]
+
+
+def _validate_request_hook(hook: _RequestHookFactory | None) -> None:
+    """Refuse a `request_hook=` that isn't a plain callable, an `async` one (an
+    `@asynccontextmanager` included) too: both clients enter it as a `with` block would.
+
+    >>> from contextlib import asynccontextmanager
+    >>> @asynccontextmanager
+    ... async def hook(request: RequestInfo): yield RequestHook()
+    >>> _validate_request_hook(hook)
+    Traceback (most recent call last):
+    ...
+    TypeError: 'request_hook' takes a plain function, not an async one: hook
+    """
+    if hook is None:
+        return
+    if not callable(hook):
+        raise TypeError(f"'request_hook' takes a function of a RequestInfo, not {hook!r}")
+    unwrapped = inspect.unwrap(hook)
+    if (
+        inspect.iscoroutinefunction(unwrapped)
+        or inspect.isasyncgenfunction(unwrapped)
+        or inspect.iscoroutinefunction(type(hook).__call__)
+    ):
+        name = getattr(hook, "__qualname__", repr(hook))
+        raise TypeError(f"'request_hook' takes a plain function, not an async one: {name}")
 
 
 def _retry_method_set(
@@ -179,6 +222,7 @@ class _TransportSettings:  # pylint: disable=too-many-instance-attributes
     max_retry_after: float | None
     retry_statuses: frozenset[int]
     retry_rule: _RetryRule | None
+    request_hook: _RequestHookFactory | None
     connect_timeout: float | None
     read_timeout: float | None
     root_certificates: Sequence[bytes] | None
@@ -209,6 +253,7 @@ class _TransportSettings:  # pylint: disable=too-many-instance-attributes
             raise ValueError(f"'native' must be 'auto', 'off' or 'on', not {self.native!r}")
         _validate_max_retries(self.max_retries)
         _validate_retry_rule(self.retry_rule)
+        _validate_request_hook(self.request_hook)
 
 
 @cache

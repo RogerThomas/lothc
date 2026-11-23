@@ -29,6 +29,8 @@
 #[cfg(unix)]
 mod body;
 #[cfg(unix)]
+mod chunks;
+#[cfg(unix)]
 mod connect;
 #[cfg(unix)]
 mod cookie;

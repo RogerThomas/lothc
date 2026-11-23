@@ -156,6 +156,12 @@ See [Benchmarks](benchmarks.md) for the full numbers.
     Exponential backoff that honors `Retry-After`, on the idempotent verbs by default. See
     [Retries](retries.md).
 
+-   **Request hooks**
+
+    `request_hook=` wraps every attempt at a request, retries and reconnects included, in your own
+    context manager: a tracing span per attempt, its headers sent on that attempt. See
+    [Request hooks](hooks.md).
+
 -   **Authentication**
 
     A static `bearer_token`, `bearer_auth` for a token resolved fresh on every request, or

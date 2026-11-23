@@ -1359,12 +1359,23 @@ impl PoolState {
         typed_headers: Option<Py<PyAny>>,
         headers_only: bool,
         defer_error: bool,
+        verb_headers: VerbHeaders,
     ) -> PyResult<Py<PyAny>> {
         if self.is_closed {
             return Err(Glue::closed_error());
         }
-        let prepared =
-            self.config.prepare(py, &self.glue, method.to_str()?, path, query, headers, auth, body, body_kind)?;
+        let prepared = self.config.prepare(
+            py,
+            &self.glue,
+            method.to_str()?,
+            path,
+            query,
+            headers,
+            auth,
+            body,
+            body_kind,
+            verb_headers,
+        )?;
         let settings = Settings { decode, timeout, raises, defer_error, typed_headers, headers_only };
         self.submit(py, method.unbind(), prepared, settings)
     }
@@ -1422,7 +1433,7 @@ impl PoolState {
             return Err(Glue::closed_error());
         }
         let prepared =
-            self.config.prepare_with(py, &self.glue, method.to_str()?, path, query, headers, auth, body, body_kind, verb_headers)?;
+            self.config.prepare(py, &self.glue, method.to_str()?, path, query, headers, auth, body, body_kind, verb_headers)?;
         self.add_stream(py, method, prepared, timeout)
     }
 
@@ -1724,18 +1735,27 @@ impl Pool {
     }
 
     /// The pool's own bound `on_deadline`, `on_writable` and `on_readable`, handed back once so
-    /// arming the timer, a writer or a paused reader doesn't look them up.
-    fn set_callbacks(&mut self, on_deadline: Py<PyAny>, on_writable: Py<PyAny>, on_readable: Py<PyAny>) -> PyResult<()> {
+    /// arming the timer, a writer or a paused reader doesn't look them up, and its `wake`, which
+    /// a request streaming a `form=` part from an async iterable runs it with (`chunks.rs`).
+    fn set_callbacks(&mut self, on_deadline: Py<PyAny>, on_writable: Py<PyAny>, on_readable: Py<PyAny>, wake: Py<PyAny>) -> PyResult<()> {
         let state = self.state.get_mut()?;
         state.event_loop.on_deadline = Some(on_deadline);
         state.event_loop.on_writable = Some(on_writable);
         state.event_loop.on_readable = Some(on_readable);
+        state.config.set_stream_wake(wake);
         Ok(())
+    }
+
+    /// A streamed `form=` part's chunk has been pulled, and the request waiting for it woken: run
+    /// it, and whatever else that makes ready.
+    fn wake(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.state.get_mut()?.run(py)
     }
 
     /// Start a request and return the asyncio Future it resolves (see `response.rs`); under a
     /// mock hook (`mock.rs`), whatever the hook's `request` returns for it instead.
-    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, decode, timeout, raises, typed_headers, headers_only, defer_error))]
+    /// `hook_headers` are a `request_hook=`'s (`VerbHeaders::overrides`).
+    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, decode, timeout, raises, typed_headers, headers_only, defer_error, hook_headers=None))]
     #[allow(clippy::too_many_arguments)]
     fn request(
         slf: &Bound<'_, Self>,
@@ -1753,9 +1773,11 @@ impl Pool {
         typed_headers: Option<Py<PyAny>>,
         headers_only: bool,
         defer_error: bool,
+        hook_headers: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
+        let verb_headers = VerbHeaders::default().with_overrides(hook_headers.as_ref());
         if let Some(hook) = mock::hook(py) {
-            let call = Call { path, query: query.as_ref(), headers: headers.as_ref(), auth, body: body.as_ref(), body_kind, verb_headers: VerbHeaders::default() };
+            let call = Call { path, query: query.as_ref(), headers: headers.as_ref(), auth, body: body.as_ref(), body_kind, verb_headers };
             let settings = Settings { decode, timeout, raises, defer_error, typed_headers, headers_only };
             let intercepted = Intercepted::new(slf, py, method, call, settings)?;
             return hook.call_method1(py, intern!(py, "request"), (intercepted,));
@@ -1775,14 +1797,24 @@ impl Pool {
             typed_headers,
             headers_only,
             defer_error,
+            verb_headers,
         )
+    }
+
+    /// The `RequestInfo` a request with these arguments carries, sending nothing: what a
+    /// `request_hook=` is shown before its headers are added. Fails as `request` does for the
+    /// method, URL and query.
+    fn request_info(&mut self, py: Python<'_>, method: Bound<'_, PyString>, path: &str, query: Option<Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+        let state = self.state.get_mut()?;
+        let url = state.config.request_url(py, &state.glue, method.to_str()?, path, query.as_ref())?;
+        Ok(state.glue.request_info_of(py, &method, &url)?.unbind())
     }
 
     /// Prepare a streamed request (nothing is sent until its `open`): `request`'s arguments, less
     /// the decoding and status check (Python reads an error's body itself), plus `accept` and
     /// `last_event_id`, the headers `sse()` sets. Under a mock hook, whatever its `stream`
     /// returns, with `Stream`'s methods.
-    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, timeout, accept, last_event_id))]
+    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, timeout, accept, last_event_id, hook_headers=None))]
     #[allow(clippy::too_many_arguments)]
     fn stream(
         slf: &Bound<'_, Self>,
@@ -1797,8 +1829,9 @@ impl Pool {
         timeout: Option<Duration>,
         accept: Option<&str>,
         last_event_id: Option<&str>,
+        hook_headers: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let verb_headers = VerbHeaders::sse(accept, last_event_id)?;
+        let verb_headers = VerbHeaders::sse(accept, last_event_id)?.with_overrides(hook_headers.as_ref());
         if let Some(hook) = mock::hook(py) {
             let call = Call { path, query: query.as_ref(), headers: headers.as_ref(), auth, body: body.as_ref(), body_kind, verb_headers };
             let intercepted = Intercepted::new(slf, py, method, call, Settings { timeout, ..Settings::default() })?;
