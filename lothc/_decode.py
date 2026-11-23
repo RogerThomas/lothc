@@ -1,5 +1,6 @@
 """Turning an `into=` type form into one cached decoder, and decoding bodies and lines with it."""
 
+import sys
 from collections import defaultdict
 from collections.abc import (
     Buffer,
@@ -18,7 +19,12 @@ from typing import (
     get_type_hints,
 )
 
-from typing_extensions import TypeForm, is_typeddict
+from typing_extensions import is_typeddict
+
+if sys.version_info >= (3, 15):
+    from typing import TypeForm
+else:
+    from typing_extensions import TypeForm
 
 from ._compat import (
     BaseModel,
