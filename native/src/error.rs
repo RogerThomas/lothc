@@ -1,5 +1,9 @@
 //! Why an exchange failed, before it becomes one of lothc's exceptions.
+use std::error::Error;
+use std::io;
+
 use http::Request;
+use pyo3::prelude::*;
 
 use crate::body::RequestBody;
 
@@ -34,14 +38,40 @@ pub(crate) enum Failure {
     /// The client closed while the request was running: the `RuntimeError` a request made after
     /// it closed raises.
     Closed,
+    /// A streamed `form=` part's iterator raised it (`chunks.rs`): raised as it was, as
+    /// pyreqwest re-raises an exception from a body stream.
+    Raised(PyErr),
 }
 
 impl Failure {
+    /// A failed exchange as hyper reports it: the exception a streamed part raised, if that's
+    /// what failed its body, else the error with its causes.
+    pub(crate) fn of_hyper(error: &hyper::Error) -> Self {
+        match raised(error) {
+            Some(error) => Self::Raised(error),
+            None => Self::Transport(error_chain(error)),
+        }
+    }
+
     /// Whether the connection is still good after this failure: a redirect that wasn't followed
     /// only drops its response, which hyper drains (or closes) as for any hop.
     pub(crate) fn keeps_connection(&self) -> bool {
         matches!(self, Self::Redirect(_) | Self::Builder(_))
     }
+}
+
+/// The Python exception among `error`'s causes, if any: the `io::Error` a body's stream failed
+/// with holds one when pulling a streamed part raised it (as pyreqwest finds one in reqwest's).
+fn raised(error: &(dyn Error + 'static)) -> Option<PyErr> {
+    let mut cause = Some(error);
+    while let Some(error) = cause {
+        let inner = error.downcast_ref::<io::Error>().and_then(io::Error::get_ref);
+        if let Some(raised) = inner.and_then(|inner| inner.downcast_ref::<PyErr>()) {
+            return Some(Python::attach(|py| raised.clone_ref(py)));
+        }
+        cause = error.source();
+    }
+    None
 }
 
 /// An error and its causes as one line. hyper's `Display` omits the causes, and lothc's tests

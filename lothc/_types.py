@@ -1,8 +1,10 @@
 """The public type aliases for request inputs and auth, plus the re-authentication protocols."""
 
 from collections.abc import (
+    AsyncIterable,
     Awaitable,
     Callable,
+    Iterator,
     Mapping,
 )
 from io import BufferedIOBase
@@ -30,11 +32,15 @@ type TypedHeaders = BaseModelTyping | StructTyping
 # and was already sent correctly at runtime; only the type rejected it.
 type JSONPayload = dict[str, Any] | list[Any] | BaseModelTyping | StructTyping
 
+# A file's content may also be a stream of byte chunks, read as the body is sent: an iterator, or,
+# on `HTTPClient` only (a `SyncHTTPClient` refuses one with a `TypeError`), an async iterable. Not
+# any iterable: in `Form` a `list` already means "JSON-encode this" and a `tuple` "repeat".
+type _FormFileContent = bytes | Path | BufferedIOBase | Iterator[bytes] | AsyncIterable[bytes]
 # A caller never constructs these three directly — they just write a plain tuple literal, and
 # _form_value_parts tells them apart by exact arity + element type. Keep them private; File
 # (below) is the only name a caller-facing type hint ever needs.
-type _FormFileNoContentType = tuple[str, bytes | Path | BufferedIOBase]
-type _FormFileWithContentType = tuple[str, bytes | Path | BufferedIOBase, str]
+type _FormFileNoContentType = tuple[str, _FormFileContent]
+type _FormFileWithContentType = tuple[str, _FormFileContent, str]
 type _FormFileFromPathOverrideContentType = tuple[Path, str]
 type File = (
     _FormFileNoContentType

@@ -281,7 +281,9 @@ encoded), `default_headers`, auth and your own `headers=` (in the order they go 
 `json=`/`content=` body's bytes. It answers before the transport takes over, so the request has
 none of the headers the transport adds while sending (`Accept`, `User-Agent`, `Accept-Encoding`,
 cookies, `Host`), and `.body` is `None` for a `data=` or `form=` body, which the transport encodes
-itself (their `Content-Type`, and a `form=` body's `Content-Length`, are there). The response a mock
-gives comes back as is: a `3xx` isn't followed, a compressed body isn't decompressed, a
-`Set-Cookie` isn't stored, and neither the client's `timeout` nor `max_connections` applies to it.
+itself (their `Content-Type`, and a `form=` body's `Content-Length`, are there). A form with a
+[streamed file](verbs.md#streaming-a-files-content) has no `Content-Length`, and a mock that
+answers it never reads the stream. The response a mock gives comes back as is: a `3xx` isn't
+followed, a compressed body isn't decompressed, a `Set-Cookie` isn't stored, and neither the
+client's `timeout` nor `max_connections` applies to it.
 Retries and a `401`'s re-authentication do go through the mocks again, one request each.

@@ -16,6 +16,7 @@ nav = [
   { "Streaming" = "streaming.md" },
   { "SSE" = "sse.md" },
   { "Retries" = "retries.md" },
+  { "Request hooks" = "hooks.md" },
   { "Authentication" = "auth.md" },
   { "Testing" = "testing.md" },
   { "Networking" = "networking.md" },

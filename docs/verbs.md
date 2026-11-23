@@ -256,9 +256,9 @@ type decides how it's sent:
   `Content-Type: application/json` set automatically.
 - A **file**, in one of four shapes:
   - `pathlib.Path` — read and streamed from disk; filename is the path's own `.name`.
-  - `(filename, bytes | Path | file_object)` — an explicit filename paired with the content.
-  - `(filename, bytes | Path | file_object, content_type)` — same, plus an explicit content-type
-    override.
+  - `(filename, content)` — an explicit filename paired with the content: `bytes`, a `Path`, a
+    file object, or a stream of `bytes` chunks (see below).
+  - `(filename, content, content_type)` — same, plus an explicit content-type override.
   - `(Path, content_type)` — keeps the path's own auto-derived filename, but overrides just the
     content-type.
   - An already-opened binary file object (anything `io.BufferedIOBase`, e.g. `open(path, "rb")` or
@@ -287,6 +287,40 @@ await client.post(
     },
 )
 ```
+
+#### Streaming a file's content
+
+A file's content can also be a stream of `bytes` chunks: any iterator (a generator, say), and on
+`HTTPClient` an async iterable too (an async generator, say). Each chunk is pulled only as the
+body is sent, so an upload of any size is never held in memory whole:
+
+```python
+from collections.abc import Iterator
+
+
+def export_rows() -> Iterator[bytes]:
+    yield b"id,name\n"
+    for item in items:
+        yield f"{item.id},{item.name}\n".encode()
+
+
+await client.post("upload", form={"note": "shiny", "export": ("export.csv", export_rows())})
+```
+
+- Its length isn't known up front, so a form with a streamed part goes out with
+  `Transfer-Encoding: chunked` and no `Content-Length`. A form without one keeps its
+  `Content-Length`.
+- Every chunk must be `bytes`; anything else raises `TypeError` from the call. So does an async
+  iterable on `SyncHTTPClient`, before anything is sent.
+- An exception your iterator raises mid-upload comes out of the call as it was.
+- A `list` or `tuple` is never a stream: in a form, a `list` is one JSON part and a `tuple`
+  repeats the field.
+- The request is sent once, never retried, as for any `form=` with parts (see
+  [Retries](retries.md#multipart-form-requests-are-sent-once)): an iterator can only be read once,
+  so to send it again, call the verb again with a new one.
+- On `HTTPClient`, stream anything that waits (a network read, say) from an async iterable: the
+  [native transport](networking.md#native-transport) pulls a plain iterator's chunks on the event
+  loop's thread, so one that blocks stalls the loop.
 
 ## DELETE
 

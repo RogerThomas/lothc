@@ -128,7 +128,8 @@ byte.
 The same goes for re-authenticating on a `401` (see [Authentication](auth.md)): the rejected
 token is still discarded, so the next call gets a fresh one, but the `form=` request itself is
 raised rather than sent again. To retry an upload, catch the error and call the verb again; the
-form is rebuilt from your `dict` (a `Path` is reopened) on every call.
+form is rebuilt from your `dict` (a `Path` is reopened) on every call, though a file streamed from
+an iterator needs a new iterator, since the first was read.
 
 `retry_methods` is case-insensitive (`{"get"}` works), and an empty collection means "retry
 nothing": with `max_retries` set, pass `retry_methods=set()` to switch retries off per client.

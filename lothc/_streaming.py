@@ -3,6 +3,7 @@ limits, line splitting, atomic downloads, the sync chunk worker, and `stream_get
 `download` themselves (`sse()` is in `_sse.py`)."""
 
 import asyncio
+import contextvars
 import queue
 import secrets
 import threading
@@ -21,7 +22,7 @@ from contextlib import (
     asynccontextmanager,
     contextmanager,
 )
-from dataclasses import KW_ONLY, dataclass
+from dataclasses import KW_ONLY, dataclass, field
 from io import BufferedWriter
 from pathlib import Path
 from typing import (
@@ -178,6 +179,41 @@ class _SyncReplayedBody:
         return body
 
 
+class _StreamAbandoned(Exception):  # noqa: N818 — it's a state, not a failure anyone sees
+    """Raised on a sync stream's worker thread in place of an attempt its caller gave up on
+    (`_Abandonment`). Not an `HTTPTransportError`, so the retry loop never retries it."""
+
+
+@dataclass(slots=True)
+class _Abandonment:
+    """Whether the caller of a sync stream gave up on it before its head arrived, while `open`
+    may still be waiting on the worker thread (`_SyncStreamSource.abandon`), and `error`, what
+    the hook's attempt in flight then exits with: an instance of its own, never the one the
+    caller raised, which exiting a `@contextmanager` hook would change from the worker thread
+    (its traceback and context) while the caller's thread handles it."""
+
+    error: BaseException | None = None
+    _retrying: bool = field(default=False, init=False)
+
+    def attempt[T](self, attempt: Callable[[], T]) -> T:
+        """`attempt()`, an attempt at opening the stream that the retry loop makes, unless the
+        caller has given up, before it (the first goes out regardless, as an unretried stream's
+        one does) or while it waited: then `_StreamAbandoned`, so no further attempt is made, and
+        nothing is sent that nobody would read."""
+        if self._retrying and self.error is not None:
+            raise _StreamAbandoned
+        self._retrying = True
+        try:
+            outcome = attempt()
+        except HTTPTransportError:
+            if self.error is not None:
+                raise _StreamAbandoned from None
+            raise
+        if self.error is not None:
+            raise _StreamAbandoned
+        return outcome
+
+
 @dataclass(slots=True)
 class _StreamCall:
     """A streaming verb's request, as the client passed it, for a transport's stream source to
@@ -238,6 +274,11 @@ class _SyncStreamSource(Protocol):
     def permanent(self, error: HTTPTransportError, /) -> bool: ...
     def prepare(self) -> None: ...
     def open(self, stack: ExitStack) -> tuple[_ResponseHead, _SyncChunkReader]: ...
+    def abandon(self, error: BaseException, /) -> None:
+        """The caller gave up on the exchange (a stall past its idle limit, or Ctrl-C) while
+        `open` may still be waiting on the worker thread: no further attempt is made, and a
+        `request_hook=` attempt still in flight exits with `error` once `open` returns. `error`
+        is the hook's own instance of what the caller raised (`_Abandonment`)."""
 
 
 async def _read_chunk_within(read_chunk: _ChunkReader, idle: float | None) -> Buffer | None:
@@ -294,6 +335,7 @@ def _drain_stream_chunks(
     item_queue: queue.Queue[_StreamQueueItem],
     abandoned: threading.Event,
     head_sink: list[_ResponseHead] | None,
+    context: contextvars.Context,
 ) -> None:
     """Worker-thread target for `_interruptible_chunk_iter` — owns the entire exchange itself
     (opening it, the status check, `on_head`, the read loop, and its own eventual close), never
@@ -303,11 +345,13 @@ def _drain_stream_chunks(
     opens and closes the exchange, sequentially, or cleanup itself becomes the new hang.
 
     `head_sink` gets the response's status line and headers before any chunk is queued, so the
-    queue hand-off orders it ahead of the consumer's first `get()`.
+    queue hand-off orders it ahead of the consumer's first `get()`. The exchange is opened in
+    `context`, a copy of the caller's, so a `request_hook=` entered there sees the caller's context
+    variables (a tracer's active span, say).
     """
     try:
         with ExitStack() as stack:
-            head, read_chunk = source.open(stack)
+            head, read_chunk = context.run(source.open, stack)
             if on_head is not None:
                 on_head(head)
             if head_sink is not None:
@@ -357,7 +401,7 @@ def _interruptible_chunk_iter(
     abandoned = threading.Event()
     worker = threading.Thread(
         target=_drain_stream_chunks,
-        args=(source, on_head, item_queue, abandoned, head_sink),
+        args=(source, on_head, item_queue, abandoned, head_sink, contextvars.copy_context()),
         daemon=True,
     )
     worker.start()
@@ -373,8 +417,15 @@ def _interruptible_chunk_iter(
                 item = item_queue.get(timeout=wait)
             except queue.Empty:
                 if idle_timeout is not None and time.monotonic() - waiting_since > idle_timeout:
+                    source.abandon(_idle_timeout_error(idle_timeout))
                     raise _idle_timeout_error(idle_timeout) from None
                 continue
+            # Ctrl-C while waiting, the head perhaps still on its way: as for the idle limit. A
+            # caller closing the stream early needs no such telling: it can only stop at a
+            # `yield`, by which time the head has arrived.
+            except KeyboardInterrupt:
+                source.abandon(KeyboardInterrupt())
+                raise
             match item:
                 case ("chunk", bytes_chunk):
                     yield bytes_chunk

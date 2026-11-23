@@ -1108,7 +1108,7 @@ impl SyncPool {
 
     /// One blocking request: same arguments as `Pool.request`, returns lothc's `Response`; under
     /// a mock hook (`mock.rs`), whatever the hook's `request_sync` returns for it instead.
-    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, decode, timeout, raises, typed_headers, headers_only, defer_error))]
+    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, decode, timeout, raises, typed_headers, headers_only, defer_error, hook_headers=None))]
     #[allow(clippy::too_many_arguments)]
     fn request<'py>(
         slf: &Bound<'py, Self>,
@@ -1126,10 +1126,12 @@ impl SyncPool {
         typed_headers: Option<Py<PyAny>>,
         headers_only: bool,
         defer_error: bool,
+        hook_headers: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let settings = Settings { decode, timeout, raises, defer_error, typed_headers, headers_only };
+        let verb_headers = VerbHeaders::default().with_overrides(hook_headers.as_ref());
         if let Some(hook) = mock::hook(py) {
-            let call = Call { path, query: query.as_ref(), headers: headers.as_ref(), auth, body: body.as_ref(), body_kind, verb_headers: VerbHeaders::default() };
+            let call = Call { path, query: query.as_ref(), headers: headers.as_ref(), auth, body: body.as_ref(), body_kind, verb_headers };
             let intercepted = SyncIntercepted::new(slf, py, method, call, settings)?;
             return hook.bind(py).call_method1(intern!(py, "request_sync"), (intercepted,));
         }
@@ -1137,13 +1139,30 @@ impl SyncPool {
         if pool.shared.closed.load(Ordering::Relaxed) {
             return Err(Glue::closed_error());
         }
-        let prepared = pool.config.prepare(py, &pool.glue, method.to_str()?, path, query.as_ref(), headers.as_ref(), auth, body.as_ref(), body_kind)?;
+        let prepared = pool.config.prepare(
+            py,
+            &pool.glue,
+            method.to_str()?,
+            path,
+            query.as_ref(),
+            headers.as_ref(),
+            auth,
+            body.as_ref(),
+            body_kind,
+            verb_headers,
+        )?;
         pool.send_prepared(py, method.unbind(), prepared, settings)
+    }
+
+    /// `Pool.request_info`.
+    fn request_info(&self, py: Python<'_>, method: Bound<'_, PyString>, path: &str, query: Option<Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
+        let url = self.config.request_url(method.to_str()?, path, query.as_ref())?;
+        Ok(self.glue.request_info_of(py, &method, &url)?.unbind())
     }
 
     /// Prepare a streamed request (nothing is sent until its `open`): `Pool.stream`'s arguments;
     /// under a mock hook, whatever its `stream_sync` returns, with `SyncStream`'s methods.
-    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, timeout, accept, last_event_id))]
+    #[pyo3(signature = (method, path, query, headers, auth, body, body_kind, timeout, accept, last_event_id, hook_headers=None))]
     #[allow(clippy::too_many_arguments)]
     fn stream<'py>(
         slf: &Bound<'py, Self>,
@@ -1158,8 +1177,9 @@ impl SyncPool {
         timeout: Option<Duration>,
         accept: Option<&str>,
         last_event_id: Option<&str>,
+        hook_headers: Option<Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let verb_headers = VerbHeaders::sse(accept, last_event_id)?;
+        let verb_headers = VerbHeaders::sse(accept, last_event_id)?.with_overrides(hook_headers.as_ref());
         if let Some(hook) = mock::hook(py) {
             let call = Call { path, query: query.as_ref(), headers: headers.as_ref(), auth, body: body.as_ref(), body_kind, verb_headers };
             let intercepted = SyncIntercepted::new(slf, py, method, call, Settings { timeout, ..Settings::default() })?;
@@ -1169,7 +1189,7 @@ impl SyncPool {
         if pool.shared.closed.load(Ordering::Relaxed) {
             return Err(Glue::closed_error());
         }
-        let prepared = pool.config.prepare_with(
+        let prepared = pool.config.prepare(
             py,
             &pool.glue,
             method.to_str()?,

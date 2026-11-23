@@ -166,6 +166,9 @@ or editing Python here.
     cancel and retried a POST would submit it twice.
   - Addresses are tried in order (no happy eyeballs), and an async client is bound to the loop
     that opened it.
+  - A streamed `form=` part's plain iterator is pulled on the loop thread (pyreqwest: a tokio
+    thread), and a cancel mid-upload sends `CancelledError` into an async generator (pyreqwest
+    leaves it pending).
 - **Redirects run in Rust; retries and re-auth in Python.** A hop's headers must be reqwest's,
   in reqwest's order, which only the same Rust calls produce. Retries wrap the whole redirect
   chain, on both transports.
@@ -304,6 +307,8 @@ Each of these was a real bug or a lost hour once.
 - **`.to_bytes()`, never `bytes(x.bytes())`**, and don't convert at all when the decoder takes a
   buffer (msgspec does; pydantic needs `bytes`).
 - **Keep `_send_method` one async layer deep**: each extra layer is a frame on every resume.
+- **A failed `isinstance` against a runtime-checkable `Protocol` costs over 1us and isn't
+  cached**: keep them out of hot `match` patterns (two in `form=` cost plain forms ~35%).
 - **The async idle limit wraps each chunk read, never a `yield`**, or a slow consumer looks like
   a stalled server.
 - **The mocker validates before registering** (a rule matches from the moment it's added) **and

@@ -1,16 +1,24 @@
 """Multipart `form=` bodies: validated and described part by part (`_form_parts`), which either
 transport builds from. The pyreqwest transport's `FormBuilder` is built here; the native transport
-hands the description to `lothc._native` (`_NativeForm`, `native/src/multipart.rs`)."""
+hands the description to `lothc._native` (`_NativeForm`, `native/src/multipart.rs`). A file part
+streamed from an iterator (`_ChunkStream`) or an async iterable (`_AsyncChunkStream`) is pulled
+chunk by chunk as either transport writes the body, never held whole."""
 
-from collections.abc import Iterator
+import asyncio
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterator
+from contextvars import Context, copy_context
 from dataclasses import dataclass
-from io import BufferedIOBase
+from io import BufferedIOBase, IOBase
 from json import dumps as _json_dumps
 from mimetypes import guess_type as _guess_mime_type
 from pathlib import Path
 from typing import (
     Any,
+    Protocol,
+    Self,
+    TypeIs,
     cast,
+    runtime_checkable,
 )
 
 from pyreqwest.multipart import FormBuilder, PartBuilder
@@ -24,16 +32,105 @@ from ._encode import _pydantic_by_alias
 from ._types import Form, JSONPayload
 
 
+# A streamed file part's content: an iterator, or an async iterable, of anything (each chunk is
+# checked as it's pulled, `_checked_chunk`). As `Iterator` would type it, but with its items known
+# (`object`), where `collections.abc`'s leave them unknown. Matched only once a value is known to
+# be file content (`_is_file_content`), since a runtime-checkable protocol's failed `isinstance`
+# costs over a microsecond.
+@runtime_checkable
+class _ChunkSource(Protocol):
+    def __iter__(self) -> Self: ...
+    def __next__(self) -> object: ...
+
+
+@runtime_checkable
+class _AsyncChunkSource(Protocol):
+    def __aiter__(self) -> AsyncIterator[object]: ...
+
+
+def _checked_chunk(name: str, chunk: object) -> bytes:
+    """A chunk of streamed form part `name`, which must be `bytes` on either transport, as the
+    type says (pyreqwest's own stream would also take a `bytearray` or `memoryview`): anything
+    else raises from the send, where the stream yielded it.
+
+    >>> _checked_chunk("f", b"a")
+    b'a'
+    >>> _checked_chunk("f", "a")
+    Traceback (most recent call last):
+    ...
+    TypeError: Streamed form part 'f' yielded a str chunk; each chunk must be bytes
+    """
+    if not isinstance(chunk, bytes):
+        raise TypeError(
+            f"Streamed form part {name!r} yielded a {type(chunk).__name__} chunk; each chunk "
+            "must be bytes"
+        )
+    return chunk
+
+
+@dataclass(slots=True)
+class _ChunkStream:
+    """A file part streamed from an iterator, which either transport pulls a chunk at a time as
+    it writes the body (pyreqwest's `PartBuilder.from_stream`, the native transport's
+    `multipart.rs`), each checked to be `bytes`. An exception the iterator raises comes out of
+    the send as it was, as pyreqwest re-raises it."""
+
+    _name: str
+    _chunks: Iterator[object]
+
+    def __iter__(self) -> Self:
+        return self
+
+    def __next__(self) -> bytes:
+        return _checked_chunk(self._name, next(self._chunks))
+
+
+@dataclass(slots=True)
+class _AsyncChunkStream:
+    """`_ChunkStream` for an async iterable, on an async client only. pyreqwest iterates it; the
+    native transport `pull`s each chunk as a task on the loop, run in `_context` (a copy of the
+    caller's, taken when the part was described), as pyreqwest runs each of its pulls in the
+    context it took when the part was built."""
+
+    _name: str
+    _chunks: AsyncIterator[object]
+    _context: Context
+
+    async def _next_chunk(self) -> bytes | None:
+        try:
+            chunk = await anext(self._chunks)
+        except StopAsyncIteration:
+            return None
+        return _checked_chunk(self._name, chunk)
+
+    def __aiter__(self) -> Self:
+        return self
+
+    async def __anext__(self) -> bytes:
+        return _checked_chunk(self._name, await anext(self._chunks))
+
+    def pull(
+        self, ready: Callable[[asyncio.Task[bytes | None]], object]
+    ) -> asyncio.Task[bytes | None]:
+        """The next chunk (`None` once there are no more), as a task on the running loop that
+        calls `ready` once it's done: how the native transport reads one without blocking."""
+        task = asyncio.get_running_loop().create_task(self._next_chunk(), context=self._context)
+        task.add_done_callback(ready)
+        return task
+
+
 @dataclass(slots=True)
 class _FormPart:
     """One part of a multipart body, as reqwest's `multipart::Part` is made from it: `content` a
-    `str` is `Part::text`, `bytes` `Part::bytes`, and a `Path` `Part::file` (which opens the file
-    and takes its name, and a type guessed from its extension), then `filename` and `mime` are
-    applied where set. Each transport builds a part when `_form_parts` reaches it, so an error
-    (a missing file, an invalid name or type) surfaces at the same part as on pyreqwest."""
+    `str` is `Part::text`, `bytes` `Part::bytes`, a `Path` `Part::file` (which opens the file and
+    takes its name, and a type guessed from its extension), and a `_ChunkStream` or
+    `_AsyncChunkStream` `Part::stream`, whose length is unknown, so the whole body goes out
+    chunked, with no `Content-Length`; then `filename` and `mime` are applied where set. Each
+    transport builds a part when `_form_parts` reaches it, so an error (a missing file, an
+    invalid name or type) surfaces at the same part as on pyreqwest."""
 
     name: str
-    content: str | bytes | Path
+    content: str | bytes | Path | _ChunkStream | _AsyncChunkStream
     filename: str | None = None
     mime: str | None = None
 
@@ -68,6 +165,31 @@ def _encode_json_form_part(value: list[Any] | JSONPayload) -> bytes:
     return _json_dumps(value).encode()
 
 
+# Hot even for a form with no file in it: a file pattern is tried on plain values too (each `str`
+# of a repeat tuple). So a `str` is ruled out first, and the rest is checked against
+# `collections.abc`'s classes, not `_ChunkSource`'s, whose failed `isinstance` made such a form
+# ~35% slower to send.
+def _is_file_content(
+    content: object,
+) -> TypeIs[bytes | Path | BufferedIOBase | _ChunkSource | _AsyncChunkSource]:
+    """Whether `content` is what a file part is made from: `bytes`, a `Path`, a buffered binary
+    file, or a stream of chunks (an iterator, or an async iterable), but not a file object that
+    isn't buffered binary (a text-mode file, or one opened with `buffering=0`), which iterates
+    like a stream of chunks but is refused before sending, as an unsupported form value.
+
+    >>> import io
+    >>> [_is_file_content(c) for c in (b"a", io.BytesIO(), io.StringIO(), iter([b"a"]), "a")]
+    [True, True, False, True, False]
+    """
+    if isinstance(content, (bytes, Path)):
+        return True
+    if isinstance(content, str):
+        return False
+    if isinstance(content, IOBase):
+        return isinstance(content, BufferedIOBase)
+    return isinstance(content, (Iterator, AsyncIterable))
+
+
 # Mirrors _form_value_parts's own branch order (not _FormRepeat's member order) so a value's kind
 # here is always the branch it will actually take. Returns None for anything unclassifiable and
 # leaves the reporting to _form_value_parts's `case _`, which names the offending value.
@@ -80,12 +202,11 @@ def _form_value_kind(value: object) -> str | None:
         case list():
             return "json"
         case (
-            (str(), bytes() | Path() | BufferedIOBase())
-            | (str(), bytes() | Path() | BufferedIOBase(), str())
-            | (Path(), str())
-            | Path()
-            | BufferedIOBase()
-        ):
+            (str(), object() as content)
+            | (str(), object() as content, str())
+            | (Path() as content, str())
+            | (Path() | BufferedIOBase() as content)
+        ) if _is_file_content(content):
             return "file"
         case dict() | BaseModel() | Struct():
             return "json"
@@ -120,19 +241,44 @@ def _buffered_io_filename(value: BufferedIOBase) -> str | None:
     return Path(raw_name).name if isinstance(raw_name, str) else None
 
 
+# What a file part's content goes to a transport as. A buffered stream is read here, whole
+# (`bytes(...)`, so one whose `read()` gives a `bytearray`/`memoryview` works on both transports;
+# no copy for `bytes`), before the iterator case, since it's an iterator too. A stream of chunks
+# is only wrapped: nothing is read from it until the body is written.
+def _file_part_content(
+    name: str,
+    content: bytes | Path | BufferedIOBase | _ChunkSource | _AsyncChunkSource,
+    *,
+    async_client: bool,
+) -> bytes | Path | _ChunkStream | _AsyncChunkStream:
+    match content:
+        case BufferedIOBase():
+            return bytes(content.read())
+        case bytes() | Path():
+            return content
+        case _ChunkSource():
+            return _ChunkStream(name, content)
+        case _:
+            if not async_client:
+                raise TypeError(
+                    f"Unsupported form value for {name!r}: a SyncHTTPClient streams a file part "
+                    f"from an iterator, not an async iterable ({type(content).__name__})"
+                )
+            return _AsyncChunkStream(name, aiter(content), copy_context())
+
+
 # `explicit_mime` always wins over inference; `filename` is `None` for the Path-override shape,
-# whose part keeps the name its own path gives it. A buffered stream is read here, whole.
+# whose part keeps the name its own path gives it.
 def _form_file_part(
     name: str,
-    content: bytes | Path | BufferedIOBase,
+    content: bytes | Path | BufferedIOBase | _ChunkSource | _AsyncChunkSource,
     filename: str | None,
     explicit_mime: str | None,
     *,
     infer_mime_type_from_file_extension: bool,
+    async_client: bool,
 ) -> _FormPart:
-    # `bytes(...)`, so a stream whose `read()` gives a `bytearray`/`memoryview` works on both
-    # transports (pyreqwest takes any buffer); it's the same object, no copy, for `bytes`.
-    body = bytes(content.read()) if isinstance(content, BufferedIOBase) else content
+    body = _file_part_content(name, content, async_client=async_client)
     mime = explicit_mime or _guess_form_part_mime(
         filename, infer_mime_type_from_file_extension=infer_mime_type_from_file_extension
     )
@@ -143,9 +289,10 @@ def _form_file_part(
 # bypassing the type checker, so the `case _` fallback below must stay reachable rather than
 # basedpyright proving it `Never` from a narrower declared type. A generator, so a part is only
 # described once the one before it is built: a missing file still fails before a later part's
-# `TypeError`, as when pyreqwest's builder was driven value by value.
+# `TypeError`, as when pyreqwest's builder was driven value by value. `async_client` says whether
+# a file may be streamed from an async iterable, which only an async client can pull.
 def _form_value_parts(
-    name: str, value: object, *, infer_mime_type_from_file_extension: bool
+    name: str, value: object, *, infer_mime_type_from_file_extension: bool, async_client: bool
 ) -> Iterator[_FormPart]:
     infer = infer_mime_type_from_file_extension
     match value:
@@ -161,26 +308,53 @@ def _form_value_parts(
         case list():
             body = _encode_json_form_part(cast(list[Any], value))
             yield _FormPart(name, body, None, "application/json")
-        case (str() as filename, bytes() | Path() | BufferedIOBase() as content):
+        # A text-mode or unbuffered file is an iterator too, but not a file part's content: it
+        # falls through to `case tuple()`, whose `case _` refuses it before anything is sent.
+        case (str() as filename, object() as content) if _is_file_content(content):
             yield _form_file_part(
-                name, content, filename, None, infer_mime_type_from_file_extension=infer
+                name,
+                content,
+                filename,
+                None,
+                infer_mime_type_from_file_extension=infer,
+                async_client=async_client,
             )
-        case (str() as filename, bytes() | Path() | BufferedIOBase() as content, str() as mime):
+        case (str() as filename, object() as content, str() as mime) if _is_file_content(content):
             yield _form_file_part(
-                name, content, filename, mime, infer_mime_type_from_file_extension=infer
+                name,
+                content,
+                filename,
+                mime,
+                infer_mime_type_from_file_extension=infer,
+                async_client=async_client,
             )
         case (Path() as content_path, str() as mime):
             yield _form_file_part(
-                name, content_path, None, mime, infer_mime_type_from_file_extension=infer
+                name,
+                content_path,
+                None,
+                mime,
+                infer_mime_type_from_file_extension=infer,
+                async_client=async_client,
             )
         case Path():
             yield _form_file_part(
-                name, value, value.name, None, infer_mime_type_from_file_extension=infer
+                name,
+                value,
+                value.name,
+                None,
+                infer_mime_type_from_file_extension=infer,
+                async_client=async_client,
             )
         case BufferedIOBase():
             filename = _buffered_io_filename(value)
             yield _form_file_part(
-                name, value, filename, None, infer_mime_type_from_file_extension=infer
+                name,
+                value,
+                filename,
+                None,
+                infer_mime_type_from_file_extension=infer,
+                async_client=async_client,
             )
         case dict() | BaseModel() | Struct():
             body = _encode_json_form_part(cast("JSONPayload", value))
@@ -189,20 +363,29 @@ def _form_value_parts(
             items = cast("tuple[object, ...]", value)
             _check_form_repeat(name, items)
             for item in items:
-                yield from _form_value_parts(name, item, infer_mime_type_from_file_extension=infer)
+                yield from _form_value_parts(
+                    name,
+                    item,
+                    infer_mime_type_from_file_extension=infer,
+                    async_client=async_client,
+                )
         case _:
             raise TypeError(
                 f"Unsupported form value for {name!r}: {value!r} ({type(value).__name__})"
             )
 
 
-def _form_parts(form: Form, *, infer_mime_type_from_file_extension: bool) -> Iterator[_FormPart]:
-    """Every part of `form`, in order: a tuple value repeats its name once per element."""
+def _form_parts(
+    form: Form, *, infer_mime_type_from_file_extension: bool, async_client: bool
+) -> Iterator[_FormPart]:
+    """Every part of `form`, in order: a tuple value repeats its name once per element. On a
+    sync client (not `async_client`), a file streamed from an async iterable is a `TypeError`."""
     for name, value in form.items():
         yield from _form_value_parts(
             name,
             value,
             infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+            async_client=async_client,
         )
 
 
@@ -212,16 +395,20 @@ def _finish_part(part: PartBuilder, form_part: _FormPart) -> PartBuilder:
     return part if form_part.mime is None else part.mime(form_part.mime)
 
 
-async def _build_file_part(content: bytes | Path) -> PartBuilder:
+async def _build_file_part(content: bytes | Path | _ChunkStream | _AsyncChunkStream) -> PartBuilder:
     if isinstance(content, Path):
         return await PartBuilder.from_file(content)
-    return PartBuilder.from_bytes(content)
+    if isinstance(content, bytes):
+        return PartBuilder.from_bytes(content)
+    return PartBuilder.from_stream(content)
 
 
 async def _build_form(form: Form, *, infer_mime_type_from_file_extension: bool) -> FormBuilder:
     form_builder = FormBuilder()
     parts = _form_parts(
-        form, infer_mime_type_from_file_extension=infer_mime_type_from_file_extension
+        form,
+        infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+        async_client=True,
     )
     for form_part in parts:
         if isinstance(form_part.content, str):
@@ -232,16 +419,20 @@ async def _build_form(form: Form, *, infer_mime_type_from_file_extension: bool) 
     return form_builder
 
 
-def _build_sync_file_part(content: bytes | Path) -> PartBuilder:
+def _build_sync_file_part(content: bytes | Path | _ChunkStream | _AsyncChunkStream) -> PartBuilder:
     if isinstance(content, Path):
         return PartBuilder.from_sync_file(content)
-    return PartBuilder.from_bytes(content)
+    if isinstance(content, bytes):
+        return PartBuilder.from_bytes(content)
+    return PartBuilder.from_stream(content)
 
 
 def _build_sync_form(form: Form, *, infer_mime_type_from_file_extension: bool) -> FormBuilder:
     form_builder = FormBuilder()
     parts = _form_parts(
-        form, infer_mime_type_from_file_extension=infer_mime_type_from_file_extension
+        form,
+        infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+        async_client=False,
     )
     for form_part in parts:
         if isinstance(form_part.content, str):

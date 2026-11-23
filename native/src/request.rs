@@ -141,10 +141,16 @@ pub(crate) fn server_name(url: &Url) -> Result<ServerName<'static>, String> {
 /// Headers a verb sets itself, each dropped from the defaults first: `before` ahead of the auth
 /// and `headers=` (`sse()`'s `accept`), appended as pyreqwest's `.header()` does; `after` behind
 /// them (its `last-event-id`), replacing a same-named `headers=` value as `.headers()` does.
+/// `overrides` are a `request_hook=`'s, set on the request once it's built, as the pyreqwest
+/// transport sets them on its built request (`HeaderMap::insert`): a header of the same name is
+/// replaced where it stands, wherever it came from, and any other is appended. They're a `dict`,
+/// or a callable returning one, called only once the request has been built (`stage`), so a
+/// request that can't be built never enters the hook, as on pyreqwest.
 #[derive(Default)]
 pub(crate) struct VerbHeaders {
     pub(crate) before: Option<(HeaderName, HeaderValue)>,
     pub(crate) after: Option<(HeaderName, HeaderValue)>,
+    pub(crate) overrides: Option<Py<PyAny>>,
 }
 
 impl VerbHeaders {
@@ -154,8 +160,31 @@ impl VerbHeaders {
         Ok(Self {
             before: accept.map(value).transpose()?.map(|value| (ACCEPT, value)),
             after: last_event_id.map(value).transpose()?.map(|value| (HeaderName::from_static("last-event-id"), value)),
+            overrides: None,
         })
     }
+
+    /// These, plus a `request_hook=`'s headers, if any (`overrides`).
+    pub(crate) fn with_overrides(mut self, hook_headers: Option<&Bound<'_, PyAny>>) -> Self {
+        self.overrides = hook_headers.map(|headers| headers.clone().unbind());
+        self
+    }
+}
+
+/// `overrides` (`VerbHeaders`) set on `headers`, calling them first if they're a callable; a bad
+/// name or value is refused with the `ValueError` pyreqwest's `HeaderMap` raises for it.
+fn set_overrides(py: Python<'_>, headers: &mut HeaderMap, overrides: &Py<PyAny>) -> PyResult<()> {
+    let overrides = overrides.bind(py);
+    let resolved = if overrides.is_callable() { overrides.call0()? } else { overrides.clone() };
+    let dict = resolved.cast::<PyDict>().map_err(|_| PyTypeError::new_err("headers must be a dict of str to str"))?;
+    for (key, value) in dict.iter() {
+        let name = HeaderName::from_bytes(key.extract::<String>()?.as_bytes())
+            .map_err(|_| PyValueError::new_err("invalid HTTP header name"))?;
+        let value = HeaderValue::from_str(&value.extract::<String>()?)
+            .map_err(|_| PyValueError::new_err("failed to parse header value"))?;
+        headers.try_insert(name, value).map_err(too_many_headers)?;
+    }
+    Ok(())
 }
 
 /// A request built as far as pyreqwest's middleware sees one (`ClientConfig::stage`), which is
@@ -198,6 +227,9 @@ pub(crate) struct ClientConfig {
     redirects: Option<Policy>,
     /// `cookie_store=True`'s jar (`cookie.rs`).
     cookies: Option<Arc<Jar>>,
+    /// An async pool's own `wake`, which a `form=` part streamed from an async iterable runs it
+    /// with once a chunk has been pulled (`chunks.rs`); `None` on a sync pool.
+    stream_wake: Option<Py<PyAny>>,
 }
 
 enum QueryFailure {
@@ -494,7 +526,21 @@ impl ClientConfig {
         // reqwest's `user_agent()` keeps the error for `build()`, which raises it as its own.
         let user_agent = HeaderValue::from_str(user_agent).map_err(|e| ClientBuildError::new_err(format!("builder error: {e}")))?;
         client_headers.insert(USER_AGENT, user_agent);
-        Ok(Self { base_url, default_headers, client_headers, https_only, proxies: Proxies::none(), redirects: None, cookies: None })
+        Ok(Self {
+            base_url,
+            default_headers,
+            client_headers,
+            https_only,
+            proxies: Proxies::none(),
+            redirects: None,
+            cookies: None,
+            stream_wake: None,
+        })
+    }
+
+    /// An async pool's own `wake` (see `stream_wake`), handed over once it exists.
+    pub(crate) fn set_stream_wake(&mut self, wake: Py<PyAny>) {
+        self.stream_wake = Some(wake);
     }
 
     /// The client's proxies (`proxy.rs`), which `prepare` routes every request by.
@@ -536,29 +582,13 @@ impl ClientConfig {
         (RequestBody::full(bytes), copy, seen)
     }
 
-    /// Everything about a request but the connection. Fails before any I/O: a `ValueError` for
-    /// what pyreqwest rejects while building (an unparseable URL, an invalid header or query
-    /// value), `HTTPTransportError` for what reqwest rejects when sending (a scheme other than
-    /// http(s), plain http under `https_only`, a sequence as a query value).
+    /// Everything about a request but the connection, with the headers a verb sets itself
+    /// (`VerbHeaders`). Fails before any I/O: a `ValueError` for what pyreqwest rejects while
+    /// building (an unparseable URL, an invalid header or query value), `HTTPTransportError` for
+    /// what reqwest rejects when sending (a scheme other than http(s), plain http under
+    /// `https_only`, a sequence as a query value).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
-        &self,
-        py: Python<'_>,
-        glue: &Glue,
-        method_name: &str,
-        path: &str,
-        query: Option<&Bound<'_, PyAny>>,
-        headers: Option<&Bound<'_, PyAny>>,
-        auth: Option<&str>,
-        body: Option<&Bound<'_, PyAny>>,
-        body_kind: u8,
-    ) -> PyResult<Prepared> {
-        self.prepare_with(py, glue, method_name, path, query, headers, auth, body, body_kind, VerbHeaders::default())
-    }
-
-    /// `prepare`, plus the headers a verb sets itself (`VerbHeaders`).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare_with(
         &self,
         py: Python<'_>,
         glue: &Glue,
@@ -594,30 +624,15 @@ impl ClientConfig {
         keep_seen: bool,
     ) -> PyResult<Staged> {
         let method = method(method_name)?;
-        let mut url = self.url(path)?;
+        let (url, userinfo, mut unsupported) = self.staged_url(path, query)?;
         let mut reqwest_headers = HeaderMap::new();
-        if let Some(value) = authority_auth(&mut url)? {
+        if let Some(value) = userinfo {
             reqwest_headers.append(AUTHORIZATION, value);
-        }
-        let mut unsupported = false;
-        if let Some(query) = query {
-            let result = {
-                let mut serializer = url.query_pairs_mut();
-                append_pairs(&mut serializer, query, "query")
-            };
-            match result {
-                Ok(()) => {}
-                Err(QueryFailure::Invalid(error)) => return Err(error),
-                Err(QueryFailure::Unsupported) => unsupported = true,
-            }
-            if url.query() == Some("") {
-                url.set_query(None);
-            }
         }
 
         let mut defaults = self.default_headers.clone();
         let mut own: Option<HeaderMap> = None;
-        let VerbHeaders { before, after } = verb_headers;
+        let VerbHeaders { before, after, overrides } = verb_headers;
         if let Some((name, value)) = before {
             set_header(&mut defaults, &mut own, name, value)?;
         }
@@ -669,7 +684,7 @@ impl ClientConfig {
                     self.copyable(Bytes::from(serializer.finish()), false)
                 }
                 BODY_MULTIPART => {
-                    let (body, copy) = multipart_body(body, &mut reqwest_headers)?;
+                    let (body, copy) = multipart_body(body, self.stream_wake.as_ref(), &mut reqwest_headers)?;
                     (body, copy, None)
                 }
                 other => return Err(PyValueError::new_err(format!("unknown body kind {other}"))),
@@ -693,7 +708,45 @@ impl ClientConfig {
         if body_kind == BODY_JSON {
             headers.try_insert(CONTENT_TYPE, HeaderValue::from_static("application/json")).map_err(too_many_headers)?;
         }
+        if let Some(overrides) = &overrides {
+            set_overrides(py, &mut headers, overrides)?;
+        }
         Ok(Staged { method, url, headers, body, copy, seen_body })
+    }
+
+    /// Steps 1 and 2: the URL, the basic-auth header its `user:pass@` became (if any), and
+    /// whether `query` held a value reqwest's builder refuses (raised by `stage` only after the
+    /// headers, as pyreqwest raises it).
+    fn staged_url(&self, path: &str, query: Option<&Bound<'_, PyAny>>) -> PyResult<(Url, Option<HeaderValue>, bool)> {
+        let mut url = self.url(path)?;
+        let userinfo = authority_auth(&mut url)?;
+        let mut unsupported = false;
+        if let Some(query) = query {
+            let result = {
+                let mut serializer = url.query_pairs_mut();
+                append_pairs(&mut serializer, query, "query")
+            };
+            match result {
+                Ok(()) => {}
+                Err(QueryFailure::Invalid(error)) => return Err(error),
+                Err(QueryFailure::Unsupported) => unsupported = true,
+            }
+            if url.query() == Some("") {
+                url.set_query(None);
+            }
+        }
+        Ok((url, userinfo, unsupported))
+    }
+
+    /// The URL a request goes to, as `stage` builds it, before anything else is: what its
+    /// `RequestInfo` carries, for a `request_hook=` to see before the hook's headers are added.
+    /// Fails only where `stage` fails first (the method, then the URL and query); an unsupported
+    /// query value or a URL without a host is left for `stage` to raise after the headers and
+    /// body, as it does without a hook, and the scheme for `finish`, inside the hook.
+    pub(crate) fn request_url(&self, method_name: &str, path: &str, query: Option<&Bound<'_, PyAny>>) -> PyResult<Url> {
+        method(method_name)?;
+        let (url, _, _) = self.staged_url(path, query)?;
+        Ok(url)
     }
 
     /// Step 4 for a staged request: what reqwest checks and adds while sending it, from its
@@ -746,11 +799,12 @@ impl ClientConfig {
     }
 }
 
-/// reqwest's `RequestBuilder::multipart`: the form's parts built (`multipart.rs`), its
-/// `Content-Type`, then its `Content-Length` when every part's length is known, appended to
-/// reqwest's own headers; the body, and its copy for a redirect (an empty form's only).
-fn multipart_body(form: &Bound<'_, PyAny>, reqwest_headers: &mut HeaderMap) -> PyResult<(RequestBody, Option<Bytes>)> {
-    let form = Form::extract(form)?;
+/// reqwest's `RequestBuilder::multipart`: the form's parts built (`multipart.rs`, with an async
+/// pool's `wake`), its `Content-Type`, then its `Content-Length` when every part's length is
+/// known, appended to reqwest's own headers; the body, and its copy for a redirect (an empty
+/// form's only).
+fn multipart_body(form: &Bound<'_, PyAny>, wake: Option<&Py<PyAny>>, reqwest_headers: &mut HeaderMap) -> PyResult<(RequestBody, Option<Bytes>)> {
+    let form = Form::extract(form, wake)?;
     let copy = form.is_empty().then(Bytes::new);
     let encoded = form.encode();
     let content_type = HeaderValue::from_str(&encoded.content_type).map_err(|e| PyValueError::new_err(e.to_string()))?;

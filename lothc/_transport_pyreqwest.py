@@ -1,5 +1,6 @@
 """The pyreqwest transport: request building, re-auth middleware, retries, and every verb's send."""
 
+import asyncio
 import time
 from collections.abc import (
     AsyncGenerator,
@@ -77,6 +78,7 @@ from ._raises import (
 )
 from ._response import Response, _parse_typed_headers
 from ._retry import (
+    _AttemptHook,
     _call_retries,
     _retried,
     _retried_sync,
@@ -84,10 +86,13 @@ from ._retry import (
     _RetryPolicy,
     _RetryRuling,
     _SyncRetryRuling,
+    _through_hook,
+    _through_hook_sync,
 )
-from ._settings import TlsVersion, _default_user_agent, _TransportSettings
+from ._settings import TlsVersion, _default_user_agent, _RequestHookFactory, _TransportSettings
 from ._sse import SSEEvent, _sse_events, _sse_events_sync
 from ._streaming import (
+    _Abandonment,
     _ChunkReader,
     _download_stream,
     _download_stream_sync,
@@ -208,29 +213,64 @@ class _PyreqwestMockHook:
 _mock_hook = _PyreqwestMockHook()
 
 
-async def _send(request_builder: RequestBuilder) -> tuple[RawResponse, RequestInfo]:
+def _apply_hook_headers(request: Request, headers: dict[str, str]) -> None:
+    """A `request_hook=`'s headers on an attempt's built request: each replaces a header of the
+    same name where it stands (a default or the call's own), or is appended. The native side
+    sets them the same way (`VerbHeaders::overrides`)."""
+    for name, value in headers.items():
+        request.headers[name] = value
+
+
+def _enter_hook(hook: _AttemptHook, request: Request, request_info: RequestInfo) -> None:
+    """Enter the call's `request_hook=` for an attempt at `request`, which gets its headers.
+    Called only with a hook, so a request without one pays a `None` check, not a call."""
+    hook.request_info = request_info
+    _apply_hook_headers(request, hook.enter())
+
+
+async def _send(
+    request_builder: RequestBuilder, hook: _AttemptHook | None
+) -> tuple[RawResponse, RequestInfo]:
     if (mock := _mock_hook.middleware) is not None:
         request_builder = request_builder.with_middleware(mock)
-    # `.build()` (not just `.send()`) can raise — e.g. `BuilderError` when `https_only=True`
-    # rejects a plain-http URL — so it must be inside this same try, not called by the caller
-    # beforehand, or that exception type leaks past this translation layer entirely.
+    # `.build()` (not just `.send()`) can raise `BuilderError`, so it must be inside a
+    # translating try too, not called by the caller beforehand, or that exception type leaks
+    # past this translation layer entirely.
     try:
         built = request_builder.build()
-        request_info = _request_info(built)
-        return await built.send(), request_info
     except (PyreqwestRequestError, PyreqwestBuilderError) as error:
         raise _translate_transport_error(error) from error
+    request_info = _request_info(built)
+    if hook is not None:
+        _enter_hook(hook, built, request_info)
+    try:
+        raw_response = await built.send()
+    except (PyreqwestRequestError, PyreqwestBuilderError) as error:
+        raise _translate_transport_error(error) from error
+    if hook is not None:
+        hook.responded(raw_response.status)
+    return raw_response, request_info
 
 
-def _send_sync(request_builder: SyncRequestBuilder) -> tuple[RawSyncResponse, RequestInfo]:
+def _send_sync(
+    request_builder: SyncRequestBuilder, hook: _AttemptHook | None
+) -> tuple[RawSyncResponse, RequestInfo]:
     if (mock := _mock_hook.sync_middleware) is not None:
         request_builder = request_builder.with_middleware(mock)
     try:
         built = request_builder.build()
-        request_info = _request_info(built)
-        return built.send(), request_info
     except (PyreqwestRequestError, PyreqwestBuilderError) as error:
         raise _translate_transport_error(error) from error
+    request_info = _request_info(built)
+    if hook is not None:
+        _enter_hook(hook, built, request_info)
+    try:
+        raw_response = built.send()
+    except (PyreqwestRequestError, PyreqwestBuilderError) as error:
+        raise _translate_transport_error(error) from error
+    if hook is not None:
+        hook.responded(raw_response.status)
+    return raw_response, request_info
 
 
 def _is_retryable_send_error(error: PyreqwestRequestError) -> bool:
@@ -258,20 +298,37 @@ def _raw_retry_signal(raw_response: RawResponse | RawSyncResponse) -> tuple[int,
     return raw_response.status, raw_response.headers.get("retry-after")
 
 
-async def _send_copy(request: ConsumedRequest) -> RawResponse:
-    """One attempt of `_send_retried`: a copy of `request`, which stays unsent for the next."""
+async def _send_copy(
+    request: ConsumedRequest, request_info: RequestInfo, hook: _AttemptHook | None
+) -> RawResponse:
+    """One attempt of `_send_retried`: a copy of `request`, which stays unsent for the next,
+    with the hook's headers for this attempt."""
+    attempt = request.copy()
+    if hook is not None:
+        _enter_hook(hook, attempt, request_info)
     try:
-        return await request.copy().send()
+        raw_response = await attempt.send()
     except (PyreqwestRequestError, PyreqwestBuilderError) as error:
         raise _translate_transport_error(error) from error
+    if hook is not None:
+        hook.responded(raw_response.status)
+    return raw_response
 
 
-def _send_copy_sync(request: SyncConsumedRequest) -> RawSyncResponse:
+def _send_copy_sync(
+    request: SyncConsumedRequest, request_info: RequestInfo, hook: _AttemptHook | None
+) -> RawSyncResponse:
     """Sync mirror of `_send_copy`."""
+    attempt = request.copy()
+    if hook is not None:
+        _enter_hook(hook, attempt, request_info)
     try:
-        return request.copy().send()
+        raw_response = attempt.send()
     except (PyreqwestRequestError, PyreqwestBuilderError) as error:
         raise _translate_transport_error(error) from error
+    if hook is not None:
+        hook.responded(raw_response.status)
+    return raw_response
 
 
 async def _raw_status_error(
@@ -339,6 +396,7 @@ async def _send_retried(
     retries: int,
     raises: _RaisesArg | None,
     client_raises: _RaisesTable,
+    hook: _AttemptHook | None,
 ) -> tuple[RawResponse, RequestInfo, HTTPResponseError[Any] | None]:
     """`_send`, retried up to `retries` times: each attempt sends a copy of the request as built
     (its auth included) through the client's middleware (re-authentication) and the mocker, and
@@ -355,10 +413,11 @@ async def _send_retried(
     raw_response, ruled = await _retried(
         retry,
         retries,
-        partial(_send_copy, built),
+        partial(_send_copy, built, request_info, hook),
         _raw_retry_signal,
         _pyreqwest_retryable,
         _raw_ruling(retry, raises, client_raises, request_info),
+        hook,
     )
     return raw_response, request_info, ruled
 
@@ -369,6 +428,7 @@ def _send_retried_sync(
     retries: int,
     raises: _RaisesArg | None,
     client_raises: _RaisesTable,
+    hook: _AttemptHook | None,
 ) -> tuple[RawSyncResponse, RequestInfo, HTTPResponseError[Any] | None]:
     """Sync mirror of `_send_retried`."""
     if (mock := _mock_hook.sync_middleware) is not None:
@@ -381,31 +441,55 @@ def _send_retried_sync(
     raw_response, ruled = _retried_sync(
         retry,
         retries,
-        partial(_send_copy_sync, built),
+        partial(_send_copy_sync, built, request_info, hook),
         _raw_retry_signal,
         _pyreqwest_retryable,
         _raw_ruling_sync(retry, raises, client_raises, request_info),
+        hook,
     )
     return raw_response, request_info, ruled
 
 
-async def _open_streamed_attempt(request: StreamRequest, attempts: AsyncExitStack) -> RawResponse:
-    """One attempt at opening a retried stream: a copy of `request`, entered on `attempts` once
-    the attempt before it, whose status the retry loop turned down, is closed."""
+async def _open_streamed_attempt(
+    request: StreamRequest,
+    attempts: AsyncExitStack,
+    request_info: RequestInfo,
+    hook: _AttemptHook | None,
+) -> RawResponse:
+    """One attempt at opening a retried stream: a copy of `request`, with the hook's headers for
+    this attempt, entered on `attempts` once the attempt before it, whose status the retry loop
+    turned down, is closed."""
     await attempts.aclose()
+    attempt = request.copy()
+    if hook is not None:
+        _enter_hook(hook, attempt, request_info)
     try:
-        return await attempts.enter_async_context(request.copy())
+        raw_response = await attempts.enter_async_context(attempt)
     except (PyreqwestRequestError, PyreqwestBuilderError) as error:
         raise _translate_transport_error(error) from error
+    if hook is not None:
+        hook.responded(raw_response.status)
+    return raw_response
 
 
-def _open_streamed_attempt_sync(request: SyncStreamRequest, attempts: ExitStack) -> RawSyncResponse:
+def _open_streamed_attempt_sync(
+    request: SyncStreamRequest,
+    attempts: ExitStack,
+    request_info: RequestInfo,
+    hook: _AttemptHook | None,
+) -> RawSyncResponse:
     """Sync mirror of `_open_streamed_attempt`."""
     attempts.close()
+    attempt = request.copy()
+    if hook is not None:
+        _enter_hook(hook, attempt, request_info)
     try:
-        return attempts.enter_context(request.copy())
+        raw_response = attempts.enter_context(attempt)
     except (PyreqwestRequestError, PyreqwestBuilderError) as error:
         raise _translate_transport_error(error) from error
+    if hook is not None:
+        hook.responded(raw_response.status)
+    return raw_response
 
 
 def _bearer_token_sent(request: Request) -> str | None:
@@ -749,7 +833,8 @@ def _translated(error: Exception) -> Exception:
 class _PyreqwestStreamSource:
     """`_StreamSource` (`_streaming.py`) over a pyreqwest streamed request: `build` gives the
     prepared builder (auth, params, headers, body), opening builds and enters it (with `retries`,
-    a copy of it per attempt, `_retried` around them), and the body is pyreqwest's `read_chunk`."""
+    a copy of it per attempt, `_retried` around them), and the body is pyreqwest's `read_chunk`.
+    The client's `request_hook=` is entered per attempt and exited once the head has arrived."""
 
     failures: ClassVar[tuple[type[Exception], ...]] = (
         PyreqwestRequestError,
@@ -763,25 +848,13 @@ class _PyreqwestStreamSource:
     _retry: _RetryPolicy
     # How many times opening may be retried (0: sent once).
     _retries: int
+    _request_hook: _RequestHookFactory | None
     _request_builder: RequestBuilder | None = _dataclass_field(default=None, init=False)
     _info: RequestInfo | None = _dataclass_field(default=None, init=False)
 
-    @property
-    def request_info(self) -> RequestInfo:
-        if self._info is None:
-            raise RuntimeError("The stream was never opened")
-        return self._info
-
-    def failure(self, error: Exception, /) -> Exception:
-        return _translated(error)
-
-    def permanent(self, error: HTTPTransportError, /) -> bool:
-        return _is_permanent_transport_error(error)
-
-    async def prepare(self) -> None:
-        self._request_builder = await self._build()
-
-    async def open(self, stack: AsyncExitStack) -> tuple[_ResponseHead, _ChunkReader]:
+    async def _open(
+        self, stack: AsyncExitStack, hook: _AttemptHook | None
+    ) -> tuple[_ResponseHead, _ChunkReader]:
         if self._request_builder is None:
             raise RuntimeError("The stream was opened before it was prepared")
         # pyreqwest's default streamed_read_buffer_limit is 64KB — it withholds received bytes
@@ -800,10 +873,11 @@ class _PyreqwestStreamSource:
             raw_response, ruled = await _retried(
                 self._retry,
                 self._retries,
-                partial(_open_streamed_attempt, request, attempts),
+                partial(_open_streamed_attempt, request, attempts, request_info, hook),
                 _raw_retry_signal,
                 _pyreqwest_retryable,
                 _raw_ruling(self._retry, self._raises, self._client_raises, request_info),
+                hook,
             )
             # An error status a `retry=` rule stopped retrying on: its body is already read.
             if ruled is not None:
@@ -811,10 +885,52 @@ class _PyreqwestStreamSource:
                     raise ruled
                 return _response_head(raw_response), _ReplayedBody(ruled.body).read
         else:
-            raw_response = await stack.enter_async_context(request)
+            if hook is not None:
+                _enter_hook(hook, request, request_info)
+            # Translated here, not only by the streaming verb, so a hook sees lothc's error.
+            try:
+                raw_response = await stack.enter_async_context(request)
+            except (PyreqwestRequestError, PyreqwestBuilderError) as error:
+                raise _translate_transport_error(error) from error
+            if hook is not None:
+                hook.responded(raw_response.status)
         if self._check_status is not None:
             await self._check_status(raw_response, self._raises, request_info)
         return _response_head(raw_response), raw_response.body_reader.read_chunk
+
+    @property
+    def request_info(self) -> RequestInfo:
+        if self._info is None:
+            raise RuntimeError("The stream was never opened")
+        return self._info
+
+    def failure(self, error: Exception, /) -> Exception:
+        return _translated(error)
+
+    def permanent(self, error: HTTPTransportError, /) -> bool:
+        return _is_permanent_transport_error(error)
+
+    async def prepare(self) -> None:
+        self._request_builder = await self._build()
+
+    async def open(self, stack: AsyncExitStack) -> tuple[_ResponseHead, _ChunkReader]:
+        if self._request_hook is None:
+            return await self._open(stack, None)
+        # The hook's context ends with the head: what an exception raised by then is, the
+        # status error included, goes into it.
+        hook = _AttemptHook(self._request_hook)
+        try:
+            opened = await self._open(stack, hook)
+        except asyncio.CancelledError:
+            # Cancelled by the streaming verb's idle limit, say, which raises its own
+            # `HTTPTimeoutError` instead: the hook exits with whatever the stack unwinds with.
+            stack.push(hook.exit_with)
+            raise
+        except BaseException as error:
+            hook.fail(error)
+            raise
+        hook.close()
+        return opened
 
 
 @dataclass(slots=True, eq=False)
@@ -833,8 +949,55 @@ class _SyncPyreqwestStreamSource:
     _retry: _RetryPolicy
     # How many times opening may be retried (0: sent once).
     _retries: int
+    _request_hook: _RequestHookFactory | None
     _request_builder: SyncRequestBuilder | None = _dataclass_field(default=None, init=False)
     _info: RequestInfo | None = _dataclass_field(default=None, init=False)
+    # Whether the caller gave up before the head arrived (`abandon`).
+    _abandonment: _Abandonment = _dataclass_field(default_factory=_Abandonment, init=False)
+
+    def _open(
+        self, stack: ExitStack, hook: _AttemptHook | None
+    ) -> tuple[_ResponseHead, _SyncChunkReader]:
+        if self._request_builder is None:
+            raise RuntimeError("The stream was opened before it was prepared")
+        # See the matching comment in `_PyreqwestStreamSource.open`.
+        request_builder = self._request_builder.streamed_read_buffer_limit(1)
+        if (mock := _mock_hook.sync_middleware) is not None:
+            request_builder = request_builder.with_middleware(mock)
+        request = request_builder.build_streamed()
+        request_info = self._info = _request_info(request)
+        if self._retries:
+            attempts = stack.enter_context(ExitStack())
+            raw_response, ruled = _retried_sync(
+                self._retry,
+                self._retries,
+                partial(
+                    self._abandonment.attempt,
+                    partial(_open_streamed_attempt_sync, request, attempts, request_info, hook),
+                ),
+                _raw_retry_signal,
+                _pyreqwest_retryable,
+                _raw_ruling_sync(self._retry, self._raises, self._client_raises, request_info),
+                hook,
+            )
+            # An error status a `retry=` rule stopped retrying on: its body is already read.
+            if ruled is not None:
+                if self._check_status is not None:
+                    raise ruled
+                return _response_head(raw_response), _SyncReplayedBody(ruled.body).read
+        else:
+            if hook is not None:
+                _enter_hook(hook, request, request_info)
+            # Translated here, not only by the streaming verb, so a hook sees lothc's error.
+            try:
+                raw_response = stack.enter_context(request)
+            except (PyreqwestRequestError, PyreqwestBuilderError) as error:
+                raise _translate_transport_error(error) from error
+            if hook is not None:
+                hook.responded(raw_response.status)
+        if self._check_status is not None:
+            self._check_status(raw_response, self._raises, request_info)
+        return _response_head(raw_response), raw_response.body_reader.read_chunk
 
     @property
     def request_info(self) -> RequestInfo:
@@ -851,35 +1014,28 @@ class _SyncPyreqwestStreamSource:
     def prepare(self) -> None:
         self._request_builder = self._build()
 
+    def abandon(self, error: BaseException, /) -> None:
+        self._abandonment.error = error
+
     def open(self, stack: ExitStack) -> tuple[_ResponseHead, _SyncChunkReader]:
-        if self._request_builder is None:
-            raise RuntimeError("The stream was opened before it was prepared")
-        # See the matching comment in `_PyreqwestStreamSource.open`.
-        request_builder = self._request_builder.streamed_read_buffer_limit(1)
-        if (mock := _mock_hook.sync_middleware) is not None:
-            request_builder = request_builder.with_middleware(mock)
-        request = request_builder.build_streamed()
-        request_info = self._info = _request_info(request)
-        if self._retries:
-            attempts = stack.enter_context(ExitStack())
-            raw_response, ruled = _retried_sync(
-                self._retry,
-                self._retries,
-                partial(_open_streamed_attempt_sync, request, attempts),
-                _raw_retry_signal,
-                _pyreqwest_retryable,
-                _raw_ruling_sync(self._retry, self._raises, self._client_raises, request_info),
-            )
-            # An error status a `retry=` rule stopped retrying on: its body is already read.
-            if ruled is not None:
-                if self._check_status is not None:
-                    raise ruled
-                return _response_head(raw_response), _SyncReplayedBody(ruled.body).read
+        if self._request_hook is None:
+            return self._open(stack, None)
+        # See `_PyreqwestStreamSource.open`.
+        hook = _AttemptHook(self._request_hook)
+        try:
+            opened = self._open(stack, hook)
+        except BaseException as error:
+            abandoned = self._abandonment.error
+            hook.fail(error if abandoned is None else abandoned)
+            raise
+        # Given up on by a caller that has already raised (`abandon`): the hook exits with its
+        # own instance of that, however late the head came.
+        abandoned = self._abandonment.error
+        if abandoned is None:
+            hook.close()
         else:
-            raw_response = stack.enter_context(request)
-        if self._check_status is not None:
-            self._check_status(raw_response, self._raises, request_info)
-        return _response_head(raw_response), raw_response.body_reader.read_chunk
+            hook.fail(abandoned)
+        return opened
 
 
 @dataclass(slots=True, eq=False, repr=False)
@@ -916,6 +1072,8 @@ class _PyreqwestTransport:
     _stream_idle_timeout: float | None = _dataclass_field(init=False)
     # The client's retry policy, which `_retried` runs each retried call through.
     _retry: _RetryPolicy = _dataclass_field(init=False)
+    # The client's `request_hook=`, entered per attempt (`_AttemptHook`).
+    _request_hook: _RequestHookFactory | None = _dataclass_field(init=False)
     _pyreqwest_client: Client | None = _dataclass_field(default=None, init=False)
     _exit_stack: AsyncExitStack | None = _dataclass_field(default=None, init=False)
 
@@ -924,6 +1082,7 @@ class _PyreqwestTransport:
             self._settings.timeout if self._settings.read_timeout is None else None
         )
         self._retry = _retry_policy(self._settings)
+        self._request_hook = self._settings.request_hook
 
     @property
     def _client(self) -> Client:
@@ -1049,6 +1208,7 @@ class _PyreqwestTransport:
             self._retry,
             # A multipart body with parts is sent once: pyreqwest can't copy it.
             0 if call.form else retries,
+            self._request_hook,
         )
 
     def _sse_source(
@@ -1057,31 +1217,7 @@ class _PyreqwestTransport:
         request_builder = self._client.get(path).header("accept", "text/event-stream")
         return self._stream_source(request_builder, "GET", call, last_event_id)
 
-    async def open(self) -> None:
-        if self._pyreqwest_client is not None:
-            raise RuntimeError("This HTTPClient is already open; enter it once at a time.")
-        builder = _configure_client_builder(ClientBuilder(), self._settings)
-        if isinstance(self._bearer_auth, _InvalidatableAuth):
-            builder = builder.with_middleware(
-                _ReauthMiddleware(self._bearer_auth, self._idempotent_methods)
-            )
-        try:
-            pyreqwest_client = builder.build()
-        except PyreqwestBuilderError as error:
-            raise _client_build_error(error) from error
-        stack = AsyncExitStack()
-        self._pyreqwest_client = await stack.enter_async_context(pyreqwest_client)
-        self._exit_stack = stack
-
-    async def close(self) -> None:
-        stack = self._exit_stack
-        self._pyreqwest_client = None
-        self._exit_stack = None
-        if stack is not None:
-            await stack.aclose()
-
-    # Every local but a few is a verb argument; the hot path stays inline (see the docstring).
-    async def send(  # pylint: disable=too-many-locals
+    async def _sent(  # pylint: disable=too-many-locals
         self,
         method: str,
         path: str,
@@ -1094,6 +1230,7 @@ class _PyreqwestTransport:
         content: str | bytes | None,
         into: _Into,
         response_headers_type: type[TypedHeaders] | None,
+        hook: _AttemptHook | None,
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
@@ -1127,14 +1264,14 @@ class _PyreqwestTransport:
         # A multipart body with parts is sent once: pyreqwest can't copy it.
         if retries and not form:
             raw_response, request_info, ruled = await _send_retried(
-                request_builder, self._retry, retries, raises, self._raises
+                request_builder, self._retry, retries, raises, self._raises, hook
             )
         else:
-            raw_response, request_info = await _send(request_builder)
+            raw_response, request_info = await _send(request_builder, hook)
             ruled = None
         elapsed = time.monotonic() - started
         if raw_response.status >= 400:
-            return await self._error_status(
+            response = await self._error_status(
                 raw_response,
                 raises,
                 request_info,
@@ -1142,34 +1279,36 @@ class _PyreqwestTransport:
                 ruled,
                 raise_for_status=raise_for_status,
             )
-        body = await _read_body(raw_response)
-        try:
-            decoded = _decode_body(body, decoder)
-        except (ValueError, RecursionError) as error:
-            raise _response_decode_error(
-                error, raw_response, body.to_bytes(), request_info
-            ) from error
-        response_headers = _LazyHeaders(raw_response.headers)
-        if response_headers_type is None:
-            typed_headers = None
         else:
+            body = await _read_body(raw_response)
             try:
-                typed_headers = _parse_typed_headers(response_headers, response_headers_type)
-            except ValueError as error:
+                decoded = _decode_body(body, decoder)
+            except (ValueError, RecursionError) as error:
                 raise _response_decode_error(
                     error, raw_response, body.to_bytes(), request_info
                 ) from error
-        return Response(
-            decoded,
-            raw_response.status,
-            response_headers,
-            typed_headers,
-            request_info,
-            raw_response.version,
-            elapsed,
-        )
+            response_headers = _LazyHeaders(raw_response.headers)
+            if response_headers_type is None:
+                typed_headers = None
+            else:
+                try:
+                    typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+                except ValueError as error:
+                    raise _response_decode_error(
+                        error, raw_response, body.to_bytes(), request_info
+                    ) from error
+            response = Response(
+                decoded,
+                raw_response.status,
+                response_headers,
+                typed_headers,
+                request_info,
+                raw_response.version,
+                elapsed,
+            )
+        return response
 
-    async def send_headers_only(
+    async def _sent_headers_only(
         self,
         method: str,
         path: str,
@@ -1177,6 +1316,7 @@ class _PyreqwestTransport:
         headers: Headers | None,
         timeout: float | None,
         response_headers_type: type[TypedHeaders] | None,
+        hook: _AttemptHook | None,
         *,
         skip_auth: bool,
         raise_for_status: bool | None,
@@ -1192,14 +1332,14 @@ class _PyreqwestTransport:
         started = time.monotonic()
         if retries:
             raw_response, request_info, ruled = await _send_retried(
-                request_builder, self._retry, retries, raises, self._raises
+                request_builder, self._retry, retries, raises, self._raises, hook
             )
         else:
-            raw_response, request_info = await _send(request_builder)
+            raw_response, request_info = await _send(request_builder, hook)
             ruled = None
         elapsed = time.monotonic() - started
         if raw_response.status >= 400:
-            return await self._error_status(
+            response = await self._error_status(
                 raw_response,
                 raises,
                 request_info,
@@ -1207,23 +1347,165 @@ class _PyreqwestTransport:
                 ruled,
                 raise_for_status=raise_for_status,
             )
-        response_headers = _LazyHeaders(raw_response.headers)
-        if response_headers_type is None:
-            typed_headers = None
         else:
-            try:
-                typed_headers = _parse_typed_headers(response_headers, response_headers_type)
-            except ValueError as error:
-                # The body is never read here, so there's none to carry.
-                raise _response_decode_error(error, raw_response, b"", request_info) from error
-        return Response(
-            None,
-            raw_response.status,
-            response_headers,
-            typed_headers,
-            request_info,
-            raw_response.version,
-            elapsed,
+            response_headers = _LazyHeaders(raw_response.headers)
+            if response_headers_type is None:
+                typed_headers = None
+            else:
+                try:
+                    typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+                except ValueError as error:
+                    # The body is never read here, so there's none to carry.
+                    raise _response_decode_error(error, raw_response, b"", request_info) from error
+            response = Response(
+                None,
+                raw_response.status,
+                response_headers,
+                typed_headers,
+                request_info,
+                raw_response.version,
+                elapsed,
+            )
+        return response
+
+    async def open(self) -> None:
+        if self._pyreqwest_client is not None:
+            raise RuntimeError("This HTTPClient is already open; enter it once at a time.")
+        builder = _configure_client_builder(ClientBuilder(), self._settings)
+        if isinstance(self._bearer_auth, _InvalidatableAuth):
+            builder = builder.with_middleware(
+                _ReauthMiddleware(self._bearer_auth, self._idempotent_methods)
+            )
+        try:
+            pyreqwest_client = builder.build()
+        except PyreqwestBuilderError as error:
+            raise _client_build_error(error) from error
+        stack = AsyncExitStack()
+        self._pyreqwest_client = await stack.enter_async_context(pyreqwest_client)
+        self._exit_stack = stack
+
+    async def close(self) -> None:
+        stack = self._exit_stack
+        self._pyreqwest_client = None
+        self._exit_stack = None
+        if stack is not None:
+            await stack.aclose()
+
+    # Every local but a few is a verb argument; the hot path stays inline (see the docstring).
+    def send(
+        self,
+        method: str,
+        path: str,
+        params: Params | None,
+        headers: Headers | None,
+        timeout: float | None,
+        json: JSONPayload | None,
+        data: Params | None,
+        form: Form | None,
+        content: str | bytes | None,
+        into: _Into,
+        response_headers_type: type[TypedHeaders] | None,
+        *,
+        skip_auth: bool,
+        infer_mime_type_from_file_extension: bool,
+        raise_for_status: bool | None,
+        raises: _RaisesArg | None,
+        max_retries: int | None,
+    ) -> Awaitable[Response[Any, Any]]:
+        """`_sent`, and with the client's `request_hook=`, through `_through_hook`, which exits
+        the hook's last attempt. Not `async`: without a hook, the verb awaits `_sent`'s own
+        coroutine, so a call without one has no frame more than one per send."""
+        if self._request_hook is None:
+            return self._sent(
+                method,
+                path,
+                params,
+                headers,
+                timeout,
+                json,
+                data,
+                form,
+                content,
+                into,
+                response_headers_type,
+                None,
+                skip_auth=skip_auth,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+                raise_for_status=raise_for_status,
+                raises=raises,
+                max_retries=max_retries,
+            )
+        hook = _AttemptHook(self._request_hook)
+        return _through_hook(
+            hook,
+            partial(
+                self._sent,
+                method,
+                path,
+                params,
+                headers,
+                timeout,
+                json,
+                data,
+                form,
+                content,
+                into,
+                response_headers_type,
+                hook,
+                skip_auth=skip_auth,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+                raise_for_status=raise_for_status,
+                raises=raises,
+                max_retries=max_retries,
+            ),
+        )
+
+    def send_headers_only(
+        self,
+        method: str,
+        path: str,
+        params: Params | None,
+        headers: Headers | None,
+        timeout: float | None,
+        response_headers_type: type[TypedHeaders] | None,
+        *,
+        skip_auth: bool,
+        raise_for_status: bool | None,
+        raises: _RaisesArg | None,
+        max_retries: int | None,
+    ) -> Awaitable[Response[None, Any]]:
+        """`_sent_headers_only`, through the client's `request_hook=` as `send`."""
+        if self._request_hook is None:
+            return self._sent_headers_only(
+                method,
+                path,
+                params,
+                headers,
+                timeout,
+                response_headers_type,
+                None,
+                skip_auth=skip_auth,
+                raise_for_status=raise_for_status,
+                raises=raises,
+                max_retries=max_retries,
+            )
+        hook = _AttemptHook(self._request_hook)
+        return _through_hook(
+            hook,
+            partial(
+                self._sent_headers_only,
+                method,
+                path,
+                params,
+                headers,
+                timeout,
+                response_headers_type,
+                hook,
+                skip_auth=skip_auth,
+                raise_for_status=raise_for_status,
+                raises=raises,
+                max_retries=max_retries,
+            ),
         )
 
     def sse(
@@ -1366,6 +1648,8 @@ class _SyncPyreqwestTransport:
     _stream_idle_timeout: float | None = _dataclass_field(init=False)
     # The client's retry policy, which `_retried_sync` runs each retried call through.
     _retry: _RetryPolicy = _dataclass_field(init=False)
+    # The client's `request_hook=`, entered per attempt (`_AttemptHook`).
+    _request_hook: _RequestHookFactory | None = _dataclass_field(init=False)
     _pyreqwest_client: SyncClient | None = _dataclass_field(default=None, init=False)
     _exit_stack: ExitStack | None = _dataclass_field(default=None, init=False)
 
@@ -1374,6 +1658,7 @@ class _SyncPyreqwestTransport:
             self._settings.timeout if self._settings.read_timeout is None else None
         )
         self._retry = _retry_policy(self._settings)
+        self._request_hook = self._settings.request_hook
 
     @property
     def _client(self) -> SyncClient:
@@ -1499,6 +1784,7 @@ class _SyncPyreqwestTransport:
             self._retry,
             # A multipart body with parts is sent once: pyreqwest can't copy it.
             0 if call.form else retries,
+            self._request_hook,
         )
 
     def _sse_source(
@@ -1507,31 +1793,7 @@ class _SyncPyreqwestTransport:
         request_builder = self._client.get(path).header("accept", "text/event-stream")
         return self._stream_source(request_builder, "GET", call, last_event_id)
 
-    def open(self) -> None:
-        if self._pyreqwest_client is not None:
-            raise RuntimeError("This SyncHTTPClient is already open; enter it once at a time.")
-        builder = _configure_client_builder(SyncClientBuilder(), self._settings)
-        if isinstance(self._bearer_auth, _SyncInvalidatableAuth):
-            builder = builder.with_middleware(
-                _SyncReauthMiddleware(self._bearer_auth, self._idempotent_methods)
-            )
-        try:
-            pyreqwest_client = builder.build()
-        except PyreqwestBuilderError as error:
-            raise _client_build_error(error) from error
-        stack = ExitStack()
-        self._pyreqwest_client = stack.enter_context(pyreqwest_client)
-        self._exit_stack = stack
-
-    def close(self) -> None:
-        stack = self._exit_stack
-        self._pyreqwest_client = None
-        self._exit_stack = None
-        if stack is not None:
-            stack.close()
-
-    # Every local but a few is a verb argument; the hot path stays inline (see the docstring).
-    def send(  # pylint: disable=too-many-locals
+    def _sent(  # pylint: disable=too-many-locals
         self,
         method: str,
         path: str,
@@ -1544,6 +1806,7 @@ class _SyncPyreqwestTransport:
         content: str | bytes | None,
         into: _Into,
         response_headers_type: type[TypedHeaders] | None,
+        hook: _AttemptHook | None,
         *,
         skip_auth: bool,
         infer_mime_type_from_file_extension: bool,
@@ -1575,14 +1838,14 @@ class _SyncPyreqwestTransport:
         # A multipart body with parts is sent once: pyreqwest can't copy it.
         if retries and not form:
             raw_response, request_info, ruled = _send_retried_sync(
-                request_builder, self._retry, retries, raises, self._raises
+                request_builder, self._retry, retries, raises, self._raises, hook
             )
         else:
-            raw_response, request_info = _send_sync(request_builder)
+            raw_response, request_info = _send_sync(request_builder, hook)
             ruled = None
         elapsed = time.monotonic() - started
         if raw_response.status >= 400:
-            return self._error_status(
+            response = self._error_status(
                 raw_response,
                 raises,
                 request_info,
@@ -1590,31 +1853,183 @@ class _SyncPyreqwestTransport:
                 ruled,
                 raise_for_status=raise_for_status,
             )
-        body = _read_body_sync(raw_response)
-        try:
-            decoded = _decode_body(body, decoder)
-        except (ValueError, RecursionError) as error:
-            raise _response_decode_error(
-                error, raw_response, body.to_bytes(), request_info
-            ) from error
-        response_headers = _LazyHeaders(raw_response.headers)
-        if response_headers_type is None:
-            typed_headers = None
         else:
+            body = _read_body_sync(raw_response)
             try:
-                typed_headers = _parse_typed_headers(response_headers, response_headers_type)
-            except ValueError as error:
+                decoded = _decode_body(body, decoder)
+            except (ValueError, RecursionError) as error:
                 raise _response_decode_error(
                     error, raw_response, body.to_bytes(), request_info
                 ) from error
-        return Response(
-            decoded,
-            raw_response.status,
-            response_headers,
-            typed_headers,
-            request_info,
-            raw_response.version,
-            elapsed,
+            response_headers = _LazyHeaders(raw_response.headers)
+            if response_headers_type is None:
+                typed_headers = None
+            else:
+                try:
+                    typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+                except ValueError as error:
+                    raise _response_decode_error(
+                        error, raw_response, body.to_bytes(), request_info
+                    ) from error
+            response = Response(
+                decoded,
+                raw_response.status,
+                response_headers,
+                typed_headers,
+                request_info,
+                raw_response.version,
+                elapsed,
+            )
+        return response
+
+    def _sent_headers_only(
+        self,
+        method: str,
+        path: str,
+        params: Params | None,
+        headers: Headers | None,
+        timeout: float | None,
+        response_headers_type: type[TypedHeaders] | None,
+        hook: _AttemptHook | None,
+        *,
+        skip_auth: bool,
+        raise_for_status: bool | None,
+        raises: _RaisesArg | None,
+        max_retries: int | None,
+    ) -> Response[None, Any]:
+        """`head`/`options`: status and headers only, the body is never read."""
+        _validate_raises(raises)
+        retries = _call_retries(self._retry, method, max_retries)
+        request_builder = self._prepare_request(
+            self._client.request(method, path), params, headers, timeout, skip_auth=skip_auth
+        )
+        started = time.monotonic()
+        if retries:
+            raw_response, request_info, ruled = _send_retried_sync(
+                request_builder, self._retry, retries, raises, self._raises, hook
+            )
+        else:
+            raw_response, request_info = _send_sync(request_builder, hook)
+            ruled = None
+        elapsed = time.monotonic() - started
+        if raw_response.status >= 400:
+            response = self._error_status(
+                raw_response,
+                raises,
+                request_info,
+                elapsed,
+                ruled,
+                raise_for_status=raise_for_status,
+            )
+        else:
+            response_headers = _LazyHeaders(raw_response.headers)
+            if response_headers_type is None:
+                typed_headers = None
+            else:
+                try:
+                    typed_headers = _parse_typed_headers(response_headers, response_headers_type)
+                except ValueError as error:
+                    # The body is never read here, so there's none to carry.
+                    raise _response_decode_error(error, raw_response, b"", request_info) from error
+            response = Response(
+                None,
+                raw_response.status,
+                response_headers,
+                typed_headers,
+                request_info,
+                raw_response.version,
+                elapsed,
+            )
+        return response
+
+    def open(self) -> None:
+        if self._pyreqwest_client is not None:
+            raise RuntimeError("This SyncHTTPClient is already open; enter it once at a time.")
+        builder = _configure_client_builder(SyncClientBuilder(), self._settings)
+        if isinstance(self._bearer_auth, _SyncInvalidatableAuth):
+            builder = builder.with_middleware(
+                _SyncReauthMiddleware(self._bearer_auth, self._idempotent_methods)
+            )
+        try:
+            pyreqwest_client = builder.build()
+        except PyreqwestBuilderError as error:
+            raise _client_build_error(error) from error
+        stack = ExitStack()
+        self._pyreqwest_client = stack.enter_context(pyreqwest_client)
+        self._exit_stack = stack
+
+    def close(self) -> None:
+        stack = self._exit_stack
+        self._pyreqwest_client = None
+        self._exit_stack = None
+        if stack is not None:
+            stack.close()
+
+    # Every local but a few is a verb argument; the hot path stays inline (see the docstring).
+    def send(
+        self,
+        method: str,
+        path: str,
+        params: Params | None,
+        headers: Headers | None,
+        timeout: float | None,
+        json: JSONPayload | None,
+        data: Params | None,
+        form: Form | None,
+        content: str | bytes | None,
+        into: _Into,
+        response_headers_type: type[TypedHeaders] | None,
+        *,
+        skip_auth: bool,
+        infer_mime_type_from_file_extension: bool,
+        raise_for_status: bool | None,
+        raises: _RaisesArg | None,
+        max_retries: int | None,
+    ) -> Response[Any, Any]:
+        """Sync mirror of `_PyreqwestTransport.send`."""
+        if self._request_hook is None:
+            return self._sent(
+                method,
+                path,
+                params,
+                headers,
+                timeout,
+                json,
+                data,
+                form,
+                content,
+                into,
+                response_headers_type,
+                None,
+                skip_auth=skip_auth,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+                raise_for_status=raise_for_status,
+                raises=raises,
+                max_retries=max_retries,
+            )
+        hook = _AttemptHook(self._request_hook)
+        return _through_hook_sync(
+            hook,
+            partial(
+                self._sent,
+                method,
+                path,
+                params,
+                headers,
+                timeout,
+                json,
+                data,
+                form,
+                content,
+                into,
+                response_headers_type,
+                hook,
+                skip_auth=skip_auth,
+                infer_mime_type_from_file_extension=infer_mime_type_from_file_extension,
+                raise_for_status=raise_for_status,
+                raises=raises,
+                max_retries=max_retries,
+            ),
         )
 
     def send_headers_only(
@@ -1631,47 +2046,38 @@ class _SyncPyreqwestTransport:
         raises: _RaisesArg | None,
         max_retries: int | None,
     ) -> Response[None, Any]:
-        """`head`/`options`: status and headers only, the body is never read."""
-        _validate_raises(raises)
-        retries = _call_retries(self._retry, method, max_retries)
-        request_builder = self._prepare_request(
-            self._client.request(method, path), params, headers, timeout, skip_auth=skip_auth
-        )
-        started = time.monotonic()
-        if retries:
-            raw_response, request_info, ruled = _send_retried_sync(
-                request_builder, self._retry, retries, raises, self._raises
-            )
-        else:
-            raw_response, request_info = _send_sync(request_builder)
-            ruled = None
-        elapsed = time.monotonic() - started
-        if raw_response.status >= 400:
-            return self._error_status(
-                raw_response,
-                raises,
-                request_info,
-                elapsed,
-                ruled,
+        """Sync mirror of `_PyreqwestTransport.send_headers_only`."""
+        if self._request_hook is None:
+            return self._sent_headers_only(
+                method,
+                path,
+                params,
+                headers,
+                timeout,
+                response_headers_type,
+                None,
+                skip_auth=skip_auth,
                 raise_for_status=raise_for_status,
+                raises=raises,
+                max_retries=max_retries,
             )
-        response_headers = _LazyHeaders(raw_response.headers)
-        if response_headers_type is None:
-            typed_headers = None
-        else:
-            try:
-                typed_headers = _parse_typed_headers(response_headers, response_headers_type)
-            except ValueError as error:
-                # The body is never read here, so there's none to carry.
-                raise _response_decode_error(error, raw_response, b"", request_info) from error
-        return Response(
-            None,
-            raw_response.status,
-            response_headers,
-            typed_headers,
-            request_info,
-            raw_response.version,
-            elapsed,
+        hook = _AttemptHook(self._request_hook)
+        return _through_hook_sync(
+            hook,
+            partial(
+                self._sent_headers_only,
+                method,
+                path,
+                params,
+                headers,
+                timeout,
+                response_headers_type,
+                hook,
+                skip_auth=skip_auth,
+                raise_for_status=raise_for_status,
+                raises=raises,
+                max_retries=max_retries,
+            ),
         )
 
     def sse(

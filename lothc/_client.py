@@ -8,6 +8,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from contextlib import AbstractContextManager
 from os import PathLike
 from pathlib import Path
 from typing import (
@@ -26,11 +27,12 @@ from ._compat import (
     DecoderTyping,
     TypeAdapterTyping,
 )
-from ._errors import HTTPResponseError
+from ._errors import HTTPResponseError, RequestInfo
 from ._raises import _resolve_raises
 from ._response import Response
 from ._settings import (
     NativeMode,
+    RequestHook,
     RetryAttempt,
     TlsVersion,
     _retry_method_set,
@@ -88,6 +90,7 @@ class HTTPClient:
         max_retry_after: float | None = 60.0,
         retry_statuses: Collection[int] | None = None,
         retry: Callable[[RetryAttempt], float | None] | None = None,
+        request_hook: Callable[[RequestInfo], AbstractContextManager[RequestHook]] | None = None,
         connect_timeout: float | None = None,
         read_timeout: float | None = None,
         root_certificates: Sequence[bytes] | None = None,
@@ -133,6 +136,16 @@ class HTTPClient:
         `max_retry_after` stops retrying too, a negative one is no wait, and anything but a
         finite number or `None` is a `TypeError`/`ValueError` raised from the call; an exception
         the rule raises propagates unchanged.
+
+        `request_hook` is entered, as a `with` block, around each attempt at a request (each
+        retry, and each `sse()` reconnect, gets its own; a redirect chain is one attempt), with
+        the request's `RequestInfo`: a plain function returning a context manager, not an async
+        one, that yields a `RequestHook`. Its `headers` go out on that attempt, each replacing a
+        header of the same name the request already has, and lothc sets its `status` once a
+        response arrives. The context exits once the body has been read, or for the streaming
+        verbs once the response's headers have arrived; an exception from the attempt (a
+        transport, status or decode error) is raised into it, and the call raises it even if the
+        hook would swallow it. For tracing, say: a span per attempt, its trace headers injected.
 
         `connect_timeout` bounds only the TCP connect phase (separate from `timeout`, which
         covers the whole request); `read_timeout` bounds the idle gap between two consecutive
@@ -192,6 +205,7 @@ class HTTPClient:
             max_retry_after=max_retry_after,
             retry_statuses=_retry_status_set(retry_statuses, self._default_retry_statuses),
             retry_rule=retry,
+            request_hook=request_hook,
             connect_timeout=connect_timeout,
             read_timeout=read_timeout,
             root_certificates=root_certificates,
