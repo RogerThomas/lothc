@@ -1,3 +1,4 @@
+import sys
 import time
 from collections.abc import AsyncGenerator, Generator
 from concurrent.futures import ThreadPoolExecutor
@@ -8,7 +9,11 @@ import pytest
 from msgspec import Struct
 from msgspec.json import Decoder
 from pydantic import BaseModel, TypeAdapter
-from typing_extensions import TypeForm
+
+if sys.version_info >= (3, 15):
+    from typing import TypeForm
+else:
+    from typing_extensions import TypeForm
 
 from lothc import (
     HTTPClient,

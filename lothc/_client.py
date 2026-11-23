@@ -1,5 +1,6 @@
 """`HTTPClient`, the async client: its verbs and their overloads."""
 
+import sys
 from collections.abc import (
     AsyncGenerator,
     Callable,
@@ -16,7 +17,10 @@ from typing import (
     overload,
 )
 
-from typing_extensions import TypeForm
+if sys.version_info >= (3, 15):
+    from typing import TypeForm
+else:
+    from typing_extensions import TypeForm
 
 from ._compat import (
     DecoderTyping,
