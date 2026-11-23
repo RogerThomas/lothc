@@ -1156,7 +1156,7 @@ impl SyncPool {
 
     /// `Pool.request_info`.
     fn request_info(&self, py: Python<'_>, method: Bound<'_, PyString>, path: &str, query: Option<Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
-        let url = self.config.request_url(py, &self.glue, method.to_str()?, path, query.as_ref())?;
+        let url = self.config.request_url(method.to_str()?, path, query.as_ref())?;
         Ok(self.glue.request_info_of(py, &method, &url)?.unbind())
     }
 

@@ -2,7 +2,9 @@
 its headers sent on that attempt and its `status` set once a response arrives, and whatever the
 attempt ends in raised into it."""
 
+import _thread
 import json
+import threading
 import time
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager, suppress
@@ -11,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from _helpers import echoed_header_values, release, sync_release
+from _helpers import echoed_header_values, release, sync_arrived, sync_release
 
 from lothc import (
     HTTPClient,
@@ -111,6 +113,12 @@ def _wait_until_exited(attempt: _Attempt) -> None:
     deadline = time.monotonic() + 5
     while not attempt.exited and time.monotonic() < deadline:
         time.sleep(0.01)
+
+
+def _interrupt_once_arrived(base_url: str, key: str) -> None:
+    """Ctrl-C, on the main thread, once the request counting `key` is waiting on the server."""
+    sync_arrived(base_url, key)
+    _thread.interrupt_main()
 
 
 @contextmanager
@@ -499,7 +507,84 @@ def test_sync_a_streams_idle_timeout_while_opening_is_raised_into_the_hook(
         [attempt] = recorder.attempts
         _wait_until_exited(attempt)
 
+    # Its own instance: exiting the hook from the worker thread leaves the caller's alone.
+    assert isinstance(attempt.error, HTTPTimeoutError)
+    assert attempt.error is not raised.value
+    assert str(attempt.error) == str(raised.value)
+
+
+async def test_a_stream_given_up_on_while_opening_is_not_retried(
+    base_url: str, server_key: str, recorder: _Recorder
+) -> None:
+    async with HTTPClient(
+        base_url=base_url, timeout=0.05, max_retries=3, backoff_base=0.001, request_hook=recorder
+    ) as client:
+        with pytest.raises(HTTPTimeoutError) as raised:
+            _ = [
+                chunk
+                async for chunk in client.stream_get(
+                    "slow", params={"key": server_key, "seconds": 5, "status": 503}
+                )
+            ]
+        await release(base_url, server_key)
+    [attempt] = recorder.attempts
+
+    # The idle limit cancels the retry loop itself, whether or not the request had gone out.
     assert attempt.error is raised.value
+    assert recorder.events == ["enter 1", "exit 1"]
+
+
+def test_sync_a_stream_given_up_on_while_opening_is_not_retried(
+    base_url: str, server_key: str, recorder: _Recorder
+) -> None:
+    with SyncHTTPClient(
+        base_url=base_url, timeout=0.05, max_retries=3, backoff_base=0.001, request_hook=recorder
+    ) as client:
+        with pytest.raises(HTTPTimeoutError) as raised:
+            _ = list(
+                client.stream_get("slow", params={"key": server_key, "seconds": 5, "status": 503})
+            )
+        traceback = raised.value.__traceback__
+        # Answered once it's there, with a status the client retries: the worker thread gives up
+        # instead.
+        sync_arrived(base_url, server_key)
+        sync_release(base_url, server_key)
+        [attempt] = recorder.attempts
+        _wait_until_exited(attempt)
+    with SyncHTTPClient(base_url=base_url) as client:
+        hits = client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert isinstance(attempt.error, HTTPTimeoutError)
+    assert attempt.error is not raised.value
+    assert raised.value.__traceback__ is traceback
+    assert (recorder.events, hits) == (["enter 1", "exit 1"], {"hits": 1})
+
+
+def test_sync_a_stream_interrupted_while_opening_is_not_retried(
+    base_url: str, server_key: str, recorder: _Recorder
+) -> None:
+    interrupter = threading.Thread(target=_interrupt_once_arrived, args=(base_url, server_key))
+    with SyncHTTPClient(
+        base_url=base_url, max_retries=3, backoff_base=0.001, request_hook=recorder
+    ) as client:
+        interrupter.start()
+        with pytest.raises(KeyboardInterrupt):
+            _ = list(
+                client.stream_get(
+                    "slow",
+                    params={"key": server_key, "seconds": 5, "status": 503},
+                    interruptible=True,
+                )
+            )
+        interrupter.join()
+        sync_release(base_url, server_key)
+        [attempt] = recorder.attempts
+        _wait_until_exited(attempt)
+    with SyncHTTPClient(base_url=base_url) as client:
+        hits = client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert isinstance(attempt.error, KeyboardInterrupt)
+    assert (recorder.events, hits) == (["enter 1", "exit 1"], {"hits": 1})
 
 
 async def test_a_stream_sends_the_hooks_headers(

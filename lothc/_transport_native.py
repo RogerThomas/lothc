@@ -62,10 +62,13 @@ from ._retry import (
     _RetryPolicy,
     _RetryRuling,
     _SyncRetryRuling,
+    _through_hook,
+    _through_hook_sync,
 )
 from ._settings import _default_user_agent, _RequestHookFactory, _TransportSettings
 from ._sse import SSEEvent, _sse_events, _sse_events_sync
 from ._streaming import (
+    _Abandonment,
     _ChunkReader,
     _download_stream,
     _download_stream_sync,
@@ -850,8 +853,8 @@ class _SyncNativeStreamSource:  # pylint: disable=too-many-instance-attributes
     # headers from it; `prepare` then leaves each attempt to make its own stream.
     _hook: _AttemptHook | None = _dataclass_field(default=None, init=False)
     _hook_headers: dict[str, str] | None = _dataclass_field(default=None, init=False)
-    # What the caller raised on giving up before the head arrived (`abandon`).
-    _abandoned: Exception | None = _dataclass_field(default=None, init=False)
+    # Whether the caller gave up before the head arrived (`abandon`).
+    _abandonment: _Abandonment = _dataclass_field(default_factory=_Abandonment, init=False)
 
     def _new_stream(
         self,
@@ -954,7 +957,7 @@ class _SyncNativeStreamSource:  # pylint: disable=too-many-instance-attributes
             opened, ruled = _retried_sync(
                 self._retry,
                 self._retries,
-                self._attempt,
+                partial(self._abandonment.attempt, self._attempt),
                 _head_retry_signal,
                 _native_retryable,
                 self._ruling(),
@@ -999,8 +1002,8 @@ class _SyncNativeStreamSource:  # pylint: disable=too-many-instance-attributes
             request_info = self._pool.request_info(self._method, self._path, request.query)
             self._hook = _AttemptHook(self._request_hook, request_info)
 
-    def abandon(self, error: Exception, /) -> None:
-        self._abandoned = error
+    def abandon(self, error: BaseException, /) -> None:
+        self._abandonment.error = error
 
     def open(self, stack: ExitStack) -> tuple[_ResponseHead, _SyncChunkReader]:
         hook = self._hook
@@ -1011,14 +1014,16 @@ class _SyncNativeStreamSource:  # pylint: disable=too-many-instance-attributes
         try:
             opened = self._open(stack)
         except BaseException as error:
-            hook.fail(error if self._abandoned is None else self._abandoned)
+            abandoned = self._abandonment.error
+            hook.fail(error if abandoned is None else abandoned)
             raise
-        # Given up on by a caller that has already raised `_abandoned` (`abandon`): the hook
-        # exits with that, however late the head came.
-        if self._abandoned is None:
+        # Given up on by a caller that has already raised (`abandon`): the hook exits with its
+        # own instance of that, however late the head came.
+        abandoned = self._abandonment.error
+        if abandoned is None:
             hook.close()
         else:
-            hook.fail(self._abandoned)
+            hook.fail(abandoned)
         return opened
 
 
@@ -1060,7 +1065,7 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
     # The client's retry policy, which `_call_retries` reads each call's retries from.
     _retry: _RetryPolicy = _dataclass_field(init=False)
     # The client's `request_hook=`, entered per attempt (`_AttemptHook`); a call with one goes
-    # through `_send_through_middleware`.
+    # through `_send_through_middleware`, inside `_through_hook`.
     _request_hook: _RequestHookFactory | None = _dataclass_field(init=False)
     # The longest gap `stream_get`/`stream_post`/`download` tolerate between chunks: the client's
     # `timeout`, unless `read_timeout` was set, which the native side then enforces at the socket
@@ -1228,11 +1233,13 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
         headers_only: bool,
         defer_error: bool,
         retries: int,
+        hook: _AttemptHook | None,
     ) -> Response[Any, Any]:
         """The pyreqwest transport's order: `_retried` (up to `retries` times) around
         `_ReauthMiddleware` (for a `bearer_auth` that can invalidate), each `_attempt`. The auth is
         fetched once, before either, as pyreqwest applies it to the request each attempt copies,
-        so `.elapsed` starts after it. A client's `request_hook=` is entered for each attempt."""
+        so `.elapsed` starts after it. With a `hook` (the client's `request_hook=`, the call made
+        through `_through_hook`), it's entered for each attempt."""
         reauth = None if skip_auth else self._reauth
         token = None
         if skip_auth:
@@ -1242,49 +1249,34 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
             auth = f"Bearer {token}"
         else:
             auth = self._static_auth
-        hook = (
-            None
-            if self._request_hook is None
-            else _AttemptHook(
-                self._request_hook, pool.request_info(call.method, call.path, call.query)
-            )
-        )
+        if hook is not None:
+            # After the auth, as without a hook: what the request would raise first, this does.
+            hook.request_info = pool.request_info(call.method, call.path, call.query)
         started = time.monotonic()
         attempt = partial(self._attempt, pool, call, auth, reauth, token, hook)
-        # One `try` around the rest, rather than a helper wrapped in one, which would put a
-        # frame on every retried call: whatever the last attempt ends in, a status or decode
-        # error included, goes into the hook's context, which ends once the body has been read.
-        try:
-            if retries and call.replayable:
-                response, ruled = await _retried(
-                    self._retry,
-                    retries,
-                    attempt,
-                    _response_retry_signal,
-                    _native_retryable,
-                    _response_ruling(self._retry, error_class, call.method),
-                    hook,
-                )
-            else:
-                response = await attempt()
-                ruled = None
-            finished = _finish_undecoded(
-                response,
-                decode,
-                error_class,
-                response_headers_type,
-                time.monotonic() - started,
-                ruled,
-                headers_only=headers_only,
-                defer_error=defer_error,
+        if retries and call.replayable:
+            response, ruled = await _retried(
+                self._retry,
+                retries,
+                attempt,
+                _response_retry_signal,
+                _native_retryable,
+                _response_ruling(self._retry, error_class, call.method),
+                hook,
             )
-        except BaseException as error:
-            if hook is not None:
-                hook.fail(error)
-            raise
-        if hook is not None:
-            hook.close()
-        return finished
+        else:
+            response = await attempt()
+            ruled = None
+        return _finish_undecoded(
+            response,
+            decode,
+            error_class,
+            response_headers_type,
+            time.monotonic() - started,
+            ruled,
+            headers_only=headers_only,
+            defer_error=defer_error,
+        )
 
     def _stream_source(
         self,
@@ -1445,16 +1437,35 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
             call = _NativeCall(
                 method, path, query, encoded_headers, body, body_kind, effective_timeout, not form
             )
-            return await self._send_through_middleware(
-                pool,
-                call,
-                decode,
-                error_class,
-                response_headers_type,
-                skip_auth=skip_auth,
-                headers_only=False,
-                defer_error=defer_error,
-                retries=retries,
+            if self._request_hook is None:
+                return await self._send_through_middleware(
+                    pool,
+                    call,
+                    decode,
+                    error_class,
+                    response_headers_type,
+                    skip_auth=skip_auth,
+                    headers_only=False,
+                    defer_error=defer_error,
+                    retries=retries,
+                    hook=None,
+                )
+            hook = _AttemptHook(self._request_hook)
+            return await _through_hook(
+                hook,
+                partial(
+                    self._send_through_middleware,
+                    pool,
+                    call,
+                    decode,
+                    error_class,
+                    response_headers_type,
+                    skip_auth=skip_auth,
+                    headers_only=False,
+                    defer_error=defer_error,
+                    retries=retries,
+                    hook=hook,
+                ),
             )
         if skip_auth:
             auth = None
@@ -1523,16 +1534,35 @@ class _NativeTransport:  # pylint: disable=too-many-instance-attributes
             call = _NativeCall(
                 method, path, query, encoded_headers, None, _NativeBody.RAW, effective_timeout
             )
-            return await self._send_through_middleware(
-                pool,
-                call,
-                None,
-                error_class,
-                response_headers_type,
-                skip_auth=skip_auth,
-                headers_only=True,
-                defer_error=defer_error,
-                retries=retries,
+            if self._request_hook is None:
+                return await self._send_through_middleware(
+                    pool,
+                    call,
+                    None,
+                    error_class,
+                    response_headers_type,
+                    skip_auth=skip_auth,
+                    headers_only=True,
+                    defer_error=defer_error,
+                    retries=retries,
+                    hook=None,
+                )
+            hook = _AttemptHook(self._request_hook)
+            return await _through_hook(
+                hook,
+                partial(
+                    self._send_through_middleware,
+                    pool,
+                    call,
+                    None,
+                    error_class,
+                    response_headers_type,
+                    skip_auth=skip_auth,
+                    headers_only=True,
+                    defer_error=defer_error,
+                    retries=retries,
+                    hook=hook,
+                ),
             )
         if skip_auth:
             auth = None
@@ -1698,7 +1728,7 @@ class _SyncNativeTransport:
     # The client's retry policy, which `_call_retries` reads each call's retries from.
     _retry: _RetryPolicy = _dataclass_field(init=False)
     # The client's `request_hook=`, entered per attempt (`_AttemptHook`); a call with one goes
-    # through `_send_through_middleware`.
+    # through `_send_through_middleware`, inside `_through_hook`.
     _request_hook: _RequestHookFactory | None = _dataclass_field(init=False)
     # The longest gap `stream_get`/`stream_post`/`download` tolerate between chunks: the client's
     # `timeout`, unless `read_timeout` was set, which the native side then enforces at the socket
@@ -1858,6 +1888,7 @@ class _SyncNativeTransport:
         headers_only: bool,
         defer_error: bool,
         retries: int,
+        hook: _AttemptHook | None,
     ) -> Response[Any, Any]:
         """Sync mirror of `_NativeTransport._send_through_middleware`."""
         reauth = None if skip_auth else self._reauth
@@ -1869,49 +1900,34 @@ class _SyncNativeTransport:
             auth = f"Bearer {token}"
         else:
             auth = self._static_auth
-        hook = (
-            None
-            if self._request_hook is None
-            else _AttemptHook(
-                self._request_hook, pool.request_info(call.method, call.path, call.query)
-            )
-        )
+        if hook is not None:
+            # After the auth, as without a hook: what the request would raise first, this does.
+            hook.request_info = pool.request_info(call.method, call.path, call.query)
         started = time.monotonic()
         attempt = partial(self._attempt, pool, call, auth, reauth, token, hook)
-        # One `try` around the rest, rather than a helper wrapped in one, which would put a
-        # frame on every retried call: whatever the last attempt ends in, a status or decode
-        # error included, goes into the hook's context, which ends once the body has been read.
-        try:
-            if retries and call.replayable:
-                response, ruled = _retried_sync(
-                    self._retry,
-                    retries,
-                    attempt,
-                    _response_retry_signal,
-                    _native_retryable,
-                    _response_ruling_sync(self._retry, error_class, call.method),
-                    hook,
-                )
-            else:
-                response = attempt()
-                ruled = None
-            finished = _finish_undecoded(
-                response,
-                decode,
-                error_class,
-                response_headers_type,
-                time.monotonic() - started,
-                ruled,
-                headers_only=headers_only,
-                defer_error=defer_error,
+        if retries and call.replayable:
+            response, ruled = _retried_sync(
+                self._retry,
+                retries,
+                attempt,
+                _response_retry_signal,
+                _native_retryable,
+                _response_ruling_sync(self._retry, error_class, call.method),
+                hook,
             )
-        except BaseException as error:
-            if hook is not None:
-                hook.fail(error)
-            raise
-        if hook is not None:
-            hook.close()
-        return finished
+        else:
+            response = attempt()
+            ruled = None
+        return _finish_undecoded(
+            response,
+            decode,
+            error_class,
+            response_headers_type,
+            time.monotonic() - started,
+            ruled,
+            headers_only=headers_only,
+            defer_error=defer_error,
+        )
 
     def _stream_source(
         self,
@@ -1998,7 +2014,7 @@ class _SyncNativeTransport:
         if pool is not None:
             pool.close()
 
-    def send(
+    def send(  # pylint: disable=too-many-locals
         self,
         method: str,
         path: str,
@@ -2059,16 +2075,35 @@ class _SyncNativeTransport:
             call = _NativeCall(
                 method, path, query, encoded_headers, body, body_kind, effective_timeout, not form
             )
-            return self._send_through_middleware(
-                pool,
-                call,
-                decode,
-                error_class,
-                response_headers_type,
-                skip_auth=skip_auth,
-                headers_only=False,
-                defer_error=defer_error,
-                retries=retries,
+            if self._request_hook is None:
+                return self._send_through_middleware(
+                    pool,
+                    call,
+                    decode,
+                    error_class,
+                    response_headers_type,
+                    skip_auth=skip_auth,
+                    headers_only=False,
+                    defer_error=defer_error,
+                    retries=retries,
+                    hook=None,
+                )
+            hook = _AttemptHook(self._request_hook)
+            return _through_hook_sync(
+                hook,
+                partial(
+                    self._send_through_middleware,
+                    pool,
+                    call,
+                    decode,
+                    error_class,
+                    response_headers_type,
+                    skip_auth=skip_auth,
+                    headers_only=False,
+                    defer_error=defer_error,
+                    retries=retries,
+                    hook=hook,
+                ),
             )
         if skip_auth:
             auth = None
@@ -2132,16 +2167,35 @@ class _SyncNativeTransport:
             call = _NativeCall(
                 method, path, query, encoded_headers, None, _NativeBody.RAW, effective_timeout
             )
-            return self._send_through_middleware(
-                pool,
-                call,
-                None,
-                error_class,
-                response_headers_type,
-                skip_auth=skip_auth,
-                headers_only=True,
-                defer_error=defer_error,
-                retries=retries,
+            if self._request_hook is None:
+                return self._send_through_middleware(
+                    pool,
+                    call,
+                    None,
+                    error_class,
+                    response_headers_type,
+                    skip_auth=skip_auth,
+                    headers_only=True,
+                    defer_error=defer_error,
+                    retries=retries,
+                    hook=None,
+                )
+            hook = _AttemptHook(self._request_hook)
+            return _through_hook_sync(
+                hook,
+                partial(
+                    self._send_through_middleware,
+                    pool,
+                    call,
+                    None,
+                    error_class,
+                    response_headers_type,
+                    skip_auth=skip_auth,
+                    headers_only=True,
+                    defer_error=defer_error,
+                    retries=retries,
+                    hook=hook,
+                ),
             )
         if skip_auth:
             auth = None

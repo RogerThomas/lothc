@@ -43,7 +43,7 @@ from _tls_server import tls_server_context
 from msgspec import Struct
 from pydantic import BaseModel, Field
 
-from lothc import HTTPClient, RequestHook, RequestInfo, SyncHTTPClient
+from lothc import HTTPClient, HTTPTransportError, RequestHook, RequestInfo, SyncHTTPClient
 
 # Every test here sends through the native transport, which is POSIX only.
 pytestmark = pytest.mark.skipif(
@@ -612,6 +612,99 @@ def test_sync_native_transport_streams_what_pyreqwest_streams(
     actual = _sync_streamed(native_client, case, base_url)
 
     assert actual == expected
+
+
+def _unbuildable_cases() -> list[_Case]:
+    """Requests with two faults each, the second one a client with a `request_hook=` on the native
+    transport once raised first, as it built the `RequestInfo` the hook is shown."""
+    unsupported_query = {"a": [[1, 2]]}
+    bad_header = {"x-bad": "bad\n"}
+    missing_file = {"f": Path("missing-file")}
+    return [
+        _Case(
+            "bad-header-unsupported-query",
+            call={"headers": bad_header, "params": unsupported_query},
+        ),
+        _Case(
+            "missing-file-unsupported-query",
+            "post",
+            call={"form": missing_file, "params": unsupported_query},
+        ),
+        _Case("bad-header-no-host", path="unix:/x", call={"headers": bad_header}),
+        _Case(
+            "stream-bad-header-unsupported-query",
+            "stream_get",
+            call={"headers": bad_header, "params": unsupported_query},
+        ),
+        _Case(
+            "stream-missing-file-unsupported-query",
+            "stream_post",
+            call={"form": missing_file, "params": unsupported_query},
+        ),
+    ]
+
+
+async def _async_sent(client: HTTPClient, case: _Case, base_url: str) -> None:
+    send: Callable[..., Any] = getattr(client, case.verb)
+    if case.verb.startswith("stream"):
+        _ = [chunk async for chunk in send(_path(case, base_url), **case.call)]
+    else:
+        await send(_path(case, base_url), **case.call)
+
+
+def _sync_sent(client: SyncHTTPClient, case: _Case, base_url: str) -> None:
+    send: Callable[..., Any] = getattr(client, case.verb)
+    if case.verb.startswith("stream"):
+        _ = list(send(_path(case, base_url), **case.call))
+    else:
+        send(_path(case, base_url), **case.call)
+
+
+async def _async_raised(client: HTTPClient, case: _Case, base_url: str) -> type[BaseException]:
+    async with client:
+        with pytest.raises((ValueError, OSError, HTTPTransportError)) as raised:
+            await _async_sent(client, case, base_url)
+    return raised.type
+
+
+def _sync_raised(client: SyncHTTPClient, case: _Case, base_url: str) -> type[BaseException]:
+    with client, pytest.raises((ValueError, OSError, HTTPTransportError)) as raised:
+        _sync_sent(client, case, base_url)
+    return raised.type
+
+
+@pytest.mark.parametrize("case", _unbuildable_cases(), ids=lambda case: case.id)
+async def test_native_transport_raises_what_pyreqwest_raises_with_a_request_hook(
+    base_url: str, case: _Case, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pyreqwest_client, native_client = _pair(partial(HTTPClient, base_url=base_url), monkeypatch)
+    hooked = partial(HTTPClient, base_url=base_url, request_hook=_hook_headers)
+    pyreqwest_hooked, native_hooked = _pair(hooked, monkeypatch)
+
+    expected = await _async_raised(pyreqwest_client, case, base_url)
+    actual = [
+        await _async_raised(client, case, base_url)
+        for client in (native_client, pyreqwest_hooked, native_hooked)
+    ]
+
+    assert actual == [expected] * 3
+
+
+@pytest.mark.parametrize("case", _unbuildable_cases(), ids=lambda case: case.id)
+def test_sync_native_transport_raises_what_pyreqwest_raises_with_a_request_hook(
+    base_url: str, case: _Case, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pyreqwest_client, native_client = _pair(partial(SyncHTTPClient, base_url=base_url), monkeypatch)
+    hooked = partial(SyncHTTPClient, base_url=base_url, request_hook=_hook_headers)
+    pyreqwest_hooked, native_hooked = _pair(hooked, monkeypatch)
+
+    expected = _sync_raised(pyreqwest_client, case, base_url)
+    actual = [
+        _sync_raised(client, case, base_url)
+        for client in (native_client, pyreqwest_hooked, native_hooked)
+    ]
+
+    assert actual == [expected] * 3
 
 
 def _hop_seen(response: Any) -> _Seen:  # noqa: ANN401 — whichever `Response` the verb returned

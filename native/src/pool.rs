@@ -1802,11 +1802,11 @@ impl Pool {
     }
 
     /// The `RequestInfo` a request with these arguments carries, sending nothing: what a
-    /// `request_hook=` is shown before its headers are added. Fails as `request` does for the
-    /// method, URL and query.
+    /// `request_hook=` is shown before its headers are added. Fails only as `request` fails
+    /// first (`ClientConfig::request_url`), so the error order is the same with a hook.
     fn request_info(&mut self, py: Python<'_>, method: Bound<'_, PyString>, path: &str, query: Option<Bound<'_, PyAny>>) -> PyResult<Py<PyAny>> {
         let state = self.state.get_mut()?;
-        let url = state.config.request_url(py, &state.glue, method.to_str()?, path, query.as_ref())?;
+        let url = state.config.request_url(method.to_str()?, path, query.as_ref())?;
         Ok(state.glue.request_info_of(py, &method, &url)?.unbind())
     }
 

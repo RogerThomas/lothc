@@ -7,6 +7,7 @@ import time
 from collections.abc import AsyncIterator, Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -289,6 +290,38 @@ def test_sync_an_async_iterable_is_refused_before_anything_is_sent(
             params={"key": server_key},
             form={"a": "b", "f": ("f.bin", _AsyncChunks((b"one",)))},
         )
+    hits = sync_client.get("hits", params={"key": server_key}, into=dict).data
+
+    assert hits == {"hits": 0}
+
+
+# A text-mode or unbuffered file iterates, but isn't a stream of chunks: it's refused before
+# anything is sent, as before streamed parts, not sent until its first chunk fails.
+@pytest.mark.parametrize(("mode", "buffering"), [("r", -1), ("rb", 0)], ids=["text", "unbuffered"])
+async def test_a_file_that_is_not_buffered_binary_is_refused_before_anything_is_sent(
+    client: HTTPClient, server_key: str, tmp_path: Path, mode: str, buffering: int
+) -> None:
+    (tmp_path / "f.txt").write_text("one\n")
+
+    with (tmp_path / "f.txt").open(mode, buffering=buffering) as file:
+        value: Any = ("f.txt", file)
+        with pytest.raises(TypeError, match="Unsupported form value for 'f'"):
+            await client.post("status-then-ok", params={"key": server_key}, form={"f": value})
+    hits = (await client.get("hits", params={"key": server_key}, into=dict)).data
+
+    assert hits == {"hits": 0}
+
+
+@pytest.mark.parametrize(("mode", "buffering"), [("r", -1), ("rb", 0)], ids=["text", "unbuffered"])
+def test_sync_a_file_that_is_not_buffered_binary_is_refused_before_anything_is_sent(
+    sync_client: SyncHTTPClient, server_key: str, tmp_path: Path, mode: str, buffering: int
+) -> None:
+    (tmp_path / "f.txt").write_text("one\n")
+
+    with (tmp_path / "f.txt").open(mode, buffering=buffering) as file:
+        value: Any = ("f.txt", file, "text/plain")
+        with pytest.raises(TypeError, match="Unsupported form value for 'f'"):
+            sync_client.post("status-then-ok", params={"key": server_key}, form={"f": value})
     hits = sync_client.get("hits", params={"key": server_key}, into=dict).data
 
     assert hits == {"hits": 0}

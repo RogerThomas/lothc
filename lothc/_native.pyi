@@ -295,8 +295,9 @@ class Pool:
 
     def request_info(self, method: str, path: str, query: object) -> RequestInfo:
         """The `RequestInfo` a request with these arguments carries, sending nothing: what a
-        `request_hook=` is shown before its headers are added. Raises as `request` does for the
-        method, URL and query."""
+        `request_hook=` is shown before its headers are added. Raises only what `request` would
+        raise first (a bad method, URL or query encoding), leaving an unsupported query value or
+        a URL without a host for `request` to raise in its own order."""
 
     def stream(
         self,

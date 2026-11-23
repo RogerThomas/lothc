@@ -907,6 +907,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
         # request as it arrives (read back via `/hits`), so a test can wait until one is in flight,
         # and `/release?key=` answers it at once: a test holding a `max_connections` slot asks for
         # a long sleep and releases it once done, rather than guessing how long it needs it for.
+        # `status` (200 by default) is the answer's, so a test can stall a response it then fails.
         params = parse_qs(query)
         seconds = float(params.get("seconds", ["0.5"])[0])
         if "key" in params:
@@ -915,7 +916,7 @@ class TestAppHandler(BaseHTTPRequestHandler):
             self._releases.setdefault(key, threading.Event()).wait(seconds)
         else:
             sleep(seconds)
-        self._write_json(200, {"finally": True})
+        self._write_json(int(params.get("status", ["200"])[0]), {"finally": True})
 
     def _handle_longest_gap(self, query: str) -> None:
         # How long `/events?key=` went at most between two writes (`sent` first), and whether it

@@ -73,7 +73,12 @@ def _differing_implementations() -> dict[str, str]:
         "async: a stream's idle limit cancels `open`, so the hook's attempt exits with what the "
         "stack unwinds with, the verb's `HTTPTimeoutError`; sync: the limit fires on the "
         "caller's thread while `open` waits on a worker, which `abandon` tells, so the attempt "
-        "exits with that error once `open` returns"
+        "exits with its own instance of that error once `open` returns"
+    )
+    stops_retrying_once_abandoned = (
+        "sync: the caller gives up on a stalled head on its own thread while the worker's retry "
+        "loop goes on, so each attempt goes through `_Abandonment.attempt`, which stops it; "
+        "async: the idle limit cancels the loop itself"
     )
     native_pool_lifecycle = (
         "the async native pool is bound to the running loop and opens its sockets through "
@@ -89,7 +94,9 @@ def _differing_implementations() -> dict[str, str]:
         "_NativeTransport.close": native_pool_lifecycle,
         "_NativeStreamSource._open_current": awaits_the_native_stream,
         "_NativeStreamSource._read_chunk": awaits_the_native_stream,
+        "_NativeStreamSource._open": stops_retrying_once_abandoned,
         "_NativeStreamSource.open": idle_limit_while_opening,
+        "_PyreqwestStreamSource._open": stops_retrying_once_abandoned,
         "_PyreqwestStreamSource.open": idle_limit_while_opening,
         "_native_answer": awaits_the_native_future,
         "_build_form": (

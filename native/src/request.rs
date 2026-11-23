@@ -740,17 +740,12 @@ impl ClientConfig {
 
     /// The URL a request goes to, as `stage` builds it, before anything else is: what its
     /// `RequestInfo` carries, for a `request_hook=` to see before the hook's headers are added.
-    /// Fails as `stage` does for the method, URL and query; the scheme is `finish`'s to check,
-    /// as reqwest checks it while sending, inside the hook.
-    pub(crate) fn request_url(&self, py: Python<'_>, glue: &Glue, method_name: &str, path: &str, query: Option<&Bound<'_, PyAny>>) -> PyResult<Url> {
+    /// Fails only where `stage` fails first (the method, then the URL and query); an unsupported
+    /// query value or a URL without a host is left for `stage` to raise after the headers and
+    /// body, as it does without a hook, and the scheme for `finish`, inside the hook.
+    pub(crate) fn request_url(&self, method_name: &str, path: &str, query: Option<&Bound<'_, PyAny>>) -> PyResult<Url> {
         method(method_name)?;
-        let (url, _, unsupported) = self.staged_url(path, query)?;
-        if unsupported {
-            return Err(glue.builder_error(py, "builder error: unsupported value".to_owned()));
-        }
-        if !url.has_host() {
-            return Err(glue.builder_error(py, format!("builder error for url ({url}): URL scheme is not allowed")));
-        }
+        let (url, _, _) = self.staged_url(path, query)?;
         Ok(url)
     }
 

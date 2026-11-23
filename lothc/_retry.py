@@ -89,6 +89,16 @@ class _AttemptHook:
     _context: AbstractContextManager[RequestHook] | None = field(default=None, init=False)
     _hook: RequestHook | None = field(default=None, init=False)
 
+    def _fail(self, error: BaseException) -> None:
+        context, self._context, self._hook = self._context, None, None
+        if context is not None:
+            context.__exit__(type(error), error, error.__traceback__)
+
+    def _close(self) -> None:
+        context, self._context, self._hook = self._context, None, None
+        if context is not None:
+            context.__exit__(None, None, None)
+
     def enter(self) -> dict[str, str]:
         if self.request_info is None:
             raise RuntimeError("A request hook was entered before its request was built")
@@ -126,19 +136,39 @@ class _AttemptHook:
         """`close`, or `fail` with `error`, as an exit callback on an exit stack, so the attempt
         exits with whatever the stack unwinds with (never swallowing it)."""
         if error is None:
-            self.close()
+            self._close()
         else:
-            self.fail(error)
+            self._fail(error)
 
     def fail(self, error: BaseException) -> None:
-        context, self._context, self._hook = self._context, None, None
-        if context is not None:
-            context.__exit__(type(error), error, error.__traceback__)
+        self._fail(error)
 
     def close(self) -> None:
-        context, self._context, self._hook = self._context, None, None
-        if context is not None:
-            context.__exit__(None, None, None)
+        self._close()
+
+
+async def _through_hook[T](hook: _AttemptHook, sent: Callable[[], Awaitable[T]]) -> T:
+    """`sent()`, a call made with `hook`, whose last attempt then exits: with what the call
+    raises (a status or decode error included), else cleanly. Only a call with a `request_hook=`
+    comes through here, so a call without one has no frame of it."""
+    try:
+        outcome = await sent()
+    except BaseException as error:
+        hook.fail(error)
+        raise
+    hook.close()
+    return outcome
+
+
+def _through_hook_sync[T](hook: _AttemptHook, sent: Callable[[], T]) -> T:
+    """Sync mirror of `_through_hook`."""
+    try:
+        outcome = sent()
+    except BaseException as error:
+        hook.fail(error)
+        raise
+    hook.close()
+    return outcome
 
 
 def _retry_policy(settings: _TransportSettings) -> _RetryPolicy:

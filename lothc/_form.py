@@ -8,7 +8,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextvars import Context, copy_context
 from dataclasses import dataclass
-from io import BufferedIOBase
+from io import BufferedIOBase, IOBase
 from json import dumps as _json_dumps
 from mimetypes import guess_type as _guess_mime_type
 from pathlib import Path
@@ -162,6 +162,19 @@ def _encode_json_form_part(value: list[Any] | JSONPayload) -> bytes:
     return _json_dumps(value).encode()
 
 
+def _is_file_content(content: object) -> bool:
+    """Whether a file part's `content` is one a part is made from: anything its pattern takes
+    but a file object that isn't buffered binary (a text-mode file, or one opened with
+    `buffering=0`), which iterates like a stream of chunks but is refused before sending, as an
+    unsupported form value.
+
+    >>> import io
+    >>> [_is_file_content(c) for c in (io.BytesIO(), io.StringIO(), iter([b"a"]))]
+    [True, False, True]
+    """
+    return not isinstance(content, IOBase) or isinstance(content, BufferedIOBase)
+
+
 # Mirrors _form_value_parts's own branch order (not _FormRepeat's member order) so a value's kind
 # here is always the branch it will actually take. Returns None for anything unclassifiable and
 # leaves the reporting to _form_value_parts's `case _`, which names the offending value.
@@ -174,16 +187,26 @@ def _form_value_kind(value: object) -> str | None:
         case list():
             return "json"
         case (
-            (str(), bytes() | Path() | BufferedIOBase() | _ChunkSource() | _AsyncChunkSource())
+            (
+                str(),
+                bytes()
+                | Path()
+                | BufferedIOBase()
+                | _ChunkSource()
+                | _AsyncChunkSource() as content,
+            )
             | (
                 str(),
-                bytes() | Path() | BufferedIOBase() | _ChunkSource() | _AsyncChunkSource(),
+                bytes()
+                | Path()
+                | BufferedIOBase()
+                | _ChunkSource()
+                | _AsyncChunkSource() as content,
                 str(),
             )
-            | (Path(), str())
-            | Path()
-            | BufferedIOBase()
-        ):
+            | (Path() as content, str())
+            | (Path() | BufferedIOBase() as content)
+        ) if _is_file_content(content):
             return "file"
         case dict() | BaseModel() | Struct():
             return "json"
@@ -285,10 +308,12 @@ def _form_value_parts(
         case list():
             body = _encode_json_form_part(cast(list[Any], value))
             yield _FormPart(name, body, None, "application/json")
+        # A text-mode or unbuffered file is an iterator too, but not a file part's content: it
+        # falls through to `case tuple()`, whose `case _` refuses it before anything is sent.
         case (
             str() as filename,
             bytes() | Path() | BufferedIOBase() | _ChunkSource() | _AsyncChunkSource() as content,
-        ):
+        ) if _is_file_content(content):
             yield _form_file_part(
                 name,
                 content,
@@ -301,7 +326,7 @@ def _form_value_parts(
             str() as filename,
             bytes() | Path() | BufferedIOBase() | _ChunkSource() | _AsyncChunkSource() as content,
             str() as mime,
-        ):
+        ) if _is_file_content(content):
             yield _form_file_part(
                 name,
                 content,
