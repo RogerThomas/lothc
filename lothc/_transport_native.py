@@ -203,21 +203,29 @@ def _multipart_boundary() -> str:
 @dataclass(slots=True)
 class _NativeForm:
     """A `form=` body as the native side builds it (`native/src/multipart.rs`), each time its
-    request is prepared: `parts()` describes the parts afresh, and the boundary is drawn once per
-    call, so a replayed attempt (only an empty form is ever replayed, as on pyreqwest) carries the
-    same one, as a copy of pyreqwest's request does. The native side says whether the pool
-    building it is async (`async_client`), since only that one can pull a file part streamed
-    from an async iterable."""
+    request is prepared: `sync_parts()` or `async_parts()` describes the parts afresh, and the
+    boundary is drawn once per call, so a replayed attempt (only an empty form is ever replayed,
+    as on pyreqwest) carries the same one, as a copy of pyreqwest's request does. The native side
+    calls the one for its pool's kind of client, since only an async one can pull a file part
+    streamed from an async iterable: a method each, not an `async_client=` argument, which the
+    native side would build a `dict` for on every form request."""
 
     boundary: str
     form: Form
     infer_mime_type_from_file_extension: bool
 
-    def parts(self, *, async_client: bool) -> Iterator[_FormPart]:
+    def sync_parts(self) -> Iterator[_FormPart]:
         return _form_parts(
             self.form,
             infer_mime_type_from_file_extension=self.infer_mime_type_from_file_extension,
-            async_client=async_client,
+            async_client=False,
+        )
+
+    def async_parts(self) -> Iterator[_FormPart]:
+        return _form_parts(
+            self.form,
+            infer_mime_type_from_file_extension=self.infer_mime_type_from_file_extension,
+            async_client=True,
         )
 
 

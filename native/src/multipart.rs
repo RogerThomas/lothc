@@ -31,7 +31,7 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use pyo3::exceptions::PyValueError;
 use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyString};
+use pyo3::types::{PyBytes, PyString};
 
 use crate::body::{RequestBody, Segment, Segments, CHUNKED_FILE_CHUNK, FILE_CHUNK};
 use crate::chunks::Chunks;
@@ -165,16 +165,16 @@ pub(crate) struct Encoded {
 }
 
 impl Form {
-    /// Build every part `form.parts()` describes, in order, each before the next is described.
-    /// `wake` is an async pool's own, which only it passes: the parts are described for an async
-    /// client then, which alone may stream one from an async iterable.
+    /// Build every part `form.sync_parts()` or `form.async_parts()` describes, in order, each
+    /// before the next is described. `wake` is an async pool's own, which only it passes: the
+    /// parts are described for an async client then (`async_parts`), which alone may stream one
+    /// from an async iterable.
     pub(crate) fn extract(form: &Bound<'_, PyAny>, wake: Option<&Py<PyAny>>) -> PyResult<Self> {
         let py = form.py();
         let boundary = form.getattr(intern!(py, "boundary"))?.extract::<String>()?;
-        let kwargs = PyDict::new(py);
-        kwargs.set_item(intern!(py, "async_client"), wake.is_some())?;
+        let parts = if wake.is_some() { intern!(py, "async_parts") } else { intern!(py, "sync_parts") };
         let mut fields = Vec::new();
-        for part in form.call_method(intern!(py, "parts"), (), Some(&kwargs))?.try_iter()? {
+        for part in form.call_method0(parts)?.try_iter()? {
             fields.push(build_part(&part?, wake)?);
         }
         Ok(Self { boundary, fields })

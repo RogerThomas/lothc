@@ -5,7 +5,7 @@ streamed from an iterator (`_ChunkStream`) or an async iterable (`_AsyncChunkStr
 chunk by chunk as either transport writes the body, never held whole."""
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import AsyncIterable, AsyncIterator, Callable, Iterator
 from contextvars import Context, copy_context
 from dataclasses import dataclass
 from io import BufferedIOBase, IOBase
@@ -16,6 +16,7 @@ from typing import (
     Any,
     Protocol,
     Self,
+    TypeIs,
     cast,
     runtime_checkable,
 )
@@ -31,9 +32,11 @@ from ._encode import _pydantic_by_alias
 from ._types import Form, JSONPayload
 
 
-# What a `match` takes for a streamed file part's content: an iterator, or an async iterable, of
-# anything (each chunk is checked as it's pulled, `_checked_chunk`). As `case Iterator()` would
-# take it, but with its items known (`object`), where `collections.abc`'s leave them unknown.
+# A streamed file part's content: an iterator, or an async iterable, of anything (each chunk is
+# checked as it's pulled, `_checked_chunk`). As `Iterator` would type it, but with its items known
+# (`object`), where `collections.abc`'s leave them unknown. Matched only once a value is known to
+# be file content (`_is_file_content`), since a runtime-checkable protocol's failed `isinstance`
+# costs over a microsecond.
 @runtime_checkable
 class _ChunkSource(Protocol):
     def __iter__(self) -> Self: ...
@@ -162,17 +165,29 @@ def _encode_json_form_part(value: list[Any] | JSONPayload) -> bytes:
     return _json_dumps(value).encode()
 
 
-def _is_file_content(content: object) -> bool:
-    """Whether a file part's `content` is one a part is made from: anything its pattern takes
-    but a file object that isn't buffered binary (a text-mode file, or one opened with
-    `buffering=0`), which iterates like a stream of chunks but is refused before sending, as an
-    unsupported form value.
+# Hot even for a form with no file in it: a file pattern is tried on plain values too (each `str`
+# of a repeat tuple). So a `str` is ruled out first, and the rest is checked against
+# `collections.abc`'s classes, not `_ChunkSource`'s, whose failed `isinstance` made such a form
+# ~35% slower to send.
+def _is_file_content(
+    content: object,
+) -> TypeIs[bytes | Path | BufferedIOBase | _ChunkSource | _AsyncChunkSource]:
+    """Whether `content` is what a file part is made from: `bytes`, a `Path`, a buffered binary
+    file, or a stream of chunks (an iterator, or an async iterable), but not a file object that
+    isn't buffered binary (a text-mode file, or one opened with `buffering=0`), which iterates
+    like a stream of chunks but is refused before sending, as an unsupported form value.
 
     >>> import io
-    >>> [_is_file_content(c) for c in (io.BytesIO(), io.StringIO(), iter([b"a"]))]
-    [True, False, True]
+    >>> [_is_file_content(c) for c in (b"a", io.BytesIO(), io.StringIO(), iter([b"a"]), "a")]
+    [True, True, False, True, False]
     """
-    return not isinstance(content, IOBase) or isinstance(content, BufferedIOBase)
+    if isinstance(content, (bytes, Path)):
+        return True
+    if isinstance(content, str):
+        return False
+    if isinstance(content, IOBase):
+        return isinstance(content, BufferedIOBase)
+    return isinstance(content, (Iterator, AsyncIterable))
 
 
 # Mirrors _form_value_parts's own branch order (not _FormRepeat's member order) so a value's kind
@@ -187,23 +202,8 @@ def _form_value_kind(value: object) -> str | None:
         case list():
             return "json"
         case (
-            (
-                str(),
-                bytes()
-                | Path()
-                | BufferedIOBase()
-                | _ChunkSource()
-                | _AsyncChunkSource() as content,
-            )
-            | (
-                str(),
-                bytes()
-                | Path()
-                | BufferedIOBase()
-                | _ChunkSource()
-                | _AsyncChunkSource() as content,
-                str(),
-            )
+            (str(), object() as content)
+            | (str(), object() as content, str())
             | (Path() as content, str())
             | (Path() | BufferedIOBase() as content)
         ) if _is_file_content(content):
@@ -310,10 +310,7 @@ def _form_value_parts(
             yield _FormPart(name, body, None, "application/json")
         # A text-mode or unbuffered file is an iterator too, but not a file part's content: it
         # falls through to `case tuple()`, whose `case _` refuses it before anything is sent.
-        case (
-            str() as filename,
-            bytes() | Path() | BufferedIOBase() | _ChunkSource() | _AsyncChunkSource() as content,
-        ) if _is_file_content(content):
+        case (str() as filename, object() as content) if _is_file_content(content):
             yield _form_file_part(
                 name,
                 content,
@@ -322,11 +319,7 @@ def _form_value_parts(
                 infer_mime_type_from_file_extension=infer,
                 async_client=async_client,
             )
-        case (
-            str() as filename,
-            bytes() | Path() | BufferedIOBase() | _ChunkSource() | _AsyncChunkSource() as content,
-            str() as mime,
-        ) if _is_file_content(content):
+        case (str() as filename, object() as content, str() as mime) if _is_file_content(content):
             yield _form_file_part(
                 name,
                 content,
