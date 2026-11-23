@@ -7,6 +7,19 @@ messages; 0.0.17 to 0.0.19 were hand-written in the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. Releases up to and including
 0.0.16 predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/releases).
 
+## [0.4.1](https://github.com/RogerThomas/lothc/compare/0.4.0...0.4.1) (2026-11-23)
+
+
+### Features
+
+* request_hook and streamed form file parts ([#91](https://github.com/RogerThomas/lothc/issues/91)) ([e510408](https://github.com/RogerThomas/lothc/commit/e5104088915315f4269d9a2aa4fad69b462750cc))
+
+
+### Bug Fixes
+
+* import TypeForm from typing on Python 3.15+ ([4e72fb4](https://github.com/RogerThomas/lothc/commit/4e72fb40770afa57c133cad87f8ecf420eb7987c))
+* import TypeForm from typing on Python 3.15+ ([62368c3](https://github.com/RogerThomas/lothc/commit/62368c3b9cbbcc8d7130551e2f8f63865e567db2))
+
 ## [0.4.0](https://github.com/RogerThomas/lothc/compare/0.3.0...0.4.0) (2026-11-17)
 
 
