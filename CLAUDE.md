@@ -307,6 +307,8 @@ Each of these was a real bug or a lost hour once.
 - **`.to_bytes()`, never `bytes(x.bytes())`**, and don't convert at all when the decoder takes a
   buffer (msgspec does; pydantic needs `bytes`).
 - **Keep `_send_method` one async layer deep**: each extra layer is a frame on every resume.
+- **A failed `isinstance` against a runtime-checkable `Protocol` costs over 1us and isn't
+  cached**: keep them out of hot `match` patterns (two in `form=` cost plain forms ~35%).
 - **The async idle limit wraps each chunk read, never a `yield`**, or a slow consumer looks like
   a stalled server.
 - **The mocker validates before registering** (a rule matches from the moment it's added) **and
