@@ -7,6 +7,13 @@ messages; 0.0.17 to 0.0.19 were hand-written in the
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format. Releases up to and including
 0.0.16 predate this file; see [GitHub Releases](https://github.com/RogerThomas/lothc/releases).
 
+## [0.4.2](https://github.com/RogerThomas/lothc/compare/0.4.1...0.4.2) (2026-11-23)
+
+
+### Documentation
+
+* drop duplicate 0.4.1 changelog entry ([#92](https://github.com/RogerThomas/lothc/issues/92)) ([fc59329](https://github.com/RogerThomas/lothc/commit/fc59329231e63b28b0808612ea213e4ea96b64ee))
+
 ## [0.4.1](https://github.com/RogerThomas/lothc/compare/0.4.0...0.4.1) (2026-11-23)
 
 
