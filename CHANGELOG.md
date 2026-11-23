@@ -17,7 +17,6 @@ messages; 0.0.17 to 0.0.19 were hand-written in the
 
 ### Bug Fixes
 
-* import TypeForm from typing on Python 3.15+ ([4e72fb4](https://github.com/RogerThomas/lothc/commit/4e72fb40770afa57c133cad87f8ecf420eb7987c))
 * import TypeForm from typing on Python 3.15+ ([62368c3](https://github.com/RogerThomas/lothc/commit/62368c3b9cbbcc8d7130551e2f8f63865e567db2))
 
 ## [0.4.0](https://github.com/RogerThomas/lothc/compare/0.3.0...0.4.0) (2026-11-17)
